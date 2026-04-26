@@ -1,8 +1,26 @@
 <script lang="ts">
+  import { open } from "@tauri-apps/plugin-dialog";
   import { updateDeck, removeDeck } from "../lib/state/session";
   import type { Deck } from "../lib/state/types";
 
   let { deck }: { deck: Deck } = $props();
+
+  async function loadVideo() {
+    const file = await open({
+      multiple: false,
+      filters: [{ name: "Video", extensions: ["mp4", "webm", "mkv", "mov", "avi", "ogv"] }],
+    });
+    if (typeof file === "string") {
+      updateDeck(deck.id, { source: { type: "video", filePath: file, duration: 0 }, playing: false });
+    }
+  }
+
+  function formatDuration(s: number): string {
+    if (!s) return "--:--";
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60).toString().padStart(2, "0");
+    return `${m}:${sec}`;
+  }
 </script>
 
 <div class="deck-card" class:playing={deck.playing}>
@@ -15,18 +33,21 @@
 
   <div class="preview">
     {#if deck.source?.type === "video"}
-      <span class="source-label">▶ {deck.source.filePath.split("/").pop()}</span>
+      <span class="source-label">{deck.source.filePath.split("/").pop()}</span>
+      <span class="duration">{formatDuration(deck.source.duration)}</span>
     {:else if deck.source?.type === "shader"}
       <span class="source-label">✦ shader</span>
     {:else}
       <span class="source-label empty">— no source —</span>
     {/if}
+    <button class="load-btn" onclick={loadVideo}>Load Video</button>
   </div>
 
   <div class="transport">
     <button
       class="play-btn"
       onclick={() => updateDeck(deck.id, { playing: !deck.playing })}
+      disabled={!deck.source}
     >
       {deck.playing ? "⏸" : "▶"}
     </button>
@@ -37,6 +58,14 @@
     >
       ⟲
     </button>
+    {#if deck.source?.type === "video"}
+      <button
+        onclick={() => updateDeck(deck.id, { cuePoint: 0, playing: false })}
+        title="Return to cue"
+      >
+        ⏮
+      </button>
+    {/if}
   </div>
 
   <div class="sliders">

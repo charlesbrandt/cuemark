@@ -33,6 +33,14 @@ export class DeckFBO {
     this.gl.viewport(0, 0, this.width, this.height);
   }
 
+  uploadVideoFrame(video: HTMLVideoElement) {
+    if (video.readyState < 2) return;
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, this.texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  }
+
   destroy() {
     this.gl.deleteTexture(this.texture);
     this.gl.deleteFramebuffer(this.fbo);

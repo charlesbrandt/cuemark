@@ -2,12 +2,18 @@
 
 ## Phase 1 — Two decks, crossfader, MIDI
 
-### video playback [next]
-- File picker → set `deck.source` (Tauri `dialog` plugin or `open` command)
-- `<video>` element per deck, hidden off-screen
-- Render loop: `requestAnimationFrame` → `texImage2D` each playing video into its FBO → `compositor.composite()`
-- Wire `deck.playing`, `deck.loop`, `deck.playbackRate`, `deck.volume` to the video element
-- Seek to `deck.cuePoint` on cue-jump
+### video playback [done]
+- File picker via `tauri-plugin-dialog` → `open()` → sets `deck.source`
+- Hidden `<video>` per deck, managed in `App.svelte` via `$effect`
+- RAF loop: `fbo.uploadVideoFrame(videoEl)` → `compositor.composite()`
+- `deck.playing`, `deck.loop`, `deck.playbackRate`, `deck.volume` wired to video element
+- `loadedmetadata` event updates `deck.source.duration`
+- `convertFileSrc` + asset protocol serves local files to WebKit
+
+### cue-jump seek [next]
+- On `cue_jump` MIDI action: `video.currentTime = deck.cuePoint`
+- On ⏮ button click: same (currently resets to 0)
+- Set cue point: hold cue button while playing to mark current position
 
 ### output window
 - Open a second Tauri `WebviewWindow` for the projector output
