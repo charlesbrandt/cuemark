@@ -10,12 +10,13 @@
 - `loadedmetadata` event updates `deck.source.duration`
 - `convertFileSrc` + asset protocol serves local files to WebKit
 
-### cue-jump seek [next]
-- On `cue_jump` MIDI action: `video.currentTime = deck.cuePoint`
-- On ⏮ button click: same (currently resets to 0)
-- Set cue point: hold cue button while playing to mark current position
+### cue-jump seek [done]
+- On `cue_jump` MIDI action: `seekDeck(id, cuePoint)` via `seekBus.ts` + stop playing
+- On ⏮ button: same — seeks to `deck.cuePoint` (not 0)
+- "Cue" button in DeckCard: captures `video.currentTime` → sets `deck.cuePoint`
+- `seekBus.ts` holds module-level video element refs; App.svelte registers on create/destroy
 
-### output window
+### output window [next]
 - Open a second Tauri `WebviewWindow` for the projector output
 - Output window renders only the compositor canvas, fullscreen on display 2
 - Share compositor state between windows via Tauri events or a shared canvas approach

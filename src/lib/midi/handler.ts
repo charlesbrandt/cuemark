@@ -1,5 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { updateDeck, getDeck, setCrossfader } from "../state/session";
+import { seekDeck } from "../renderer/seekBus";
 
 // Must match the Rust MidiAction enum (snake_case tag + camelCase fields from serde)
 export interface MidiAction {
@@ -44,7 +45,10 @@ export async function startMidiListener(): Promise<() => void> {
       case "cue_jump": {
         if (!a.deck_id) break;
         const d = getDeck(a.deck_id);
-        if (d) updateDeck(d.id, { playing: false }); // TODO: seek to cuePoint
+        if (d) {
+          seekDeck(d.id, d.cuePoint);
+          updateDeck(d.id, { playing: false });
+        }
         break;
       }
       case "loop_toggle": {

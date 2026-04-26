@@ -1,6 +1,7 @@
 <script lang="ts">
   import { open } from "@tauri-apps/plugin-dialog";
   import { updateDeck, removeDeck } from "../lib/state/session";
+  import { seekDeck, getDeckTime } from "../lib/renderer/seekBus";
   import type { Deck } from "../lib/state/types";
 
   let { deck }: { deck: Deck } = $props();
@@ -60,10 +61,16 @@
     </button>
     {#if deck.source?.type === "video"}
       <button
-        onclick={() => updateDeck(deck.id, { cuePoint: 0, playing: false })}
-        title="Return to cue"
+        onclick={() => { seekDeck(deck.id, deck.cuePoint); updateDeck(deck.id, { playing: false }); }}
+        title="Return to cue ({formatDuration(deck.cuePoint)})"
       >
         ⏮
+      </button>
+      <button
+        onclick={() => { const t = getDeckTime(deck.id); if (t !== null) updateDeck(deck.id, { cuePoint: t }); }}
+        title="Set cue point at current position"
+      >
+        Cue
       </button>
     {/if}
   </div>

@@ -5,6 +5,7 @@
   import { startMidiListener } from "./lib/midi/handler";
   import { Compositor } from "./lib/renderer/compositor";
   import { convertFileSrc } from "@tauri-apps/api/core";
+  import { registerVideoEl, unregisterVideoEl } from "./lib/renderer/seekBus";
   import DeckCard from "./components/DeckCard.svelte";
   import Crossfader from "./components/Crossfader.svelte";
   import type { Deck } from "./lib/state/types";
@@ -25,7 +26,7 @@
   onDestroy(() => {
     midiUnlisten?.();
     cancelAnimationFrame(rafId);
-    for (const v of videoEls.values()) { v.pause(); v.remove(); }
+    for (const [id, v] of videoEls) { v.pause(); v.remove(); unregisterVideoEl(id); }
     videoEls.clear();
   });
 
@@ -44,6 +45,7 @@
       if (!deck || deck.source?.type !== "video") {
         v.pause();
         v.remove();
+        unregisterVideoEl(id);
         videoEls.delete(id);
       }
     }
@@ -59,6 +61,7 @@
         v.style.cssText = "position:fixed;top:-9999px;width:1px;height:1px;pointer-events:none";
         v.crossOrigin = "anonymous";
         document.body.appendChild(v);
+        registerVideoEl(deck.id, v);
         videoEls.set(deck.id, v);
       }
 

@@ -13,6 +13,7 @@ Domain: cuemark.com (Charles Brandt's former DJ name)
 - **GLSL shaders** — effects and audio-reactive visualizations
 - **Rust `midir` crate** — MIDI input (Web MIDI API unreliable in WebKitGTK); events piped to frontend via Tauri IPC
 - **`<video>` element → texImage2D** — hardware-accelerated video decode into WebGL texture (WebKitGTK uses GStreamer under the hood)
+- **Tauri asset protocol** — `convertFileSrc()` converts local paths to `asset://localhost/...` so WebKit can load them; requires `protocol-asset` Cargo feature + `assetProtocol` enabled in `tauri.conf.json`
 
 ## Architecture
 
@@ -123,12 +124,13 @@ cuemark/
       renderer/
         fbo.ts                  # DeckFBO — allocates WebGL texture + framebuffer
         compositor.ts           # Compositor — syncDecks(), composite()
+        seekBus.ts              # Module-level video element registry; seekDeck() / getDeckTime()
       audio/
         analyzer.ts             # AudioAnalyzer — Web Audio API FFT
       midi/
         handler.ts              # Tauri IPC listener → session mutations
     components/
-      DeckCard.svelte           # Per-deck controls (opacity, volume, rate, play, loop)
+      DeckCard.svelte           # Per-deck controls (opacity, volume, rate, play, loop, cue set/jump)
       Crossfader.svelte         # Hardware crossfader UI (maps to two deck opacities)
   src-tauri/                    # Rust backend (Tauri 2)
     src/
@@ -181,6 +183,7 @@ Every layer is deliberately free of hardcoded deck counts:
 | Session store | `src/lib/state/session.ts` | `addDeck()` / `removeDeck()` / `updateDeck(id, patch)` by string ID |
 | Compositor | `src/lib/renderer/compositor.ts` | `syncDecks(ids[])` allocates one FBO per deck; `composite(decks[])` iterates all |
 | UI | `src/App.svelte` | `{#each $session.decks as deck (deck.id)}` — `+ Deck` button in toolbar |
+| Seek | `src/lib/renderer/seekBus.ts` | `Map<deckId, HTMLVideoElement>` — `seekDeck(id, t)` works for any deck ID |
 | MIDI | `src-tauri/src/midi.rs` | `MidiMap: HashMap<(u8,u8), ControlBinding>` — bindings reference deck IDs as strings |
 
 The crossfader maps to two *named* deck IDs (`crossfaderMapping.left/right`), not indices 0 and 1.
