@@ -1,1 +1,8 @@
 scratch.md
+
+# build outputs
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/WixTools/
+src-tauri/gen/

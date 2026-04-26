@@ -1,0 +1,39 @@
+export type DeckSource =
+  | { type: "video"; filePath: string; duration: number }
+  | { type: "shader"; fragmentSrc: string; uniforms: Record<string, number> }
+  | null;
+
+export interface Deck {
+  id: string;
+  source: DeckSource;
+  playing: boolean;
+  playbackRate: number; // 0.25–4.0
+  volume: number;       // 0–1 audio
+  opacity: number;      // 0–1 compositor weight
+  loop: boolean;
+  cuePoint: number;     // seconds
+  hotCues: number[];    // up to 3 time markers
+}
+
+export interface AudioAnalysis {
+  bass: number; // 0–1 normalized
+  mid: number;
+  high: number;
+  waveform: Float32Array;
+}
+
+export interface Effect {
+  type: string;
+  params: Record<string, number>;
+}
+
+export interface Session {
+  decks: Deck[];          // ordered array; render back-to-front
+  masterVolume: number;
+  bpm: number | null;
+  crossfaderMapping: {
+    left: string;         // deck id
+    right: string;        // deck id
+  };
+  effects: Effect[];      // global post-process chain
+}

@@ -112,19 +112,41 @@ Two modes per deck:
 
 ```
 cuemark/
-  src/                  # Frontend (TypeScript/Svelte)
+  src/                          # Frontend (TypeScript/Svelte 5)
+    main.ts                     # Svelte mount entry point
+    App.svelte                  # Root component — deck grid + toolbar
+    app.css                     # Global dark UI styles
     lib/
-      renderer/         # WebGL FBO, compositor, shader runner
-      audio/            # Web Audio API, FFT analysis
-      midi/             # Tauri IPC MIDI event handler, mapping
-      state/            # Session store
-    components/         # UI components
-  src-tauri/            # Rust backend
+      state/
+        types.ts                # Deck, Session, AudioAnalysis interfaces
+        session.ts              # Svelte writable store + addDeck/updateDeck/etc.
+      renderer/
+        fbo.ts                  # DeckFBO — allocates WebGL texture + framebuffer
+        compositor.ts           # Compositor — syncDecks(), composite()
+      audio/
+        analyzer.ts             # AudioAnalyzer — Web Audio API FFT
+      midi/
+        handler.ts              # Tauri IPC listener → session mutations
+    components/
+      DeckCard.svelte           # Per-deck controls (opacity, volume, rate, play, loop)
+      Crossfader.svelte         # Hardware crossfader UI (maps to two deck opacities)
+  src-tauri/                    # Rust backend (Tauri 2)
     src/
-      midi.rs           # midir integration
-      main.rs
-  shaders/              # Built-in GLSL visualizations
-  docs/                 # Design notes
+      main.rs                   # Binary entry point
+      lib.rs                    # Tauri builder + setup
+      midi.rs                   # midir listener → MidiAction events
+    capabilities/
+      default.json              # Tauri 2 capability config
+    icons/                      # App icons (placeholder PNGs)
+    build.rs
+    Cargo.toml
+    tauri.conf.json
+  shaders/                      # Built-in GLSL visualizations (Phase 2)
+  index.html
+  package.json
+  vite.config.ts
+  tsconfig.json
+  svelte.config.js
   todo.md
   journal.md
 ```
@@ -148,6 +170,41 @@ cuemark/
 - Shader effect overlays on video
 - Media browser / clip library
 - Remote control (network, phone as secondary)
+
+## N-deck guarantee
+
+Every layer is deliberately free of hardcoded deck counts:
+
+| Concern | File | Mechanism |
+|---|---|---|
+| Data model | `src/lib/state/types.ts` | `Session.decks: Deck[]` — no count anywhere |
+| Session store | `src/lib/state/session.ts` | `addDeck()` / `removeDeck()` / `updateDeck(id, patch)` by string ID |
+| Compositor | `src/lib/renderer/compositor.ts` | `syncDecks(ids[])` allocates one FBO per deck; `composite(decks[])` iterates all |
+| UI | `src/App.svelte` | `{#each $session.decks as deck (deck.id)}` — `+ Deck` button in toolbar |
+| MIDI | `src-tauri/src/midi.rs` | `MidiMap: HashMap<(u8,u8), ControlBinding>` — bindings reference deck IDs as strings |
+
+The crossfader maps to two *named* deck IDs (`crossfaderMapping.left/right`), not indices 0 and 1.
+Adding a third deck and reassigning the crossfader mapping is fully supported.
+
+## Running
+
+```
+cargo tauri dev        # starts Vite dev server + Tauri window
+npm run check          # TypeScript + Svelte type check
+cd src-tauri && cargo check   # Rust type check only
+```
+
+## MIDI calibration
+
+The CC/note numbers in `src-tauri/src/midi.rs → hercules_starlight_map()` are initial estimates.
+Verify against your unit:
+
+```
+aconnect -l                   # find the Hercules port number
+aseqdump -p <port>            # wiggle each control, read the output
+```
+
+Then update the `(0x90, ...)` / `(0xB0, ...)` keys in the map to match.
 
 ## Constraints
 

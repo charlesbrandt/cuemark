@@ -1,0 +1,184 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: #0a0a0a;
+  color: #e0e0e0;
+  font-family: 'Roboto Mono', 'Courier New', monospace;
+  font-size: 13px;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* ── Toolbar ──────────────────────────────────────────── */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 16px;
+  background: #111;
+  border-bottom: 1px solid #222;
+  flex-shrink: 0;
+}
+
+.logo {
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.15em;
+  color: #e04040;
+}
+
+.add-deck {
+  padding: 4px 10px;
+  background: #1e1e1e;
+  border: 1px solid #333;
+  color: #aaa;
+  cursor: pointer;
+  border-radius: 3px;
+  font: inherit;
+}
+.add-deck:hover { border-color: #e04040; color: #fff; }
+
+.bpm { color: #666; font-size: 12px; }
+
+.master-vol {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  color: #666;
+  font-size: 11px;
+}
+.master-vol span { min-width: 32px; color: #999; }
+
+/* ── Deck grid ────────────────────────────────────────── */
+.decks {
+  display: grid;
+  grid-template-columns: repeat(var(--deck-count, 2), 1fr);
+  flex: 1;
+  overflow: hidden;
+  background: #111;
+  gap: 1px;
+}
+
+/* ── Deck card ────────────────────────────────────────── */
+.deck-card {
+  background: #141414;
+  display: flex;
+  flex-direction: column;
+  padding: 10px;
+  gap: 8px;
+  border-top: 2px solid transparent;
+  overflow: hidden;
+}
+.deck-card.playing { border-top-color: #e04040; }
+
+.deck-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.deck-id {
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  color: #e04040;
+  text-transform: uppercase;
+}
+.remove-btn {
+  background: none;
+  border: none;
+  color: #3a3a3a;
+  cursor: pointer;
+  font-size: 20px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.remove-btn:hover { color: #e04040; }
+
+.preview {
+  flex: 1;
+  background: #0c0c0c;
+  border: 1px solid #1e1e1e;
+  border-radius: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 80px;
+}
+.source-label { color: #555; font-size: 11px; }
+.source-label.empty { color: #2a2a2a; }
+
+.transport {
+  display: flex;
+  gap: 6px;
+}
+.play-btn {
+  flex: 1;
+  padding: 8px;
+  background: #1e1e1e;
+  border: 1px solid #2e2e2e;
+  color: #e0e0e0;
+  cursor: pointer;
+  font-size: 16px;
+  border-radius: 3px;
+  font: inherit;
+}
+.play-btn:hover { background: #282828; }
+.deck-card.playing .play-btn { border-color: #e04040; }
+
+.transport button:not(.play-btn) {
+  padding: 8px 10px;
+  background: #1e1e1e;
+  border: 1px solid #2e2e2e;
+  color: #666;
+  cursor: pointer;
+  border-radius: 3px;
+  font: inherit;
+}
+.transport button:not(.play-btn):hover { color: #ccc; }
+.transport button.active { color: #e04040; border-color: #e04040; }
+
+/* ── Sliders ──────────────────────────────────────────── */
+.sliders {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.sliders label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: #555;
+  font-size: 11px;
+}
+.sliders label > span {
+  display: flex;
+  justify-content: space-between;
+}
+.sliders label strong { color: #999; }
+.sliders input[type="range"] { width: 100%; accent-color: #e04040; cursor: pointer; }
+
+/* ── Crossfader ───────────────────────────────────────── */
+.crossfader-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: #0f0f0f;
+  border-top: 1px solid #1e1e1e;
+  flex-shrink: 0;
+}
+.cf-label {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: #555;
+  min-width: 60px;
+}
+.cf-label.right { text-align: right; }
+.crossfader { flex: 1; accent-color: #e04040; cursor: pointer; }
