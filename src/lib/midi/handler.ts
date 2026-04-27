@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { updateDeck, getDeck, setCrossfader } from "../state/session";
+import { updateDeck, getDeck, setCrossfader, setMasterVolume } from "../state/session";
 import { seekDeck } from "../renderer/seekBus";
 
 // Must match the Rust MidiAction enum (snake_case tag + camelCase fields from serde)
@@ -10,6 +10,7 @@ export interface MidiAction {
     | "deck_volume"
     | "deck_playback_rate"
     | "crossfader"
+    | "master_volume"
     | "cue_jump"
     | "hot_cue"
     | "loop_toggle";
@@ -41,6 +42,9 @@ export async function startMidiListener(): Promise<() => void> {
         break;
       case "crossfader":
         if (a.value !== undefined) setCrossfader(a.value);
+        break;
+      case "master_volume":
+        if (a.value !== undefined) setMasterVolume(a.value);
         break;
       case "cue_jump": {
         if (!a.deck_id) break;

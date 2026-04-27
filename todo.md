@@ -30,11 +30,19 @@
 - Output window (`output.html` / `src/output.ts`): receives `ImageBitmap` frames, blits to full-viewport canvas
 - `preserveDrawingBuffer: true` on compositor's WebGL context ensures frame is readable by `createImageBitmap`
 
-### MIDI calibration
+### MIDI calibration [done]
 - Connect Hercules DJ Control Starlight
 - Run `aseqdump` to find actual CC/note numbers
 - Update `hercules_starlight_map()` in `src-tauri/src/midi.rs`
 - Test: crossfader, jog wheels, play/pause, volume faders
+
+### MIDI — unmapped controls (decide what to do with each)
+- Shift button `(0x90, 3)` — global modifier; could enable secondary bindings or MIDI learn mode
+- Vinyl / Scratch button `(0x91/0x92, 3)` — fires on both decks; could toggle jog scratch vs. pitch-bend mode
+- Headphone Cue buttons `(0x91/0x92, 12)` — could flag a deck for pre-listen / solo monitor
+- Bass/Filter toggle `(0x90, 1)` — could switch bass knob between EQ and shader `u_bass_gain`
+- Hot-cue mode / Loop mode buttons `(0x91, 15/16)` — context switches for the 4-pad row
+- Headphone volume `(0xB0, 4)` — no headphone concept yet; defer to Phase 3 monitor mix
 
 ### audio crossfade
 - `AudioAnalyzer` connects each deck's `<video>` element via `connectMediaElement()`

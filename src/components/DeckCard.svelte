@@ -133,8 +133,8 @@
       <span>Rate <strong>{deck.playbackRate.toFixed(2)}×</strong></span>
       <input
         type="range"
-        min="0.25"
-        max="4"
+        min="0.5"
+        max="1.5"
         step="0.01"
         value={deck.playbackRate}
         oninput={(e) => updateDeck(deck.id, { playbackRate: +e.currentTarget.value })}

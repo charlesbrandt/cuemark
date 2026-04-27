@@ -83,20 +83,44 @@ Rust backend (`midir`) receives raw MIDI → maps to structured actions → emit
 
 ## MIDI controller
 
-**Hercules DJ Control Starlight** (USB)
+**Hercules DJControl Starlight** (USB)
 
-| Controller | Action |
+### Channel layout (verified)
+
+The Starlight uses separate MIDI channels per deck — do **not** mask the channel nibble in the map key:
+
+| MIDI bytes | Deck / purpose |
 |---|---|
-| Jog wheel L | Deck-0 playback rate / scrub |
-| Jog wheel R | Deck-1 playback rate / scrub |
-| Crossfader | deck-0/deck-1 opacity inverse |
-| Channel fader L | Deck-0 volume |
-| Channel fader R | Deck-1 volume |
-| Play/Pause L/R | Deck play toggle |
-| Cue L/R | Jump to cue point |
-| Hot cues (3×2) | Jump to / set hot cue |
-| Loop L/R | Toggle loop |
-| EQ Bass L | Shader `u_bass_gain` / effect param |
+| `0x91` Note On, `0xB1` CC | Left deck (ch 2) |
+| `0x92` Note On, `0xB2` CC | Right deck (ch 3) |
+| `0x96` Note On | Left hot-cue pads (ch 7) |
+| `0x97` Note On | Right hot-cue pads (ch 8) |
+| `0xB0` CC | Global — crossfader, master volume (ch 1) |
+
+14-bit CC pairs: every continuous control sends a coarse MSB on CC N and a fine LSB on CC N+32. Map the MSB; ignore the LSB (7-bit resolution is sufficient).
+
+### Control map
+
+| Physical control | MIDI key | Action |
+|---|---|---|
+| Play/Pause L | `(0x91, 7)` | DeckPlayToggle deck-0 |
+| Play/Pause R | `(0x92, 7)` | DeckPlayToggle deck-1 |
+| Cue L | `(0x91, 6)` | CueJump deck-0 |
+| Cue R | `(0x92, 6)` | CueJump deck-1 |
+| Loop L | `(0x91, 5)` | LoopToggle deck-0 |
+| Loop R | `(0x92, 5)` | LoopToggle deck-1 |
+| Volume fader L | `(0xB1, 0)` | DeckVolume deck-0 |
+| Volume fader R | `(0xB2, 0)` | DeckVolume deck-1 |
+| Tempo fader L | `(0xB1, 8)` | DeckPlaybackRate deck-0 (center=64→1.0×, range 0.5–1.5×) |
+| Tempo fader R | `(0xB2, 8)` | DeckPlaybackRate deck-1 |
+| Jog wheel L | `(0xB1, 10)` | DeckPlaybackRate deck-0 (relative, ±2%/step) |
+| Jog wheel R | `(0xB2, 10)` | DeckPlaybackRate deck-1 |
+| Crossfader | `(0xB0, 0)` | Crossfader (deck-0 ↔ deck-1 opacity) |
+| Master volume | `(0xB0, 3)` | MasterVolume |
+| Hot cues L (1–4) | `(0x96, 0–3)` | HotCue deck-0 index 0–3 |
+| Hot cues R (1–4) | `(0x97, 0–3)` | HotCue deck-1 index 0–3 |
+
+Intentionally unmapped: Shift `(0x90,3)`, Vinyl `(0x91/92,3)`, Headphone cue `(0x91/92,12)`, Bass/filter toggle `(0x90,1)`, Headphone volume `(0xB0,4)`, mode-switch buttons `(0x91,15/16)`.
 
 Phase 2: MIDI learn mode (click control in UI, wiggle knob to map).
 
@@ -199,17 +223,19 @@ npm run check          # TypeScript + Svelte type check
 cd src-tauri && cargo check   # Rust type check only
 ```
 
-## MIDI calibration
+## Adding or re-calibrating a MIDI controller
 
-The CC/note numbers in `src-tauri/src/midi.rs → hercules_starlight_map()` are initial estimates.
-Verify against your unit:
+To map a new controller or verify an existing one:
 
-```
-aconnect -l                   # find the Hercules port number
-aseqdump -p <port>            # wiggle each control, read the output
-```
-
-Then update the `(0x90, ...)` / `(0xB0, ...)` keys in the map to match.
+1. Add a one-line debug print inside the MIDI callback in `midi.rs` (before the map lookup):
+   ```rust
+   eprintln!("[midi] raw: msg[0]=0x{:02X} d1={} d2={}", msg[0], msg[1], msg[2]);
+   ```
+2. Run `cargo tauri dev` and wiggle each physical control. The terminal shows the raw bytes.
+3. `msg[0]` is the **full status byte** — high nibble = message type (`0x90`=Note On, `0xB0`=CC), low nibble = MIDI channel. Keep the full byte as the map key; do **not** mask off the channel nibble — DJ controllers use different channels for left/right decks.
+4. Identify 14-bit CC pairs: if two CC messages fire together where `d1_B = d1_A + 32`, the coarse (MSB) is `d1_A` and the fine (LSB) is `d1_B`. Map the MSB and ignore the LSB.
+5. Add entries to `hercules_starlight_map()` (or a new `foo_map()` function) using `(msg[0], d1)` as the key.
+6. Remove the debug print when done.
 
 ## Constraints
 

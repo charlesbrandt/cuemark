@@ -15,6 +15,7 @@ pub enum MidiAction {
     DeckVolume { deck_id: String, value: f32 },
     DeckPlaybackRate { deck_id: String, value: f32 },
     Crossfader { value: f32 },
+    MasterVolume { value: f32 },
     CueJump { deck_id: String },
     HotCue { deck_id: String, index: u8 },
     LoopToggle { deck_id: String },
@@ -28,45 +29,77 @@ pub enum ControlBinding {
     DeckVolume { deck_id: String },
     DeckPlaybackRate { deck_id: String },
     Crossfader,
+    MasterVolume,
     CueJump { deck_id: String },
     HotCue { deck_id: String, index: u8 },
     LoopToggle { deck_id: String },
-    /// Relative jog wheel (center=64, above=faster, below=slower)
+    /// Relative jog wheel (two's complement: 1=+1 CW, 127=-1 CCW)
     JogWheel { deck_id: String },
 }
 
-/// Key: (message_type_nibble, data1). Channel nibble is masked out so any
-/// MIDI channel works — most DJ controllers send on channel 0.
+/// Key: (full_status_byte, data1).
+/// Channel is NOT masked — the Starlight sends left/right decks on separate
+/// MIDI channels (0x90/0xB0 = ch1 left, 0x91/0xB1 = ch2 right).
 type MidiMap = HashMap<(u8, u8), ControlBinding>;
 
-/// Default mapping for Hercules DJ Control Starlight.
+/// Hercules DJControl Starlight MIDI map.
+/// Keys are (full_status_byte, data1) — channel nibble is NOT masked.
 ///
-/// Calibration: run `aseqdump -p <port>` while pressing controls to verify
-/// the CC/note numbers. Adjust the values below to match your unit.
+/// Channel layout (confirmed by hardware):
+///   ch 2  (0x91 Note On, 0xB1 CC) = left deck
+///   ch 3  (0x92 Note On, 0xB2 CC) = right deck
+///   ch 7  (0x96 Note On)          = left hot cues
+///   ch 8  (0x97 Note On)          = right hot cues (by symmetry; unverified)
+///   ch 1  (0xB0 CC)               = global (crossfader)
+///
+/// 14-bit CC pairs: controller sends coarse MSB on CC N and fine LSB on CC N+32.
+/// We map the MSB only; 7-bit (128-step) resolution is sufficient for all controls.
 fn hercules_starlight_map() -> MidiMap {
     let mut m = MidiMap::new();
 
-    // Note On (0x90) ── buttons ─────────────────────────────────────────────
-    m.insert((0x90, 11), ControlBinding::DeckPlayToggle { deck_id: "deck-0".into() });
-    m.insert((0x90, 12), ControlBinding::DeckPlayToggle { deck_id: "deck-1".into() });
-    m.insert((0x90, 13), ControlBinding::CueJump { deck_id: "deck-0".into() });
-    m.insert((0x90, 14), ControlBinding::CueJump { deck_id: "deck-1".into() });
-    m.insert((0x90, 21), ControlBinding::LoopToggle { deck_id: "deck-0".into() });
-    m.insert((0x90, 22), ControlBinding::LoopToggle { deck_id: "deck-1".into() });
-    // Hot cues: 3 per deck
-    m.insert((0x90, 31), ControlBinding::HotCue { deck_id: "deck-0".into(), index: 0 });
-    m.insert((0x90, 32), ControlBinding::HotCue { deck_id: "deck-0".into(), index: 1 });
-    m.insert((0x90, 33), ControlBinding::HotCue { deck_id: "deck-0".into(), index: 2 });
-    m.insert((0x90, 34), ControlBinding::HotCue { deck_id: "deck-1".into(), index: 0 });
-    m.insert((0x90, 35), ControlBinding::HotCue { deck_id: "deck-1".into(), index: 1 });
-    m.insert((0x90, 36), ControlBinding::HotCue { deck_id: "deck-1".into(), index: 2 });
+    // ── Left deck (ch 2) ──────────────────────────────────────────────────
+    m.insert((0x91, 7),  ControlBinding::DeckPlayToggle { deck_id: "deck-0".into() });
+    m.insert((0x91, 6),  ControlBinding::CueJump        { deck_id: "deck-0".into() });
+    m.insert((0x91, 5),  ControlBinding::LoopToggle     { deck_id: "deck-0".into() });
+    // CC: volume fader (CC 0 coarse; CC 32 fine — ignored)
+    m.insert((0xB1, 0),  ControlBinding::DeckVolume     { deck_id: "deck-0".into() });
+    // CC: tempo/pitch fader (CC 8 coarse; CC 40 fine — ignored); center=64 → rate 1.0
+    m.insert((0xB1, 8),  ControlBinding::DeckPlaybackRate { deck_id: "deck-0".into() });
+    // CC: bass/filter knob (CC 2 coarse; CC 34 fine — ignored)
+    // TODO: wire to shader u_bass_gain once Phase 2 audio-reactive uniforms land
+    // Jog wheel rotation (relative encoder, CC 10, two's complement)
+    m.insert((0xB1, 10), ControlBinding::JogWheel       { deck_id: "deck-0".into() });
+    // Hot cues on ch 7 (d1 = cue index 0–3)
+    m.insert((0x96, 0),  ControlBinding::HotCue { deck_id: "deck-0".into(), index: 0 });
+    m.insert((0x96, 1),  ControlBinding::HotCue { deck_id: "deck-0".into(), index: 1 });
+    m.insert((0x96, 2),  ControlBinding::HotCue { deck_id: "deck-0".into(), index: 2 });
+    m.insert((0x96, 3),  ControlBinding::HotCue { deck_id: "deck-0".into(), index: 3 });
 
-    // Control Change (0xB0) ── knobs, faders, wheels ────────────────────────
-    m.insert((0xB0, 23), ControlBinding::Crossfader);
-    m.insert((0xB0, 24), ControlBinding::DeckVolume { deck_id: "deck-0".into() });
-    m.insert((0xB0, 25), ControlBinding::DeckVolume { deck_id: "deck-1".into() });
-    m.insert((0xB0, 33), ControlBinding::JogWheel { deck_id: "deck-0".into() });
-    m.insert((0xB0, 34), ControlBinding::JogWheel { deck_id: "deck-1".into() });
+    // ── Right deck (ch 3) ─────────────────────────────────────────────────
+    m.insert((0x92, 7),  ControlBinding::DeckPlayToggle { deck_id: "deck-1".into() });
+    m.insert((0x92, 6),  ControlBinding::CueJump        { deck_id: "deck-1".into() });
+    m.insert((0x92, 5),  ControlBinding::LoopToggle     { deck_id: "deck-1".into() });
+    m.insert((0xB2, 0),  ControlBinding::DeckVolume     { deck_id: "deck-1".into() });
+    m.insert((0xB2, 8),  ControlBinding::DeckPlaybackRate { deck_id: "deck-1".into() });
+    m.insert((0xB2, 10), ControlBinding::JogWheel       { deck_id: "deck-1".into() });
+    // Right hot cues on ch 8 — unverified; test and adjust if wrong
+    m.insert((0x97, 0),  ControlBinding::HotCue { deck_id: "deck-1".into(), index: 0 });
+    m.insert((0x97, 1),  ControlBinding::HotCue { deck_id: "deck-1".into(), index: 1 });
+    m.insert((0x97, 2),  ControlBinding::HotCue { deck_id: "deck-1".into(), index: 2 });
+    m.insert((0x97, 3),  ControlBinding::HotCue { deck_id: "deck-1".into(), index: 3 });
+
+    // ── Global (ch 1) ─────────────────────────────────────────────────────
+    // Crossfader: 14-bit pair — CC 0 (MSB) mapped; CC 32 (LSB) ignored
+    m.insert((0xB0, 0),  ControlBinding::Crossfader);
+    // Master volume: 14-bit pair — CC 3 (MSB) mapped; CC 35 (LSB) ignored
+    m.insert((0xB0, 3),  ControlBinding::MasterVolume);
+    // Unmapped (no action needed):
+    //   (0x90, 3)  = Shift button
+    //   (0x90, 1)  = Bass/filter toggle
+    //   (0x91, 3)  = Vinyl mode left   (0x92, 3) = Vinyl mode right
+    //   (0x91, 12) = Headphone cue L   (0x92, 12) = Headphone cue R
+    //   (0x91, 15) = Hot-cue mode btn  (0x91, 16) = Loop mode btn
+    //   (0xB0, 4)  = Headphone volume (CC 4 MSB; CC 36 LSB)
 
     m
 }
@@ -81,6 +114,7 @@ fn resolve_action(binding: &ControlBinding, data2: u8) -> Option<MidiAction> {
             Some(MidiAction::DeckVolume { deck_id: deck_id.clone(), value: v })
         }
         ControlBinding::Crossfader => Some(MidiAction::Crossfader { value: v }),
+        ControlBinding::MasterVolume => Some(MidiAction::MasterVolume { value: v }),
         ControlBinding::CueJump { deck_id } => {
             (data2 > 0).then_some(MidiAction::CueJump { deck_id: deck_id.clone() })
         }
@@ -91,13 +125,18 @@ fn resolve_action(binding: &ControlBinding, data2: u8) -> Option<MidiAction> {
             (data2 > 0).then_some(MidiAction::LoopToggle { deck_id: deck_id.clone() })
         }
         ControlBinding::JogWheel { deck_id } => {
-            // Relative encoder: 64 = centre, 65+ = faster, 63- = slower
-            let delta = (data2 as f32 - 64.0) / 64.0;
-            let rate = (1.0 + delta * 0.1_f32).clamp(0.25, 4.0);
+            // Relative encoder, two's complement: 1=+1 CW, 127=-1 CCW (i.e. 0x7F = -1 i8)
+            // Each step nudges the playback rate by ±2%; rate resets to 1.0 only on
+            // jog-touch release (handled by frontend or manual play-toggle).
+            let step = data2 as i8 as f32; // -128..127
+            let rate = (1.0 + step * 0.02_f32).clamp(0.25, 4.0);
             Some(MidiAction::DeckPlaybackRate { deck_id: deck_id.clone(), value: rate })
         }
         ControlBinding::DeckPlaybackRate { deck_id } => {
-            Some(MidiAction::DeckPlaybackRate { deck_id: deck_id.clone(), value: v * 4.0 })
+            // Tempo/pitch fader: center=64 → rate 1.0; full throw = ±50%
+            let delta = (data2 as f32 - 64.0) / 64.0; // -1.0 .. +1.0
+            let rate = (1.0 + delta * 0.5_f32).clamp(0.25, 4.0);
+            Some(MidiAction::DeckPlaybackRate { deck_id: deck_id.clone(), value: rate })
         }
     }
 }
@@ -149,9 +188,12 @@ fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>) -> Result<(), Box<dyn
         "cuemark-midi",
         move |_stamp, msg, _| {
             if msg.len() < 3 { return; }
-            let key = (msg[0] & 0xF0, msg[1]); // mask channel nibble
+            let raw_status = msg[0]; // full byte — includes channel nibble
+            let data1 = msg[1];
+            let data2 = msg[2];
+            let key = (raw_status, data1); // no channel mask — left/right on separate channels
             if let Some(binding) = map.get(&key) {
-                if let Some(action) = resolve_action(binding, msg[2]) {
+                if let Some(action) = resolve_action(binding, data2) {
                     let _ = app.emit("midi-action", action);
                 }
             }

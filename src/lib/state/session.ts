@@ -50,6 +50,10 @@ export function getDeck(id: string): Deck | undefined {
   return get(session).decks.find((d) => d.id === id);
 }
 
+export function setMasterVolume(value: number) {
+  session.update((s) => ({ ...s, masterVolume: value }));
+}
+
 // value: 0.0 (full left) → 1.0 (full right)
 export function setCrossfader(value: number) {
   session.update((s) => ({
