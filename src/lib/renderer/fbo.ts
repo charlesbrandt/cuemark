@@ -1,6 +1,10 @@
 export class DeckFBO {
   readonly texture: WebGLTexture;
   readonly fbo: WebGLFramebuffer;
+  // 2D canvas intermediary — drawImage(video) is always safe; avoids direct
+  // video→texImage2D which triggers assertion failures in WebKitGTK.
+  private scratch: HTMLCanvasElement;
+  private scratchCtx: CanvasRenderingContext2D;
 
   constructor(
     private gl: WebGL2RenderingContext,
@@ -26,6 +30,11 @@ export class DeckFBO {
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.bindTexture(gl.TEXTURE_2D, null);
+
+    this.scratch = document.createElement("canvas");
+    this.scratch.width = width;
+    this.scratch.height = height;
+    this.scratchCtx = this.scratch.getContext("2d")!;
   }
 
   bind() {
@@ -34,10 +43,14 @@ export class DeckFBO {
   }
 
   uploadVideoFrame(video: HTMLVideoElement) {
-    if (video.readyState < 2) return;
+    if (video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) return;
+    this.scratchCtx.drawImage(video, 0, 0, this.width, this.height);
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+    // Canvas Y=0 is top; WebGL texture Y=0 is bottom — flip on upload so video is right-side up.
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.scratch);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.bindTexture(gl.TEXTURE_2D, null);
   }
 

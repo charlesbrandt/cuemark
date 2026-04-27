@@ -53,7 +53,7 @@ export class Compositor {
   readonly height: number;
 
   constructor(canvas: HTMLCanvasElement) {
-    const gl = canvas.getContext("webgl2");
+    const gl = canvas.getContext("webgl2", { preserveDrawingBuffer: true });
     if (!gl) throw new Error("WebGL2 not available");
     this.gl = gl;
     this.width = canvas.width;

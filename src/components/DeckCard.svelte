@@ -5,6 +5,7 @@
   import type { Deck } from "../lib/state/types";
 
   let { deck }: { deck: Deck } = $props();
+  let isDragOver = $state(false);
 
   async function loadVideo() {
     const file = await open({
@@ -16,6 +17,26 @@
     }
   }
 
+  function handleDragOver(e: DragEvent) {
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+    isDragOver = true;
+  }
+
+  function handleDragLeave(e: DragEvent) {
+    if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) {
+      isDragOver = false;
+    }
+  }
+
+  // File path extraction happens in App.svelte via onDragDropEvent (Tauri intercepts
+  // the native drop before HTML5 DataTransfer is populated). This handler just clears
+  // the visual state.
+  function handleDrop(e: DragEvent) {
+    e.preventDefault();
+    isDragOver = false;
+  }
+
   function formatDuration(s: number): string {
     if (!s) return "--:--";
     const m = Math.floor(s / 60);
@@ -24,7 +45,17 @@
   }
 </script>
 
-<div class="deck-card" class:playing={deck.playing}>
+<div
+  class="deck-card"
+  class:playing={deck.playing}
+  class:drag-over={isDragOver}
+  role="region"
+  aria-label={deck.id}
+  data-deck-id={deck.id}
+  ondragover={handleDragOver}
+  ondragleave={handleDragLeave}
+  ondrop={handleDrop}
+>
   <div class="deck-header">
     <span class="deck-id">{deck.id}</span>
     <button class="remove-btn" onclick={() => removeDeck(deck.id)} aria-label="Remove deck">

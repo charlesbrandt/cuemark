@@ -8,7 +8,13 @@
 - RAF loop: `fbo.uploadVideoFrame(videoEl)` → `compositor.composite()`
 - `deck.playing`, `deck.loop`, `deck.playbackRate`, `deck.volume` wired to video element
 - `loadedmetadata` event updates `deck.source.duration`
-- `convertFileSrc` + asset protocol serves local files to WebKit
+- Dev: files served via Vite HTTP middleware at `/media/<abs-path>` (GStreamer speaks plain HTTP)
+- Prod: Rust `media://` custom URI scheme handler with Range support
+
+### OS drag-and-drop [done]
+- Tauri intercepts native file-drop before HTML5 DataTransfer is populated
+- `getCurrentWebview().onDragDropEvent()` → path + screen position → `elementFromPoint` + `[data-deck-id]`
+- Visual drag-over state on DeckCard (`isDragOver`, `drag-over` CSS class)
 
 ### cue-jump seek [done]
 - On `cue_jump` MIDI action: `seekDeck(id, cuePoint)` via `seekBus.ts` + stop playing
@@ -16,10 +22,13 @@
 - "Cue" button in DeckCard: captures `video.currentTime` → sets `deck.cuePoint`
 - `seekBus.ts` holds module-level video element refs; App.svelte registers on create/destroy
 
-### output window [next]
-- Open a second Tauri `WebviewWindow` for the projector output
-- Output window renders only the compositor canvas, fullscreen on display 2
-- Share compositor state between windows via Tauri events or a shared canvas approach
+### output window [done]
+- "Output Window" button in toolbar calls `open_output_window` Tauri command
+- Rust creates a 1280×720 resizable `WebviewWindow("output", "output.html")` (idempotent)
+- Move to projector display and press `F` to fullscreen; `Esc` to exit
+- Main window: `compositor.composite()` → `postFrame(canvas)` via `BroadcastChannel('cuemark-output')`
+- Output window (`output.html` / `src/output.ts`): receives `ImageBitmap` frames, blits to full-viewport canvas
+- `preserveDrawingBuffer: true` on compositor's WebGL context ensures frame is readable by `createImageBitmap`
 
 ### MIDI calibration
 - Connect Hercules DJ Control Starlight

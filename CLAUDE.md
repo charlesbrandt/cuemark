@@ -12,22 +12,24 @@ Domain: cuemark.com (Charles Brandt's former DJ name)
 - **Web Audio API** — audio playback + FFT analysis for audio-reactive visuals
 - **GLSL shaders** — effects and audio-reactive visualizations
 - **Rust `midir` crate** — MIDI input (Web MIDI API unreliable in WebKitGTK); events piped to frontend via Tauri IPC
-- **`<video>` element → texImage2D** — hardware-accelerated video decode into WebGL texture (WebKitGTK uses GStreamer under the hood)
-- **Tauri asset protocol** — `convertFileSrc()` converts local paths to `asset://localhost/...` so WebKit can load them; requires `protocol-asset` Cargo feature + `assetProtocol` enabled in `tauri.conf.json`
+- **`<video>` element → 2D canvas → texImage2D** — video decode into WebGL texture via a scratch canvas intermediary (direct video→texImage2D triggers SIGTRAP assertion failures in WebKitGTK; see `fbo.ts`)
+- **Vite dev middleware** — in dev mode, local video files are served as `http://localhost:1420/media/<abs-path>` by a Node.js middleware in `vite.config.ts`; GStreamer's `souphttpsrc` speaks plain HTTP fine. In production the Rust `media://` custom scheme is used instead. Never use `asset://` or `file://` from an `http:` origin — WebKit blocks them silently.
 
 ## Architecture
 
 ### Rendering pipeline
 
 ```
-decks[0] opacity=1.0 ──► [FBO 0] ──┐
-decks[1] opacity=0.6 ──► [FBO 1] ──┤──► alpha composite ──► Output canvas (fullscreen, display 2)
-decks[N] opacity=...  ──► [FBO N] ──┘
-
-Control UI: preview FBO per deck + composite preview
+<video> element
+  └─► drawImage() ──► scratch HTMLCanvasElement (per FBO)
+        └─► texImage2D (UNPACK_FLIP_Y_WEBGL=true) ──► WebGL texture
+              └─► [FBO N] ──► alpha composite ──► preview canvas + output window
 ```
 
 Each FBO renders at full output resolution. Compositor alpha-blends decks back-to-front by `opacity`.
+
+**WebGL Y-flip**: HTML canvas Y=0 is top; WebGL texture Y=0 is bottom. `UNPACK_FLIP_Y_WEBGL=true`
+corrects this on upload so video appears right-side up.
 The crossfader is a UI/MIDI convenience that drives two selected decks' opacities inversely — not a
 structural field in the data model.
 

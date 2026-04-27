@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body { background: #000; overflow: hidden; }
+      canvas { display: block; width: 100vw; height: 100vh; }
+      #hint {
+        position: fixed;
+        bottom: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        color: rgba(255, 255, 255, 0.7);
+        font: 12px 'Courier New', monospace;
+        background: rgba(0, 0, 0, 0.6);
+        padding: 6px 14px;
+        border-radius: 4px;
+        pointer-events: none;
+        animation: fadeout 2s forwards;
+        animation-delay: 2s;
+      }
+      @keyframes fadeout { to { opacity: 0; } }
+    </style>
+  </head>
+  <body>
+    <canvas id="output"></canvas>
+    <div id="hint">F — toggle fullscreen &nbsp;·&nbsp; Esc — exit fullscreen</div>
+    <script type="module" src="/src/output.ts"></script>
+  </body>
+</html>

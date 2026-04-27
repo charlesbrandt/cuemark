@@ -88,6 +88,7 @@ body {
   overflow: hidden;
 }
 .deck-card.playing { border-top-color: #e04040; }
+.deck-card.drag-over { border-top-color: #4080e0; outline: 1px dashed #4080e0; }
 
 .deck-header {
   display: flex;
