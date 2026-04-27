@@ -4,6 +4,7 @@
   import { session, addDeck, updateDeck } from "./lib/state/session";
   import { startMidiListener } from "./lib/midi/handler";
   import { Compositor } from "./lib/renderer/compositor";
+  import { AudioAnalyzer } from "./lib/audio/analyzer";
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { registerVideoEl, unregisterVideoEl } from "./lib/renderer/seekBus";
@@ -22,9 +23,18 @@
   let compositor = $state<Compositor | undefined>(undefined);
   // Hidden <video> elements keyed by deck id; lives outside Svelte reactivity
   const videoEls = new Map<string, HTMLVideoElement>();
+  // Per-deck Web Audio gain nodes; created when a video element is connected
+  const deckGains = new Map<string, GainNode>();
+  let analyzer: AudioAnalyzer;
   let rafId: number;
 
+  // Sync master volume to the audio graph whenever it changes
+  $effect(() => {
+    analyzer?.setMasterVolume($session.masterVolume);
+  });
+
   onMount(async () => {
+    analyzer = new AudioAnalyzer();
     midiUnlisten = await startMidiListener();
     compositor = new Compositor(canvas);
     rafId = requestAnimationFrame(frame);
@@ -52,6 +62,8 @@
     cancelAnimationFrame(rafId);
     for (const [id, v] of videoEls) { v.pause(); v.remove(); unregisterVideoEl(id); }
     videoEls.clear();
+    for (const g of deckGains.values()) g.disconnect();
+    deckGains.clear();
   });
 
   // Keep compositor FBOs and video elements in sync with the deck list
@@ -73,6 +85,8 @@
         v.remove();
         unregisterVideoEl(id);
         videoEls.delete(id);
+        deckGains.get(id)?.disconnect();
+        deckGains.delete(id);
       }
     }
 
@@ -95,6 +109,10 @@
         document.body.appendChild(v);
         registerVideoEl(deck.id, v);
         videoEls.set(deck.id, v);
+        // Connect to Web Audio; gain node drives per-deck volume from here on
+        const gain = analyzer.connectMediaElement(v);
+        deckGains.set(deck.id, gain);
+        v.volume = 1.0; // element volume fixed at unity; GainNode handles level
       }
 
       // Update event handlers each sync so they capture the current filePath / deckId
@@ -126,11 +144,13 @@
       }
 
       v.loop = deck.loop;
-      v.volume = deck.volume;
+      const g = deckGains.get(deck.id);
+      if (g) g.gain.value = deck.volume;
       // playbackRate must be ≥ 0.0625 in most browsers
       v.playbackRate = Math.max(0.0625, deck.playbackRate);
 
       if (deck.playing && v.paused) {
+        analyzer.resume();
         v.play().catch(console.error);
       } else if (!deck.playing && !v.paused) {
         v.pause();

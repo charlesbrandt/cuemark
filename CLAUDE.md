@@ -237,6 +237,36 @@ To map a new controller or verify an existing one:
 5. Add entries to `hercules_starlight_map()` (or a new `foo_map()` function) using `(msg[0], d1)` as the key.
 6. Remove the debug print when done.
 
+## Integration: Digger
+
+Media library management lives in a **separate project** (`~/repos/digger`).
+Cuemark does not embed a media browser — Digger owns that concern.
+
+**What Digger provides** (FastAPI REST at `http://localhost:8000` by default):
+
+| Endpoint | Used for |
+|---|---|
+| `GET /queue/next` | Weighted-random track suggestion to push to the cuemark queue |
+| `GET /search?q=` | Quick track search from the cuemark toolbar |
+| `GET /tracks/{id}/cuemark` | Deck-ready payload: `filePath`, `cuePoint`, `hotCues[]` |
+| `POST /tracks/{id}/markers` | Write cue/hot-cue positions back after editing in cuemark |
+
+The `/cuemark` payload maps directly to cuemark's `Deck` source interface:
+```json
+{ "filePath": "/media/charles/music/artist/track.mp4", "cuePoint": 4.2, "hotCues": [32.0, 128.5] }
+```
+File preference in Digger: video > audio > any. Marker mapping: first `cue` → `cuePoint`, first 3 `hot_cue` → `hotCues[]`.
+
+**What cuemark owns:**
+- Current play queue — ordered list of upcoming loads; may be populated from Digger or manually
+- Session playback history — what has played this session (deck, title, artist, timestamp)
+- Runtime cue/hot-cue state; persisting them across sessions = push back to Digger markers API
+
+**Boundary rules:**
+- Cuemark calls Digger; Digger never calls cuemark
+- Graceful degradation: if Digger is unreachable, drag-and-drop and manual load still work
+- No embedded file browser in cuemark
+
 ## Constraints
 
 - No hardcoded 2-deck limit — `Session.decks` is always an array

@@ -3,6 +3,7 @@ import type { AudioAnalysis } from "../state/types";
 export class AudioAnalyzer {
   private ctx: AudioContext;
   private analyser: AnalyserNode;
+  private masterGain: GainNode;
   private freqData: Uint8Array<ArrayBuffer>;
   private timeData: Float32Array<ArrayBuffer>;
   private readonly fftSize = 2048;
@@ -11,15 +12,24 @@ export class AudioAnalyzer {
     this.ctx = new AudioContext();
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = this.fftSize;
-    this.analyser.connect(this.ctx.destination);
+    this.masterGain = this.ctx.createGain();
+    this.analyser.connect(this.masterGain);
+    this.masterGain.connect(this.ctx.destination);
     this.freqData = new Uint8Array(this.analyser.frequencyBinCount);
     this.timeData = new Float32Array(this.analyser.fftSize);
   }
 
-  connectMediaElement(el: HTMLMediaElement): MediaElementAudioSourceNode {
+  /** Connect a media element; returns the per-deck GainNode for volume control. */
+  connectMediaElement(el: HTMLMediaElement): GainNode {
     const src = this.ctx.createMediaElementSource(el);
-    src.connect(this.analyser);
-    return src;
+    const gain = this.ctx.createGain();
+    src.connect(gain);
+    gain.connect(this.analyser);
+    return gain;
+  }
+
+  setMasterVolume(v: number) {
+    this.masterGain.gain.value = v;
   }
 
   read(): AudioAnalysis {
