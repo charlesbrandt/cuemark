@@ -46,3 +46,24 @@ is blocked by same-origin policy when the page is served from `http:`. Solution:
 dev middleware serves local files as plain `http://localhost:1420/media/<abs-path>` with
 Range support — GStreamer's `souphttpsrc` handles this perfectly. Production will use the
 Rust `media://` custom scheme handler.
+
+---
+
+# 2026.04.27 — canvas quality fixes
+
+Video previews and output window were grainy and slightly zoomed-in. Three root causes:
+
+1. **Hardcoded small canvas buffer CSS-stretched** — `DeckCard.svelte` had
+   `width="160" height="90"` on the preview canvas but CSS set `width: 100%`. A 160 px
+   canvas filling a 300–400 px slot causes ~2–3× upscale blur. Fix: `ResizeObserver`
+   resizes `canvas.width/height` to `entry.contentRect.width/height × devicePixelRatio`
+   so the buffer always matches the rendered pixel count exactly.
+
+2. **2D context image smoothing defaults to low quality** — `HTMLCanvasElement.getContext('2d')`
+   defaults to `imageSmoothingQuality = 'low'` when resampling. Set it to `'high'`
+   on the FBO scratch canvas (used to feed the WebGL texture) and the output window canvas.
+   **Gotcha**: resizing a canvas (`canvas.width = ...`) resets *all* 2D context state,
+   including `imageSmoothingQuality`. Must be re-applied after every resize.
+
+3. **`mediump` precision in blit shader** — minor improvement, changed to `highp float`
+   in the compositor fragment shader.

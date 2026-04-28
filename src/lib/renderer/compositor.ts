@@ -14,7 +14,7 @@ void main() {
 // Blits a single deck FBO onto the output with an opacity weight.
 // Called once per deck in back-to-front order; blending accumulates.
 const FRAG_BLIT = `#version 300 es
-precision mediump float;
+precision highp float;
 uniform sampler2D u_tex;
 uniform float u_opacity;
 in vec2 v_uv;

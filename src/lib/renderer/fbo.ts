@@ -35,6 +35,8 @@ export class DeckFBO {
     this.scratch.width = width;
     this.scratch.height = height;
     this.scratchCtx = this.scratch.getContext("2d")!;
+    this.scratchCtx.imageSmoothingEnabled = true;
+    this.scratchCtx.imageSmoothingQuality = "high";
   }
 
   bind() {

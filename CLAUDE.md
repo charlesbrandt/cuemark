@@ -33,6 +33,13 @@ corrects this on upload so video appears right-side up.
 The crossfader is a UI/MIDI convenience that drives two selected decks' opacities inversely — not a
 structural field in the data model.
 
+**Canvas buffer sizing**: Any `<canvas>` displayed in the UI must have its pixel buffer sized to
+its rendered CSS width × `devicePixelRatio` — never hardcode a small resolution and rely on CSS
+to scale it up; that causes blurry upscaling. Use a `ResizeObserver` to keep buffer dimensions in
+sync with layout. Use `imageSmoothingQuality = 'high'` on 2D contexts.  
+**Gotcha**: assigning `canvas.width` or `canvas.height` resets all 2D context state, including
+`imageSmoothingQuality` — re-apply it after every resize.
+
 ### Dual output
 
 - Window 1 (control): deck previews, crossfader, media browser, MIDI status

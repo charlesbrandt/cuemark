@@ -1,10 +1,14 @@
 const channel = new BroadcastChannel('cuemark-output');
 const canvas = document.getElementById('output') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
+ctx.imageSmoothingEnabled = true;
+ctx.imageSmoothingQuality = 'high';
 
 function resize() {
   canvas.width = window.innerWidth * devicePixelRatio;
   canvas.height = window.innerHeight * devicePixelRatio;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
 }
 resize();
 window.addEventListener('resize', resize);

@@ -13,6 +13,23 @@
     const canvas = previewCanvas;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
+
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+
+    // Keep canvas buffer sized to its actual rendered pixels so it isn't upscaled blurry.
+    const dpr = window.devicePixelRatio || 1;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        canvas.width = Math.round(width * dpr);
+        canvas.height = Math.round(height * dpr);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+      }
+    });
+    ro.observe(canvas);
+
     let rafId: number;
     function draw() {
       const video = getVideoEl(deck.id);
@@ -22,7 +39,10 @@
       rafId = requestAnimationFrame(draw);
     }
     rafId = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(rafId);
+    return () => {
+      cancelAnimationFrame(rafId);
+      ro.disconnect();
+    };
   });
 
   async function loadVideo() {
@@ -83,8 +103,6 @@
       <canvas
         bind:this={previewCanvas}
         class="deck-preview"
-        width="160"
-        height="90"
         title={deck.source.filePath.split("/").pop()}
       ></canvas>
       <span class="source-meta">
