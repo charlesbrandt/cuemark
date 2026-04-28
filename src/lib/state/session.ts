@@ -9,7 +9,7 @@ function makeDeck(index: number): Deck {
     playbackRate: 1.0,
     volume: 1.0,
     opacity: 1.0,
-    loop: true,
+    loop: false,
     cuePoint: 0,
     hotCues: [],
   };

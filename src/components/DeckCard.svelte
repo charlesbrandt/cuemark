@@ -1,11 +1,29 @@
 <script lang="ts">
   import { open } from "@tauri-apps/plugin-dialog";
   import { updateDeck, removeDeck } from "../lib/state/session";
-  import { seekDeck, getDeckTime } from "../lib/renderer/seekBus";
+  import { seekDeck, getDeckTime, getVideoEl } from "../lib/renderer/seekBus";
   import type { Deck } from "../lib/state/types";
 
   let { deck }: { deck: Deck } = $props();
   let isDragOver = $state(false);
+  let previewCanvas = $state<HTMLCanvasElement | null>(null);
+
+  $effect(() => {
+    if (!previewCanvas || deck.source?.type !== "video") return;
+    const canvas = previewCanvas;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    let rafId: number;
+    function draw() {
+      const video = getVideoEl(deck.id);
+      if (video && video.readyState >= 2) {
+        ctx!.drawImage(video, 0, 0, canvas.width, canvas.height);
+      }
+      rafId = requestAnimationFrame(draw);
+    }
+    rafId = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(rafId);
+  });
 
   async function loadVideo() {
     const file = await open({
@@ -29,9 +47,6 @@
     }
   }
 
-  // File path extraction happens in App.svelte via onDragDropEvent (Tauri intercepts
-  // the native drop before HTML5 DataTransfer is populated). This handler just clears
-  // the visual state.
   function handleDrop(e: DragEvent) {
     e.preventDefault();
     isDragOver = false;
@@ -65,12 +80,21 @@
 
   <div class="preview">
     {#if deck.source?.type === "video"}
-      <span class="source-label">{deck.source.filePath.split("/").pop()}</span>
-      <span class="duration">{formatDuration(deck.source.duration)}</span>
+      <canvas
+        bind:this={previewCanvas}
+        class="deck-preview"
+        width="160"
+        height="90"
+        title={deck.source.filePath.split("/").pop()}
+      ></canvas>
+      <span class="source-meta">
+        <span class="source-label">{deck.source.filePath.split("/").pop()}</span>
+        <span class="duration">{formatDuration(deck.source.duration)}</span>
+      </span>
     {:else if deck.source?.type === "shader"}
-      <span class="source-label">✦ shader</span>
+      <div class="preview-placeholder">✦ shader</div>
     {:else}
-      <span class="source-label empty">— no source —</span>
+      <div class="preview-placeholder empty">— no source —</div>
     {/if}
     <button class="load-btn" onclick={loadVideo}>Load Video</button>
   </div>

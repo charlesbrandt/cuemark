@@ -11,6 +11,7 @@
   import { postFrame } from "./lib/renderer/outputBus";
   import DeckCard from "./components/DeckCard.svelte";
   import Crossfader from "./components/Crossfader.svelte";
+  import WaveformCanvas from "./components/WaveformCanvas.svelte";
   import type { Deck } from "./lib/state/types";
 
   function openOutputWindow() {
@@ -196,12 +197,17 @@
     </label>
   </header>
 
-  <canvas
-    bind:this={canvas}
-    width={1920}
-    height={1080}
-    class="preview-canvas"
-  ></canvas>
+  <!-- Compositor renders here; hidden from control window — visible only in Output Window -->
+  <canvas bind:this={canvas} width={1920} height={1080} style="display:none"></canvas>
+
+  <div class="waveform-stack">
+    {#each $session.decks as deck (deck.id)}
+      <div class="waveform-row">
+        <span class="waveform-label">{deck.id}</span>
+        <WaveformCanvas {deck} />
+      </div>
+    {/each}
+  </div>
 
   <div class="decks" style="--deck-count: {$session.decks.length}">
     {#each $session.decks as deck (deck.id)}

@@ -16,3 +16,7 @@ export function seekDeck(deckId: string, time: number) {
 export function getDeckTime(deckId: string): number | null {
   return els.get(deckId)?.currentTime ?? null;
 }
+
+export function getVideoEl(deckId: string): HTMLVideoElement | undefined {
+  return els.get(deckId);
+}

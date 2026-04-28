@@ -53,13 +53,13 @@
 
 ## Batch A — UI polish (next up)
 
-### video preview in deck card
-- Show a scaled-down live preview of the deck's video inside DeckCard
-- Approach: pull the hidden `<video>` ref from `seekBus` and render it to a small `<canvas>` per card
-  via `drawImage(videoEl, ...)` in the RAF loop, or compositor exposes a `getPreviewCanvas(deckId)`
-  method that blits the FBO to a 160×90 offscreen canvas each frame
-- Replace the filename label as the primary visual; keep filename as `title` attribute tooltip
-- Show a "no source" placeholder graphic when deck has no source
+### video preview in deck card [done]
+- `getVideoEl(deckId)` exported from `seekBus.ts`; DeckCard binds a `<canvas class="deck-preview">`
+- Per-deck RAF loop in `$effect` calls `drawImage(videoEl, ...)` each frame; cancels on cleanup
+- Filename shown as truncated label + tooltip; duration shown below
+- Placeholder text for shader and no-source states
+- `crossfaderTargets: ('opacity' | 'volume')[]` added to Session; crossfader now drives audio by default
+- `loop` defaults to `false`
 
 ### waveform display
 - Full-track analysis on load: fetch file as ArrayBuffer (HTTP in dev, `readFile` Tauri command in prod)
