@@ -1,5 +1,5 @@
 import { writable, get } from "svelte/store";
-import type { Session, Deck } from "./types";
+import type { Session, Deck, CrossfaderTarget } from "./types";
 
 function makeDeck(index: number): Deck {
   return {
@@ -20,6 +20,8 @@ const initial: Session = {
   masterVolume: 1.0,
   bpm: null,
   crossfaderMapping: { left: "deck-0", right: "deck-1" },
+  crossfaderValue: 0.5,
+  crossfaderTargets: ["opacity", "volume"],
   effects: [],
 };
 
@@ -58,10 +60,20 @@ export function setMasterVolume(value: number) {
 export function setCrossfader(value: number) {
   session.update((s) => ({
     ...s,
+    crossfaderValue: value,
     decks: s.decks.map((d) => {
-      if (d.id === s.crossfaderMapping.left) return { ...d, opacity: 1.0 - value };
-      if (d.id === s.crossfaderMapping.right) return { ...d, opacity: value };
-      return d;
+      const isLeft = d.id === s.crossfaderMapping.left;
+      const isRight = d.id === s.crossfaderMapping.right;
+      if (!isLeft && !isRight) return d;
+      const level = isLeft ? 1.0 - value : value;
+      const patch: Partial<Deck> = {};
+      if (s.crossfaderTargets.includes("opacity")) patch.opacity = level;
+      if (s.crossfaderTargets.includes("volume")) patch.volume = level;
+      return { ...d, ...patch };
     }),
   }));
+}
+
+export function setCrossfaderTargets(targets: CrossfaderTarget[]) {
+  session.update((s) => ({ ...s, crossfaderTargets: targets }));
 }

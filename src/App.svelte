@@ -209,5 +209,10 @@
     {/each}
   </div>
 
-  <Crossfader mapping={$session.crossfaderMapping} decks={$session.decks} />
+  <Crossfader
+    mapping={$session.crossfaderMapping}
+    decks={$session.decks}
+    crossfaderValue={$session.crossfaderValue}
+    crossfaderTargets={$session.crossfaderTargets}
+  />
 </div>

@@ -27,6 +27,8 @@ export interface Effect {
   params: Record<string, number>;
 }
 
+export type CrossfaderTarget = "opacity" | "volume";
+
 export interface Session {
   decks: Deck[];          // ordered array; render back-to-front
   masterVolume: number;
@@ -35,5 +37,7 @@ export interface Session {
     left: string;         // deck id
     right: string;        // deck id
   };
+  crossfaderValue: number;              // 0.0 (full left) – 1.0 (full right)
+  crossfaderTargets: CrossfaderTarget[]; // which deck properties the crossfader drives
   effects: Effect[];      // global post-process chain
 }
