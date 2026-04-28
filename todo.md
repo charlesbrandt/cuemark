@@ -37,7 +37,7 @@
 - Test: crossfader, jog wheels, play/pause, volume faders
 
 ### unmapped MIDI controls — to decide
-- Shift button `(0x90, 3)` — global modifier; could enable secondary bindings or MIDI learn mode
+- Shift button `(0x90, 3)` — hardware handles in firmware (remaps pad notes +8); no standalone action needed
 - Vinyl / Scratch button `(0x91/0x92, 3)` — could toggle jog scratch vs. pitch-bend mode or beat sync
 - Headphone Cue buttons `(0x91/0x92, 12)` — flag a deck for pre-listen / solo monitor (see Batch C)
 - Bass/Filter toggle `(0x90, 1)` — could switch bass knob between EQ mode and shader `u_bass_gain`
@@ -71,15 +71,13 @@
 - Draw cue point marker (white line) and hot cue markers (colored lines) on waveform
 - Draw loop region as a translucent highlight when loop is active
 
-### hot cue set/clear UI
-- `hotCues: number[]` already in data model (up to 4 per MIDI map)
-- DeckCard: row of 4 pad buttons labeled 1–4 (matching physical pads on controller)
-- Empty pad: click = set hot cue at current time; right-click (or Shift+click) = no-op / clear if occupied
-- Occupied pad: left-click = seek + stop (jump); right-click = clear (set to undefined / splice)
-- Wire up the `hot_cue` MIDI handler stub in `handler.ts`:
-  - if `hotCues[index]` defined → `seekDeck` + stop
-  - else → set `hotCues[index] = currentTime`
-- Hot cue markers reflected on waveform canvas (see above)
+### hot cue set/clear UI [done]
+- DeckCard: row of 4 pad buttons labeled 1–4; empty = dim, occupied = green with timestamp
+- Empty pad: click = stamp current time; occupied pad: click = jump, shift+click = re-stamp, right-click = clear
+- MIDI `hot_cue` handler: seeks to `hotCues[index]` if set
+- MIDI `hot_cue_set` handler: stamps `getDeckTime()` into `hotCues[index]`
+- Shift+pad on Starlight: hardware sends note+8 on same channel → maps directly to HotCueSet (no host modifier state)
+- Hot cue markers on waveform canvas: pending (see waveform display task)
 
 ### crossfader deck selector
 - Crossfader component: add two `<select>` dropdowns (left / right) listing all deck IDs

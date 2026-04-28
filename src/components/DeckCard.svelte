@@ -148,6 +148,44 @@
     {/if}
   </div>
 
+  <div class="hot-cues">
+    {#each [0, 1, 2, 3] as i}
+      {@const t = deck.hotCues[i]}
+      {@const isSet = t !== undefined && !isNaN(t)}
+      <button
+        class="hot-cue-btn"
+        class:set={isSet}
+        onclick={(e) => {
+          if (isSet && !e.shiftKey) {
+            seekDeck(deck.id, t);
+          } else {
+            const now = getDeckTime(deck.id);
+            if (now !== null) {
+              const cues = [...deck.hotCues];
+              cues[i] = now;
+              updateDeck(deck.id, { hotCues: cues });
+            }
+          }
+        }}
+        oncontextmenu={(e) => {
+          e.preventDefault();
+          if (isSet) {
+            const cues = [...deck.hotCues];
+            cues[i] = NaN;
+            updateDeck(deck.id, { hotCues: cues });
+          }
+        }}
+        title={isSet ? `Hot cue ${i + 1}: ${formatDuration(t)} — shift+click to move, right-click to clear` : `Set hot cue ${i + 1} at current position`}
+        disabled={!deck.source}
+      >
+        <span class="hc-num">{i + 1}</span>
+        {#if isSet}
+          <span class="hc-time">{formatDuration(t)}</span>
+        {/if}
+      </button>
+    {/each}
+  </div>
+
   <div class="sliders">
     <label>
       <span>Opacity <strong>{deck.opacity.toFixed(2)}</strong></span>
@@ -184,3 +222,57 @@
     </label>
   </div>
 </div>
+
+<style>
+  .hot-cues {
+    display: flex;
+    gap: 4px;
+    margin: 6px 0 2px;
+  }
+
+  .hot-cue-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 4px 2px;
+    font-size: 11px;
+    background: #222;
+    border: 1px solid #444;
+    border-radius: 4px;
+    color: #888;
+    cursor: pointer;
+    min-height: 36px;
+    line-height: 1.2;
+  }
+
+  .hot-cue-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  .hot-cue-btn.set {
+    background: #1a3a1a;
+    border-color: #4caf50;
+    color: #4caf50;
+  }
+
+  .hot-cue-btn.set:hover {
+    background: #1e4d1e;
+  }
+
+  .hot-cue-btn:not(.set):not(:disabled):hover {
+    border-color: #666;
+    color: #ccc;
+  }
+
+  .hc-num {
+    font-weight: bold;
+    font-size: 13px;
+  }
+
+  .hc-time {
+    font-size: 9px;
+    opacity: 0.85;
+  }
+</style>

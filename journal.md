@@ -49,6 +49,29 @@ Rust `media://` custom scheme handler.
 
 ---
 
+# 2026.04.27 — hot cue UI and MIDI set/jump
+
+## What shipped
+
+**Hot cue pad row in DeckCard** — four buttons per deck (1–4) matching the physical pads.
+Empty pads are dimmed; occupied pads show green with the stamped time. Click behaviour:
+- Empty: stamp current playback position
+- Occupied: jump (seek + keep playing)
+- Shift+click: re-stamp at current position (overwrite)
+- Right-click: clear
+
+**MIDI hot cue wiring** — the `hot_cue` stub in `handler.ts` now seeks to `hotCues[index]`
+when set. A new `hot_cue_set` action stamps `getDeckTime()` into the slot.
+
+**Shift+pad on the Starlight** — initial approach tracked shift state in Rust via `AtomicBool`,
+emitting `HotCueSet` when the shift flag was set. This was wrong: the Hercules handles Shift
+entirely in hardware. When Shift is held, the hot cue pads send note+8 on the same channel
+(`(0x96, 8–11)` left, `(0x97, 8–11)` right) instead of their normal notes 0–3. The fix is
+simply to add direct `HotCueSet` map entries for those notes — no host-side modifier tracking.
+Verified by running with the debug eprintln and pressing each shifted pad in sequence.
+
+---
+
 # 2026.04.27 — canvas quality fixes
 
 Video previews and output window were grainy and slightly zoomed-in. Three root causes:

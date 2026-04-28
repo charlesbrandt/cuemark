@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { updateDeck, getDeck, setCrossfader, setMasterVolume } from "../state/session";
-import { seekDeck } from "../renderer/seekBus";
+import { seekDeck, getDeckTime } from "../renderer/seekBus";
 
 // Must match the Rust MidiAction enum (snake_case tag + camelCase fields from serde)
 export interface MidiAction {
@@ -13,6 +13,7 @@ export interface MidiAction {
     | "master_volume"
     | "cue_jump"
     | "hot_cue"
+    | "hot_cue_set"
     | "loop_toggle";
   deck_id?: string;
   value?: number;
@@ -61,9 +62,26 @@ export async function startMidiListener(): Promise<() => void> {
         if (d) updateDeck(d.id, { loop: !d.loop });
         break;
       }
-      case "hot_cue":
-        // TODO: seek to hotCues[index] when implemented
+      case "hot_cue": {
+        if (!a.deck_id || a.index === undefined) break;
+        const d = getDeck(a.deck_id);
+        if (!d) break;
+        const t = d.hotCues[a.index];
+        if (t !== undefined && !isNaN(t)) seekDeck(d.id, t);
         break;
+      }
+      case "hot_cue_set": {
+        if (!a.deck_id || a.index === undefined) break;
+        const d = getDeck(a.deck_id);
+        if (!d) break;
+        const now = getDeckTime(a.deck_id);
+        if (now !== null) {
+          const cues = [...d.hotCues];
+          cues[a.index] = now;
+          updateDeck(d.id, { hotCues: cues });
+        }
+        break;
+      }
     }
   });
   return unlisten;
