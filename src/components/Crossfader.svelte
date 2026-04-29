@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { setCrossfader, setCrossfaderTargets } from "../lib/state/session";
+  import { setCrossfader, setCrossfaderTargets, setCrossfaderMapping } from "../lib/state/session";
   import type { Deck, CrossfaderTarget } from "../lib/state/types";
 
   let {
@@ -14,9 +14,6 @@
     crossfaderTargets: CrossfaderTarget[];
   } = $props();
 
-  const leftDeck = $derived(decks.find((d) => d.id === mapping.left));
-  const rightDeck = $derived(decks.find((d) => d.id === mapping.right));
-
   function toggleTarget(target: CrossfaderTarget) {
     if (crossfaderTargets.includes(target)) {
       setCrossfaderTargets(crossfaderTargets.filter((t) => t !== target));
@@ -27,7 +24,15 @@
 </script>
 
 <div class="crossfader-bar">
-  <span class="cf-label left">{leftDeck?.id ?? "—"}</span>
+  <select
+    class="cf-select"
+    value={mapping.left}
+    onchange={(e) => setCrossfaderMapping(e.currentTarget.value, mapping.right)}
+  >
+    {#each decks as deck (deck.id)}
+      <option value={deck.id}>{deck.id}</option>
+    {/each}
+  </select>
   <input
     class="crossfader"
     type="range"
@@ -37,7 +42,15 @@
     value={crossfaderValue}
     oninput={(e) => setCrossfader(+e.currentTarget.value)}
   />
-  <span class="cf-label right">{rightDeck?.id ?? "—"}</span>
+  <select
+    class="cf-select"
+    value={mapping.right}
+    onchange={(e) => setCrossfaderMapping(mapping.left, e.currentTarget.value)}
+  >
+    {#each decks as deck (deck.id)}
+      <option value={deck.id}>{deck.id}</option>
+    {/each}
+  </select>
   <label class="cf-target">
     <input
       type="checkbox"
@@ -53,3 +66,14 @@
     /> Audio
   </label>
 </div>
+
+<style>
+  .cf-select {
+    background: #222;
+    color: #ccc;
+    border: 1px solid #444;
+    border-radius: 3px;
+    padding: 2px 4px;
+    font-size: 0.8rem;
+  }
+</style>

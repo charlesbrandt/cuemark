@@ -159,7 +159,7 @@ cuemark/
     lib/
       state/
         types.ts                # Deck, Session, AudioAnalysis interfaces
-        session.ts              # Svelte writable store + addDeck/updateDeck/etc.
+        session.ts              # Svelte writable store + addDeck/updateDeck/setCrossfaderMapping/etc.
       renderer/
         fbo.ts                  # DeckFBO — allocates WebGL texture + framebuffer
         compositor.ts           # Compositor — syncDecks(), composite()
@@ -170,7 +170,7 @@ cuemark/
         handler.ts              # Tauri IPC listener → session mutations
     components/
       DeckCard.svelte           # Per-deck controls (opacity, volume, rate, play, loop, cue set/jump)
-      Crossfader.svelte         # Hardware crossfader UI (maps to two deck opacities)
+      Crossfader.svelte         # Hardware crossfader UI — deck selectors (left/right), slider, Visual/Audio toggles
   src-tauri/                    # Rust backend (Tauri 2)
     src/
       main.rs                   # Binary entry point

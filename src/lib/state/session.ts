@@ -77,3 +77,7 @@ export function setCrossfader(value: number) {
 export function setCrossfaderTargets(targets: CrossfaderTarget[]) {
   session.update((s) => ({ ...s, crossfaderTargets: targets }));
 }
+
+export function setCrossfaderMapping(left: string, right: string) {
+  session.update((s) => ({ ...s, crossfaderMapping: { left, right } }));
+}
