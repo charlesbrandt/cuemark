@@ -61,15 +61,21 @@
 - `crossfaderTargets: ('opacity' | 'volume')[]` added to Session; crossfader now drives audio by default
 - `loop` defaults to `false`
 
-### waveform display
-- Full-track analysis on load: fetch file as ArrayBuffer (HTTP in dev, `readFile` Tauri command in prod)
-  → `AudioContext.decodeAudioData()` → compute peak/RMS per ~1000 chunks → `Float32Array`
-- New module `src/lib/audio/waveform.ts`: `computeWaveform(buffer, chunkCount)` → peaks
-- New component `WaveformCanvas.svelte`: canvas element, draws peaks + colored playhead scrubber
-- Mount one `WaveformCanvas` per deck; show above (or below) the deck card area
-- Click on waveform seeks to that position (`seekDeck`)
-- Draw cue point marker (white line) and hot cue markers (colored lines) on waveform
-- Draw loop region as a translucent highlight when loop is active
+### waveform display [done]
+- Full-track analysis on load: fetch file as ArrayBuffer → `AudioContext.decodeAudioData()` →
+  30 peaks/second (amplitude) → `Float32Array`; re-analyzes on source change
+- `src/lib/audio/waveform.ts`: `computeWaveform(buffer)` + pre-computed 256-entry color LUTs
+  (dark blue → cyan → green → yellow → orange keyed to amplitude; played region dimmed ~40%)
+- `WaveformCanvas.svelte`: amplitude-colored bars, depth gradient overlay, ResizeObserver sizing
+- **Overview mode**: full track, played region dimmer, playhead as red line
+- **Zoom mode** (OVR/ZOOM toggle button): 16s window by default; playhead pinned at 25% from left
+  so both decks' playheads share the same canvas X — beat alignment visible by waveform shape
+  - Scroll on canvas to adjust zoom window (4–32s)
+  - Second-interval tick marks (longer every 4s) for rhythm reference
+  - Out-of-bounds regions (before/after track) shaded darker
+- Click on waveform seeks to that position (works in both modes)
+- Cue point (white) and hot cue markers (colored) drawn in both modes; clipped when off-screen
+- Loop region highlight: pending (no loop in/out points in model yet)
 
 ### hot cue set/clear UI [done]
 - DeckCard: row of 4 pad buttons labeled 1–4; empty = dim, occupied = green with timestamp
@@ -77,7 +83,7 @@
 - MIDI `hot_cue` handler: seeks to `hotCues[index]` if set
 - MIDI `hot_cue_set` handler: stamps `getDeckTime()` into `hotCues[index]`
 - Shift+pad on Starlight: hardware sends note+8 on same channel → maps directly to HotCueSet (no host modifier state)
-- Hot cue markers on waveform canvas: pending (see waveform display task)
+- Hot cue markers drawn on waveform canvas in both overview and zoom modes
 
 ### crossfader deck selector
 - Crossfader component: add two `<select>` dropdowns (left / right) listing all deck IDs

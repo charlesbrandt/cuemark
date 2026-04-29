@@ -166,11 +166,13 @@ cuemark/
         seekBus.ts              # Module-level video element registry; seekDeck() / getDeckTime()
       audio/
         analyzer.ts             # AudioAnalyzer — Web Audio API FFT
+        waveform.ts             # computeWaveform() at 30 peaks/sec + pre-built amplitude color LUTs
       midi/
         handler.ts              # Tauri IPC listener → session mutations
     components/
       DeckCard.svelte           # Per-deck controls (opacity, volume, rate, play, loop, cue set/jump, elapsed/remaining time)
       Crossfader.svelte         # Hardware crossfader UI — deck selectors (left/right), slider, Visual/Audio toggles
+      WaveformCanvas.svelte     # Per-deck waveform: overview (full track) + zoom mode (16s window, playhead pinned at 25%)
   src-tauri/                    # Rust backend (Tauri 2)
     src/
       main.rs                   # Binary entry point
