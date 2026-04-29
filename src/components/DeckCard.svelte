@@ -7,6 +7,8 @@
   let { deck }: { deck: Deck } = $props();
   let isDragOver = $state(false);
   let previewCanvas = $state<HTMLCanvasElement | null>(null);
+  let currentTime = $state(0);
+  let videoDuration = $state(0);
 
   $effect(() => {
     if (!previewCanvas || deck.source?.type !== "video") return;
@@ -35,6 +37,8 @@
       const video = getVideoEl(deck.id);
       if (video && video.readyState >= 2) {
         ctx!.drawImage(video, 0, 0, canvas.width, canvas.height);
+        currentTime = video.currentTime;
+        if (video.duration && isFinite(video.duration)) videoDuration = video.duration;
       }
       rafId = requestAnimationFrame(draw);
     }
@@ -148,6 +152,13 @@
     {/if}
   </div>
 
+  {#if deck.source?.type === "video" && videoDuration > 0}
+    <div class="time-display">
+      <span class="time-elapsed">{formatDuration(currentTime)}</span>
+      <span class="time-remaining">-{formatDuration(videoDuration - currentTime)}</span>
+    </div>
+  {/if}
+
   <div class="hot-cues">
     {#each [0, 1, 2, 3] as i}
       {@const t = deck.hotCues[i]}
@@ -224,6 +235,23 @@
 </div>
 
 <style>
+  .time-display {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    padding: 2px 4px;
+    color: #aaa;
+  }
+
+  .time-elapsed {
+    color: #ddd;
+  }
+
+  .time-remaining {
+    color: #888;
+  }
+
   .hot-cues {
     display: flex;
     gap: 4px;

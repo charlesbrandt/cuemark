@@ -169,7 +169,7 @@ cuemark/
       midi/
         handler.ts              # Tauri IPC listener → session mutations
     components/
-      DeckCard.svelte           # Per-deck controls (opacity, volume, rate, play, loop, cue set/jump)
+      DeckCard.svelte           # Per-deck controls (opacity, volume, rate, play, loop, cue set/jump, elapsed/remaining time)
       Crossfader.svelte         # Hardware crossfader UI — deck selectors (left/right), slider, Visual/Audio toggles
   src-tauri/                    # Rust backend (Tauri 2)
     src/
