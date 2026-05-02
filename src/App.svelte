@@ -13,6 +13,8 @@
   import DeckCard from "./components/DeckCard.svelte";
   import Crossfader from "./components/Crossfader.svelte";
   import WaveformCanvas from "./components/WaveformCanvas.svelte";
+  import AudioSettings from "./components/AudioSettings.svelte";
+  import { cueOutputDeviceId, cueGain } from "./lib/audio/audioSettings";
   import type { Deck } from "./lib/state/types";
 
   function openOutputWindow() {
@@ -23,6 +25,7 @@
   let dragDropUnlisten: (() => void) | undefined;
   let tapTimestamps: number[] = [];
   let tapResetTimer: ReturnType<typeof setTimeout> | undefined;
+  let showAudioSettings = $state(false);
 
   function handleTap() {
     const now = Date.now();
@@ -46,6 +49,31 @@
   // Sync master volume to the audio graph whenever it changes
   $effect(() => {
     analyzer?.setMasterVolume($session.masterVolume);
+  });
+
+  // Sync per-deck EQ to the audio graph whenever any deck's eq changes
+  $effect(() => {
+    for (const deck of $session.decks) {
+      analyzer?.setDeckEQ(deck.id, deck.eq.low, deck.eq.mid, deck.eq.high);
+    }
+  });
+
+  // Recreate the cue AudioContext when the headphone output device changes
+  $effect(() => {
+    const deviceId = $cueOutputDeviceId;
+    analyzer?.setCueOutputDevice(deviceId).catch(console.error);
+  });
+
+  // Sync headphone cue gain
+  $effect(() => {
+    analyzer?.setCueVolume($cueGain);
+  });
+
+  // Sync deck cueEnabled flags to audio graph
+  $effect(() => {
+    for (const deck of $session.decks) {
+      analyzer?.setCueDeck(deck.id, deck.cueEnabled);
+    }
   });
 
   onMount(async () => {
@@ -77,7 +105,7 @@
     cancelAnimationFrame(rafId);
     for (const [id, v] of videoEls) { v.pause(); v.remove(); unregisterVideoEl(id); }
     videoEls.clear();
-    for (const g of deckGains.values()) g.disconnect();
+    for (const id of deckGains.keys()) analyzer?.disconnectDeck(id);
     deckGains.clear();
   });
 
@@ -110,7 +138,7 @@
         v.remove();
         unregisterVideoEl(id);
         videoEls.delete(id);
-        deckGains.get(id)?.disconnect();
+        analyzer.disconnectDeck(id);
         deckGains.delete(id);
         playPromises.delete(id);
       }
@@ -136,7 +164,7 @@
         registerVideoEl(deck.id, v);
         videoEls.set(deck.id, v);
         // Connect to Web Audio; gain node drives per-deck volume from here on
-        const gain = analyzer.connectMediaElement(v);
+        const gain = analyzer.connectMediaElement(deck.id, v);
         deckGains.set(deck.id, gain);
         v.volume = 1.0; // element volume fixed at unity; GainNode handles level
       }
@@ -224,6 +252,11 @@
     <span class="logo">CUEMARK</span>
     <button class="add-deck" onclick={addDeck}>+ Deck</button>
     <button class="output-btn" onclick={openOutputWindow}>Output Window</button>
+    <button
+      class="output-btn"
+      class:active={showAudioSettings}
+      onclick={() => { showAudioSettings = !showAudioSettings; }}
+    >Audio</button>
     <span class="bpm">{$session.bpm ? `${$session.bpm} BPM` : "—"}</span>
     <button class="tap-btn" onclick={handleTap}>TAP</button>
     {#if $session.bpm !== null}
@@ -246,6 +279,12 @@
 
   <!-- Compositor renders here; hidden from control window — visible only in Output Window -->
   <canvas bind:this={canvas} width={1920} height={1080} style="display:none"></canvas>
+
+  {#if showAudioSettings}
+    <AudioSettings
+      onMainDeviceChange={(id) => analyzer?.setOutputDevice(id).catch(console.error)}
+    />
+  {/if}
 
   <div class="waveform-stack">
     {#each $session.decks as deck (deck.id)}

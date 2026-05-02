@@ -137,6 +137,13 @@
     >
       ⟲
     </button>
+    <button
+      class:active={deck.cueEnabled}
+      onclick={() => updateDeck(deck.id, { cueEnabled: !deck.cueEnabled })}
+      title="Headphone cue — route pre-fader signal to headphone output"
+    >
+      CUE
+    </button>
     {#if deck.source?.type === "video"}
       <button
         onclick={() => { seekDeck(deck.id, deck.cuePoint); updateDeck(deck.id, { playing: false }); }}
@@ -331,9 +338,35 @@
       />
     </label>
   </div>
+
+  <div class="eq-row">
+    <label title="Low shelf ±12 dB @ 250 Hz">
+      <span>Lo <strong class:eq-active={deck.eq.low !== 0}>{deck.eq.low >= 0 ? '+' : ''}{deck.eq.low.toFixed(0)}</strong></span>
+      <input type="range" min="-12" max="12" step="0.5" value={deck.eq.low}
+        oninput={(e) => updateDeck(deck.id, { eq: { ...deck.eq, low: +e.currentTarget.value } })} />
+    </label>
+    <label title="Mid peak ±12 dB @ 1 kHz">
+      <span>Mid <strong class:eq-active={deck.eq.mid !== 0}>{deck.eq.mid >= 0 ? '+' : ''}{deck.eq.mid.toFixed(0)}</strong></span>
+      <input type="range" min="-12" max="12" step="0.5" value={deck.eq.mid}
+        oninput={(e) => updateDeck(deck.id, { eq: { ...deck.eq, mid: +e.currentTarget.value } })} />
+    </label>
+    <label title="High shelf ±12 dB @ 4 kHz">
+      <span>Hi <strong class:eq-active={deck.eq.high !== 0}>{deck.eq.high >= 0 ? '+' : ''}{deck.eq.high.toFixed(0)}</strong></span>
+      <input type="range" min="-12" max="12" step="0.5" value={deck.eq.high}
+        oninput={(e) => updateDeck(deck.id, { eq: { ...deck.eq, high: +e.currentTarget.value } })} />
+    </label>
+    <button
+      class="eq-reset"
+      onclick={() => updateDeck(deck.id, { eq: { low: 0, mid: 0, high: 0 } })}
+      title="Reset EQ"
+      disabled={deck.eq.low === 0 && deck.eq.mid === 0 && deck.eq.high === 0}
+    >↺</button>
+  </div>
 </div>
 
 <style>
+  .eq-active { color: #f5a623; }
+
   .bpm-row {
     display: flex;
     align-items: center;

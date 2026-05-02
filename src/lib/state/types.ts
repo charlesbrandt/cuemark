@@ -3,6 +3,12 @@ export type DeckSource =
   | { type: "shader"; fragmentSrc: string; uniforms: Record<string, number> }
   | null;
 
+export interface DeckEQ {
+  low: number;   // ±12 dB low shelf  @ 250 Hz
+  mid: number;   // ±12 dB mid peak   @ 1 kHz
+  high: number;  // ±12 dB high shelf @ 4 kHz
+}
+
 export interface Deck {
   id: string;
   source: DeckSource;
@@ -17,6 +23,8 @@ export interface Deck {
   bpm: number | null;     // detected or tapped BPM for this deck
   loopIn: number | null;  // loop region start (seconds); null = use track start
   loopOut: number | null; // loop region end (seconds); null = use track end
+  eq: DeckEQ;
+  cueEnabled: boolean;    // route pre-fader signal to headphone cue context
 }
 
 export interface AudioAnalysis {

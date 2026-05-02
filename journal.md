@@ -1,3 +1,38 @@
+# 2026.05.02 — Batch C: EQ, audio output device selection, headphone cue
+
+## What shipped
+
+**EQ per deck** — three biquad filter nodes inserted into each deck's signal chain:
+`gain → lowShelf(250Hz) → midPeak(1kHz,Q=1) → highShelf(4kHz) → analyser`
+- `DeckEQ { low, mid, high }` added to `Deck` type; `eq: { 0, 0, 0 }` default
+- `setDeckEQ(deckId, low, mid, high)` on `AudioAnalyzer`; synced via `$effect` in App.svelte
+- Three ±12 dB sliders + reset button (enabled only when any band is non-zero) in each DeckCard
+- `cueEnabled: boolean` added to `Deck` type in the same pass (used by headphone cue)
+
+**Audio output device selection** — settings bar toggled from toolbar "Audio" button:
+- `src/lib/audio/devices.ts`: `listAudioOutputs()` enumerates `audiooutput` devices;
+  `sinkIdSupported()` checks `'setSinkId' in AudioContext.prototype`
+- `AudioAnalyzer.setOutputDevice(deviceId)` calls `ctx.setSinkId(deviceId)` if supported
+- Falls back gracefully: shows "unavailable in this runtime" message if WebKitGTK doesn't expose `setSinkId`
+- Settings bar also exposes headphone device selector and cue gain slider (see below)
+- `src/lib/audio/audioSettings.ts`: module-level Svelte stores (`mainOutputDeviceId`, `cueOutputDeviceId`, `cueGain`)
+  keep device selections accessible without prop drilling
+
+**Headphone cue / pre-listen** — second `AudioContext` routed to the selected headphone output:
+- Bridge: `highShelf → MediaStreamDestinationNode` in main ctx → `MediaStreamSource` in cue ctx
+  (cross-context routing; Web Audio contexts can't share nodes directly)
+- `setCueDeck(deckId, enabled)` on `AudioAnalyzer`: connects / disconnects each deck's post-EQ
+  pre-fader signal to the cue mix; `cueStreamDest` node is created lazily and kept alive for reconnection
+- `setCueOutputDevice(deviceId)`: tears down and rebuilds the cue `AudioContext` when device changes;
+  reconnects all currently-enabled cue decks automatically
+- `setCueVolume(v)`: headphone master gain
+- CUE toggle button added to transport row in each DeckCard
+- `cueGain` slider appears in the Audio settings bar only when a headphone device is selected
+- MIDI: headphone cue buttons `(0x91, 12)` / `(0x92, 12)` → new `HeadphoneCue` action → toggles `cueEnabled`
+- `HeadphoneCue` added to `MidiAction` and `ControlBinding` enums in `midi.rs`
+
+---
+
 # 2026.05.02 — MIDI calibration complete + Gain/Volume split
 
 ## What shipped

@@ -18,7 +18,8 @@ export interface MidiAction {
     | "hot_cue"
     | "hot_cue_set"
     | "loop_toggle"
-    | "sync_toggle";
+    | "sync_toggle"
+    | "headphone_cue";
   deck_id?: string;
   value?: number;
   index?: number;
@@ -119,6 +120,12 @@ export async function startMidiListener(): Promise<() => void> {
           // masterBpm / deck.bpm: if deck is slower, rate > 1 to speed up to match master
           updateDeck(d.id, { playbackRate: masterBpm / d.bpm });
         }
+        break;
+      }
+      case "headphone_cue": {
+        if (!a.deck_id) break;
+        const d = getDeck(a.deck_id);
+        if (d) updateDeck(d.id, { cueEnabled: !d.cueEnabled });
         break;
       }
     }

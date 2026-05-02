@@ -24,6 +24,7 @@ pub enum MidiAction {
     HotCueSet { deck_id: String, index: u8 },
     LoopToggle { deck_id: String },
     SyncToggle { deck_id: String },
+    HeadphoneCue { deck_id: String },
 }
 
 /// What a specific MIDI control does. Stored in the mapping table so the
@@ -46,6 +47,7 @@ pub enum ControlBinding {
     HotCueSet { deck_id: String, index: u8 },
     LoopToggle { deck_id: String },
     SyncToggle { deck_id: String },
+    HeadphoneCue { deck_id: String },
     /// Relative jog wheel (7-bit two's complement: 1–63 = CW, 64–127 = CCW)
     JogWheel { deck_id: String },
 }
@@ -121,10 +123,12 @@ fn hercules_starlight_map() -> MidiMap {
     m.insert((0xB0, 0),  ControlBinding::Crossfader);
     // Master volume: 14-bit pair — CC 3 (MSB) mapped; CC 35 (LSB) ignored
     m.insert((0xB0, 3),  ControlBinding::MasterVolume);
+    // Headphone CUE buttons (Note On, velocity > 0 = press)
+    m.insert((0x91, 12), ControlBinding::HeadphoneCue { deck_id: "deck-0".into() });
+    m.insert((0x92, 12), ControlBinding::HeadphoneCue { deck_id: "deck-1".into() });
     // Unmapped (no action needed):
     //   (0x90, 3)  = Shift button — controller remaps pads in firmware; no host tracking needed
     //   (0x90, 1)  = Bass/filter toggle
-    //   (0x91, 12) = Headphone cue L   (0x92, 12) = Headphone cue R
     //   (0x91, 15) = Hot-cue mode btn  (0x91, 16) = Loop mode btn
     //   (0xB0, 4)  = Headphone volume (CC 4 MSB; CC 36 LSB)
 
@@ -169,6 +173,9 @@ fn resolve_action(binding: &ControlBinding, data2: u8) -> Option<MidiAction> {
         }
         ControlBinding::SyncToggle { deck_id } => {
             (data2 > 0).then_some(MidiAction::SyncToggle { deck_id: deck_id.clone() })
+        }
+        ControlBinding::HeadphoneCue { deck_id } => {
+            (data2 > 0).then_some(MidiAction::HeadphoneCue { deck_id: deck_id.clone() })
         }
         ControlBinding::JogWheel { deck_id } => {
             // 7-bit two's complement: values 1–63 = CW (+), 64–127 = CCW (−).

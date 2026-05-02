@@ -8,26 +8,27 @@ What about   Phase nudge (brief rate spike for beat phase alignment) is the
 
 ---
 
-## Batch C — Audio routing
+## Batch C — Audio routing [done]
 
-### EQ per deck
-- Three biquad filter nodes per deck in the Web Audio chain (low shelf, mid peak, high shelf)
-- AudioAnalyzer needs to support per-deck source chains (currently single chain into one analyser)
-- UI: three small knobs or sliders per deck (range ±12 dB)
-- MIDI: Bass/Filter toggle `(0x90, 1)` could cycle EQ focus for the hardware knobs
+### EQ per deck [done]
+- Three biquad filter nodes per deck: lowShelf(250Hz) → midPeak(1kHz,Q=1) → highShelf(4kHz)
+- `DeckEQ { low, mid, high }` in Deck type; ±12 dB sliders + reset in DeckCard
+- `AudioAnalyzer.setDeckEQ(deckId, low, mid, high)`; synced via `$effect`
+- MIDI: Bass/Filter toggle `(0x90, 1)` still unmapped — would need dedicated EQ knob CCs
 
-### audio output device selection
-- Enumerate `audiooutput` devices: `navigator.mediaDevices.enumerateDevices()`
-- Settings panel (modal or sidebar): dropdown for main output device
-- `AudioContext({ sinkId: deviceId })` — verify WebKitGTK support before relying on it
-- Fallback: instruct user to route via system audio mixer if sinkId unsupported
+### audio output device selection [done]
+- `src/lib/audio/devices.ts`: `listAudioOutputs()`, `sinkIdSupported()`
+- `AudioAnalyzer.setOutputDevice(deviceId)` via `setSinkId()`
+- "Audio" toolbar button toggles settings bar; graceful fallback if setSinkId unsupported
+- `src/lib/audio/audioSettings.ts`: module-level stores for device IDs and cue gain
 
-### headphone cue / pre-listen
-- Second `AudioContext` routed to headphone output device
-- "CUE" button per deck routes that deck's pre-fader signal to headphone context
-- Headphone gain separate from main volume
-- Split-cue mode option: left ear = cued deck, right ear = main mix
-- MIDI: Headphone Cue buttons `(0x91/0x92, 12)` → toggle cue for that deck
+### headphone cue / pre-listen [done]
+- Second `AudioContext` (cue ctx) on headphone device via `setSinkId()`
+- Bridge: `highShelf → MediaStreamDest` (main ctx) → `MediaStreamSource` (cue ctx)
+- `setCueDeck(deckId, enabled)`, `setCueOutputDevice(deviceId)`, `setCueVolume(v)`
+- CUE button per deck in transport row; cue gain slider in Audio settings bar
+- MIDI: `(0x91/0x92, 12)` → `HeadphoneCue` action → toggles `deck.cueEnabled`
+- Split-cue mode (left=cue, right=main) not yet implemented
 
 ---
 
