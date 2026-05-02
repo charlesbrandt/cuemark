@@ -8,7 +8,8 @@ export interface Deck {
   source: DeckSource;
   playing: boolean;
   playbackRate: number;   // 0.25–4.0
-  volume: number;         // 0–1 audio
+  gain: number;           // 0–1 pre-fader trim (normalize between tracks)
+  volume: number;         // 0–1 post-fader level (driven by crossfader)
   opacity: number;        // 0–1 compositor weight
   loop: boolean;
   cuePoint: number;       // seconds

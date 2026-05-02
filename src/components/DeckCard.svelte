@@ -297,7 +297,18 @@
         oninput={(e) => updateDeck(deck.id, { opacity: +e.currentTarget.value })}
       />
     </label>
-    <label>
+    <label title="Pre-fader trim — normalize source level between tracks">
+      <span>Gain <strong>{deck.gain.toFixed(2)}</strong></span>
+      <input
+        type="range"
+        min="0"
+        max="1"
+        step="0.01"
+        value={deck.gain}
+        oninput={(e) => updateDeck(deck.id, { gain: +e.currentTarget.value })}
+      />
+    </label>
+    <label title="Post-fader level — driven by crossfader">
       <span>Volume <strong>{deck.volume.toFixed(2)}</strong></span>
       <input
         type="range"

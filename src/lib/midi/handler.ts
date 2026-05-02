@@ -8,6 +8,7 @@ export interface MidiAction {
   type:
     | "deck_play_toggle"
     | "deck_opacity"
+    | "deck_gain"
     | "deck_volume"
     | "deck_playback_rate"
     | "jog_nudge"
@@ -36,6 +37,10 @@ export async function startMidiListener(): Promise<() => void> {
         if (d) updateDeck(d.id, { playing: !d.playing });
         break;
       }
+      case "deck_gain":
+        if (a.deck_id && a.value !== undefined)
+          updateDeck(a.deck_id, { gain: a.value });
+        break;
       case "deck_volume":
         if (a.deck_id && a.value !== undefined)
           updateDeck(a.deck_id, { volume: a.value });

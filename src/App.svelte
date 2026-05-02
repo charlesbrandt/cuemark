@@ -158,6 +158,7 @@
       };
       v.onerror = () => console.error(`[${deckId}] video error: code=${v!.error?.code} message=${v!.error?.message} src=${v!.src}`);
       v.onstalled = () => console.warn(`[${deckId}] stalled (networkState=${v!.networkState})`);
+      v.onended = () => updateDeck(deckId, { playing: false });
 
       if (v.getAttribute('src') !== src) {
         console.log(`[${deck.id}] setting src:`, src);
@@ -184,7 +185,7 @@
       }
 
       const g = deckGains.get(deck.id);
-      if (g) g.gain.value = deck.volume;
+      if (g) g.gain.value = deck.gain * deck.volume;
       // playbackRate must be ≥ 0.0625 in most browsers
       v.playbackRate = Math.max(0.0625, deck.playbackRate);
 

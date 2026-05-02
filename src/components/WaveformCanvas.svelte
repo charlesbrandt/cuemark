@@ -136,7 +136,7 @@
 
     for (let i = 0; i < p.length; i++) {
       const x = i * barW;
-      const amp = p[i];
+      const amp = p[i] * deck.gain;
       const h = Math.max(1, amp * mid * 0.92);
       const colorIdx = Math.min(255, Math.floor(amp * 255));
       ctx.fillStyle = x < playheadX ? COLOR_PLAYED[colorIdx] : COLOR_UPCOMING[colorIdx];
@@ -183,7 +183,7 @@
     for (let i = firstIdx; i <= lastIdx; i++) {
       const t = (i / p.length) * duration;
       const x = ((t - timeStart) / zoomSeconds) * W;
-      const amp = p[i];
+      const amp = p[i] * deck.gain;
       const h = Math.max(1, amp * mid * 0.92);
       const colorIdx = Math.min(255, Math.floor(amp * 255));
       ctx.fillStyle = t < currentTime ? COLOR_PLAYED[colorIdx] : COLOR_UPCOMING[colorIdx];

@@ -12,6 +12,7 @@ use tauri::{AppHandle, Emitter};
 pub enum MidiAction {
     DeckPlayToggle { deck_id: String },
     DeckOpacity { deck_id: String, value: f32 },
+    DeckGain { deck_id: String, value: f32 },
     DeckVolume { deck_id: String, value: f32 },
     DeckPlaybackRate { deck_id: String, value: f32 },
     /// Relative jog nudge: value is steps (-63..+63); frontend applies ±2%/step and resets after idle.
@@ -30,6 +31,8 @@ pub enum MidiAction {
 #[derive(Clone, Debug)]
 pub enum ControlBinding {
     DeckPlayToggle { deck_id: String },
+    /// Pre-fader trim: normalizes source level independently of the crossfader.
+    DeckGain { deck_id: String },
     DeckVolume { deck_id: String },
     /// Coarse (MSB) half of a 14-bit pitch/tempo fader.
     /// Fine (LSB) CC is this CC + 32; both are combined in run_midi_loop.
@@ -73,8 +76,10 @@ fn hercules_starlight_map() -> MidiMap {
     // Notes 3 and 5 confirmed by hardware: Loop=note3, Vinyl/Scratch(Sync)=note5
     m.insert((0x91, 3),  ControlBinding::LoopToggle     { deck_id: "deck-0".into() });
     m.insert((0x91, 5),  ControlBinding::SyncToggle     { deck_id: "deck-0".into() });
-    // CC: volume fader (CC 0 coarse; CC 32 fine — ignored)
-    m.insert((0xB1, 0),  ControlBinding::DeckVolume     { deck_id: "deck-0".into() });
+    // CC: volume/gain fader (CC 0 coarse; CC 32 fine — ignored)
+    // Mapped to DeckGain (pre-fader trim) so the fader normalizes source level;
+    // crossfader drives DeckVolume separately.
+    m.insert((0xB1, 0),  ControlBinding::DeckGain       { deck_id: "deck-0".into() });
     // CC: tempo/pitch fader — 14-bit pair: CC 8 (MSB) + CC 40 (LSB, = 8+32)
     m.insert((0xB1, 8),  ControlBinding::DeckPlaybackRate    { deck_id: "deck-0".into() });
     m.insert((0xB1, 40), ControlBinding::DeckPlaybackRateLsb { deck_id: "deck-0".into() });
@@ -97,7 +102,7 @@ fn hercules_starlight_map() -> MidiMap {
     m.insert((0x92, 6),  ControlBinding::CueJump        { deck_id: "deck-1".into() });
     m.insert((0x92, 3),  ControlBinding::LoopToggle     { deck_id: "deck-1".into() });
     m.insert((0x92, 5),  ControlBinding::SyncToggle     { deck_id: "deck-1".into() });
-    m.insert((0xB2, 0),  ControlBinding::DeckVolume     { deck_id: "deck-1".into() });
+    m.insert((0xB2, 0),  ControlBinding::DeckGain       { deck_id: "deck-1".into() });
     m.insert((0xB2, 8),  ControlBinding::DeckPlaybackRate    { deck_id: "deck-1".into() });
     m.insert((0xB2, 40), ControlBinding::DeckPlaybackRateLsb { deck_id: "deck-1".into() });
     m.insert((0xB2, 10), ControlBinding::JogWheel       { deck_id: "deck-1".into() });
@@ -141,6 +146,9 @@ fn resolve_action(binding: &ControlBinding, data2: u8) -> Option<MidiAction> {
     match binding {
         ControlBinding::DeckPlayToggle { deck_id } => {
             (data2 > 0).then_some(MidiAction::DeckPlayToggle { deck_id: deck_id.clone() })
+        }
+        ControlBinding::DeckGain { deck_id } => {
+            Some(MidiAction::DeckGain { deck_id: deck_id.clone(), value: v })
         }
         ControlBinding::DeckVolume { deck_id } => {
             Some(MidiAction::DeckVolume { deck_id: deck_id.clone(), value: v })

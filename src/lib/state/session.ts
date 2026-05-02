@@ -7,6 +7,7 @@ function makeDeck(index: number): Deck {
     source: null,
     playing: false,
     playbackRate: 1.0,
+    gain: 1.0,
     volume: 1.0,
     opacity: 1.0,
     loop: false,

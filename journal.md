@@ -1,3 +1,26 @@
+# 2026.05.02 — MIDI calibration complete + Gain/Volume split
+
+## What shipped
+
+**MIDI calibration complete** — all Starlight controls verified on hardware:
+- Tempo fader center at physical detent = 1.0× confirmed
+- Tempo fader full throw range confirmed (≈±50%)
+- Loop=note3, Sync=note5 confirmed by raw MIDI dump (d2=127 note-on triggers, d2=0 note-off unmapped — correct)
+- Jog wheel feel acceptable for now
+
+**Deck gain/volume split** — `deck.gain` (pre-fader trim) is now separate from `deck.volume`
+(post-fader crossfader level). Effective audio = `gain × volume`.
+- Hardware volume faders (CC B1/0, B2/0) remapped from `DeckVolume` → `DeckGain`
+- Crossfader still drives `deck.volume` as before
+- GainNode applies `gain × volume` so both scale correctly together
+- Gain slider added to DeckCard UI (between Opacity and Volume)
+- Waveform bars in both overview and zoom modes now scale height and color intensity by `deck.gain`
+
+**Auto-stop on track end** — when a non-looping clip finishes, `onended` fires and sets
+`deck.playing = false`. The play button now correctly shows ▶ after a clip runs out.
+
+---
+
 # 2026.05.01 — MIDI calibration round 2 + waveform layout fix
 
 ## What shipped

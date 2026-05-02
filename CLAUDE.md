@@ -72,7 +72,8 @@ interface Deck {
   source: DeckSource
   playing: boolean
   playbackRate: number    // 0.25–4.0
-  volume: number          // 0–1 audio
+  gain: number            // 0–1 pre-fader trim (normalize source level between tracks)
+  volume: number          // 0–1 post-fader level (driven by crossfader); effective audio = gain × volume
   opacity: number         // 0–1 visual compositor weight
   loop: boolean
   cuePoint: number        // seconds
@@ -145,8 +146,8 @@ formula negates the delta so lower combined → rate > 1.0.
 | Loop R | `(0x92, 3)` | LoopToggle deck-1 |
 | Vinyl/Scratch L | `(0x91, 5)` | SyncToggle deck-0 (apply master BPM / deck BPM rate) |
 | Vinyl/Scratch R | `(0x92, 5)` | SyncToggle deck-1 |
-| Volume fader L | `(0xB1, 0)` | DeckVolume deck-0 |
-| Volume fader R | `(0xB2, 0)` | DeckVolume deck-1 |
+| Volume fader L | `(0xB1, 0)` | DeckGain deck-0 (pre-fader trim; crossfader drives DeckVolume) |
+| Volume fader R | `(0xB2, 0)` | DeckGain deck-1 |
 | Tempo fader L | `(0xB1, 8)` MSB + `(0xB1, 40)` LSB | DeckPlaybackRate deck-0 (14-bit combined; center 8192→1.0×; higher=slower) |
 | Tempo fader R | `(0xB2, 8)` MSB + `(0xB2, 40)` LSB | DeckPlaybackRate deck-1 |
 | Jog wheel L | `(0xB1, 10)` | JogNudge deck-0 (relative ±1 step → ±2% rate; resets after 150ms idle) |
