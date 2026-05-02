@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { get } from "svelte/store";
-  import { session, addDeck, updateDeck } from "./lib/state/session";
+  import { session, addDeck, updateDeck, setMasterBpm } from "./lib/state/session";
+  import { tapTempo } from "./lib/audio/bpm";
   import { startMidiListener } from "./lib/midi/handler";
   import { Compositor } from "./lib/renderer/compositor";
   import { AudioAnalyzer } from "./lib/audio/analyzer";
@@ -20,12 +21,25 @@
 
   let midiUnlisten: (() => void) | undefined;
   let dragDropUnlisten: (() => void) | undefined;
+  let tapTimestamps: number[] = [];
+  let tapResetTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function handleTap() {
+    const now = Date.now();
+    tapTimestamps.push(now);
+    clearTimeout(tapResetTimer);
+    tapResetTimer = setTimeout(() => { tapTimestamps = []; }, 2000);
+    const bpm = tapTempo(tapTimestamps);
+    if (bpm !== null) setMasterBpm(bpm);
+  }
   let canvas: HTMLCanvasElement;
   let compositor = $state<Compositor | undefined>(undefined);
   // Hidden <video> elements keyed by deck id; lives outside Svelte reactivity
   const videoEls = new Map<string, HTMLVideoElement>();
   // Per-deck Web Audio gain nodes; created when a video element is connected
   const deckGains = new Map<string, GainNode>();
+  // Per-deck in-flight play() promises; prevents overlapping play() calls that abort each other
+  const playPromises = new Map<string, Promise<void>>();
   let analyzer: AudioAnalyzer;
   let rafId: number;
 
@@ -67,13 +81,23 @@
     deckGains.clear();
   });
 
-  // Keep compositor FBOs and video elements in sync with the deck list
+  // Keep compositor FBOs and video elements in sync with the deck list.
+  // syncVideoElements handles src changes, property sync, and play/pause.
+  // rAF-throttled: rapid MIDI CC events (tempo fader at 14-bit = 200+/sec) are coalesced to
+  // one syncVideoElements call per frame, preventing GStreamer from being overwhelmed with
+  // rapid playbackRate changes that cause the pipeline to stall.
+  let syncScheduled = false;
   $effect(() => {
     const decks = $session.decks; // read before early-return so Svelte always tracks it
-    console.log('[effect] running, compositor ready:', !!compositor);
     if (!compositor) return;
     compositor.syncDecks(decks.map((d) => d.id));
-    syncVideoElements(decks);
+    if (!syncScheduled) {
+      syncScheduled = true;
+      requestAnimationFrame(() => {
+        syncScheduled = false;
+        syncVideoElements(get(session).decks);
+      });
+    }
   });
 
   function syncVideoElements(decks: Deck[]) {
@@ -88,6 +112,7 @@
         videoEls.delete(id);
         deckGains.get(id)?.disconnect();
         deckGains.delete(id);
+        playPromises.delete(id);
       }
     }
 
@@ -144,16 +169,33 @@
         }, 500);
       }
 
-      v.loop = deck.loop;
+      // Custom loop: when loopIn/loopOut are set and loop is on, seek back manually
+      // rather than relying on native video loop (which loops the whole file).
+      if (deck.loop && deck.loopIn !== null && deck.loopOut !== null) {
+        const loopIn = deck.loopIn;
+        const loopOut = deck.loopOut;
+        v.loop = false;
+        v.ontimeupdate = () => {
+          if (v!.currentTime >= loopOut) v!.currentTime = loopIn;
+        };
+      } else {
+        v.loop = deck.loop;
+        v.ontimeupdate = null;
+      }
+
       const g = deckGains.get(deck.id);
       if (g) g.gain.value = deck.volume;
       // playbackRate must be ≥ 0.0625 in most browsers
       v.playbackRate = Math.max(0.0625, deck.playbackRate);
 
-      if (deck.playing && v.paused) {
+      if (deck.playing && v.paused && !playPromises.has(deck.id)) {
         analyzer.resume();
-        v.play().catch(console.error);
+        const p = v.play().catch((e) => {
+          if (e.name !== 'AbortError') console.error(e);
+        }).finally(() => playPromises.delete(deck.id)) as Promise<void>;
+        playPromises.set(deck.id, p);
       } else if (!deck.playing && !v.paused) {
+        playPromises.delete(deck.id); // pending play() will abort; that's intentional
         v.pause();
       }
     }
@@ -182,6 +224,10 @@
     <button class="add-deck" onclick={addDeck}>+ Deck</button>
     <button class="output-btn" onclick={openOutputWindow}>Output Window</button>
     <span class="bpm">{$session.bpm ? `${$session.bpm} BPM` : "—"}</span>
+    <button class="tap-btn" onclick={handleTap}>TAP</button>
+    {#if $session.bpm !== null}
+      <button class="tap-reset" onclick={() => { setMasterBpm(null); tapTimestamps = []; }}>✕</button>
+    {/if}
     <label class="master-vol">
       Master
       <input
@@ -204,7 +250,7 @@
     {#each $session.decks as deck (deck.id)}
       <div class="waveform-row">
         <span class="waveform-label">{deck.id}</span>
-        <WaveformCanvas {deck} />
+        <WaveformCanvas {deck} onBpmDetected={(bpm) => updateDeck(deck.id, { bpm })} />
       </div>
     {/each}
   </div>

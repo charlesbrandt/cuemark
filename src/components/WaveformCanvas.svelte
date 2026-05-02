@@ -3,7 +3,13 @@
   import { seekDeck, getDeckTime } from '../lib/renderer/seekBus';
   import type { Deck } from '../lib/state/types';
 
-  let { deck }: { deck: Deck } = $props();
+  let {
+    deck,
+    onBpmDetected,
+  }: {
+    deck: Deck;
+    onBpmDetected?: (bpm: number | null) => void;
+  } = $props();
 
   let canvas = $state<HTMLCanvasElement | null>(null);
   let peaks = $state<Float32Array | null>(null);
@@ -28,8 +34,12 @@
     peaks = null;
     analyzedPath = filePath;
     loading = true;
-    analyzeFile(filePath).then((p) => {
-      if (analyzedPath === filePath) { peaks = p; loading = false; }
+    analyzeFile(filePath).then((result) => {
+      if (analyzedPath === filePath) {
+        peaks = result.peaks;
+        loading = false;
+        onBpmDetected?.(result.bpm);
+      }
     }).catch((err) => {
       console.warn('[waveform] analysis failed:', err);
       if (analyzedPath === filePath) loading = false;
@@ -210,6 +220,26 @@
     W: number, H: number,
     timeToX: (t: number) => number
   ) {
+    // Loop region highlight
+    if (deck.loopIn !== null && deck.loopOut !== null && deck.loop) {
+      const lx1 = timeToX(deck.loopIn);
+      const lx2 = timeToX(deck.loopOut);
+      const lLeft = Math.min(lx1, lx2);
+      const lRight = Math.max(lx1, lx2);
+      if (lRight > 0 && lLeft < W) {
+        ctx.fillStyle = 'rgba(0, 200, 80, 0.18)';
+        ctx.fillRect(Math.max(0, lLeft), 0, Math.min(W, lRight) - Math.max(0, lLeft), H);
+        ctx.strokeStyle = 'rgba(0, 220, 100, 0.7)';
+        ctx.lineWidth = 1;
+        if (lx1 >= -1 && lx1 <= W + 1) {
+          ctx.beginPath(); ctx.moveTo(lx1, 0); ctx.lineTo(lx1, H); ctx.stroke();
+        }
+        if (lx2 >= -1 && lx2 <= W + 1) {
+          ctx.beginPath(); ctx.moveTo(lx2, 0); ctx.lineTo(lx2, H); ctx.stroke();
+        }
+      }
+    }
+
     // Cue point (white)
     const cueX = Math.round(timeToX(deck.cuePoint));
     if (cueX >= -4 && cueX <= W + 4) {
@@ -281,6 +311,13 @@
     position: relative;
     flex: 1;
     min-width: 0;
+  }
+  .waveform-canvas {
+    display: block;
+    width: 100%;
+    height: 72px;
+    cursor: crosshair;
+    background: #080d18;
   }
   .zoom-toggle {
     position: absolute;

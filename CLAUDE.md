@@ -40,6 +40,20 @@ sync with layout. Use `imageSmoothingQuality = 'high'` on 2D contexts.
 **Gotcha**: assigning `canvas.width` or `canvas.height` resets all 2D context state, including
 `imageSmoothingQuality` — re-apply it after every resize.
 
+**Svelte CSS scoping for canvas elements**: Canvas layout styles (especially `width: 100%`) must be
+declared in the component's own `<style>` block, not in global `app.css`. Global selectors apply
+correctly in theory, but in practice the Svelte/WebKit combination does not reliably apply
+`width: 100%` to a `<canvas>` from a global stylesheet when the canvas is inside a flex container
+in a child component — the canvas falls back to its 300 px default CSS width, making waveforms
+appear smooshed to the left and any absolute-positioned overlays misaligned. Rule: scope canvas
+styles to the component that owns the canvas.
+
+**MIDI-driven `syncVideoElements` must be rAF-throttled**: MIDI CC events arrive as separate
+Tauri IPC macro-tasks, so `queueMicrotask` does not coalesce them. The 14-bit tempo fader can
+fire 200+ events/second. Calling `v.play()` or setting `v.playbackRate` that frequently overloads
+GStreamer's pipeline and causes playback to stall. Solution: use `requestAnimationFrame` as the
+throttle gate so `syncVideoElements` runs at most once per rendered frame (≤ 60/s).
+
 ### Dual output
 
 - Window 1 (control): deck previews, crossfader, media browser, MIDI status
@@ -62,17 +76,24 @@ interface Deck {
   opacity: number         // 0–1 visual compositor weight
   loop: boolean
   cuePoint: number        // seconds
-  hotCues: number[]       // up to 3 time markers
+  hotCues: number[]       // up to 4 time markers
+  bpm: number | null      // auto-detected or tapped BPM for this deck
+  loopIn: number | null   // custom loop region start (seconds); null = full track
+  loopOut: number | null  // custom loop region end (seconds); null = full track
+  // When loop=true and both loopIn/loopOut are set, ontimeupdate seeks back to loopIn
+  // at loopOut (native video.loop is disabled in that case — App.svelte manages it).
 }
 
 interface Session {
   decks: Deck[]           // ordered array; render back-to-front
   masterVolume: number
-  bpm: number | null
+  bpm: number | null      // master/reference BPM; set via tap tempo or "Master" button
   crossfaderMapping: {    // which two decks the hardware crossfader controls
     left: string          // deck id
     right: string         // deck id
   }
+  crossfaderValue: number              // 0.0 (full left) – 1.0 (full right)
+  crossfaderTargets: CrossfaderTarget[] // 'opacity' | 'volume' — what the fader drives
   effects: Effect[]       // global post-process chain
 }
 
@@ -104,7 +125,13 @@ The Starlight uses separate MIDI channels per deck — do **not** mask the chann
 | `0x97` Note On | Right hot-cue pads (ch 8) |
 | `0xB0` CC | Global — crossfader, master volume (ch 1) |
 
-14-bit CC pairs: every continuous control sends a coarse MSB on CC N and a fine LSB on CC N+32. Map the MSB; ignore the LSB (7-bit resolution is sufficient).
+14-bit CC pairs: every continuous control sends a coarse MSB on CC N and a fine LSB on CC N+32.
+For volume/crossfader, mapping the MSB only (7-bit = 128 steps) is sufficient.
+For the **tempo fader**, map **both** MSB (CC 8) and LSB (CC 40): the MSB barely moves for small
+slider adjustments — the real fine data is in the LSB. Both are combined via `rate_from_14bit(msb, lsb)`:
+14-bit center = 8192 (MSB=64) → 1.0×; full range ±50% (0.5–1.5×).
+**Direction**: the Starlight sends *higher* values for negative pitch (pushing down = faster). The
+formula negates the delta so lower combined → rate > 1.0.
 
 ### Control map
 
@@ -114,14 +141,16 @@ The Starlight uses separate MIDI channels per deck — do **not** mask the chann
 | Play/Pause R | `(0x92, 7)` | DeckPlayToggle deck-1 |
 | Cue L | `(0x91, 6)` | CueJump deck-0 |
 | Cue R | `(0x92, 6)` | CueJump deck-1 |
-| Loop L | `(0x91, 5)` | LoopToggle deck-0 |
-| Loop R | `(0x92, 5)` | LoopToggle deck-1 |
+| Loop L | `(0x91, 3)` | LoopToggle deck-0 |
+| Loop R | `(0x92, 3)` | LoopToggle deck-1 |
+| Vinyl/Scratch L | `(0x91, 5)` | SyncToggle deck-0 (apply master BPM / deck BPM rate) |
+| Vinyl/Scratch R | `(0x92, 5)` | SyncToggle deck-1 |
 | Volume fader L | `(0xB1, 0)` | DeckVolume deck-0 |
 | Volume fader R | `(0xB2, 0)` | DeckVolume deck-1 |
-| Tempo fader L | `(0xB1, 8)` | DeckPlaybackRate deck-0 (center=64→1.0×, range 0.5–1.5×) |
-| Tempo fader R | `(0xB2, 8)` | DeckPlaybackRate deck-1 |
-| Jog wheel L | `(0xB1, 10)` | DeckPlaybackRate deck-0 (relative, ±2%/step) |
-| Jog wheel R | `(0xB2, 10)` | DeckPlaybackRate deck-1 |
+| Tempo fader L | `(0xB1, 8)` MSB + `(0xB1, 40)` LSB | DeckPlaybackRate deck-0 (14-bit combined; center 8192→1.0×; higher=slower) |
+| Tempo fader R | `(0xB2, 8)` MSB + `(0xB2, 40)` LSB | DeckPlaybackRate deck-1 |
+| Jog wheel L | `(0xB1, 10)` | JogNudge deck-0 (relative ±1 step → ±2% rate; resets after 150ms idle) |
+| Jog wheel R | `(0xB2, 10)` | JogNudge deck-1 |
 | Crossfader | `(0xB0, 0)` | Crossfader (deck-0 ↔ deck-1 opacity) |
 | Master volume | `(0xB0, 3)` | MasterVolume |
 | Hot cues L (1–4) | `(0x96, 0–3)` | HotCue deck-0 index 0–3 |
@@ -133,7 +162,7 @@ The Starlight uses separate MIDI channels per deck — do **not** mask the chann
 MIDI. Instead, Shift+pad sends a different note number on the same channel (note += 8). No host-side
 shift-state tracking is needed; the shifted notes map directly to `HotCueSet` bindings.
 
-Intentionally unmapped: Vinyl `(0x91/92,3)`, Headphone cue `(0x91/92,12)`, Bass/filter toggle `(0x90,1)`, Headphone volume `(0xB0,4)`, mode-switch buttons `(0x91,15/16)`.
+Intentionally unmapped: Headphone cue `(0x91/92,12)`, Bass/filter toggle `(0x90,1)`, Headphone volume `(0xB0,4)`, mode-switch buttons `(0x91,15/16)`.
 
 Phase 2: MIDI learn mode (click control in UI, wiggle knob to map).
 
@@ -166,13 +195,14 @@ cuemark/
         seekBus.ts              # Module-level video element registry; seekDeck() / getDeckTime()
       audio/
         analyzer.ts             # AudioAnalyzer — Web Audio API FFT
-        waveform.ts             # computeWaveform() at 30 peaks/sec + pre-built amplitude color LUTs
+        waveform.ts             # computeWaveform() at 30 peaks/sec + pre-built amplitude color LUTs; analyzeFile() returns { peaks, bpm }
+        bpm.ts                  # detectBpm(peaks, peaksPerSecond) — energy-onset histogram; tapTempo(timestamps[])
       midi/
         handler.ts              # Tauri IPC listener → session mutations
     components/
-      DeckCard.svelte           # Per-deck controls (opacity, volume, rate, play, loop, cue set/jump, elapsed/remaining time)
+      DeckCard.svelte           # Per-deck controls: transport, hot cues, BPM/Master/Sync, loop in/out + bar presets, sliders
       Crossfader.svelte         # Hardware crossfader UI — deck selectors (left/right), slider, Visual/Audio toggles
-      WaveformCanvas.svelte     # Per-deck waveform: overview (full track) + zoom mode (16s window, playhead pinned at 25%)
+      WaveformCanvas.svelte     # Per-deck waveform: overview + zoom (16s window); loop region highlight; fires onBpmDetected callback
   src-tauri/                    # Rust backend (Tauri 2)
     src/
       main.rs                   # Binary entry point

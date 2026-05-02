@@ -1,6 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
-import { updateDeck, getDeck, setCrossfader, setMasterVolume } from "../state/session";
+import { updateDeck, getDeck, setCrossfader, setMasterVolume, session } from "../state/session";
 import { seekDeck, getDeckTime } from "../renderer/seekBus";
+import { get } from "svelte/store";
 
 // Must match the Rust MidiAction enum (snake_case tag + camelCase fields from serde)
 export interface MidiAction {
@@ -9,16 +10,22 @@ export interface MidiAction {
     | "deck_opacity"
     | "deck_volume"
     | "deck_playback_rate"
+    | "jog_nudge"
     | "crossfader"
     | "master_volume"
     | "cue_jump"
     | "hot_cue"
     | "hot_cue_set"
-    | "loop_toggle";
+    | "loop_toggle"
+    | "sync_toggle";
   deck_id?: string;
   value?: number;
   index?: number;
 }
+
+// Per-deck jog state: saves the rate that was active before jog started so it can be restored.
+const jogBaseRate: Record<string, number> = {};
+const jogTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 
 export async function startMidiListener(): Promise<() => void> {
   const unlisten = await listen<MidiAction>("midi-action", ({ payload: a }) => {
@@ -79,6 +86,33 @@ export async function startMidiListener(): Promise<() => void> {
           const cues = [...d.hotCues];
           cues[a.index] = now;
           updateDeck(d.id, { hotCues: cues });
+        }
+        break;
+      }
+      case "jog_nudge": {
+        if (!a.deck_id || a.value === undefined) break;
+        const deckId = a.deck_id;
+        const d = getDeck(deckId);
+        if (!d) break;
+        // Save rate before first jog event so we can restore it after jog stops.
+        if (!(deckId in jogBaseRate)) jogBaseRate[deckId] = d.playbackRate;
+        const nudged = Math.max(0.25, Math.min(4.0, d.playbackRate + a.value * 0.02));
+        updateDeck(d.id, { playbackRate: nudged });
+        clearTimeout(jogTimers[deckId]);
+        jogTimers[deckId] = setTimeout(() => {
+          const base = jogBaseRate[deckId];
+          delete jogBaseRate[deckId];
+          if (base !== undefined) updateDeck(deckId, { playbackRate: base });
+        }, 150);
+        break;
+      }
+      case "sync_toggle": {
+        if (!a.deck_id) break;
+        const d = getDeck(a.deck_id);
+        const masterBpm = get(session).bpm;
+        if (d && d.bpm !== null && masterBpm !== null) {
+          // masterBpm / deck.bpm: if deck is slower, rate > 1 to speed up to match master
+          updateDeck(d.id, { playbackRate: masterBpm / d.bpm });
         }
         break;
       }

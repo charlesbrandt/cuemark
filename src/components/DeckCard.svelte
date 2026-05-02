@@ -1,10 +1,11 @@
 <script lang="ts">
   import { open } from "@tauri-apps/plugin-dialog";
-  import { updateDeck, removeDeck } from "../lib/state/session";
+  import { session, updateDeck, removeDeck, setMasterBpm } from "../lib/state/session";
   import { seekDeck, getDeckTime, getVideoEl } from "../lib/renderer/seekBus";
   import type { Deck } from "../lib/state/types";
 
   let { deck }: { deck: Deck } = $props();
+  let masterBpm = $derived($session.bpm);
   let isDragOver = $state(false);
   let previewCanvas = $state<HTMLCanvasElement | null>(null);
   let currentTime = $state(0);
@@ -159,6 +160,93 @@
     </div>
   {/if}
 
+  <div class="bpm-row">
+    <span class="bpm-value">
+      {#if deck.bpm !== null}
+        {deck.bpm} BPM
+      {:else}
+        — BPM
+      {/if}
+    </span>
+    <button
+      class="bpm-btn"
+      class:active={masterBpm !== null && deck.bpm !== null && masterBpm === deck.bpm}
+      onclick={() => deck.bpm !== null && setMasterBpm(deck.bpm)}
+      disabled={deck.bpm === null}
+      title="Set this deck as the master BPM reference"
+    >
+      Master
+    </button>
+    <button
+      class="bpm-btn"
+      onclick={() => {
+        if (deck.bpm !== null && masterBpm !== null) {
+          updateDeck(deck.id, { playbackRate: masterBpm / deck.bpm });
+        }
+      }}
+      disabled={deck.bpm === null || masterBpm === null}
+      title={masterBpm !== null && deck.bpm !== null
+        ? `Sync to master: set rate to ${(masterBpm / deck.bpm).toFixed(3)}×`
+        : 'Sync requires both deck BPM and master BPM'}
+    >
+      Sync
+    </button>
+  </div>
+
+  <div class="loop-row">
+    <button
+      class="loop-pt-btn"
+      onclick={() => {
+        const t = getDeckTime(deck.id);
+        if (t !== null) {
+          updateDeck(deck.id, { loopIn: t });
+        }
+      }}
+      title="Set loop-in point at current position"
+      disabled={!deck.source}
+    >
+      IN{deck.loopIn !== null ? ` ${formatDuration(deck.loopIn)}` : ''}
+    </button>
+    <button
+      class="loop-pt-btn"
+      onclick={() => {
+        const t = getDeckTime(deck.id);
+        if (t !== null) {
+          updateDeck(deck.id, { loopOut: t });
+        }
+      }}
+      title="Set loop-out point at current position"
+      disabled={!deck.source}
+    >
+      OUT{deck.loopOut !== null ? ` ${formatDuration(deck.loopOut)}` : ''}
+    </button>
+    {#each [0.5, 1, 2, 4, 8] as bars}
+      {@const barSec = masterBpm !== null ? (bars * 4 * 60) / masterBpm : null}
+      <button
+        class="bar-btn"
+        onclick={() => {
+          if (barSec === null) return;
+          const inTime = deck.loopIn ?? getDeckTime(deck.id) ?? 0;
+          updateDeck(deck.id, { loopIn: inTime, loopOut: inTime + barSec, loop: true });
+        }}
+        disabled={barSec === null || !deck.source}
+        title={barSec !== null
+          ? `Loop ${bars === 0.5 ? '½' : bars} bar${bars !== 1 ? 's' : ''} (${barSec.toFixed(2)}s)`
+          : 'Set master BPM first'}
+      >
+        {bars === 0.5 ? '½' : bars}
+      </button>
+    {/each}
+    <button
+      class="loop-pt-btn clear-btn"
+      onclick={() => updateDeck(deck.id, { loopIn: null, loopOut: null })}
+      disabled={deck.loopIn === null && deck.loopOut === null}
+      title="Clear loop points"
+    >
+      ✕
+    </button>
+  </div>
+
   <div class="hot-cues">
     {#each [0, 1, 2, 3] as i}
       {@const t = deck.hotCues[i]}
@@ -235,6 +323,108 @@
 </div>
 
 <style>
+  .bpm-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 4px;
+    font-size: 11px;
+  }
+
+  .bpm-value {
+    flex: 1;
+    color: #aaa;
+    font-variant-numeric: tabular-nums;
+    min-width: 60px;
+  }
+
+  .bpm-btn {
+    padding: 2px 6px;
+    font-size: 10px;
+    background: #1a1a1a;
+    border: 1px solid #444;
+    border-radius: 3px;
+    color: #888;
+    cursor: pointer;
+  }
+
+  .bpm-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
+
+  .bpm-btn:not(:disabled):hover {
+    border-color: #666;
+    color: #ccc;
+  }
+
+  .bpm-btn.active {
+    border-color: #f5a623;
+    color: #f5a623;
+  }
+
+  .loop-row {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    padding: 3px 4px;
+    flex-wrap: wrap;
+  }
+
+  .loop-pt-btn {
+    padding: 2px 5px;
+    font-size: 9px;
+    background: #1a1a1a;
+    border: 1px solid #444;
+    border-radius: 3px;
+    color: #888;
+    cursor: pointer;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .loop-pt-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
+
+  .loop-pt-btn:not(:disabled):hover {
+    border-color: #666;
+    color: #ccc;
+  }
+
+  .bar-btn {
+    padding: 2px 5px;
+    font-size: 10px;
+    background: #131a13;
+    border: 1px solid #2d4a2d;
+    border-radius: 3px;
+    color: #5a9a5a;
+    cursor: pointer;
+    min-width: 22px;
+  }
+
+  .bar-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
+
+  .bar-btn:not(:disabled):hover {
+    border-color: #4caf50;
+    color: #4caf50;
+  }
+
+  .clear-btn {
+    margin-left: auto;
+    border-color: #5a2020;
+    color: #a05050;
+  }
+
+  .clear-btn:not(:disabled):hover {
+    border-color: #e04040;
+    color: #e04040;
+  }
+
   .time-display {
     display: flex;
     justify-content: space-between;

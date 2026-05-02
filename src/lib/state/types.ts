@@ -7,12 +7,15 @@ export interface Deck {
   id: string;
   source: DeckSource;
   playing: boolean;
-  playbackRate: number; // 0.25–4.0
-  volume: number;       // 0–1 audio
-  opacity: number;      // 0–1 compositor weight
+  playbackRate: number;   // 0.25–4.0
+  volume: number;         // 0–1 audio
+  opacity: number;        // 0–1 compositor weight
   loop: boolean;
-  cuePoint: number;     // seconds
-  hotCues: number[];    // up to 3 time markers
+  cuePoint: number;       // seconds
+  hotCues: number[];      // up to 4 time markers
+  bpm: number | null;     // detected or tapped BPM for this deck
+  loopIn: number | null;  // loop region start (seconds); null = use track start
+  loopOut: number | null; // loop region end (seconds); null = use track end
 }
 
 export interface AudioAnalysis {

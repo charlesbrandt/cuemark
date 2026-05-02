@@ -12,6 +12,9 @@ function makeDeck(index: number): Deck {
     loop: false,
     cuePoint: 0,
     hotCues: [],
+    bpm: null,
+    loopIn: null,
+    loopOut: null,
   };
 }
 
@@ -80,4 +83,8 @@ export function setCrossfaderTargets(targets: CrossfaderTarget[]) {
 
 export function setCrossfaderMapping(left: string, right: string) {
   session.update((s) => ({ ...s, crossfaderMapping: { left, right } }));
+}
+
+export function setMasterBpm(bpm: number | null) {
+  session.update((s) => ({ ...s, bpm }));
 }

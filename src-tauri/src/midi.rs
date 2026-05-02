@@ -14,12 +14,15 @@ pub enum MidiAction {
     DeckOpacity { deck_id: String, value: f32 },
     DeckVolume { deck_id: String, value: f32 },
     DeckPlaybackRate { deck_id: String, value: f32 },
+    /// Relative jog nudge: value is steps (-63..+63); frontend applies ±2%/step and resets after idle.
+    JogNudge { deck_id: String, value: f32 },
     Crossfader { value: f32 },
     MasterVolume { value: f32 },
     CueJump { deck_id: String },
     HotCue { deck_id: String, index: u8 },
     HotCueSet { deck_id: String, index: u8 },
     LoopToggle { deck_id: String },
+    SyncToggle { deck_id: String },
 }
 
 /// What a specific MIDI control does. Stored in the mapping table so the
@@ -28,14 +31,19 @@ pub enum MidiAction {
 pub enum ControlBinding {
     DeckPlayToggle { deck_id: String },
     DeckVolume { deck_id: String },
+    /// Coarse (MSB) half of a 14-bit pitch/tempo fader.
+    /// Fine (LSB) CC is this CC + 32; both are combined in run_midi_loop.
     DeckPlaybackRate { deck_id: String },
+    /// Fine (LSB) half of the 14-bit pitch/tempo pair. Handled alongside the MSB.
+    DeckPlaybackRateLsb { deck_id: String },
     Crossfader,
     MasterVolume,
     CueJump { deck_id: String },
     HotCue { deck_id: String, index: u8 },
     HotCueSet { deck_id: String, index: u8 },
     LoopToggle { deck_id: String },
-    /// Relative jog wheel (two's complement: 1=+1 CW, 127=-1 CCW)
+    SyncToggle { deck_id: String },
+    /// Relative jog wheel (7-bit two's complement: 1–63 = CW, 64–127 = CCW)
     JogWheel { deck_id: String },
 }
 
@@ -62,11 +70,14 @@ fn hercules_starlight_map() -> MidiMap {
     // ── Left deck (ch 2) ──────────────────────────────────────────────────
     m.insert((0x91, 7),  ControlBinding::DeckPlayToggle { deck_id: "deck-0".into() });
     m.insert((0x91, 6),  ControlBinding::CueJump        { deck_id: "deck-0".into() });
-    m.insert((0x91, 5),  ControlBinding::LoopToggle     { deck_id: "deck-0".into() });
+    // Notes 3 and 5 confirmed by hardware: Loop=note3, Vinyl/Scratch(Sync)=note5
+    m.insert((0x91, 3),  ControlBinding::LoopToggle     { deck_id: "deck-0".into() });
+    m.insert((0x91, 5),  ControlBinding::SyncToggle     { deck_id: "deck-0".into() });
     // CC: volume fader (CC 0 coarse; CC 32 fine — ignored)
     m.insert((0xB1, 0),  ControlBinding::DeckVolume     { deck_id: "deck-0".into() });
-    // CC: tempo/pitch fader (CC 8 coarse; CC 40 fine — ignored); center=64 → rate 1.0
-    m.insert((0xB1, 8),  ControlBinding::DeckPlaybackRate { deck_id: "deck-0".into() });
+    // CC: tempo/pitch fader — 14-bit pair: CC 8 (MSB) + CC 40 (LSB, = 8+32)
+    m.insert((0xB1, 8),  ControlBinding::DeckPlaybackRate    { deck_id: "deck-0".into() });
+    m.insert((0xB1, 40), ControlBinding::DeckPlaybackRateLsb { deck_id: "deck-0".into() });
     // CC: bass/filter knob (CC 2 coarse; CC 34 fine — ignored)
     // TODO: wire to shader u_bass_gain once Phase 2 audio-reactive uniforms land
     // Jog wheel rotation (relative encoder, CC 10, two's complement)
@@ -84,9 +95,11 @@ fn hercules_starlight_map() -> MidiMap {
     // ── Right deck (ch 3) ─────────────────────────────────────────────────
     m.insert((0x92, 7),  ControlBinding::DeckPlayToggle { deck_id: "deck-1".into() });
     m.insert((0x92, 6),  ControlBinding::CueJump        { deck_id: "deck-1".into() });
-    m.insert((0x92, 5),  ControlBinding::LoopToggle     { deck_id: "deck-1".into() });
+    m.insert((0x92, 3),  ControlBinding::LoopToggle     { deck_id: "deck-1".into() });
+    m.insert((0x92, 5),  ControlBinding::SyncToggle     { deck_id: "deck-1".into() });
     m.insert((0xB2, 0),  ControlBinding::DeckVolume     { deck_id: "deck-1".into() });
-    m.insert((0xB2, 8),  ControlBinding::DeckPlaybackRate { deck_id: "deck-1".into() });
+    m.insert((0xB2, 8),  ControlBinding::DeckPlaybackRate    { deck_id: "deck-1".into() });
+    m.insert((0xB2, 40), ControlBinding::DeckPlaybackRateLsb { deck_id: "deck-1".into() });
     m.insert((0xB2, 10), ControlBinding::JogWheel       { deck_id: "deck-1".into() });
     // Right hot cues on ch 8; Shift+pad sends d1+8 on same channel
     m.insert((0x97, 0),  ControlBinding::HotCue    { deck_id: "deck-1".into(), index: 0 });
@@ -106,12 +119,21 @@ fn hercules_starlight_map() -> MidiMap {
     // Unmapped (no action needed):
     //   (0x90, 3)  = Shift button — controller remaps pads in firmware; no host tracking needed
     //   (0x90, 1)  = Bass/filter toggle
-    //   (0x91, 3)  = Vinyl mode left   (0x92, 3) = Vinyl mode right
     //   (0x91, 12) = Headphone cue L   (0x92, 12) = Headphone cue R
     //   (0x91, 15) = Hot-cue mode btn  (0x91, 16) = Loop mode btn
     //   (0xB0, 4)  = Headphone volume (CC 4 MSB; CC 36 LSB)
 
     m
+}
+
+/// Combine 14-bit MSB+LSB into a playback rate.
+/// 14-bit range: 0–16383; center = 8192 (MSB=64, LSB=0); full throw = ±50%.
+fn rate_from_14bit(msb: u8, lsb: u8) -> f32 {
+    let combined = (msb as u16) << 7 | lsb as u16;
+    // Starlight sends higher values for negative pitch (pushing down = faster).
+    // Negate so that down (lower combined) → rate > 1.0.
+    let delta = (8192.0_f32 - combined as f32) / 8192.0;
+    (1.0 + delta * 0.5_f32).clamp(0.25, 4.0)
 }
 
 fn resolve_action(binding: &ControlBinding, data2: u8) -> Option<MidiAction> {
@@ -137,20 +159,16 @@ fn resolve_action(binding: &ControlBinding, data2: u8) -> Option<MidiAction> {
         ControlBinding::LoopToggle { deck_id } => {
             (data2 > 0).then_some(MidiAction::LoopToggle { deck_id: deck_id.clone() })
         }
+        ControlBinding::SyncToggle { deck_id } => {
+            (data2 > 0).then_some(MidiAction::SyncToggle { deck_id: deck_id.clone() })
+        }
         ControlBinding::JogWheel { deck_id } => {
-            // Relative encoder, two's complement: 1=+1 CW, 127=-1 CCW (i.e. 0x7F = -1 i8)
-            // Each step nudges the playback rate by ±2%; rate resets to 1.0 only on
-            // jog-touch release (handled by frontend or manual play-toggle).
-            let step = data2 as i8 as f32; // -128..127
-            let rate = (1.0 + step * 0.02_f32).clamp(0.25, 4.0);
-            Some(MidiAction::DeckPlaybackRate { deck_id: deck_id.clone(), value: rate })
+            // 7-bit two's complement: values 1–63 = CW (+), 64–127 = CCW (−).
+            let step = if data2 >= 64 { data2 as i32 - 128 } else { data2 as i32 };
+            Some(MidiAction::JogNudge { deck_id: deck_id.clone(), value: step as f32 })
         }
-        ControlBinding::DeckPlaybackRate { deck_id } => {
-            // Tempo/pitch fader: center=64 → rate 1.0; full throw = ±50%
-            let delta = (data2 as f32 - 64.0) / 64.0; // -1.0 .. +1.0
-            let rate = (1.0 + delta * 0.5_f32).clamp(0.25, 4.0);
-            Some(MidiAction::DeckPlaybackRate { deck_id: deck_id.clone(), value: rate })
-        }
+        // 14-bit rate bindings are handled in run_midi_loop where MSB/LSB state lives.
+        ControlBinding::DeckPlaybackRate { .. } | ControlBinding::DeckPlaybackRateLsb { .. } => None,
     }
 }
 
@@ -196,16 +214,62 @@ fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>) -> Result<(), Box<dyn
     let app = app.clone();
     let map = Arc::clone(midi_map);
 
+    // 14-bit CC pair state: keyed by (status_byte, msb_cc_num).
+    // Both MSB and LSB handlers look up by the MSB key (LSB key = MSB key with cc+32).
+    let mut cc14_msb: HashMap<(u8, u8), u8> = HashMap::new();
+    let mut cc14_lsb: HashMap<(u8, u8), u8> = HashMap::new();
+
     let _conn = midi_in.connect(
         &port,
         "cuemark-midi",
         move |_stamp, msg, _| {
             if msg.len() < 3 { return; }
+            // DEBUG: print every incoming MIDI message so we can verify the controller map.
+            // Remove this block once the control layout is confirmed correct.
+            let msg_type = match msg[0] & 0xF0 {
+                0x80 => "NoteOff",
+                0x90 => "NoteOn ",
+                0xB0 => "CC     ",
+                _    => "Other  ",
+            };
+            let channel = (msg[0] & 0x0F) + 1;
+            eprintln!("[midi] {msg_type} ch{channel:02}  status=0x{:02X}  d1={:3}  d2={:3}",
+                msg[0], msg[1], msg[2]);
             let key = (msg[0], msg[1]);
-            if let Some(binding) = map.get(&key) {
-                if let Some(action) = resolve_action(binding, msg[2]) {
-                    let _ = app.emit("midi-action", action);
+            let Some(binding) = map.get(&key) else {
+                eprintln!("[midi]   (unmapped)");
+                return;
+            };
+
+            // 14-bit rate bindings need mutable state; handle them before resolve_action.
+            let action = match binding {
+                ControlBinding::DeckPlaybackRate { deck_id } => {
+                    let msb_key = key;
+                    cc14_msb.insert(msb_key, msg[2]);
+                    let lsb = cc14_lsb.get(&msb_key).copied().unwrap_or(0);
+                    Some(MidiAction::DeckPlaybackRate {
+                        deck_id: deck_id.clone(),
+                        value: rate_from_14bit(msg[2], lsb),
+                    })
                 }
+                ControlBinding::DeckPlaybackRateLsb { deck_id } => {
+                    // LSB CC = MSB CC + 32, so MSB key = (same status, this_cc - 32)
+                    let msb_key = (msg[0], msg[1] - 32);
+                    cc14_lsb.insert(msb_key, msg[2]);
+                    let msb = cc14_msb.get(&msb_key).copied().unwrap_or(64);
+                    Some(MidiAction::DeckPlaybackRate {
+                        deck_id: deck_id.clone(),
+                        value: rate_from_14bit(msb, msg[2]),
+                    })
+                }
+                other => resolve_action(other, msg[2]),
+            };
+
+            if let Some(action) = action {
+                eprintln!("[midi]   => {:?}", action);
+                let _ = app.emit("midi-action", action);
+            } else {
+                eprintln!("[midi]   (no action)");
             }
         },
         (),

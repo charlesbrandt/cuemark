@@ -57,7 +57,12 @@ export function computeWaveform(buffer: AudioBuffer): Float32Array {
   return peaks;
 }
 
-export async function analyzeFile(filePath: string): Promise<Float32Array> {
+export interface AnalysisResult {
+  peaks: Float32Array;
+  bpm: number | null;
+}
+
+export async function analyzeFile(filePath: string): Promise<AnalysisResult> {
   const encoded = filePath.split('/').map(encodeURIComponent).join('/');
   const url = import.meta.env.DEV
     ? '/media' + encoded
@@ -70,7 +75,10 @@ export async function analyzeFile(filePath: string): Promise<Float32Array> {
   const audioCtx = new AudioContext();
   try {
     const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-    return computeWaveform(audioBuffer);
+    const peaks = computeWaveform(audioBuffer);
+    const { detectBpm } = await import('./bpm');
+    const bpm = detectBpm(peaks, PEAKS_PER_SECOND);
+    return { peaks, bpm };
   } finally {
     audioCtx.close();
   }
