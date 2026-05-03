@@ -44,6 +44,16 @@ body {
 }
 .add-deck:hover { border-color: #e04040; color: #fff; }
 
+.output-btn {
+  padding: 4px 10px;
+  background: #1e1e1e;
+  border: 1px solid #333;
+  color: #aaa;
+  cursor: pointer;
+  border-radius: 3px;
+  font: inherit;
+}
+.output-btn:hover { border-color: #888; color: #ddd; }
 .output-btn.active { border-color: #f5a623; color: #f5a623; }
 
 .bpm { color: #666; font-size: 12px; }

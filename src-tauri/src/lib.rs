@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod midi;
 
 use std::io::{Read, Seek, SeekFrom};
@@ -122,12 +123,33 @@ fn open_output_window(app: tauri::AppHandle) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(audio::AudioState::new(audio::AudioManager::new()))
         .register_asynchronous_uri_scheme_protocol("media", |_app, request, responder| {
             std::thread::spawn(move || {
                 responder.respond(serve_media(request));
             });
         })
-        .invoke_handler(tauri::generate_handler![open_output_window])
+        .invoke_handler(tauri::generate_handler![
+            open_output_window,
+            audio::list_audio_devices,
+            audio::audio_load,
+            audio::audio_unload,
+            audio::audio_play,
+            audio::audio_pause,
+            audio::audio_seek,
+            audio::audio_set_rate,
+            audio::audio_set_gain,
+            audio::audio_set_volume,
+            audio::audio_set_eq,
+            audio::audio_set_cue,
+            audio::audio_get_position,
+            audio::audio_set_master_volume,
+            audio::audio_set_main_device,
+            audio::audio_set_cue_device,
+            audio::audio_set_cue_gain,
+            audio::audio_record_start,
+            audio::audio_record_stop,
+        ])
         .setup(|app| {
             midi::spawn_listener(app.handle().clone())?;
             Ok(())

@@ -5,8 +5,13 @@
   import { tapTempo } from "./lib/audio/bpm";
   import { startMidiListener } from "./lib/midi/handler";
   import { Compositor } from "./lib/renderer/compositor";
-  import { AudioAnalyzer } from "./lib/audio/analyzer";
   import { invoke } from "@tauri-apps/api/core";
+  import {
+    audioLoad, audioUnload, audioPlay, audioPause,
+    audioSeek, audioSetRate, audioSetGain, audioSetVolume,
+    audioSetCue, audioSetMasterVolume, audioSetMainDevice,
+    audioSetCueDevice, audioSetCueGain,
+  } from "./lib/audio/pipeline";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { registerVideoEl, unregisterVideoEl } from "./lib/renderer/seekBus";
   import { postFrame } from "./lib/renderer/outputBus";
@@ -16,6 +21,7 @@
   import AudioSettings from "./components/AudioSettings.svelte";
   import { cueOutputDeviceId, cueGain } from "./lib/audio/audioSettings";
   import type { Deck } from "./lib/state/types";
+  import { audioGetPosition } from "./lib/audio/pipeline";
 
   function openOutputWindow() {
     invoke('open_output_window').catch(console.error);
@@ -39,45 +45,34 @@
   let compositor = $state<Compositor | undefined>(undefined);
   // Hidden <video> elements keyed by deck id; lives outside Svelte reactivity
   const videoEls = new Map<string, HTMLVideoElement>();
-  // Per-deck Web Audio gain nodes; created when a video element is connected
-  const deckGains = new Map<string, GainNode>();
   // Per-deck in-flight play() promises; prevents overlapping play() calls that abort each other
   const playPromises = new Map<string, Promise<void>>();
-  let analyzer: AudioAnalyzer;
   let rafId: number;
 
-  // Sync master volume to the audio graph whenever it changes
+  // Sync master volume to Rust audio pipeline
   $effect(() => {
-    analyzer?.setMasterVolume($session.masterVolume);
+    audioSetMasterVolume($session.masterVolume).catch(console.error);
   });
 
-  // Sync per-deck EQ to the audio graph whenever any deck's eq changes
-  $effect(() => {
-    for (const deck of $session.decks) {
-      analyzer?.setDeckEQ(deck.id, deck.eq.low, deck.eq.mid, deck.eq.high);
-    }
-  });
-
-  // Recreate the cue AudioContext when the headphone output device changes
+  // Sync headphone output device to Rust audio pipeline
   $effect(() => {
     const deviceId = $cueOutputDeviceId;
-    analyzer?.setCueOutputDevice(deviceId).catch(console.error);
+    if (deviceId) audioSetCueDevice(deviceId).catch(console.error);
   });
 
-  // Sync headphone cue gain
+  // Sync headphone cue gain to Rust audio pipeline
   $effect(() => {
-    analyzer?.setCueVolume($cueGain);
+    audioSetCueGain($cueGain).catch(console.error);
   });
 
-  // Sync deck cueEnabled flags to audio graph
+  // Sync deck cueEnabled flags to Rust audio pipeline
   $effect(() => {
     for (const deck of $session.decks) {
-      analyzer?.setCueDeck(deck.id, deck.cueEnabled);
+      audioSetCue(deck.id, deck.cueEnabled).catch(console.error);
     }
   });
 
   onMount(async () => {
-    analyzer = new AudioAnalyzer();
     midiUnlisten = await startMidiListener();
     compositor = new Compositor(canvas);
     rafId = requestAnimationFrame(frame);
@@ -103,10 +98,13 @@
     midiUnlisten?.();
     dragDropUnlisten?.();
     cancelAnimationFrame(rafId);
-    for (const [id, v] of videoEls) { v.pause(); v.remove(); unregisterVideoEl(id); }
+    for (const [id, v] of videoEls) {
+      v.pause();
+      v.remove();
+      unregisterVideoEl(id);
+      audioUnload(id).catch(console.error);
+    }
     videoEls.clear();
-    for (const id of deckGains.keys()) analyzer?.disconnectDeck(id);
-    deckGains.clear();
   });
 
   // Keep compositor FBOs and video elements in sync with the deck list.
@@ -138,8 +136,7 @@
         v.remove();
         unregisterVideoEl(id);
         videoEls.delete(id);
-        analyzer.disconnectDeck(id);
-        deckGains.delete(id);
+        audioUnload(id).catch(console.error);
         playPromises.delete(id);
       }
     }
@@ -159,14 +156,11 @@
         console.log(`[${deck.id}] creating video element`);
         v = document.createElement("video");
         v.style.cssText = "position:fixed;top:-9999px;width:1px;height:1px;pointer-events:none";
-        // no crossOrigin needed: /media/... is same-origin in dev
+        v.muted = true; // audio is handled by Rust/GStreamer; video element is for decode only
         document.body.appendChild(v);
         registerVideoEl(deck.id, v);
         videoEls.set(deck.id, v);
-        // Connect to Web Audio; gain node drives per-deck volume from here on
-        const gain = analyzer.connectMediaElement(deck.id, v);
-        deckGains.set(deck.id, gain);
-        v.volume = 1.0; // element volume fixed at unity; GainNode handles level
+        audioLoad(deck.id, filePath).catch(console.error);
       }
 
       // Update event handlers each sync so they capture the current filePath / deckId
@@ -192,6 +186,7 @@
         console.log(`[${deck.id}] setting src:`, src);
         v.src = src;
         v.load();
+        audioLoad(deck.id, filePath).catch(console.error);
         // Report state after a short delay so we can see if the network request started
         setTimeout(() => {
           console.log(`[${deck.id}] state@500ms: readyState=${v!.readyState} networkState=${v!.networkState} error=${v!.error?.code ?? 'none'} src=${v!.src}`);
@@ -203,34 +198,40 @@
       if (deck.loop && deck.loopIn !== null && deck.loopOut !== null) {
         const loopIn = deck.loopIn;
         const loopOut = deck.loopOut;
+        const deckId = deck.id;
         v.loop = false;
         v.ontimeupdate = () => {
-          if (v!.currentTime >= loopOut) v!.currentTime = loopIn;
+          if (v!.currentTime >= loopOut) {
+            v!.currentTime = loopIn;
+            audioSeek(deckId, loopIn).catch(console.error);
+          }
         };
       } else {
         v.loop = deck.loop;
         v.ontimeupdate = null;
       }
 
-      const g = deckGains.get(deck.id);
-      if (g) g.gain.value = deck.gain * deck.volume;
-      // playbackRate must be ≥ 0.0625 in most browsers
+      audioSetGain(deck.id, deck.gain).catch(console.error);
+      audioSetVolume(deck.id, deck.volume).catch(console.error);
+      // playbackRate must be ≥ 0.0625 in most browsers (video element for timing)
       v.playbackRate = Math.max(0.0625, deck.playbackRate);
+      audioSetRate(deck.id, deck.playbackRate).catch(console.error);
 
       if (deck.playing && v.paused && !playPromises.has(deck.id)) {
-        analyzer.resume();
         const p = v.play().catch((e) => {
           if (e.name !== 'AbortError') console.error(e);
         }).finally(() => playPromises.delete(deck.id)) as Promise<void>;
         playPromises.set(deck.id, p);
+        audioPlay(deck.id).catch(console.error);
       } else if (!deck.playing && !v.paused) {
         playPromises.delete(deck.id); // pending play() will abort; that's intentional
         v.pause();
+        audioPause(deck.id).catch(console.error);
       }
     }
   }
 
-  // RAF render loop: upload video frames → composite
+  // RAF render loop: upload video frames → composite; sync video to audio clock
   function frame() {
     if (compositor) {
       const { decks } = get(session);
@@ -239,6 +240,16 @@
         const v = videoEls.get(deck.id);
         const fbo = compositor.getFBO(deck.id);
         if (v && fbo) fbo.uploadVideoFrame(v);
+        // Audio is the master clock. If video has drifted, snap it back.
+        // Fire-and-forget: the Promise resolves in the next tick; no await here.
+        if (deck.playing && v) {
+          audioGetPosition(deck.id).then((audioPos) => {
+            if (audioPos === null || !v) return;
+            if (Math.abs(v.currentTime - audioPos) > 0.08) {
+              v.currentTime = audioPos;
+            }
+          }).catch(() => {/* pipeline not ready yet */});
+        }
       }
       compositor.composite(decks);
       postFrame(canvas);
@@ -282,7 +293,7 @@
 
   {#if showAudioSettings}
     <AudioSettings
-      onMainDeviceChange={(id) => analyzer?.setOutputDevice(id).catch(console.error)}
+      onMainDeviceChange={(id) => audioSetMainDevice(id).catch(console.error)}
     />
   {/if}
 

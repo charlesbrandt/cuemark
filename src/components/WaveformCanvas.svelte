@@ -46,17 +46,25 @@
     });
   });
 
-  // Keep canvas pixel buffer sized to its CSS layout size × DPR
+  // Keep canvas pixel buffer sized to its CSS layout size × DPR.
+  // Observe the WRAPPER div, not the canvas itself — the wrapper's size is set by the
+  // flex layout, while the canvas default width (300px) can cause getBoundingClientRect
+  // to return 300 on the first ResizeObserver callback before CSS width:100% resolves.
   $effect(() => {
     if (!canvas) return;
     const c = canvas;
+    const wrapper = c.parentElement!;
     const dpr = window.devicePixelRatio || 1;
-    const ro = new ResizeObserver(() => {
-      const rect = c.getBoundingClientRect();
-      c.width = Math.round(rect.width * dpr);
-      c.height = Math.round(rect.height * dpr);
-    });
-    ro.observe(c);
+    function resize() {
+      const rect = wrapper.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        c.width = Math.round(rect.width * dpr);
+        c.height = Math.round(rect.height * dpr);
+      }
+    }
+    const ro = new ResizeObserver(resize);
+    ro.observe(wrapper);
+    resize(); // sync immediately in case ResizeObserver fires asynchronously
     return () => ro.disconnect();
   });
 

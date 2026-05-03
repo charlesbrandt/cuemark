@@ -9,18 +9,42 @@ Domain: cuemark.com (Charles Brandt's former DJ name)
 
 - **Tauri** (Rust backend + WebKit frontend) — cross-platform, Wayland-native on Linux via GTK4
 - **WebGL** — GPU-accelerated rendering, FBO-per-deck compositing
-- **Web Audio API** — audio playback + FFT analysis for audio-reactive visuals
+- **GStreamer** (Rust, `gstreamer` + `gstreamer-audio` crates) — audio playback, gain/EQ, device routing, headphone cue mix, recording. Each deck has its own `DeckAudioPipeline` (uridecodebin → audioconvert → audioresample → volume → pipewiresink/autoaudiosink). Audio is the master clock; video element syncs to it.
+- **Web Audio API** — waveform peak extraction + FFT analysis for BPM detection and audio-reactive visuals (not used for playback)
 - **GLSL shaders** — effects and audio-reactive visualizations
 - **Rust `midir` crate** — MIDI input (Web MIDI API unreliable in WebKitGTK); events piped to frontend via Tauri IPC
-- **`<video>` element → 2D canvas → texImage2D** — video decode into WebGL texture via a scratch canvas intermediary (direct video→texImage2D triggers SIGTRAP assertion failures in WebKitGTK; see `fbo.ts`)
+- **`<video>` element → 2D canvas → texImage2D** — video decode into WebGL texture via a scratch canvas intermediary (direct video→texImage2D triggers SIGTRAP assertion failures in WebKitGTK; see `fbo.ts`). The `<video>` element is **muted** — audio is owned by the GStreamer pipeline.
 - **Vite dev middleware** — in dev mode, local video files are served as `http://localhost:1420/media/<abs-path>` by a Node.js middleware in `vite.config.ts`; GStreamer's `souphttpsrc` speaks plain HTTP fine. In production the Rust `media://` custom scheme is used instead. Never use `asset://` or `file://` from an `http:` origin — WebKit blocks them silently.
 
 ## Architecture
 
+### Audio pipeline
+
+```
+GStreamer (Rust, per deck):
+  uridecodebin → audioconvert → audioresample → volume → pipewiresink / autoaudiosink
+                                                             ↑               ↑
+                                               device-specific sink    system default
+```
+
+`AudioManager` (held in Tauri managed state as `Mutex<AudioManager>`) owns all `DeckAudioPipeline` instances.
+Tauri commands (`audio_load`, `audio_play`, `audio_pause`, `audio_seek`, `audio_set_rate`, `audio_set_gain`,
+`audio_set_volume`, `audio_set_eq`, `audio_set_cue`, `audio_get_position`, `audio_set_master_volume`,
+`audio_set_main_device`, `audio_set_cue_device`, `audio_set_cue_gain`, `audio_record_start/stop`) expose the
+pipeline to the frontend. The frontend wrapper lives in `src/lib/audio/pipeline.ts`.
+
+**Audio is the master clock.** The `<video>` element is muted and used only for frame decode. In the RAF loop,
+`audioGetPosition(deckId)` polls the GStreamer position and snaps the video element's `currentTime` to it if
+drift exceeds 80 ms — keeping the video texture in sync with what the audience hears.
+
+**Device routing**: default output uses `autoaudiosink` (selects PipeWire/PulseAudio/ALSA automatically).
+A specific sink is targeted via `pipewiresink target-object=<node-name>`; falls back to `autoaudiosink` if
+the `gstreamer1.0-pipewire` plugin is absent.
+
 ### Rendering pipeline
 
 ```
-<video> element
+<video> element (muted)
   └─► drawImage() ──► scratch HTMLCanvasElement (per FBO)
         └─► texImage2D (UNPACK_FLIP_Y_WEBGL=true) ──► WebGL texture
               └─► [FBO N] ──► alpha composite ──► preview canvas + output window
@@ -39,6 +63,13 @@ to scale it up; that causes blurry upscaling. Use a `ResizeObserver` to keep buf
 sync with layout. Use `imageSmoothingQuality = 'high'` on 2D contexts.  
 **Gotcha**: assigning `canvas.width` or `canvas.height` resets all 2D context state, including
 `imageSmoothingQuality` — re-apply it after every resize.
+
+**WaveformCanvas ResizeObserver — observe the wrapper, not the canvas**: The `ResizeObserver` in
+`WaveformCanvas.svelte` observes the *wrapper div*, not the canvas itself. A canvas's default CSS
+width is 300 px; observing the canvas directly causes the first callback to return `width=300` before
+the flex layout resolves, producing a mismatched pixel buffer. Observing the wrapper div (whose size
+is set by the flex container) gives the correct layout width immediately. Call `resize()` synchronously
+after setting up the observer to catch cases where the observer fires asynchronously.
 
 **Svelte CSS scoping for canvas elements**: Canvas layout styles (especially `width: 100%`) must be
 declared in the component's own `<style>` block, not in global `app.css`. Global selectors apply
@@ -108,7 +139,7 @@ interface AudioAnalysis {
 
 ### MIDI architecture
 
-Rust backend (`midir`) receives raw MIDI → maps to structured actions → emits via Tauri `emit()` → frontend applies to session state. MIDI mappings reference `deckId` strings.
+Rust backend (`midir`) receives raw MIDI → maps to structured actions → emits via Tauri `emit()` → frontend applies to session state → calls audio Tauri commands for gain/rate/play/pause changes. MIDI mappings reference `deckId` strings.
 
 ## MIDI controller
 
@@ -195,9 +226,11 @@ cuemark/
         compositor.ts           # Compositor — syncDecks(), composite()
         seekBus.ts              # Module-level video element registry; seekDeck() / getDeckTime()
       audio/
-        analyzer.ts             # AudioAnalyzer — Web Audio API FFT
+        pipeline.ts             # Typed TS wrappers around all Rust audio Tauri commands (audioLoad, audioPlay, …)
+        analyzer.ts             # AudioAnalyzer — Web Audio API FFT (waveform analysis only; not used for playback)
         waveform.ts             # computeWaveform() at 30 peaks/sec + pre-built amplitude color LUTs; analyzeFile() returns { peaks, bpm }
         bpm.ts                  # detectBpm(peaks, peaksPerSecond) — energy-onset histogram; tapTempo(timestamps[])
+        audioSettings.ts        # Svelte stores: mainOutputDeviceId, cueOutputDeviceId, cueGain
       midi/
         handler.ts              # Tauri IPC listener → session mutations
     components/
@@ -207,8 +240,15 @@ cuemark/
   src-tauri/                    # Rust backend (Tauri 2)
     src/
       main.rs                   # Binary entry point
-      lib.rs                    # Tauri builder + setup
+      lib.rs                    # Tauri builder + setup; registers all Tauri commands
       midi.rs                   # midir listener → MidiAction events
+      audio/                    # GStreamer audio backend
+        mod.rs                  # AudioManager (Mutex-wrapped), AudioState type, all Tauri command handlers
+        pipeline.rs             # DeckAudioPipeline — per-deck GStreamer graph (uridecodebin→volume→sink)
+        mixer.rs                # MasterMix — master volume + cue routing
+        devices.rs              # list_audio_devices() — PipeWire/PulseAudio sink enumeration
+        analysis.rs             # Audio analysis (FFT, peak detection)
+        record.rs               # RecordingSink — audio recording (Opus/FLAC)
     capabilities/
       default.json              # Tauri 2 capability config
     icons/                      # App icons (placeholder PNGs)
@@ -267,6 +307,14 @@ Adding a third deck and reassigning the crossfader mapping is fully supported.
 cargo tauri dev        # starts Vite dev server + Tauri window
 npm run check          # TypeScript + Svelte type check
 cd src-tauri && cargo check   # Rust type check only
+```
+
+System dependencies required for the GStreamer audio backend:
+```
+sudo apt install \
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+  gstreamer1.0-pipewire   # optional: enables device-specific routing
 ```
 
 ## Adding or re-calibrating a MIDI controller
