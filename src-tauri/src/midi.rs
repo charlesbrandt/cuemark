@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use midir::MidiInput;
 use serde::Serialize;
@@ -135,6 +136,24 @@ fn hercules_starlight_map() -> MidiMap {
     m
 }
 
+/// Returns true for controls that fire many events/second (faders, encoders).
+/// These get log-throttled; discrete controls (buttons) always log.
+fn is_continuous(binding: Option<&ControlBinding>, status: u8) -> bool {
+    match binding {
+        Some(
+            ControlBinding::DeckPlaybackRate { .. }
+            | ControlBinding::DeckPlaybackRateLsb { .. }
+            | ControlBinding::DeckGain { .. }
+            | ControlBinding::DeckVolume { .. }
+            | ControlBinding::Crossfader
+            | ControlBinding::MasterVolume
+            | ControlBinding::JogWheel { .. },
+        ) => true,
+        None => (status & 0xF0) == 0xB0, // unmapped CC — throttle too
+        _ => false,
+    }
+}
+
 /// Combine 14-bit MSB+LSB into a playback rate.
 /// 14-bit range: 0–16383; center = 8192 (MSB=64, LSB=0); full throw = ±50%.
 fn rate_from_14bit(msb: u8, lsb: u8) -> f32 {
@@ -233,14 +252,14 @@ fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>) -> Result<(), Box<dyn
     // Both MSB and LSB handlers look up by the MSB key (LSB key = MSB key with cc+32).
     let mut cc14_msb: HashMap<(u8, u8), u8> = HashMap::new();
     let mut cc14_lsb: HashMap<(u8, u8), u8> = HashMap::new();
+    // Log throttle for continuous controls: only log once per 500 ms per key.
+    let mut log_throttle: HashMap<(u8, u8), Instant> = HashMap::new();
 
     let _conn = midi_in.connect(
         &port,
         "cuemark-midi",
         move |_stamp, msg, _| {
             if msg.len() < 3 { return; }
-            // DEBUG: print every incoming MIDI message so we can verify the controller map.
-            // Remove this block once the control layout is confirmed correct.
             let msg_type = match msg[0] & 0xF0 {
                 0x80 => "NoteOff",
                 0x90 => "NoteOn ",
@@ -248,11 +267,29 @@ fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>) -> Result<(), Box<dyn
                 _    => "Other  ",
             };
             let channel = (msg[0] & 0x0F) + 1;
-            eprintln!("[midi] {msg_type} ch{channel:02}  status=0x{:02X}  d1={:3}  d2={:3}",
-                msg[0], msg[1], msg[2]);
             let key = (msg[0], msg[1]);
+
+            // Continuous controls (faders, encoders) are throttled to one log line
+            // per 500 ms so they don't drown out button/note events.
+            let should_log = if is_continuous(map.get(&key), msg[0]) {
+                let now = Instant::now();
+                let due = log_throttle
+                    .get(&key)
+                    .map(|&t| now.duration_since(t) >= Duration::from_millis(500))
+                    .unwrap_or(true);
+                if due { log_throttle.insert(key, now); }
+                due
+            } else {
+                true
+            };
+
+            if should_log {
+                eprintln!("[midi] {msg_type} ch{channel:02}  status=0x{:02X}  d1={:3}  d2={:3}",
+                    msg[0], msg[1], msg[2]);
+            }
+
             let Some(binding) = map.get(&key) else {
-                eprintln!("[midi]   (unmapped)");
+                if should_log { eprintln!("[midi]   (unmapped)"); }
                 return;
             };
 
@@ -281,9 +318,9 @@ fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>) -> Result<(), Box<dyn
             };
 
             if let Some(action) = action {
-                eprintln!("[midi]   => {:?}", action);
+                if should_log { eprintln!("[midi]   => {:?}", action); }
                 let _ = app.emit("midi-action", action);
-            } else {
+            } else if should_log {
                 eprintln!("[midi]   (no action)");
             }
         },

@@ -72,6 +72,10 @@ struct PipelineInner {
     /// Set to true by the bus monitor thread when an EOS message arrives.
     /// Read by play() to seek back to start instead of stalling at end-of-stream.
     at_eos: Arc<AtomicBool>,
+    /// Set to true by the bus monitor thread when an ERROR message arrives.
+    /// The bus thread also attempts a flush-seek recovery. set_rate() checks this
+    /// flag and resets applied_rate so the next rate event forces a fresh seek.
+    at_error: Arc<AtomicBool>,
 }
 
 pub struct DeckAudioPipeline {
@@ -167,6 +171,8 @@ impl DeckAudioPipeline {
 
         let at_eos = Arc::new(AtomicBool::new(false));
         let at_eos_thread = at_eos.clone();
+        let at_error = Arc::new(AtomicBool::new(false));
+        let at_error_thread = at_error.clone();
         let bus_thread = bus.clone();
         let deck_id_log = self.deck_id.clone();
 
@@ -174,17 +180,60 @@ impl DeckAudioPipeline {
             for msg in bus_thread.iter_timed(None) {
                 match msg.view() {
                     gst::MessageView::Eos(_) => {
+                        eprintln!("[bus/{}] EOS", deck_id_log);
                         at_eos_thread.store(true, Ordering::Relaxed);
                     }
                     gst::MessageView::Error(e) => {
                         eprintln!("[bus/{}] ERROR: {} (debug: {:?})", deck_id_log, e.error(), e.debug());
+                        at_error_thread.store(true, Ordering::Relaxed);
+                        // Do NOT attempt a recovery seek here — seeking on a qtdemux error
+                        // state triggers further errors and cascades into a crash.
+                        // Recovery is handled at the call site (set_rate / play).
                     }
                     gst::MessageView::Warning(w) => {
                         eprintln!("[bus/{}] WARNING: {} (debug: {:?})", deck_id_log, w.error(), w.debug());
                     }
+                    gst::MessageView::Info(i) => {
+                        eprintln!("[bus/{}] INFO: {} (debug: {:?})", deck_id_log, i.error(), i.debug());
+                    }
+                    gst::MessageView::Buffering(b) => {
+                        eprintln!("[bus/{}] buffering {}%", deck_id_log, b.percent());
+                    }
+                    gst::MessageView::StateChanged(s) => {
+                        // Filter to pipeline-level only — per-element noise drowns the signal.
+                        let src = msg.src().map(|e| e.name().to_string()).unwrap_or_default();
+                        if src.starts_with("pipeline") {
+                            eprintln!("[bus/{}] pipeline: {:?} → {:?} (pending {:?})",
+                                deck_id_log, s.old(), s.current(), s.pending());
+                        }
+                    }
+                    gst::MessageView::AsyncDone(_) => {
+                        // Fires when a seek or state-change async op completes.
+                        // Useful for confirming flush seeks finish before the next one.
+                        let pos = msg.src()
+                            .and_then(|e| e.downcast_ref::<gst::Pipeline>())
+                            .and_then(|p| p.query_position::<gst::ClockTime>())
+                            .map(|t| t.mseconds())
+                            .unwrap_or(0);
+                        eprintln!("[bus/{}] async-done  pos={}ms", deck_id_log, pos);
+                    }
+                    gst::MessageView::Qos(q) => {
+                        // QOS messages indicate dropped/late buffers — relevant if
+                        // the rate-change seeks are causing audio samples to duplicate.
+                        let (jitter, proportion, quality) = q.values();
+                        eprintln!("[bus/{}] QOS  jitter={jitter}ns  proportion={proportion:.3}  quality={quality}",
+                            deck_id_log);
+                    }
+                    gst::MessageView::Latency(_) => {
+                        eprintln!("[bus/{}] latency recalculation requested", deck_id_log);
+                    }
+                    gst::MessageView::StreamStatus(ss) => {
+                        eprintln!("[bus/{}] stream status: {:?}", deck_id_log, ss.type_());
+                    }
                     _ => {}
                 }
             }
+            eprintln!("[bus/{}] monitor thread exiting", deck_id_log);
         });
 
         // Start preroll (async state change to PAUSED).
@@ -205,7 +254,7 @@ impl DeckAudioPipeline {
             _ => {}
         }
 
-        self.inner = Some(PipelineInner { pipeline, volume_el: volume, bus, at_eos });
+        self.inner = Some(PipelineInner { pipeline, volume_el: volume, bus, at_eos, at_error });
         self.applied_rate = 1.0;
         self.last_rate_seek = None;
         Ok(())
@@ -252,6 +301,8 @@ impl DeckAudioPipeline {
                 gst::ClockTime::ZERO,
             );
         }
+        // The bus thread already attempted a recovery seek on error; clear the flag.
+        inner.at_error.store(false, Ordering::Relaxed);
         inner
             .pipeline
             .set_state(gst::State::Playing)
@@ -285,15 +336,20 @@ impl DeckAudioPipeline {
             None => return Ok(()), // stored; will be applied after the next load
         };
 
+        // If the pipeline recovered from an error, invalidate applied_rate so the
+        // guard below doesn't suppress the re-apply.
+        if inner.at_error.swap(false, Ordering::Relaxed) {
+            self.applied_rate = 0.0;
+            self.last_rate_seek = None;
+        }
+
         // Guard: skip if GStreamer already has this rate.
         if (self.applied_rate - self.rate).abs() < 1e-9 {
             return Ok(());
         }
 
-        // Throttle: cap at ~10 seeks/second. syncVideoElements fires every rAF frame;
-        // even INSTANT_RATE_CHANGE at 60/s causes the pipeline to stall. The rAF loop
-        // keeps calling set_rate with the latest desired value, so the final value will
-        // always be applied once the 100ms window opens.
+        // Throttle: cap at ~10 seeks/second. The rAF loop keeps calling set_rate with the
+        // latest desired value, so the final value will always be applied once the window opens.
         let now = std::time::Instant::now();
         if let Some(last) = self.last_rate_seek {
             if now.duration_since(last) < std::time::Duration::from_millis(100) {
@@ -306,38 +362,27 @@ impl DeckAudioPipeline {
 
         eprintln!("[audio/{}] set_rate → {:.4}", self.deck_id, self.rate);
 
-        // INSTANT_RATE_CHANGE (GStreamer ≥ 1.18): adjusts rate in-place without flushing,
-        // so there are no audible clicks or position jumps during tempo/jog changes.
-        let ok = inner
+        // Use a flush seek at the current position to apply the new rate.
+        // INSTANT_RATE_CHANGE would avoid the flush, but it causes qtdemux (gst-plugins-good)
+        // to emit repeated GST_FLOW_ERROR (-5) messages for MP4 files, leading to an error
+        // cascade that deadlocks the app. A flush seek produces a brief audio dropout
+        // (~one keyframe interval) but is fully reliable. The 100 ms throttle above limits
+        // this to ≤10 seeks/second so the impact is inaudible during normal fader use.
+        let pos = inner
+            .pipeline
+            .query_position::<gst::ClockTime>()
+            .unwrap_or(gst::ClockTime::ZERO);
+        inner
             .pipeline
             .seek(
                 self.rate,
-                gst::SeekFlags::INSTANT_RATE_CHANGE,
-                gst::SeekType::None,
-                gst::ClockTime::NONE,
+                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                gst::SeekType::Set,
+                pos,
                 gst::SeekType::None,
                 gst::ClockTime::NONE,
             )
-            .is_ok();
-        if !ok {
-            eprintln!("[audio/{}] INSTANT_RATE_CHANGE failed, falling back to flush seek", self.deck_id);
-            let pos = inner
-                .pipeline
-                .query_position::<gst::ClockTime>()
-                .unwrap_or(gst::ClockTime::ZERO);
-            inner
-                .pipeline
-                .seek(
-                    self.rate,
-                    gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
-                    gst::SeekType::Set,
-                    pos,
-                    gst::SeekType::None,
-                    gst::ClockTime::NONE,
-                )
-                .map_err(|e| e.to_string())?;
-        }
-        Ok(())
+            .map_err(|e| e.to_string())
     }
 
     /// Pre-fader trim (0–1). Effective audio = gain × volume.

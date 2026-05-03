@@ -47,13 +47,14 @@ checks this flag and seeks back to zero before resuming, so the track replays cl
 at end-of-stream. The bus thread is stopped via `bus.set_flushing(true)` before pipeline teardown and in
 `Drop`.
 
-**Rate changes — `INSTANT_RATE_CHANGE`**: `set_rate()` uses the GStreamer ≥ 1.18 `INSTANT_RATE_CHANGE`
-seek flag, which adjusts playback speed in-place without flushing the pipeline — no audible click or
-position jump during jog-wheel / tempo-fader moves. Falls back to a flush seek if the flag is unsupported.
+**Rate changes**: `set_rate()` applies the new rate via a `FLUSH | KEY_UNIT` seek at the current position.
+`INSTANT_RATE_CHANGE` was tried (adjusts rate without flushing) but causes `qtdemux` (gst-plugins-good)
+to emit repeated `GST_FLOW_ERROR (-5)` messages for MP4 files, cascading into an error loop and app
+deadlock. Flush seeks produce a brief dropout (~one keyframe interval) but are fully reliable.
 Two guards prevent pipeline stalls: (1) a no-change guard compares against `applied_rate` (the rate last
 confirmed in the pipeline) rather than the last requested value — so loading a new file while the rate is
 non-1.0 correctly resets `applied_rate` to 1.0 and forces a re-apply; (2) a 100 ms throttle window limits
-rate-change seeks to ~10/s, preventing the rAF loop from hammering GStreamer.
+rate-change seeks to ~10/s, keeping the dropout inaudible during normal fader use.
 
 **Preroll**: `load()` waits synchronously (up to 5 s) for the pipeline to reach `PAUSED` before returning,
 so callers can seek and play immediately without an extra wait.
@@ -377,6 +378,14 @@ File preference in Digger: video > audio > any. Marker mapping: first `cue` → 
 - Cuemark calls Digger; Digger never calls cuemark
 - Graceful degradation: if Digger is unreachable, drag-and-drop and manual load still work
 - No embedded file browser in cuemark
+
+## Skills
+
+Project-specific skills live in `skills/`. Load one with `/audio-debugging` (or via the Skill tool) when needed — don't load them on every session.
+
+| Skill | When to load |
+|---|---|
+| `audio-debugging` | GStreamer bus errors, rate-change issues, layered/detuned audio, pipeline recovery |
 
 ## Constraints
 
