@@ -1,3 +1,5 @@
+import { audioSeek } from '../audio/pipeline';
+
 const els = new Map<string, HTMLVideoElement>();
 
 export function registerVideoEl(deckId: string, el: HTMLVideoElement) {
@@ -11,6 +13,7 @@ export function unregisterVideoEl(deckId: string) {
 export function seekDeck(deckId: string, time: number) {
   const el = els.get(deckId);
   if (el) el.currentTime = time;
+  audioSeek(deckId, time).catch(console.error);
 }
 
 export function getDeckTime(deckId: string): number | null {
