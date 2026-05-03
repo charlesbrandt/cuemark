@@ -174,7 +174,6 @@ impl DeckAudioPipeline {
             for msg in bus_thread.iter_timed(None) {
                 match msg.view() {
                     gst::MessageView::Eos(_) => {
-                        eprintln!("[bus/{}] EOS", deck_id_log);
                         at_eos_thread.store(true, Ordering::Relaxed);
                     }
                     gst::MessageView::Error(e) => {
@@ -183,27 +182,9 @@ impl DeckAudioPipeline {
                     gst::MessageView::Warning(w) => {
                         eprintln!("[bus/{}] WARNING: {} (debug: {:?})", deck_id_log, w.error(), w.debug());
                     }
-                    gst::MessageView::Info(i) => {
-                        eprintln!("[bus/{}] INFO: {} (debug: {:?})", deck_id_log, i.error(), i.debug());
-                    }
-                    gst::MessageView::Buffering(b) => {
-                        eprintln!("[bus/{}] buffering {}%", deck_id_log, b.percent());
-                    }
-                    gst::MessageView::StateChanged(s) => {
-                        let src_name = msg.src().map(|e| e.name().to_string()).unwrap_or_default();
-                        eprintln!("[bus/{}] {}: {:?} → {:?} (pending {:?})",
-                            deck_id_log, src_name, s.old(), s.current(), s.pending());
-                    }
-                    gst::MessageView::Latency(_) => {
-                        eprintln!("[bus/{}] latency recalculation requested", deck_id_log);
-                    }
-                    gst::MessageView::StreamStatus(ss) => {
-                        eprintln!("[bus/{}] stream status: {:?}", deck_id_log, ss.type_());
-                    }
                     _ => {}
                 }
             }
-            eprintln!("[bus/{}] monitor thread exiting", deck_id_log);
         });
 
         // Start preroll (async state change to PAUSED).
