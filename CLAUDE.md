@@ -9,7 +9,7 @@ Domain: cuemark.com (Charles Brandt's former DJ name)
 
 - **Tauri** (Rust backend + WebKit frontend) — cross-platform, Wayland-native on Linux via GTK4
 - **WebGL** — GPU-accelerated rendering, FBO-per-deck compositing
-- **GStreamer** (Rust, `gstreamer` + `gstreamer-audio` crates) — audio playback, gain/EQ, device routing, headphone cue mix, recording. Each deck has its own `DeckAudioPipeline` (uridecodebin → audioconvert → audioresample → volume → pipewiresink/autoaudiosink). Audio is the master clock; video element syncs to it.
+- **GStreamer** (Rust, `gstreamer` + `gstreamer-audio` crates, `features = ["v1_18"]` required) — audio playback, gain/EQ, device routing, headphone cue mix, recording. Each deck has its own `DeckAudioPipeline` (uridecodebin → audioconvert → audioresample → volume → pipewiresink/autoaudiosink). Audio is the master clock; video element syncs to it.
 - **Web Audio API** — waveform peak extraction + FFT analysis for BPM detection and audio-reactive visuals (not used for playback)
 - **GLSL shaders** — effects and audio-reactive visualizations
 - **Rust `midir` crate** — MIDI input (Web MIDI API unreliable in WebKitGTK); events piped to frontend via Tauri IPC
@@ -40,6 +40,23 @@ drift exceeds 80 ms — keeping the video texture in sync with what the audience
 **Device routing**: default output uses `autoaudiosink` (selects PipeWire/PulseAudio/ALSA automatically).
 A specific sink is targeted via `pipewiresink target-object=<node-name>`; falls back to `autoaudiosink` if
 the `gstreamer1.0-pipewire` plugin is absent.
+
+**EOS handling**: Each `DeckAudioPipeline` spawns a background thread that watches the GStreamer bus.
+When an `EOS` message arrives the thread sets an `Arc<AtomicBool>` (`at_eos`). The next call to `play()`
+checks this flag and seeks back to zero before resuming, so the track replays cleanly instead of stalling
+at end-of-stream. The bus thread is stopped via `bus.set_flushing(true)` before pipeline teardown and in
+`Drop`.
+
+**Rate changes — `INSTANT_RATE_CHANGE`**: `set_rate()` uses the GStreamer ≥ 1.18 `INSTANT_RATE_CHANGE`
+seek flag, which adjusts playback speed in-place without flushing the pipeline — no audible click or
+position jump during jog-wheel / tempo-fader moves. Falls back to a flush seek if the flag is unsupported.
+Two guards prevent pipeline stalls: (1) a no-change guard compares against `applied_rate` (the rate last
+confirmed in the pipeline) rather than the last requested value — so loading a new file while the rate is
+non-1.0 correctly resets `applied_rate` to 1.0 and forces a re-apply; (2) a 100 ms throttle window limits
+rate-change seeks to ~10/s, preventing the rAF loop from hammering GStreamer.
+
+**Preroll**: `load()` waits synchronously (up to 5 s) for the pipeline to reach `PAUSED` before returning,
+so callers can seek and play immediately without an extra wait.
 
 ### Rendering pipeline
 

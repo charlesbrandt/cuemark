@@ -16,5 +16,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 midir = "0.9"
 tauri-plugin-dialog = "2"
-gstreamer = "0.23"
+gstreamer = { version = "0.23", features = ["v1_18"] }
 gstreamer-audio = "0.23"

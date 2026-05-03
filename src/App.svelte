@@ -160,7 +160,7 @@
         document.body.appendChild(v);
         registerVideoEl(deck.id, v);
         videoEls.set(deck.id, v);
-        audioLoad(deck.id, filePath).catch(console.error);
+        // audioLoad is called in the src-change block below (always runs for a new element)
       }
 
       // Update event handlers each sync so they capture the current filePath / deckId
