@@ -103,6 +103,19 @@
     </button>
   </div>
 
+  <div class="gain-row" title="Pre-fader trim — normalize source level between tracks">
+    <span>Gain</span>
+    <input
+      type="range"
+      min="0"
+      max="1"
+      step="0.01"
+      value={deck.gain}
+      oninput={(e) => updateDeck(deck.id, { gain: +e.currentTarget.value })}
+    />
+    <strong>{deck.gain.toFixed(2)}</strong>
+  </div>
+
   <div class="preview">
     {#if deck.source?.type === "video"}
       <canvas
@@ -304,17 +317,6 @@
         oninput={(e) => updateDeck(deck.id, { opacity: +e.currentTarget.value })}
       />
     </label>
-    <label title="Pre-fader trim — normalize source level between tracks">
-      <span>Gain <strong>{deck.gain.toFixed(2)}</strong></span>
-      <input
-        type="range"
-        min="0"
-        max="1"
-        step="0.01"
-        value={deck.gain}
-        oninput={(e) => updateDeck(deck.id, { gain: +e.currentTarget.value })}
-      />
-    </label>
     <label title="Post-fader level — driven by crossfader">
       <span>Volume <strong>{deck.volume.toFixed(2)}</strong></span>
       <input
@@ -366,6 +368,31 @@
 
 <style>
   .eq-active { color: #f5a623; }
+
+  .gain-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 4px;
+    font-size: 11px;
+    color: #aaa;
+  }
+
+  .gain-row span {
+    min-width: 28px;
+  }
+
+  .gain-row input[type="range"] {
+    flex: 1;
+    height: 14px;
+  }
+
+  .gain-row strong {
+    min-width: 30px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: #ccc;
+  }
 
   .bpm-row {
     display: flex;

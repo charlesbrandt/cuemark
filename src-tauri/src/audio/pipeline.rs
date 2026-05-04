@@ -7,7 +7,7 @@
 /// When a specific device is set via `set_device()`, the pipeline is rebuilt
 /// against that PipeWire node name (as reported by `pactl list sinks`).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gstreamer::{self as gst, prelude::*};
@@ -19,15 +19,27 @@ fn make_el(factory: &str) -> Result<gst::Element, String> {
 }
 
 /// Encode a filesystem path as a file:// URI suitable for uridecodebin.
+///
+/// Each byte is examined individually so multi-byte UTF-8 sequences (e.g. 'ç' → 0xC3 0xA7)
+/// are percent-encoded as %C3%A7 rather than pushed as `char` values (which produces mojibake).
 fn file_to_uri(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 7);
     out.push_str("file://");
     for byte in path.bytes() {
         match byte {
-            b' ' => out.push_str("%20"),
-            b'#' => out.push_str("%23"),
-            b'?' => out.push_str("%3F"),
-            b => out.push(b as char),
+            // RFC 3986 unreserved chars + path separators — safe unencoded in a URI path.
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'.' | b'_' | b'~'
+            | b'/' | b':' | b'@'
+            | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'=' => {
+                out.push(byte as char);
+            }
+            // Everything else — spaces, non-ASCII UTF-8 bytes, #, ?, etc.
+            b => {
+                out.push('%');
+                out.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+                out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap().to_ascii_uppercase());
+            }
         }
     }
     out
@@ -76,6 +88,14 @@ struct PipelineInner {
     /// The bus thread also attempts a flush-seek recovery. set_rate() checks this
     /// flag and resets applied_rate so the next rate event forces a fresh seek.
     at_error: Arc<AtomicBool>,
+    /// True while a FLUSH seek is in progress; cleared by the bus thread on AsyncDone.
+    seek_in_flight: Arc<AtomicBool>,
+    /// Position (ns) and wall-clock instant recorded when AsyncDone last fired.
+    /// query_position() returns the seek target for a brief window after AsyncDone
+    /// because the pipeline clock hasn't advanced yet — MIDI events arrive faster
+    /// than that window closes, so successive seeks all target the same timestamp.
+    /// set_rate() uses this to estimate the true current position instead.
+    last_async_done: Arc<Mutex<Option<(u64, std::time::Instant)>>>,
 }
 
 pub struct DeckAudioPipeline {
@@ -173,6 +193,10 @@ impl DeckAudioPipeline {
         let at_eos_thread = at_eos.clone();
         let at_error = Arc::new(AtomicBool::new(false));
         let at_error_thread = at_error.clone();
+        let seek_in_flight = Arc::new(AtomicBool::new(false));
+        let seek_in_flight_thread = seek_in_flight.clone();
+        let last_async_done: Arc<Mutex<Option<(u64, std::time::Instant)>>> = Arc::new(Mutex::new(None));
+        let last_async_done_thread = last_async_done.clone();
         let bus_thread = bus.clone();
         let deck_id_log = self.deck_id.clone();
 
@@ -208,14 +232,19 @@ impl DeckAudioPipeline {
                         }
                     }
                     gst::MessageView::AsyncDone(_) => {
-                        // Fires when a seek or state-change async op completes.
-                        // Useful for confirming flush seeks finish before the next one.
-                        let pos = msg.src()
+                        let pos_ns = msg.src()
                             .and_then(|e| e.downcast_ref::<gst::Pipeline>())
                             .and_then(|p| p.query_position::<gst::ClockTime>())
-                            .map(|t| t.mseconds())
+                            .map(|t| t.nseconds())
                             .unwrap_or(0);
-                        eprintln!("[bus/{}] async-done  pos={}ms", deck_id_log, pos);
+                        // Record position + wall-clock instant so set_rate() can estimate
+                        // the true current position rather than calling query_position(),
+                        // which returns the seek target until the clock has advanced.
+                        if let Ok(mut g) = last_async_done_thread.lock() {
+                            *g = Some((pos_ns, std::time::Instant::now()));
+                        }
+                        seek_in_flight_thread.store(false, Ordering::Relaxed);
+                        eprintln!("[bus/{}] async-done  pos={}ms", deck_id_log, pos_ns / 1_000_000);
                     }
                     gst::MessageView::Qos(q) => {
                         // QOS messages indicate dropped/late buffers — relevant if
@@ -246,6 +275,11 @@ impl DeckAudioPipeline {
         let (ret, _cur, _pending) = pipeline.state(Some(gst::ClockTime::from_seconds(5)));
         match ret {
             Err(_) => {
+                // Stop the bus monitor thread and transition elements to NULL before
+                // the local `pipeline` drops — GStreamer emits CRITICAL warnings if
+                // elements are disposed while still in READY or PAUSED state.
+                bus.set_flushing(true);
+                let _ = pipeline.set_state(gst::State::Null);
                 return Err(format!("[{}] preroll failed", self.deck_id));
             }
             Ok(gst::StateChangeSuccess::Async) => {
@@ -254,7 +288,7 @@ impl DeckAudioPipeline {
             _ => {}
         }
 
-        self.inner = Some(PipelineInner { pipeline, volume_el: volume, bus, at_eos, at_error });
+        self.inner = Some(PipelineInner { pipeline, volume_el: volume, bus, at_eos, at_error, seek_in_flight, last_async_done });
         self.applied_rate = 1.0;
         self.last_rate_seek = None;
         Ok(())
@@ -336,11 +370,12 @@ impl DeckAudioPipeline {
             None => return Ok(()), // stored; will be applied after the next load
         };
 
-        // If the pipeline recovered from an error, invalidate applied_rate so the
-        // guard below doesn't suppress the re-apply.
+        // If the pipeline recovered from an error, invalidate applied_rate and clear
+        // seek_in_flight so the next event forces a fresh seek regardless of the guards.
         if inner.at_error.swap(false, Ordering::Relaxed) {
             self.applied_rate = 0.0;
             self.last_rate_seek = None;
+            inner.seek_in_flight.store(false, Ordering::Relaxed);
         }
 
         // Guard: skip if GStreamer already has this rate.
@@ -348,17 +383,41 @@ impl DeckAudioPipeline {
             return Ok(());
         }
 
-        // Throttle: cap at ~10 seeks/second. The rAF loop keeps calling set_rate with the
-        // latest desired value, so the final value will always be applied once the window opens.
+        // Gate on AsyncDone: don't issue a new seek until the previous one completes.
+        // The bus thread clears seek_in_flight when AsyncDone fires. This prevents
+        // query_position() from returning the previous seek's target (position hasn't
+        // advanced yet), which caused every seek to target the same timestamp and the
+        // pipeline to loop audio from that point → two audible copies at a fixed offset.
+        //
+        // Safety fallback: if AsyncDone never fires (e.g. pipeline error stalled it),
+        // allow a seek after 500ms so the fader doesn't become permanently unresponsive.
         let now = std::time::Instant::now();
-        if let Some(last) = self.last_rate_seek {
-            if now.duration_since(last) < std::time::Duration::from_millis(100) {
+        if inner.seek_in_flight.load(Ordering::Relaxed) {
+            let stale = self.last_rate_seek
+                .map_or(true, |last| now.duration_since(last) >= std::time::Duration::from_millis(500));
+            if !stale {
                 return Ok(());
             }
+            eprintln!("[audio/{}] seek_in_flight timeout — forcing rate seek", self.deck_id);
         }
 
+        // Minimum play time between seeks: each FLUSH seek pauses the pipeline and
+        // flushes GStreamer's internal buffers, causing an audible dropout. Gating
+        // only on AsyncDone (~90ms seek duration) leaves zero time in Playing state
+        // between seeks. Enforce 200ms from the last seek so the pipeline plays ~110ms
+        // of stable audio between dropouts.
+        if self.last_rate_seek
+            .map_or(false, |last| now.duration_since(last) < std::time::Duration::from_millis(200))
+        {
+            return Ok(());
+        }
+
+        // Capture the previous rate before updating — it's the rate the pipeline has
+        // actually been playing at since AsyncDone, used to estimate current position.
+        let prev_rate = self.applied_rate;
         self.applied_rate = self.rate;
         self.last_rate_seek = Some(now);
+        inner.seek_in_flight.store(true, Ordering::Relaxed);
 
         eprintln!("[audio/{}] set_rate → {:.4}", self.deck_id, self.rate);
 
@@ -366,17 +425,35 @@ impl DeckAudioPipeline {
         // INSTANT_RATE_CHANGE would avoid the flush, but it causes qtdemux (gst-plugins-good)
         // to emit repeated GST_FLOW_ERROR (-5) messages for MP4 files, leading to an error
         // cascade that deadlocks the app. A flush seek produces a brief audio dropout
-        // (~one keyframe interval) but is fully reliable. The 100 ms throttle above limits
-        // this to ≤10 seeks/second so the impact is inaudible during normal fader use.
-        let pos = inner
-            .pipeline
-            .query_position::<gst::ClockTime>()
-            .unwrap_or(gst::ClockTime::ZERO);
+        // but is fully reliable.
+        //
+        // ACCURATE (not KEY_UNIT): KEY_UNIT snaps seeks to the nearest video keyframe
+        // (typically 2s intervals for music videos). All rate-change seeks within a 2s window
+        // land at the same keyframe, so the pipeline replays the same audio segment repeatedly
+        // while the hardware buffer drains audio from further along → audible doubling.
+        // ACCURATE decodes forward from the keyframe to the exact target, eliminating snap.
+        //
+        // Position is estimated from AsyncDone position + elapsed × prev_rate rather than
+        // query_position(), which returns the seek target until the pipeline clock advances.
+        let pos = {
+            let guard = inner.last_async_done.lock().ok();
+            guard
+                .as_ref()
+                .and_then(|g| g.as_ref())
+                .map(|(pos_ns, done_at)| {
+                    let elapsed_ns = now.saturating_duration_since(*done_at).as_nanos() as u64;
+                    let advance_ns = (elapsed_ns as f64 * prev_rate) as u64;
+                    gst::ClockTime::from_nseconds(pos_ns.saturating_add(advance_ns))
+                })
+                .unwrap_or_else(|| {
+                    inner.pipeline.query_position::<gst::ClockTime>().unwrap_or(gst::ClockTime::ZERO)
+                })
+        };
         inner
             .pipeline
             .seek(
                 self.rate,
-                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
                 gst::SeekType::Set,
                 pos,
                 gst::SeekType::None,
