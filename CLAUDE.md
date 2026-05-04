@@ -47,14 +47,24 @@ checks this flag and seeks back to zero before resuming, so the track replays cl
 at end-of-stream. The bus thread is stopped via `bus.set_flushing(true)` before pipeline teardown and in
 `Drop`.
 
-**Rate changes**: `set_rate()` applies the new rate via a `FLUSH | KEY_UNIT` seek at the current position.
+**Rate changes**: `set_rate()` applies the new rate via a `FLUSH | ACCURATE` seek at the current position.
 `INSTANT_RATE_CHANGE` was tried (adjusts rate without flushing) but causes `qtdemux` (gst-plugins-good)
 to emit repeated `GST_FLOW_ERROR (-5)` messages for MP4 files, cascading into an error loop and app
-deadlock. Flush seeks produce a brief dropout (~one keyframe interval) but are fully reliable.
-Two guards prevent pipeline stalls: (1) a no-change guard compares against `applied_rate` (the rate last
+deadlock. `KEY_UNIT` seeks snap to video keyframes (typically 2–5s intervals), causing all seeks within
+that window to land at the same position and replay audio — audible doubling. `ACCURATE` decodes forward
+from the keyframe to the exact target. Flush seeks produce a brief dropout (~90ms) but are fully reliable.
+Three guards prevent artifacts: (1) a no-change guard compares against `applied_rate` (the rate last
 confirmed in the pipeline) rather than the last requested value — so loading a new file while the rate is
-non-1.0 correctly resets `applied_rate` to 1.0 and forces a re-apply; (2) a 100 ms throttle window limits
-rate-change seeks to ~10/s, keeping the dropout inaudible during normal fader use.
+non-1.0 correctly resets `applied_rate` to 1.0 and forces a re-apply; (2) an AsyncDone gate prevents
+issuing a new seek until the previous one completes (with 500ms safety fallback); (3) a 200ms dwell gate
+enforces minimum spacing between seeks, allowing ~110ms of stable playback between dropouts. Position is
+estimated from the last AsyncDone timestamp + elapsed time × previous rate (not `query_position()`, which
+returns stale values during the seek window).
+
+**HW buffer**: Audio sinks default to 200ms of hardware buffering (GstAudioBaseSink `buffer-time` property).
+During rapid rate-change seeks gated at 200ms, old audio drains from the HW buffer as new audio arrives,
+producing the "doubled / slightly detuned" sound when both segments play simultaneously. Fixed by shrinking
+the HW buffer to 50ms in `make_sink()` — old audio drains completely before the next dwell window opens.
 
 **Preroll**: `load()` waits synchronously (up to 5 s) for the pipeline to reach `PAUSED` before returning,
 so callers can seek and play immediately without an extra wait.

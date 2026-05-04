@@ -1,3 +1,21 @@
+# 2026.05.04 — Doubled audio during tempo changes, HW buffer fix
+
+## What shipped
+
+**Diagnosed and fixed doubled/detuned sound during tempo fader use** — the audio sink (PipeWire / PulseAudio) was buffering 200ms of audio by default (`GstAudioBaseSink` `buffer-time` property). With rate-change seeks gated at 200ms (dwell window to allow playback between seeks), old audio was still draining from the HW buffer as the new seek's audio segment arrived, producing two simultaneous audio streams at slightly different pitches/positions = "doubled" effect.
+
+Fix: `make_sink()` now sets `buffer-time=50000us` (50ms, down from 200ms default) on all audio sinks. For `pipewiresink` (specific device), applied directly. For `autoaudiosink` (default device), hooked the `child-added` signal to apply the setting to whichever sink it picks (pipewiresink, pulsesink, etc.) at runtime.
+
+**Added diagnostics:**
+- `set_rate()` now logs `target=Xms elapsed-since-async-done=Yms prev_rate=Z` to verify position estimation and dwell gating
+- `make_sink()` logs the actual chosen sink type and its buffer-time / latency-time after application
+
+**Updated docs:**
+- CLAUDE.md: documented ACCURATE vs KEY_UNIT distinction, AsyncDone gate, 200ms dwell, and HW buffer fix
+- audio-debugging skill: added HW buffer overlap as root cause of doubling, explains the 50ms fix, updated diagnostics
+
+---
+
 # 2026.05.02 — Batch C: EQ, audio output device selection, headphone cue
 
 ## What shipped

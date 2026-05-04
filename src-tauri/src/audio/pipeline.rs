@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gstreamer::{self as gst, prelude::*};
+use gstreamer::{self as gst, glib, prelude::*};
 
 fn make_el(factory: &str) -> Result<gst::Element, String> {
     gst::ElementFactory::make(factory)
@@ -48,20 +48,61 @@ fn file_to_uri(path: &str) -> String {
 /// Build the audio output sink element.
 ///
 /// Default case (empty device): uses `autoaudiosink`, which auto-selects the best
-/// available sink (PipeWire, PulseAudio, ALSA) without needing PipeWire-specific
-/// setup. This is more reliable for the "just play audio" case.
+/// available sink (PipeWire, PulseAudio, ALSA). The `child-added` hook applies
+/// our buffer settings to whichever sink it picks and logs the choice.
 ///
 /// Explicit device: uses `pipewiresink target-object=<node-name>` to route to a
-/// specific PipeWire sink. Falls back to `autoaudiosink` if the plugin is missing.
-fn make_sink(device: &str) -> Result<gst::Element, String> {
+/// specific PipeWire sink. Falls back to autoaudiosink if the plugin is missing.
+///
+/// HW buffer is sized at 50ms (vs the default 200ms). With rapid rate-change
+/// FLUSH seeks gated at 200ms, a 200ms HW buffer leaves old audio still draining
+/// from the speakers as the new segment arrives — the source of the doubled /
+/// slightly-detuned sound during tempo fader use. 50ms drains in well under one
+/// dwell window, so old and new audio do not overlap.
+fn make_sink(device: &str, deck_id: &str) -> Result<gst::Element, String> {
+    const BUFFER_TIME_US: i64 = 50_000;
+    const LATENCY_TIME_US: i64 = 10_000;
+
     if device.is_empty() {
-        return gst::ElementFactory::make("autoaudiosink")
+        let sink = gst::ElementFactory::make("autoaudiosink")
             .build()
-            .map_err(|e| format!("autoaudiosink not found: {e}"));
+            .map_err(|e| format!("autoaudiosink not found: {e}"))?;
+
+        // autoaudiosink picks the actual sink at runtime. Hook child-added so we
+        // can apply buffer settings to whatever it picks AND log it.
+        let deck_id_owned = deck_id.to_string();
+        let _ = sink.connect("child-added", false, move |args| {
+            let child = args
+                .get(1)
+                .and_then(|v| v.get::<glib::Object>().ok())
+                .and_then(|o| o.downcast::<gst::Element>().ok());
+            let Some(child) = child else { return None };
+            child.set_property("buffer-time", BUFFER_TIME_US);
+            child.set_property("latency-time", LATENCY_TIME_US);
+            let factory = child
+                .factory()
+                .map(|f| f.name().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let bt: i64 = child.property("buffer-time");
+            let lt: i64 = child.property("latency-time");
+            eprintln!(
+                "[audio/{}] sink: {} buffer-time={}us latency-time={}us",
+                deck_id_owned, factory, bt, lt
+            );
+            None
+        });
+        return Ok(sink);
     }
+
     match gst::ElementFactory::make("pipewiresink").build() {
         Ok(sink) => {
             sink.set_property("target-object", device);
+            sink.set_property("buffer-time", BUFFER_TIME_US);
+            sink.set_property("latency-time", LATENCY_TIME_US);
+            eprintln!(
+                "[audio/{}] sink: pipewiresink target={} buffer-time={}us latency-time={}us",
+                deck_id, device, BUFFER_TIME_US, LATENCY_TIME_US
+            );
             Ok(sink)
         }
         Err(_) => {
@@ -69,9 +110,8 @@ fn make_sink(device: &str) -> Result<gst::Element, String> {
                 "[audio] pipewiresink not available (apt install gstreamer1.0-pipewire); \
                  device={device:?} ignored, falling back to autoaudiosink"
             );
-            gst::ElementFactory::make("autoaudiosink")
-                .build()
-                .map_err(|e| format!("no audio sink available: {e}"))
+            // Recurse into the empty-device path so autoaudiosink also gets the buffer hooks.
+            make_sink("", deck_id)
         }
     }
 }
@@ -149,7 +189,7 @@ impl DeckAudioPipeline {
         let convert  = make_el("audioconvert")?;
         let resample = make_el("audioresample")?;
         let volume   = make_el("volume")?;
-        let sink     = make_sink(&self.device)?;
+        let sink     = make_sink(&self.device, &self.deck_id)?;
 
         src.set_property("uri", file_to_uri(file_path));
         volume.set_property("volume", (self.gain * self.vol) as f64);
@@ -419,9 +459,37 @@ impl DeckAudioPipeline {
         self.last_rate_seek = Some(now);
         inner.seek_in_flight.store(true, Ordering::Relaxed);
 
-        eprintln!("[audio/{}] set_rate → {:.4}", self.deck_id, self.rate);
+        // Compute seek target. Position is estimated from AsyncDone position + elapsed × prev_rate
+        // rather than query_position(), which returns the seek target until the pipeline clock advances.
+        let (pos, elapsed_ms) = {
+            let guard = inner.last_async_done.lock().ok();
+            match guard.as_ref().and_then(|g| g.as_ref()) {
+                Some((pos_ns, done_at)) => {
+                    let elapsed_ns = now.saturating_duration_since(*done_at).as_nanos() as u64;
+                    let advance_ns = (elapsed_ns as f64 * prev_rate) as u64;
+                    let target = gst::ClockTime::from_nseconds(pos_ns.saturating_add(advance_ns));
+                    (target, elapsed_ns / 1_000_000)
+                }
+                None => {
+                    let q = inner
+                        .pipeline
+                        .query_position::<gst::ClockTime>()
+                        .unwrap_or(gst::ClockTime::ZERO);
+                    (q, 0)
+                }
+            }
+        };
 
-        // Use a flush seek at the current position to apply the new rate.
+        eprintln!(
+            "[audio/{}] set_rate → {:.4}  target={}ms  elapsed-since-async-done={}ms  prev_rate={:.4}",
+            self.deck_id,
+            self.rate,
+            pos.nseconds() / 1_000_000,
+            elapsed_ms,
+            prev_rate
+        );
+
+        // Use a flush seek to apply the new rate.
         // INSTANT_RATE_CHANGE would avoid the flush, but it causes qtdemux (gst-plugins-good)
         // to emit repeated GST_FLOW_ERROR (-5) messages for MP4 files, leading to an error
         // cascade that deadlocks the app. A flush seek produces a brief audio dropout
@@ -432,23 +500,6 @@ impl DeckAudioPipeline {
         // land at the same keyframe, so the pipeline replays the same audio segment repeatedly
         // while the hardware buffer drains audio from further along → audible doubling.
         // ACCURATE decodes forward from the keyframe to the exact target, eliminating snap.
-        //
-        // Position is estimated from AsyncDone position + elapsed × prev_rate rather than
-        // query_position(), which returns the seek target until the pipeline clock advances.
-        let pos = {
-            let guard = inner.last_async_done.lock().ok();
-            guard
-                .as_ref()
-                .and_then(|g| g.as_ref())
-                .map(|(pos_ns, done_at)| {
-                    let elapsed_ns = now.saturating_duration_since(*done_at).as_nanos() as u64;
-                    let advance_ns = (elapsed_ns as f64 * prev_rate) as u64;
-                    gst::ClockTime::from_nseconds(pos_ns.saturating_add(advance_ns))
-                })
-                .unwrap_or_else(|| {
-                    inner.pipeline.query_position::<gst::ClockTime>().unwrap_or(gst::ClockTime::ZERO)
-                })
-        };
         inner
             .pipeline
             .seek(
