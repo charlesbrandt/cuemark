@@ -43,7 +43,9 @@ tracking the audio clock rather than `video.currentTime` (which drifts and snaps
 **`v.playbackRate` must only be set when changed** — WebKitGTK rebuilds its internal GStreamer pipeline on
 each `v.playbackRate` write. At MIDI tempo rates (60/sec after rAF throttle) this causes CPU spikes that starve
 the audio thread → PipeWire xruns → cascade failure. `syncVideoElements` tracks `lastPlaybackRate` per deck and
-skips the write if the value is unchanged.
+skips the write if the value is unchanged. The rebuild also loses `v.muted`; fix: also set `v.volume = 0` (a JS
+property, not pipeline state — survives rebuilds). Both are applied unconditionally every pass and re-applied after
+each `v.playbackRate` write.
 
 **Device routing**: default output uses `autoaudiosink` (selects PipeWire/PulseAudio/ALSA automatically).
 A specific sink is targeted via `pipewiresink target-object=<node-name>`; falls back to `autoaudiosink` if

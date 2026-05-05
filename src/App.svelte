@@ -220,6 +220,10 @@
 
       audioSetGain(deck.id, deck.gain).catch(console.error);
       audioSetVolume(deck.id, deck.volume).catch(console.error);
+      // v.volume=0 survives WebKitGTK pipeline rebuilds (it's a JS property, not pipeline state).
+      // v.muted=true is belt-and-suspenders but can be lost on playbackRate-triggered rebuilds.
+      // Both together ensure no audio bleed even during the brief rebuild window.
+      v.volume = 0;
       v.muted = true;
       // Only update playbackRate when it changes: setting v.playbackRate causes WebKitGTK
       // to rebuild its internal GStreamer pipeline, causing CPU spikes and PipeWire xruns
@@ -228,7 +232,8 @@
       if (lastPlaybackRate.get(deck.id) !== targetRate) {
         lastPlaybackRate.set(deck.id, targetRate);
         v.playbackRate = targetRate;
-        v.muted = true; // WebKitGTK may reset muted on playbackRate change; re-apply immediately
+        v.volume = 0;
+        v.muted = true;
       }
       audioSetRate(deck.id, deck.playbackRate).catch(console.error);
 

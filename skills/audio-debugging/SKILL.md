@@ -101,18 +101,29 @@ WebKitGTK can rebuild its internal GStreamer pipeline. This is CPU-intensive. Wi
 firing at 200+/sec (rAF-throttled to 60/sec), this was causing CPU spikes that starved the audio
 streaming thread → PipeWire xrun cascade (observed: 177 xruns → 1301 within seconds → pipeline ERROR).
 
-Fix: `syncVideoElements` now tracks `lastPlaybackRate` per deck and only writes `v.playbackRate` when
-the value actually changes. MIDI CC events no longer cause WebKit pipeline rebuilds.
+Fix: `syncVideoElements` tracks `lastPlaybackRate` per deck and only writes `v.playbackRate` when the
+value actually changes. This reduces rebuilds from 60/sec constant to once per unique rate value.
+During active MIDI tempo sweeps, each unique value still triggers one rebuild.
 
-**The rebuild also loses `muted`** — after a rate change, re-apply `v.muted = true` immediately.
-The code does this inside the `if (lastPlaybackRate !== targetRate)` guard.
+**The rebuild loses `muted`** — the new WebKit pipeline initializes briefly unmuted before the JS
+`v.muted = true` re-apply lands. `v.muted` alone is not reliable because it's linked to the pipeline
+state. Fix: also set `v.volume = 0` — this is a JS object property that survives pipeline rebuilds.
+Both `v.volume = 0` and `v.muted = true` are applied unconditionally every `syncVideoElements` pass
+AND inside the `lastPlaybackRate` guard after `v.playbackRate =`.
+
+**WebKit stream always at source file sample rate** — WebKit negotiates its own audio stream at the
+source file's native rate (44100 Hz for most music files), independent of our capsfilter. You will
+always see a second `+ cuemark` stream in pw-top at 44100/3969 when a 44100 Hz file is loaded.
+This is expected and unavoidable. The ERR count here should be low (< 10); sustained growth would
+indicate the WebKit pipeline is stalling.
 
 **`createMediaElementSource(v)` does NOT fix this** — in WebKitGTK it creates a third decoder rather
 than redirecting the existing one. Tried and reverted.
 
 **Distinguishing WebKit audio bleed from other issues:**
-- WebKit bleed: continuous doubled audio independent of any seek/rate timing
-- Fix: confirm `v.muted = true` is applied after `v.playbackRate` in `syncVideoElements`
+- WebKit bleed: doubled audio specifically during or just after tempo changes
+- Root cause: muted lost on pipeline rebuild; volume survives
+- Fix: confirm `v.volume = 0` is set unconditionally in `syncVideoElements` (not just inside the rate-change guard)
 
 ---
 
