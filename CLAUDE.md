@@ -23,7 +23,7 @@ Domain: cuemark.com (Charles Brandt's former DJ name)
 ```
 GStreamer (Rust, per deck):
   uridecodebin → queue(2buf) → audioconvert → audioresample
-    → capsfilter(48kHz) → pitch(tempo) → output_queue(200ms) → volume → pipewiresink / autoaudiosink
+    → capsfilter(48kHz) → pitch(tempo) → output_queue(500ms) → volume → pipewiresink / autoaudiosink
                                                                                ↑               ↑
                                                                  device-specific sink    system default
 ```
@@ -63,7 +63,7 @@ to the ongoing audio stream in-place. The `tempo` property accepts 0.1–4.0 (1.
 
 **PipeWire quantum**: the `capsfilter(rate=48000)` ensures pipewiresink always negotiates at 48000 Hz,
 matching PipeWire's native graph rate. Without it, 44100 Hz source files produce a non-power-of-two quantum
-(e.g. 3969) in PipeWire → scheduling irregularities → xruns. The `output_queue(200ms)` after `pitch` absorbs
+(e.g. 3969) in PipeWire → scheduling irregularities → xruns. The `output_queue(500ms)` after `pitch` absorbs
 soundtouch's variable output chunk sizes so pipewiresink's pull callback always finds buffered data.
 
 Earlier approaches using `FLUSH | ACCURATE` seeks, `INSTANT_RATE_CHANGE`, and `scaletempo` were all tried

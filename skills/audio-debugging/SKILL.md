@@ -31,7 +31,7 @@ Then read `journal.md` for the most recent session notes.
 
 ```
 uridecodebin → queue(max-buffers=2) → audioconvert → audioresample
-  → capsfilter(rate=48000) → pitch(tempo) → output_queue(200ms) → volume → pipewiresink
+  → capsfilter(rate=48000) → pitch(tempo) → output_queue(500ms) → volume → pipewiresink
 ```
 
 **`pitch` element** (soundtouch, `gst-plugins-bad`) — sets playback tempo without pitch change via the
@@ -47,7 +47,7 @@ file sample rate. Without this, 44100 Hz source files cause pipewiresink to nego
 PipeWire, which assigns a non-power-of-two quantum (e.g. 3969 samples) → scheduling irregularities →
 xruns. `audioresample` handles the actual conversion; capsfilter just locks the contract.
 
-**`output_queue`** (after pitch) — 200ms time-based buffer between soundtouch and pipewiresink.
+**`output_queue`** (after pitch) — 500ms time-based buffer between soundtouch and pipewiresink.
 soundtouch produces variable-sized output chunks at non-1.0 tempos. Without buffering, PipeWire's pull
 callback can fire before soundtouch has accumulated a full 1024-sample quantum → xrun. Time-based limit
 (no buffer-count or byte limit) so it fills only when soundtouch is momentarily slow.

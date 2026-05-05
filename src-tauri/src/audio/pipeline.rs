@@ -198,7 +198,7 @@ impl DeckAudioPipeline {
         // Time-based output queue: hold up to 200ms worth of post-pitch audio.
         output_queue.set_property("max-size-buffers", 0u32);
         output_queue.set_property("max-size-bytes", 0u32);
-        output_queue.set_property("max-size-time", 200_000_000u64); // 200ms in nanoseconds
+        output_queue.set_property("max-size-time", 500_000_000u64); // 500ms in nanoseconds
 
         pipeline
             .add_many([&src, &queue, &convert, &resample, &rate_caps, &pitch, &output_queue, &volume, &sink])
