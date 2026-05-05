@@ -9,7 +9,7 @@ Domain: cuemark.com (Charles Brandt's former DJ name)
 
 - **Tauri** (Rust backend + WebKit frontend) — cross-platform, Wayland-native on Linux via GTK4
 - **WebGL** — GPU-accelerated rendering, FBO-per-deck compositing
-- **GStreamer** (Rust, `gstreamer` + `gstreamer-audio` crates, `features = ["v1_18"]` required) — audio playback, gain/EQ, device routing, headphone cue mix, recording. Each deck has its own `DeckAudioPipeline` (uridecodebin → audioconvert → audioresample → volume → pipewiresink/autoaudiosink). Audio is the master clock; video element syncs to it.
+- **GStreamer** (Rust, `gstreamer` + `gstreamer-audio` crates, `features = ["v1_18"]` required) — audio playback, gain/EQ, device routing, headphone cue mix, recording. Each deck has its own `DeckAudioPipeline` (uridecodebin → queue → audioconvert → audioresample → pitch → volume → pipewiresink/autoaudiosink). Audio is the master clock; video element syncs to it.
 - **Web Audio API** — waveform peak extraction + FFT analysis for BPM detection and audio-reactive visuals (not used for playback)
 - **GLSL shaders** — effects and audio-reactive visualizations
 - **Rust `midir` crate** — MIDI input (Web MIDI API unreliable in WebKitGTK); events piped to frontend via Tauri IPC
@@ -22,9 +22,9 @@ Domain: cuemark.com (Charles Brandt's former DJ name)
 
 ```
 GStreamer (Rust, per deck):
-  uridecodebin → audioconvert → audioresample → volume → pipewiresink / autoaudiosink
-                                                             ↑               ↑
-                                               device-specific sink    system default
+  uridecodebin → queue → audioconvert → audioresample → pitch → volume → pipewiresink / autoaudiosink
+                                                                              ↑               ↑
+                                                                device-specific sink    system default
 ```
 
 `AudioManager` (held in Tauri managed state as `Mutex<AudioManager>`) owns all `DeckAudioPipeline` instances.
@@ -47,24 +47,15 @@ checks this flag and seeks back to zero before resuming, so the track replays cl
 at end-of-stream. The bus thread is stopped via `bus.set_flushing(true)` before pipeline teardown and in
 `Drop`.
 
-**Rate changes**: `set_rate()` applies the new rate via a `FLUSH | ACCURATE` seek at the current position.
-`INSTANT_RATE_CHANGE` was tried (adjusts rate without flushing) but causes `qtdemux` (gst-plugins-good)
-to emit repeated `GST_FLOW_ERROR (-5)` messages for MP4 files, cascading into an error loop and app
-deadlock. `KEY_UNIT` seeks snap to video keyframes (typically 2–5s intervals), causing all seeks within
-that window to land at the same position and replay audio — audible doubling. `ACCURATE` decodes forward
-from the keyframe to the exact target. Flush seeks produce a brief dropout (~90ms) but are fully reliable.
-Three guards prevent artifacts: (1) a no-change guard compares against `applied_rate` (the rate last
-confirmed in the pipeline) rather than the last requested value — so loading a new file while the rate is
-non-1.0 correctly resets `applied_rate` to 1.0 and forces a re-apply; (2) an AsyncDone gate prevents
-issuing a new seek until the previous one completes (with 500ms safety fallback); (3) a 200ms dwell gate
-enforces minimum spacing between seeks, allowing ~110ms of stable playback between dropouts. Position is
-estimated from the last AsyncDone timestamp + elapsed time × previous rate (not `query_position()`, which
-returns stale values during the seek window).
+**Rate changes**: `set_rate()` sets the `tempo` property on the `pitch` element (soundtouch, `gst-plugins-bad`).
+This adjusts playback speed without changing pitch, with no seek or pipeline flush — the change is applied
+to the ongoing audio stream in-place. The `tempo` property accepts 0.1–4.0 (1.0 = normal speed).
 
-**HW buffer**: Audio sinks default to 200ms of hardware buffering (GstAudioBaseSink `buffer-time` property).
-During rapid rate-change seeks gated at 200ms, old audio drains from the HW buffer as new audio arrives,
-producing the "doubled / slightly detuned" sound when both segments play simultaneously. Fixed by shrinking
-the HW buffer to 50ms in `make_sink()` — old audio drains completely before the next dwell window opens.
+Earlier approaches using `FLUSH | ACCURATE` seeks, `INSTANT_RATE_CHANGE`, and `scaletempo` were all tried
+and abandoned — see `journal.md` for the full history. The core problem was that any seek-based approach
+requires a pipeline flush, which temporarily moves a live PipeWire sink to PAUSED for re-preroll. With
+MIDI firing at 200+ events/second this becomes unrecoverable. Property-based tempo change avoids the
+pipeline state machine entirely.
 
 **Preroll**: `load()` waits synchronously (up to 5 s) for the pipeline to reach `PAUSED` before returning,
 so callers can seek and play immediately without an extra wait.

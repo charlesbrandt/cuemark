@@ -1,3 +1,73 @@
+# 2026.05.05 — seek-based rate changes abandoned; switched to soundtouch pitch element
+
+## The problem
+
+All seek-based approaches to rate change (FLUSH | ACCURATE, scaletempo, INSTANT_RATE_CHANGE) share a
+fundamental flaw: any seek on a playing pipeline with a live PipeWire sink temporarily moves the pipeline
+to PAUSED for re-preroll. With a time-stretching element like scaletempo, re-preroll can take ~90ms while
+the WSOLA ring buffer refills. The MIDI tempo fader fires 200+ events/second. The 200ms AsyncDone timeout
+fires mid-refill, issues a second conflicting seek, and the pipeline never recovers. Visible in logs as
+`pipeline: Paused → Paused (pending Paused)` immediately after a rate seek, followed by silence.
+
+`scaletempo` was tried first (one session) — eliminated doubled audio but introduced the PAUSED freeze
+on the first real rate-change attempt.
+
+## The fix
+
+Replaced `scaletempo` with the `pitch` element from `gst-plugins-bad` (soundtouch). The `tempo`
+property sets playback speed without pitch change, in-place, with no seek and no pipeline state
+transition. `set_rate()` is now three lines.
+
+```
+uridecodebin → queue → audioconvert → audioresample → pitch → volume → pipewiresink
+```
+
+`pitch` element: `tempo` property (0.1–10.0, default 1.0) — set at any time, takes effect immediately.
+Requires `gstreamer1.0-plugins-bad` (`sudo apt install gstreamer1.0-plugins-bad`).
+`libsoundtouch1` was already present on the system; only the GStreamer wrapper package was missing.
+
+## What was stripped from pipeline.rs
+
+- `applied_rate`, `last_rate_seek`, `duration_secs` fields from `DeckAudioPipeline`
+- `seek_in_flight` from `PipelineInner`
+- `last_async_done` (`Arc<Mutex<...>>`) and all dead-reckoning position estimation
+- 300ms dwell gate, 200ms AsyncDone gate, 50ms debounce, safety timeout
+- Error recovery / pipeline rebuild in `set_rate()`
+- All QOS / xrun bus message handling
+
+## History of seek-based attempts (for the record)
+
+1. `FLUSH | ACCURATE` — correct position but ~90ms dropout per seek; 300ms dwell gate needed
+2. `INSTANT_RATE_CHANGE` — no flush, but qtdemux emits GST_FLOW_ERROR (-5) on MP4 files → crash
+3. `KEY_UNIT` — snaps to keyframes → same audio segment replays → doubled/detuned sound
+4. HW buffer shrink (200ms → 50ms) — reduced doubling window but didn't fix root cause
+5. `scaletempo` with flush seeks — eliminated doubled audio, but WSOLA re-preroll ~90ms caused
+   PAUSED freeze with rapid MIDI events; second conflicting seek made it unrecoverable
+
+---
+
+# 2026.05.04 — pipewiresink investigation: doubling resolved, rate-change regression open
+
+## What's still open
+
+**Rate changes unresponsive with pipewiresink + 300ms dwell** — after switching to pipewiresink (which eliminated doubling), raising the dwell gate to 300ms appeared to break rate changes entirely. Not yet confirmed with terminal log (`set_rate →` lines). Next session: capture those lines while moving the tempo fader to confirm whether seeks are being issued. If yes, it's a UX perception issue (300ms feels sluggish); if no, something upstream broke (MIDI → frontend → Tauri chain).
+
+**Dwell gate tuning unresolved** — 200ms = choppy but responsive; 300ms = smooth but possibly unresponsive. 250ms is the next value to try. Current code is at 300ms.
+
+**WebKit PipeWire stream** — WebKitGTK opens a second audio stream for every `<video>` element even when `v.muted = true` (~90ms quantum / 3969 samples @ 44100). Tried `createMediaElementSource(v)` to suppress it — this created a THIRD stream instead of redirecting the existing one. Reverted. Stream appears to be genuinely silent (muted at the sink); not the doubling source.
+
+## What shipped this session
+
+**Switched `make_sink()` to prefer `pipewiresink`** — `autoaudiosink` on a PipeWire+pipewire-pulse system picks `pulsesink` (rank 266 > pipewiresink rank 0), routing through three layers. Direct pipewiresink eliminates the PA emulation hop. FLUSH seeks propagate directly to PipeWire; no ring buffer accumulation → no doubling.
+
+**`pipewiresink` properties corrected** — it extends `GstBaseSink`, not `GstAudioBaseSink`. Setting `buffer-time` or `latency-time` on it crashes. Latency is via `stream-properties` GstStructure with `node.latency = "1024/48000"` (~21ms).
+
+**pipewiresink xruns explained** — FLUSH seeks create ~90ms audio gaps; with 21ms quantum that's ~4 xruns per seek. Appear in pw-top `ERR` column. Do NOT generate GStreamer bus ERROR messages. Benign.
+
+**Dwell gate raised 200ms → 300ms** — to give more stable play time between dropout gaps. May have overcorrected (rate changes became unresponsive). Not yet confirmed.
+
+---
+
 # 2026.05.04 — Doubled audio during tempo changes, HW buffer fix
 
 ## What shipped

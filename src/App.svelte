@@ -213,6 +213,9 @@
 
       audioSetGain(deck.id, deck.gain).catch(console.error);
       audioSetVolume(deck.id, deck.volume).catch(console.error);
+      // Re-apply muted every sync: WebKitGTK may reset it when playbackRate changes
+      // (its internal GStreamer pipeline may be rebuilt on rate changes, losing muted state).
+      v.muted = true;
       // playbackRate must be ≥ 0.0625 in most browsers (video element for timing)
       v.playbackRate = Math.max(0.0625, deck.playbackRate);
       audioSetRate(deck.id, deck.playbackRate).catch(console.error);
