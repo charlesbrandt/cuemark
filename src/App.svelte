@@ -13,7 +13,7 @@
     audioSetCueDevice, audioSetCueGain,
   } from "./lib/audio/pipeline";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
-  import { registerVideoEl, unregisterVideoEl } from "./lib/renderer/seekBus";
+  import { registerVideoEl, unregisterVideoEl, setDeckAudioTime } from "./lib/renderer/seekBus";
   import { postFrame } from "./lib/renderer/outputBus";
   import DeckCard from "./components/DeckCard.svelte";
   import Crossfader from "./components/Crossfader.svelte";
@@ -48,6 +48,12 @@
   // Per-deck in-flight play() promises; prevents overlapping play() calls that abort each other
   const playPromises = new Map<string, Promise<void>>();
   let rafId: number;
+  // One in-flight audioGetPosition IPC per deck. Prevents stale out-of-order responses
+  // from snapping video.currentTime backward when GStreamer is mid-rate-change.
+  const pendingPos = new Map<string, boolean>();
+  // Last playbackRate applied to each video element. Setting v.playbackRate triggers
+  // WebKitGTK to rebuild its internal GStreamer pipeline; only update on actual change.
+  const lastPlaybackRate = new Map<string, number>();
 
   // Sync master volume to Rust audio pipeline
   $effect(() => {
@@ -138,6 +144,7 @@
         videoEls.delete(id);
         audioUnload(id).catch(console.error);
         playPromises.delete(id);
+        lastPlaybackRate.delete(id);
       }
     }
 
@@ -213,11 +220,16 @@
 
       audioSetGain(deck.id, deck.gain).catch(console.error);
       audioSetVolume(deck.id, deck.volume).catch(console.error);
-      // Re-apply muted every sync: WebKitGTK may reset it when playbackRate changes
-      // (its internal GStreamer pipeline may be rebuilt on rate changes, losing muted state).
       v.muted = true;
-      // playbackRate must be ≥ 0.0625 in most browsers (video element for timing)
-      v.playbackRate = Math.max(0.0625, deck.playbackRate);
+      // Only update playbackRate when it changes: setting v.playbackRate causes WebKitGTK
+      // to rebuild its internal GStreamer pipeline, causing CPU spikes and PipeWire xruns
+      // when called at rAF rate (60/sec) from rapid MIDI tempo events.
+      const targetRate = Math.max(0.0625, deck.playbackRate);
+      if (lastPlaybackRate.get(deck.id) !== targetRate) {
+        lastPlaybackRate.set(deck.id, targetRate);
+        v.playbackRate = targetRate;
+        v.muted = true; // WebKitGTK may reset muted on playbackRate change; re-apply immediately
+      }
       audioSetRate(deck.id, deck.playbackRate).catch(console.error);
 
       if (deck.playing && v.paused && !playPromises.has(deck.id)) {
@@ -243,15 +255,18 @@
         const v = videoEls.get(deck.id);
         const fbo = compositor.getFBO(deck.id);
         if (v && fbo) fbo.uploadVideoFrame(v);
-        // Audio is the master clock. If video has drifted, snap it back.
-        // Fire-and-forget: the Promise resolves in the next tick; no await here.
-        if (deck.playing && v) {
+        // Audio is the master clock. One in-flight IPC per deck prevents stale
+        // out-of-order responses from snapping currentTime backward mid-rate-change.
+        if (deck.playing && v && !pendingPos.get(deck.id)) {
+          pendingPos.set(deck.id, true);
           audioGetPosition(deck.id).then((audioPos) => {
+            pendingPos.delete(deck.id);
             if (audioPos === null || !v) return;
+            setDeckAudioTime(deck.id, audioPos); // feeds waveform playhead
             if (Math.abs(v.currentTime - audioPos) > 0.08) {
-              v.currentTime = audioPos;
+              v.currentTime = audioPos; // snap video to audio clock
             }
-          }).catch(() => {/* pipeline not ready yet */});
+          }).catch(() => { pendingPos.delete(deck.id); });
         }
       }
       compositor.composite(decks);

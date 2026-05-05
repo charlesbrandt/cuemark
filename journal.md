@@ -1,3 +1,80 @@
+# 2026.05.05 — waveform clock sync, PipeWire xrun cascade fixes
+
+## Problems
+
+### Waveform position indicator jumping by several seconds during tempo changes
+
+The waveform reads position via `getDeckTime(deckId)` → `video.currentTime`. The video element plays
+at `v.playbackRate = deck.playbackRate` and the RAF loop snaps `v.currentTime` to the GStreamer
+position when drift exceeds 80ms. At 1.5× tempo, video and audio diverge at 0.5s per real second;
+drift hits 80ms in ~160ms. Each snap causes a visible multi-second jump in the waveform playhead
+(the video is at second 10 but gets snapped to second 15 — that's the "jump").
+
+A second problem: the RAF loop fired one `audioGetPosition` IPC call per frame per deck (60/sec).
+Responses could resolve out of order (GStreamer busy mid-rate-change → old call returns late →
+overwrites a newer snap with a stale, lower position). This caused the playhead to occasionally
+jump backward.
+
+### Fix — audio position cache in seekBus + one-in-flight IPC
+
+**`seekBus.ts`**: added `audioTimes: Map<string, number>` and `setDeckAudioTime(id, t)`. Updated
+`getDeckTime()` to return the cached audio-clock position (set by the RAF loop from IPC) instead
+of `video.currentTime`. Falls back to `video.currentTime` when no cache entry exists (e.g., when
+paused). `seekDeck()` writes the seek target to the cache immediately so the waveform shows the
+new position before the GStreamer IPC round-trips.
+
+**`App.svelte` RAF loop**: added `pendingPos: Map<string, boolean>`. Next IPC call is only issued
+after the previous one resolves (one in-flight per deck). This eliminates stale-response backward
+jumps and reduces IPC pressure from 60 calls/sec to ~IPC-latency-bounded throughput.
+
+### PipeWire xrun cascade — two separate root causes
+
+#### Cause 1: 44100 Hz source files → wrong quantum
+
+When a 44100 Hz audio file is loaded, pipewiresink negotiates at 44100 Hz with PipeWire. PipeWire's
+graph runs at 48000 Hz (hardware DAC rate). The adapter assigns a non-power-of-two quantum to the
+stream (observed: 3969 at 44100 Hz, vs. 1024 at 48000 Hz). This mismatch produces scheduling
+irregularities and xruns visible in `pw-top`'s ERR column.
+
+**Fix**: added `capsfilter` between `audioresample` and `pitch` that constrains output to 48000 Hz.
+`audioresample` now always converts to 48000 Hz before downstream. The whole chain (pitch, volume,
+pipewiresink) runs at 48000 Hz, matching PipeWire's native graph rate and the `node.latency=1024/48000`
+quantum hint.
+
+Note: existing pipelines (decks loaded before a Rust rebuild) are not affected until the track is
+re-loaded, since each `load()` builds a fresh pipeline.
+
+#### Cause 2: `v.playbackRate` changes on every MIDI tempo event → WebKit pipeline rebuilds
+
+`syncVideoElements` set `v.playbackRate = deck.playbackRate` on every call. With MIDI tempo fader
+at 200+ events/sec (rAF-throttled to 60/sec), this fires up to 60 times/sec. WebKitGTK's comment
+in the code already noted it "may rebuild its internal GStreamer pipeline on rate changes". That
+rebuild is CPU-intensive and starves the audio streaming thread, producing PipeWire xruns that
+cascade: xruns → audio gaps → the "neat effect" artifact (rhythmic skips at 48kHz/1024 = ~47/sec
+cadence) → eventually pipeline ERROR state with 1300+ accumulated xruns.
+
+**Fix**: added `lastPlaybackRate: Map<string, number>`. `syncVideoElements` now only writes
+`v.playbackRate` when the value actually changes. MIDI tempo CC events no longer cause WebKit
+pipeline rebuilds.
+
+#### Cause 3: soundtouch variable output chunks vs. PipeWire 1024-sample quantum
+
+soundtouch's time-stretch algorithm produces output chunks whose size depends on the tempo ratio
+(e.g. at 1.5× it consumes ~1.5× input per output chunk, but the exact sizes vary). Without buffering,
+PipeWire's pull callback can fire before soundtouch has produced a full 1024-sample quantum → xrun.
+
+**Fix**: added a time-based `output_queue` (200ms, no count/byte limits) between `pitch` and `volume`.
+This absorbs size mismatches between soundtouch's output cadence and PipeWire's pull schedule.
+
+## Final pipeline topology
+
+```
+uridecodebin → queue(max-bufs=2) → audioconvert → audioresample
+  → capsfilter(rate=48000) → pitch(tempo) → output_queue(200ms) → volume → pipewiresink
+```
+
+---
+
 # 2026.05.05 — seek-based rate changes abandoned; switched to soundtouch pitch element
 
 ## The problem

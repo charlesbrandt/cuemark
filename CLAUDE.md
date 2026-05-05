@@ -9,7 +9,7 @@ Domain: cuemark.com (Charles Brandt's former DJ name)
 
 - **Tauri** (Rust backend + WebKit frontend) — cross-platform, Wayland-native on Linux via GTK4
 - **WebGL** — GPU-accelerated rendering, FBO-per-deck compositing
-- **GStreamer** (Rust, `gstreamer` + `gstreamer-audio` crates, `features = ["v1_18"]` required) — audio playback, gain/EQ, device routing, headphone cue mix, recording. Each deck has its own `DeckAudioPipeline` (uridecodebin → queue → audioconvert → audioresample → pitch → volume → pipewiresink/autoaudiosink). Audio is the master clock; video element syncs to it.
+- **GStreamer** (Rust, `gstreamer` + `gstreamer-audio` crates, `features = ["v1_18"]` required) — audio playback, gain/EQ, device routing, headphone cue mix, recording. Each deck has its own `DeckAudioPipeline` (uridecodebin → queue → audioconvert → audioresample → capsfilter(48kHz) → pitch → output_queue → volume → pipewiresink/autoaudiosink). Audio is the master clock; video element syncs to it.
 - **Web Audio API** — waveform peak extraction + FFT analysis for BPM detection and audio-reactive visuals (not used for playback)
 - **GLSL shaders** — effects and audio-reactive visualizations
 - **Rust `midir` crate** — MIDI input (Web MIDI API unreliable in WebKitGTK); events piped to frontend via Tauri IPC
@@ -22,9 +22,10 @@ Domain: cuemark.com (Charles Brandt's former DJ name)
 
 ```
 GStreamer (Rust, per deck):
-  uridecodebin → queue → audioconvert → audioresample → pitch → volume → pipewiresink / autoaudiosink
-                                                                              ↑               ↑
-                                                                device-specific sink    system default
+  uridecodebin → queue(2buf) → audioconvert → audioresample
+    → capsfilter(48kHz) → pitch(tempo) → output_queue(200ms) → volume → pipewiresink / autoaudiosink
+                                                                               ↑               ↑
+                                                                 device-specific sink    system default
 ```
 
 `AudioManager` (held in Tauri managed state as `Mutex<AudioManager>`) owns all `DeckAudioPipeline` instances.
@@ -34,8 +35,15 @@ Tauri commands (`audio_load`, `audio_play`, `audio_pause`, `audio_seek`, `audio_
 pipeline to the frontend. The frontend wrapper lives in `src/lib/audio/pipeline.ts`.
 
 **Audio is the master clock.** The `<video>` element is muted and used only for frame decode. In the RAF loop,
-`audioGetPosition(deckId)` polls the GStreamer position and snaps the video element's `currentTime` to it if
-drift exceeds 80 ms — keeping the video texture in sync with what the audience hears.
+`audioGetPosition(deckId)` polls the GStreamer position (one in-flight IPC per deck via `pendingPos` map) and
+snaps the video element's `currentTime` to it if drift exceeds 80 ms. The resolved position is also written to
+`setDeckAudioTime(deckId, pos)` in `seekBus.ts`, where the waveform reads it. This keeps the waveform playhead
+tracking the audio clock rather than `video.currentTime` (which drifts and snaps at non-1× tempos).
+
+**`v.playbackRate` must only be set when changed** — WebKitGTK rebuilds its internal GStreamer pipeline on
+each `v.playbackRate` write. At MIDI tempo rates (60/sec after rAF throttle) this causes CPU spikes that starve
+the audio thread → PipeWire xruns → cascade failure. `syncVideoElements` tracks `lastPlaybackRate` per deck and
+skips the write if the value is unchanged.
 
 **Device routing**: default output uses `autoaudiosink` (selects PipeWire/PulseAudio/ALSA automatically).
 A specific sink is targeted via `pipewiresink target-object=<node-name>`; falls back to `autoaudiosink` if
@@ -50,6 +58,11 @@ at end-of-stream. The bus thread is stopped via `bus.set_flushing(true)` before 
 **Rate changes**: `set_rate()` sets the `tempo` property on the `pitch` element (soundtouch, `gst-plugins-bad`).
 This adjusts playback speed without changing pitch, with no seek or pipeline flush — the change is applied
 to the ongoing audio stream in-place. The `tempo` property accepts 0.1–4.0 (1.0 = normal speed).
+
+**PipeWire quantum**: the `capsfilter(rate=48000)` ensures pipewiresink always negotiates at 48000 Hz,
+matching PipeWire's native graph rate. Without it, 44100 Hz source files produce a non-power-of-two quantum
+(e.g. 3969) in PipeWire → scheduling irregularities → xruns. The `output_queue(200ms)` after `pitch` absorbs
+soundtouch's variable output chunk sizes so pipewiresink's pull callback always finds buffered data.
 
 Earlier approaches using `FLUSH | ACCURATE` seeks, `INSTANT_RATE_CHANGE`, and `scaletempo` were all tried
 and abandoned — see `journal.md` for the full history. The core problem was that any seek-based approach
@@ -243,7 +256,7 @@ cuemark/
       renderer/
         fbo.ts                  # DeckFBO — allocates WebGL texture + framebuffer
         compositor.ts           # Compositor — syncDecks(), composite()
-        seekBus.ts              # Module-level video element registry; seekDeck() / getDeckTime()
+        seekBus.ts              # Module-level registry: video elements + audio clock cache; seekDeck() / getDeckTime() / setDeckAudioTime()
       audio/
         pipeline.ts             # Typed TS wrappers around all Rust audio Tauri commands (audioLoad, audioPlay, …)
         analyzer.ts             # AudioAnalyzer — Web Audio API FFT (waveform analysis only; not used for playback)

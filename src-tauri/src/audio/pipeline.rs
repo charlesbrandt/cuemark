@@ -160,28 +160,47 @@ impl DeckAudioPipeline {
         // queue decouples the uridecodebin decoder thread from audioconvert.
         // Without it, FLUSH seeks can hand audioconvert a buffer still referenced
         // by the decoder (ref_count > 1), triggering a gst_buffer_is_writable assertion crash.
-        let queue    = make_el("queue")?;
-        let convert  = make_el("audioconvert")?;
-        let resample = make_el("audioresample")?;
-        let pitch    = make_el("pitch")?;
-        let volume   = make_el("volume")?;
-        let sink     = make_sink(&self.device, &self.deck_id)?;
+        let queue      = make_el("queue")?;
+        let convert    = make_el("audioconvert")?;
+        let resample   = make_el("audioresample")?;
+        // capsfilter forces 48000 Hz downstream so pipewiresink always negotiates at the
+        // PipeWire graph's native rate. Without this, 44100 Hz source files cause PipeWire
+        // to assign a non-power-of-two quantum (e.g. 3969) to the stream, producing xruns.
+        let rate_caps    = make_el("capsfilter")?;
+        let pitch        = make_el("pitch")?;
+        // output_queue buffers pitch's variable-sized output chunks (soundtouch produces
+        // non-uniform sizes at non-1.0 tempos). Without this, the PipeWire pull callback
+        // can starve when soundtouch hasn't yet produced a full 1024-sample quantum.
+        let output_queue = make_el("queue")?;
+        let volume       = make_el("volume")?;
+        let sink         = make_sink(&self.device, &self.deck_id)?;
+
+        let caps_48k = gst::Caps::builder("audio/x-raw")
+            .field("rate", 48_000i32)
+            .build();
+        rate_caps.set_property("caps", &caps_48k);
 
         src.set_property("uri", file_to_uri(file_path));
         volume.set_property("volume", (self.gain * self.vol) as f64);
-        pitch.set_property("tempo", self.rate);
+        pitch.set_property("tempo", self.rate as f32);
         queue.set_property("max-size-buffers", 2u32);
         queue.set_property("max-size-bytes", 0u32);
         queue.set_property("max-size-time", 0u64);
+        // Time-based output queue: hold up to 200ms worth of post-pitch audio.
+        output_queue.set_property("max-size-buffers", 0u32);
+        output_queue.set_property("max-size-bytes", 0u32);
+        output_queue.set_property("max-size-time", 200_000_000u64); // 200ms in nanoseconds
 
         pipeline
-            .add_many([&src, &queue, &convert, &resample, &pitch, &volume, &sink])
+            .add_many([&src, &queue, &convert, &resample, &rate_caps, &pitch, &output_queue, &volume, &sink])
             .map_err(|e| format!("[{}] pipeline add_many: {e}", self.deck_id))?;
 
         queue.link(&convert).map_err(|e| format!("queue→audioconvert: {e}"))?;
         convert.link(&resample).map_err(|e| format!("audioconvert→audioresample: {e}"))?;
-        resample.link(&pitch).map_err(|e| format!("audioresample→pitch: {e}"))?;
-        pitch.link(&volume).map_err(|e| format!("pitch→volume: {e}"))?;
+        resample.link(&rate_caps).map_err(|e| format!("audioresample→capsfilter: {e}"))?;
+        rate_caps.link(&pitch).map_err(|e| format!("capsfilter→pitch: {e}"))?;
+        pitch.link(&output_queue).map_err(|e| format!("pitch→output_queue: {e}"))?;
+        output_queue.link(&volume).map_err(|e| format!("output_queue→volume: {e}"))?;
         volume.link(&sink).map_err(|e| format!("volume→sink: {e}"))?;
 
         let queue_weak = queue.downgrade();
@@ -351,7 +370,7 @@ impl DeckAudioPipeline {
     pub fn set_rate(&mut self, rate: f64) -> Result<(), String> {
         self.rate = rate.clamp(0.1, 4.0);
         if let Some(inner) = &self.inner {
-            inner.pitch_el.set_property("tempo", self.rate);
+            inner.pitch_el.set_property("tempo", self.rate as f32);
         }
         Ok(())
     }
