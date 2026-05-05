@@ -13,6 +13,7 @@
     audioSetCueDevice, audioSetCueGain,
   } from "./lib/audio/pipeline";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
+  import { listen } from "@tauri-apps/api/event";
   import { registerVideoEl, unregisterVideoEl, setDeckAudioTime } from "./lib/renderer/seekBus";
   import { postFrame } from "./lib/renderer/outputBus";
   import DeckCard from "./components/DeckCard.svelte";
@@ -29,6 +30,7 @@
 
   let midiUnlisten: (() => void) | undefined;
   let dragDropUnlisten: (() => void) | undefined;
+  let eosUnlisten: (() => void) | undefined;
   let tapTimestamps: number[] = [];
   let tapResetTimer: ReturnType<typeof setTimeout> | undefined;
   let showAudioSettings = $state(false);
@@ -83,6 +85,11 @@
     compositor = new Compositor(canvas);
     rafId = requestAnimationFrame(frame);
 
+    // When a deck reaches EOS, mark it stopped so syncVideoElements doesn't auto-restart it.
+    eosUnlisten = await listen<string>('deck-eos', (event) => {
+      updateDeck(event.payload, { playing: false });
+    });
+
     // Tauri intercepts OS file-drop before it reaches the DOM, so DataTransfer is
     // empty in the HTML5 drop event. Use the Tauri webview API for actual paths.
     dragDropUnlisten = await getCurrentWebview().onDragDropEvent((event) => {
@@ -103,6 +110,7 @@
   onDestroy(() => {
     midiUnlisten?.();
     dragDropUnlisten?.();
+    eosUnlisten?.();
     cancelAnimationFrame(rafId);
     for (const [id, v] of videoEls) {
       v.pause();

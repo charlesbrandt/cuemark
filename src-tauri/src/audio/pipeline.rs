@@ -14,6 +14,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+type EosCallback = Arc<dyn Fn() + Send + Sync>;
+
 use gstreamer::{self as gst, glib, prelude::*};
 
 fn make_el(factory: &str) -> Result<gst::Element, String> {
@@ -130,6 +132,8 @@ pub struct DeckAudioPipeline {
     rate: f64,
     /// True when the user has pressed play (intent). Retained across device rebuilds.
     playing: bool,
+    /// Called by the bus thread when EOS fires. Used to notify the frontend.
+    eos_callback: Option<EosCallback>,
 }
 
 impl DeckAudioPipeline {
@@ -143,7 +147,12 @@ impl DeckAudioPipeline {
             vol: 1.0,
             rate: 1.0,
             playing: false,
+            eos_callback: None,
         }
+    }
+
+    pub fn set_eos_callback(&mut self, f: impl Fn() + Send + Sync + 'static) {
+        self.eos_callback = Some(Arc::new(f));
     }
 
     pub fn load(&mut self, file_path: &str) -> Result<(), String> {
@@ -234,6 +243,7 @@ impl DeckAudioPipeline {
         let at_error_thread = at_error.clone();
         let bus_thread = bus.clone();
         let deck_id_log = self.deck_id.clone();
+        let eos_cb = self.eos_callback.clone();
 
         std::thread::spawn(move || {
             for msg in bus_thread.iter_timed(None) {
@@ -241,6 +251,7 @@ impl DeckAudioPipeline {
                     gst::MessageView::Eos(_) => {
                         eprintln!("[bus/{}] EOS", deck_id_log);
                         at_eos_thread.store(true, Ordering::Relaxed);
+                        if let Some(cb) = &eos_cb { cb(); }
                     }
                     gst::MessageView::Error(e) => {
                         eprintln!("[bus/{}] ERROR: {} (debug: {:?})", deck_id_log, e.error(), e.debug());
@@ -358,6 +369,8 @@ impl DeckAudioPipeline {
 
     pub fn seek(&self, secs: f64) -> Result<(), String> {
         let inner = self.inner.as_ref().ok_or_else(|| "no pipeline loaded".to_string())?;
+        // An explicit seek means the user chose a new position — don't restart from 0 on next play().
+        inner.at_eos.store(false, Ordering::Relaxed);
         let pos = gst::ClockTime::from_nseconds((secs * 1_000_000_000.0) as u64);
         inner
             .pipeline

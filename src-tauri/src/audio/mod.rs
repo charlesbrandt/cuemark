@@ -7,7 +7,7 @@ pub mod record;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use tauri::State;
+use tauri::{Emitter, State};
 
 use self::devices::AudioDevice;
 use self::mixer::MasterMix;
@@ -52,7 +52,7 @@ pub fn list_audio_devices(_state: State<'_, AudioState>) -> Vec<AudioDevice> {
 }
 
 #[tauri::command]
-pub fn audio_load(state: State<'_, AudioState>, deck_id: String, file_path: String) -> Result<(), String> {
+pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, deck_id: String, file_path: String) -> Result<(), String> {
     let mut mgr = state.lock().unwrap();
     let main_device = mgr.main_device.clone();
     let pipeline = mgr
@@ -61,6 +61,11 @@ pub fn audio_load(state: State<'_, AudioState>, deck_id: String, file_path: Stri
         .or_insert_with(|| {
             let mut p = DeckAudioPipeline::new(&deck_id);
             p.device = main_device;
+            let app_clone = app.clone();
+            let did = deck_id.clone();
+            p.set_eos_callback(move || {
+                let _ = app_clone.emit("deck-eos", did.clone());
+            });
             p
         });
     pipeline.load(&file_path)
