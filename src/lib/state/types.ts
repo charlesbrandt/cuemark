@@ -20,8 +20,9 @@ export interface Deck {
   loop: boolean;
   cuePoint: number;       // seconds
   hotCues: number[];      // up to 4 time markers
-  bpm: number | null;     // detected or tapped BPM for this deck
-  loopIn: number | null;  // loop region start (seconds); null = use track start
+  bpm: number | null;      // detected or tapped BPM for this deck
+  downbeat: number | null; // absolute playback position (seconds) of beat 1; null = unset
+  loopIn: number | null;   // loop region start (seconds); null = use track start
   loopOut: number | null; // loop region end (seconds); null = use track end
   eq: DeckEQ;
   cueEnabled: boolean;    // route pre-fader signal to headphone cue context

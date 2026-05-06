@@ -26,6 +26,7 @@ pub enum MidiAction {
     LoopToggle { deck_id: String },
     SyncToggle { deck_id: String },
     HeadphoneCue { deck_id: String },
+    PhaseNudge { deck_id: String },
 }
 
 /// What a specific MIDI control does. Stored in the mapping table so the
@@ -49,6 +50,9 @@ pub enum ControlBinding {
     LoopToggle { deck_id: String },
     SyncToggle { deck_id: String },
     HeadphoneCue { deck_id: String },
+    // Nudge deck phase toward the reference deck's phase. No free button on the
+    // Starlight — assign via MIDI learn (Phase 2) or add to a custom map.
+    PhaseNudge { deck_id: String },
     /// Relative jog wheel (7-bit two's complement: 1–63 = CW, 64–127 = CCW)
     JogWheel { deck_id: String },
 }
@@ -195,6 +199,9 @@ fn resolve_action(binding: &ControlBinding, data2: u8) -> Option<MidiAction> {
         }
         ControlBinding::HeadphoneCue { deck_id } => {
             (data2 > 0).then_some(MidiAction::HeadphoneCue { deck_id: deck_id.clone() })
+        }
+        ControlBinding::PhaseNudge { deck_id } => {
+            (data2 > 0).then_some(MidiAction::PhaseNudge { deck_id: deck_id.clone() })
         }
         ControlBinding::JogWheel { deck_id } => {
             // 7-bit two's complement: values 1–63 = CW (+), 64–127 = CCW (−).

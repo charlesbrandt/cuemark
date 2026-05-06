@@ -1,10 +1,37 @@
 # todo
 
-What about   Phase nudge (brief rate spike for beat phase alignment) is the
-  one todo
-    sub-item deferred — it needs beat phase tracking, which is a non-trivial
-    addition.
-  What is involved with beat phase tracking?
+## Beat phase tracking + phase nudge
+
+### Step 1 — Downbeat anchor in the data model [done]
+- Add `downbeat: number | null` to `Deck` in `src/lib/state/types.ts`
+- Initialize to `null` in `addDeck()` in `session.ts`
+- Add a "SET BEAT" button to `DeckCard.svelte` transport row: on click, stamps
+  `getDeckTime(deckId)` into `deck.downbeat` via `updateDeck()`
+- Display a small indicator (e.g. "♩ 0.0s") showing the stamped downbeat time when set;
+  right-click or ✕ clears it
+
+### Step 2 — Phase computation [done]
+- Add `getPhase(deckId: string): number | null` to `seekBus.ts`:
+  - Reads `getDeckTime(deckId)` + `deck.downbeat` + `deck.bpm` from session store
+  - Returns `null` if any are null
+  - Returns `((currentTime - downbeat) / beatPeriod) % 1.0`, clamped to [0, 1)
+- Add a phase readout to `DeckCard.svelte` (small arc or numeric 0.00–1.00) so the user
+  can see phase live and verify the downbeat is set correctly
+
+### Step 3 — Phase nudge action [done]
+- Add `nudgePhaseToMaster(deckId: string)` in a new `src/lib/audio/phaseNudge.ts`:
+  - Reads `getPhase(deckId)` and `getPhase(masterDeckId)` (master = whichever deck is
+    set as the reference, or the session master BPM anchor)
+  - Computes `phaseDelta` (shortest arc, −0.5 to +0.5)
+  - If `|phaseDelta| < 0.02` (within ~1% of a beat), no-op
+  - Otherwise: apply `rate × 1.15` (advance) or `rate × 0.85` (retard) for
+    `|phaseDelta| × beatPeriod` seconds, then restore original rate
+  - Revert is scheduled in the RAF loop (track `nudgeEndTime`), not setTimeout —
+    setTimeout jitter at ~16ms is too coarse relative to a 500ms beat
+- Wire to MIDI: map an unmapped button (e.g. `(0x91/92, 5)` Vinyl/Scratch if Sync is
+  not in use, or a new binding) → `PhaseNudge` action in `midi.rs` + `handler.ts`
+- Wire to UI: a "NUDGE" button per deck in `DeckCard.svelte`, disabled when
+  `downbeat` or `bpm` is null
 
 ---
 

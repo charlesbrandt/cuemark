@@ -1,6 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { updateDeck, getDeck, setCrossfader, setMasterVolume, session } from "../state/session";
 import { seekDeck, getDeckTime } from "../renderer/seekBus";
+import { nudgePhaseToMaster } from "../audio/phaseNudge";
 import { get } from "svelte/store";
 
 // Must match the Rust MidiAction enum (snake_case tag + camelCase fields from serde)
@@ -19,7 +20,8 @@ export interface MidiAction {
     | "hot_cue_set"
     | "loop_toggle"
     | "sync_toggle"
-    | "headphone_cue";
+    | "headphone_cue"
+    | "phase_nudge";
   deck_id?: string;
   value?: number;
   index?: number;
@@ -126,6 +128,11 @@ export async function startMidiListener(): Promise<() => void> {
         if (!a.deck_id) break;
         const d = getDeck(a.deck_id);
         if (d) updateDeck(d.id, { cueEnabled: !d.cueEnabled });
+        break;
+      }
+      case "phase_nudge": {
+        if (!a.deck_id) break;
+        nudgePhaseToMaster(a.deck_id);
         break;
       }
     }

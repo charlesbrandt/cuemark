@@ -1,7 +1,8 @@
 <script lang="ts">
   import { open } from "@tauri-apps/plugin-dialog";
   import { session, updateDeck, removeDeck, setMasterBpm } from "../lib/state/session";
-  import { seekDeck, getDeckTime, getVideoEl } from "../lib/renderer/seekBus";
+  import { seekDeck, getDeckTime, getPhase, getVideoEl } from "../lib/renderer/seekBus";
+  import { nudgePhaseToMaster } from "../lib/audio/phaseNudge";
   import type { Deck } from "../lib/state/types";
 
   let { deck }: { deck: Deck } = $props();
@@ -10,6 +11,7 @@
   let previewCanvas = $state<HTMLCanvasElement | null>(null);
   let currentTime = $state(0);
   let videoDuration = $state(0);
+  let phase = $state<number | null>(null);
 
   $effect(() => {
     if (!previewCanvas || deck.source?.type !== "video") return;
@@ -41,6 +43,7 @@
         currentTime = video.currentTime;
         if (video.duration && isFinite(video.duration)) videoDuration = video.duration;
       }
+      phase = getPhase(deck.id);
       rafId = requestAnimationFrame(draw);
     }
     rafId = requestAnimationFrame(draw);
@@ -211,6 +214,37 @@
     >
       Sync
     </button>
+    <button
+      class="bpm-btn"
+      onclick={() => { const t = getDeckTime(deck.id); if (t !== null) updateDeck(deck.id, { downbeat: t }); }}
+      disabled={!deck.source}
+      title="Stamp current position as beat 1 (downbeat anchor for phase tracking)"
+    >
+      SET BEAT
+    </button>
+    <button
+      class="bpm-btn"
+      onclick={() => nudgePhaseToMaster(deck.id)}
+      disabled={!deck.playing || deck.downbeat === null || deck.bpm === null}
+      title="Nudge phase toward reference deck (±15% rate spike, auto-reverts)"
+    >
+      NUDGE
+    </button>
+    {#if deck.downbeat !== null}
+      <span class="downbeat-indicator" title="Downbeat anchor: {formatDuration(deck.downbeat)}">
+        ♩{formatDuration(deck.downbeat)}
+      </span>
+      <button
+        class="downbeat-clear"
+        onclick={() => updateDeck(deck.id, { downbeat: null })}
+        title="Clear downbeat"
+      >✕</button>
+    {/if}
+    {#if phase !== null}
+      <span class="phase-display" title="Beat phase (0.0 = on beat, 0.5 = halfway between beats)">
+        φ{phase.toFixed(2)}
+      </span>
+    {/if}
   </div>
 
   <div class="loop-row">
@@ -432,6 +466,37 @@
   .bpm-btn.active {
     border-color: #f5a623;
     color: #f5a623;
+  }
+
+  .downbeat-indicator {
+    font-size: 10px;
+    color: #7ec8e3;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .downbeat-clear {
+    padding: 1px 4px;
+    font-size: 9px;
+    background: none;
+    border: 1px solid #444;
+    border-radius: 3px;
+    color: #666;
+    cursor: pointer;
+    line-height: 1;
+  }
+
+  .downbeat-clear:hover {
+    border-color: #888;
+    color: #ccc;
+  }
+
+  .phase-display {
+    font-size: 10px;
+    color: #a8e6a3;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    min-width: 36px;
   }
 
   .loop-row {

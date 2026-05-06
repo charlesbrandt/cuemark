@@ -14,6 +14,7 @@ function makeDeck(index: number): Deck {
     cuePoint: 0,
     hotCues: [],
     bpm: null,
+    downbeat: null,
     loopIn: null,
     loopOut: null,
     eq: { low: 0, mid: 0, high: 0 },
