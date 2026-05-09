@@ -205,11 +205,12 @@
       onclick={() => {
         if (deck.bpm !== null && masterBpm !== null) {
           updateDeck(deck.id, { playbackRate: masterBpm / deck.bpm });
+          nudgePhaseToMaster(deck.id);
         }
       }}
       disabled={deck.bpm === null || masterBpm === null}
       title={masterBpm !== null && deck.bpm !== null
-        ? `Sync to master: set rate to ${(masterBpm / deck.bpm).toFixed(3)}×`
+        ? `Sync to master: set rate to ${(masterBpm / deck.bpm).toFixed(3)}× and align beat phase`
         : 'Sync requires both deck BPM and master BPM'}
     >
       Sync
@@ -225,8 +226,10 @@
     <button
       class="bpm-btn"
       onclick={() => nudgePhaseToMaster(deck.id)}
-      disabled={!deck.playing || deck.downbeat === null || deck.bpm === null}
-      title="Nudge phase toward reference deck (±15% rate spike, auto-reverts)"
+      disabled={deck.downbeat === null || deck.bpm === null}
+      title={deck.playing
+        ? 'Nudge phase toward reference deck (±15% rate spike, auto-reverts)'
+        : 'Seek to in-phase position relative to reference deck'}
     >
       NUDGE
     </button>

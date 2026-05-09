@@ -1,6 +1,6 @@
 import { get } from 'svelte/store';
 import { session, updateDeck, getDeck } from '../state/session';
-import { getPhase } from '../renderer/seekBus';
+import { getPhase, getDeckTime, seekDeck } from '../renderer/seekBus';
 import { audioSetRate } from './pipeline';
 
 const NUDGE_MAGNITUDE = 0.15; // ±15% rate change while nudge is active
@@ -53,12 +53,17 @@ function findReferenceDeck(deckId: string) {
 }
 
 // Nudge deckId's phase toward the reference deck's phase.
-// Applies a ±15% rate spike for exactly as long as needed to close the gap,
-// then reverts via RAF (not setTimeout — too coarse at ~16ms jitter).
+//
+// While PLAYING: applies a ±15% rate spike for exactly as long as needed to close
+// the gap, then reverts via RAF (not setTimeout — too coarse at ~16ms jitter).
+//
+// While PAUSED: does an immediate seek to the nearest in-phase position. This lets
+// the user pre-align decks before pressing play.
+//
 // No-op if gap < 2% of a beat, or if downbeat/bpm/position are unavailable.
 export function nudgePhaseToMaster(deckId: string): void {
   const deck = getDeck(deckId);
-  if (!deck || !deck.playing || deck.bpm === null || deck.downbeat === null) return;
+  if (!deck || deck.bpm === null || deck.downbeat === null) return;
 
   const ref = findReferenceDeck(deckId);
   if (!ref) return;
@@ -68,8 +73,8 @@ export function nudgePhaseToMaster(deckId: string): void {
   if (deckPhase === null || refPhase === null) return;
 
   // Shortest-arc delta in [-0.5, 0.5].
-  // Positive = deck is behind reference → speed up.
-  // Negative = deck is ahead of reference → slow down.
+  // Positive = deck is behind reference → advance forward.
+  // Negative = deck is ahead of reference → seek back.
   let delta = refPhase - deckPhase;
   if (delta >  0.5) delta -= 1.0;
   if (delta < -0.5) delta += 1.0;
@@ -77,6 +82,17 @@ export function nudgePhaseToMaster(deckId: string): void {
   if (Math.abs(delta) < 0.02) return;
 
   const beatPeriod = 60 / deck.bpm;
+
+  if (!deck.playing) {
+    // Paused: seek to the correct in-phase position immediately.
+    const currentTime = getDeckTime(deckId);
+    if (currentTime === null) return;
+    const targetTime = Math.max(0, currentTime + delta * beatPeriod);
+    seekDeck(deckId, targetTime);
+    return;
+  }
+
+  // Playing: rate-spike approach so audio stays gapless.
   const gapSeconds = Math.abs(delta) * beatPeriod;
 
   const nudgeRate = delta > 0

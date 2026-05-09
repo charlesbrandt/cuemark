@@ -56,6 +56,12 @@
   // Last playbackRate applied to each video element. Setting v.playbackRate triggers
   // WebKitGTK to rebuild its internal GStreamer pipeline; only update on actual change.
   const lastPlaybackRate = new Map<string, number>();
+  // Last deck.playing value sent to the Rust audio pipeline. Tracked independently of
+  // v.paused because WebKitGTK temporarily pauses the video element during its internal
+  // pipeline rebuild (triggered by any v.playbackRate write). Without this, a play→pause
+  // toggle arriving in that window finds v.paused=true, matches neither branch, and
+  // audioPause is never called — leaving GStreamer playing with the deck appearing frozen.
+  const lastAudioPlaying = new Map<string, boolean>();
 
   // Sync master volume to Rust audio pipeline
   $effect(() => {
@@ -153,6 +159,7 @@
         audioUnload(id).catch(console.error);
         playPromises.delete(id);
         lastPlaybackRate.delete(id);
+        lastAudioPlaying.delete(id);
       }
     }
 
@@ -202,6 +209,8 @@
         v.src = src;
         v.load();
         audioLoad(deck.id, filePath).catch(console.error);
+        // Reset audio state tracker so the next sync re-applies play/pause to the new pipeline.
+        lastAudioPlaying.delete(deck.id);
         // Report state after a short delay so we can see if the network request started
         setTimeout(() => {
           console.log(`[${deck.id}] state@500ms: readyState=${v!.readyState} networkState=${v!.networkState} error=${v!.error?.code ?? 'none'} src=${v!.src}`);
@@ -245,16 +254,30 @@
       }
       audioSetRate(deck.id, deck.playbackRate).catch(console.error);
 
+      // Video element: sync play/pause based on element state.
       if (deck.playing && v.paused && !playPromises.has(deck.id)) {
         const p = v.play().catch((e) => {
           if (e.name !== 'AbortError') console.error(e);
         }).finally(() => playPromises.delete(deck.id)) as Promise<void>;
         playPromises.set(deck.id, p);
-        audioPlay(deck.id).catch(console.error);
       } else if (!deck.playing && !v.paused) {
         playPromises.delete(deck.id); // pending play() will abort; that's intentional
         v.pause();
-        audioPause(deck.id).catch(console.error);
+      }
+
+      // Audio pipeline: driven by deck.playing intent, independent of video element state.
+      // WebKitGTK temporarily pauses the video element on any v.playbackRate write (it rebuilds
+      // its internal pipeline). A play→pause toggle arriving in that window finds v.paused=true,
+      // making both branches above no-ops. Tracking audio state separately ensures audioPause
+      // always fires when deck.playing flips to false, regardless of the video element state.
+      const wasAudioPlaying = lastAudioPlaying.get(deck.id);
+      if (deck.playing !== wasAudioPlaying) {
+        lastAudioPlaying.set(deck.id, deck.playing);
+        if (deck.playing) {
+          audioPlay(deck.id).catch(console.error);
+        } else {
+          audioPause(deck.id).catch(console.error);
+        }
       }
     }
   }

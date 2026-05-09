@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { updateDeck, getDeck, setCrossfader, setMasterVolume, session } from "../state/session";
-import { seekDeck, getDeckTime } from "../renderer/seekBus";
+import { seekDeck, getDeckTime, getPhase } from "../renderer/seekBus";
 import { nudgePhaseToMaster } from "../audio/phaseNudge";
 import { get } from "svelte/store";
 
@@ -117,10 +117,34 @@ export async function startMidiListener(): Promise<() => void> {
       case "sync_toggle": {
         if (!a.deck_id) break;
         const d = getDeck(a.deck_id);
-        const masterBpm = get(session).bpm;
-        if (d && d.bpm !== null && masterBpm !== null) {
-          // masterBpm / deck.bpm: if deck is slower, rate > 1 to speed up to match master
-          updateDeck(d.id, { playbackRate: masterBpm / d.bpm });
+        const s = get(session);
+        const masterBpm = s.bpm;
+        if (!d || d.bpm === null || masterBpm === null) {
+          console.warn(`[sync_toggle] no-op — masterBpm=${masterBpm}, deck.bpm=${d?.bpm ?? 'no deck'}`);
+          break;
+        }
+        updateDeck(d.id, { playbackRate: masterBpm / d.bpm });
+
+        // If both this deck and a reference deck have downbeats set, also seek to align
+        // beat phase. Works while paused so decks can be pre-aligned before pressing play.
+        if (d.downbeat !== null) {
+          const ref = s.decks.find(r => r.id !== d.id && r.bpm !== null && r.downbeat !== null);
+          if (ref) {
+            const deckPhase = getPhase(d.id);
+            const refPhase  = getPhase(ref.id);
+            if (deckPhase !== null && refPhase !== null) {
+              let delta = refPhase - deckPhase;
+              if (delta >  0.5) delta -= 1.0;
+              if (delta < -0.5) delta += 1.0;
+              if (Math.abs(delta) >= 0.02) {
+                const beatPeriod = 60 / d.bpm;
+                const currentTime = getDeckTime(d.id);
+                if (currentTime !== null) {
+                  seekDeck(d.id, Math.max(0, currentTime + delta * beatPeriod));
+                }
+              }
+            }
+          }
         }
         break;
       }
