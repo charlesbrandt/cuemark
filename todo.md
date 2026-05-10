@@ -49,6 +49,11 @@
 - "Audio" toolbar button toggles settings bar; graceful fallback if setSinkId unsupported
 - `src/lib/audio/audioSettings.ts`: module-level stores for device IDs and cue gain
 
+### crossfader curve selection [done]
+- Three curves per target (visual / audio independently): linear, equal-power (cos/sin), cut
+- Equal-power default for audio so volume stays constant across sweep; linear default for visual
+- Gain clamp extended to 4.0 (~+12 dB) for quiet track boosting
+
 ### headphone cue / pre-listen [done]
 - Second `AudioContext` (cue ctx) on headphone device via `setSinkId()`
 - Bridge: `highShelf → MediaStreamDest` (main ctx) → `MediaStreamSource` (cue ctx)
@@ -61,11 +66,11 @@
 
 ## Batch D — Shader visuals (Phase 2)
 
-### shader deck source
-- `DeckSource` type already has `{ type: 'shader'; fragmentSrc: string; uniforms: ... }`
-- UI in DeckCard: "Load Shader" button (opens built-in picker or text editor)
-- `FBO.renderShader(src, uniforms)`: compile + link fragment shader, draw fullscreen quad
-- Uniforms: `u_time`, `u_resolution`, `u_bass`, `u_mid`, `u_high`
+### shader deck source [done]
+- `DeckSource` type has `{ type: 'shader'; fragmentSrc: string; uniforms: ... }`
+- DeckCard: Plasma and Tunnel buttons alongside Load Video; active shader highlighted in preview
+- `Compositor.renderShader()`: compiles + caches GLSL program per deck, renders fullscreen quad into FBO each RAF frame
+- Uniforms: `u_time`, `u_resolution`, `u_bass`, `u_mid`, `u_high`; `a_pos` bound at location 0 so all programs share the same quadVAO
 
 ### audio-reactive shader uniforms [done]
 - GStreamer `spectrum` element (32 bands, ~30 fps) inserted after `pitch` in each deck pipeline
@@ -78,12 +83,12 @@
   connected — kept as dead code for now; GStreamer path is authoritative
 - Band weights / sensitivity tuning deferred — current linear dBFS mapping is functional
 
-### built-in shader library
-- Plasma / color wash
-- Tunnel / radial zoom
-- Particle field
-- Feedback / echo trail
-- VU bar / waveform scope
+### built-in shader library [done]
+- Plasma / color wash [done]
+- Tunnel / radial zoom [done]
+- Particle field [done] — 80 star-like glows, hue-shifted by seed, speed/size driven by bass+high
+- Feedback / echo trail [done] — 10 zoom+rotate layers with exponential decay; no ping-pong buffers needed
+- VU bar / waveform scope [done] — 24-band spectrum bars (bottom 55%, green→yellow→red) + oscilloscope trace (top 45%)
 
 ### shader overlays on video
 - Per-deck effect chain: array of shader passes applied after video texture upload
