@@ -286,23 +286,27 @@
   function frame() {
     if (compositor) {
       const { decks } = get(session);
+      const timeSecs = performance.now() / 1000;
       for (const deck of decks) {
-        if (deck.source?.type !== "video") continue;
-        const v = videoEls.get(deck.id);
-        const fbo = compositor.getFBO(deck.id);
-        if (v && fbo) fbo.uploadVideoFrame(v);
-        // Audio is the master clock. One in-flight IPC per deck prevents stale
-        // out-of-order responses from snapping currentTime backward mid-rate-change.
-        if (deck.playing && v && !pendingPos.get(deck.id)) {
-          pendingPos.set(deck.id, true);
-          audioGetPosition(deck.id).then((audioPos) => {
-            pendingPos.delete(deck.id);
-            if (audioPos === null || !v) return;
-            setDeckAudioTime(deck.id, audioPos); // feeds waveform playhead
-            if (Math.abs(v.currentTime - audioPos) > 0.08) {
-              v.currentTime = audioPos; // snap video to audio clock
-            }
-          }).catch(() => { pendingPos.delete(deck.id); });
+        if (deck.source?.type === 'shader') {
+          compositor.renderShader(deck.id, deck.source.fragmentSrc, deck.source.uniforms, timeSecs);
+        } else if (deck.source?.type === 'video') {
+          const v = videoEls.get(deck.id);
+          const fbo = compositor.getFBO(deck.id);
+          if (v && fbo) fbo.uploadVideoFrame(v);
+          // Audio is the master clock. One in-flight IPC per deck prevents stale
+          // out-of-order responses from snapping currentTime backward mid-rate-change.
+          if (deck.playing && v && !pendingPos.get(deck.id)) {
+            pendingPos.set(deck.id, true);
+            audioGetPosition(deck.id).then((audioPos) => {
+              pendingPos.delete(deck.id);
+              if (audioPos === null || !v) return;
+              setDeckAudioTime(deck.id, audioPos); // feeds waveform playhead
+              if (Math.abs(v.currentTime - audioPos) > 0.08) {
+                v.currentTime = audioPos; // snap video to audio clock
+              }
+            }).catch(() => { pendingPos.delete(deck.id); });
+          }
         }
       }
       compositor.composite(decks);

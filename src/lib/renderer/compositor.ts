@@ -36,6 +36,8 @@ function linkProgram(gl: WebGL2RenderingContext, vert: string, frag: string): We
   const p = gl.createProgram()!;
   gl.attachShader(p, compileShader(gl, gl.VERTEX_SHADER, vert));
   gl.attachShader(p, compileShader(gl, gl.FRAGMENT_SHADER, frag));
+  // Force a_pos to location 0 so all programs share the same quadVAO binding.
+  gl.bindAttribLocation(p, 0, 'a_pos');
   gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS))
     throw new Error(gl.getProgramInfoLog(p) ?? "program link error");
@@ -48,6 +50,9 @@ export class Compositor {
   private quadVAO: WebGLVertexArrayObject;
   // One FBO per deck; keyed by deck id. Created/destroyed as decks are added/removed.
   private fbos = new Map<string, DeckFBO>();
+  // Compiled shader programs for shader-source decks. Cached by deck id; recompiled when
+  // fragmentSrc changes. program=null means compilation failed — skip rendering.
+  private shaderPrograms = new Map<string, { program: WebGLProgram | null; src: string }>();
 
   readonly width: number;
   readonly height: number;
@@ -63,15 +68,15 @@ export class Compositor {
   }
 
   private buildQuad(): WebGLVertexArrayObject {
-    const { gl, blitProgram } = this;
+    const { gl } = this;
     const vao = gl.createVertexArray()!;
     const vbo = gl.createBuffer()!;
     gl.bindVertexArray(vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
     gl.bufferData(gl.ARRAY_BUFFER, QUAD_VERTS, gl.STATIC_DRAW);
-    const loc = gl.getAttribLocation(blitProgram, "a_pos");
-    gl.enableVertexAttribArray(loc);
-    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    // a_pos is bound to location 0 in linkProgram — use 0 directly so all programs share this VAO.
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     gl.bindVertexArray(null);
     return vao;
   }
@@ -83,6 +88,9 @@ export class Compositor {
       if (!deckIds.includes(id)) {
         this.fbos.get(id)!.destroy();
         this.fbos.delete(id);
+        const cached = this.shaderPrograms.get(id);
+        if (cached?.program) this.gl.deleteProgram(cached.program);
+        this.shaderPrograms.delete(id);
       }
     }
     for (const id of deckIds) {
@@ -94,6 +102,57 @@ export class Compositor {
 
   getFBO(deckId: string): DeckFBO | undefined {
     return this.fbos.get(deckId);
+  }
+
+  // Render a GLSL shader into the deck's FBO. Compiles and caches the program on first call
+  // or when fragmentSrc changes. u_bass/u_mid/u_high are placeholders (0) until audio-reactive
+  // uniforms are wired; custom uniforms from deck.source.uniforms are set as float uniforms.
+  renderShader(
+    deckId: string,
+    fragmentSrc: string,
+    customUniforms: Record<string, number>,
+    time: number,
+  ) {
+    const { gl, quadVAO } = this;
+
+    let cached = this.shaderPrograms.get(deckId);
+    if (!cached || cached.src !== fragmentSrc) {
+      if (cached?.program) gl.deleteProgram(cached.program);
+      let program: WebGLProgram | null = null;
+      try {
+        program = linkProgram(gl, VERT_SRC, fragmentSrc);
+      } catch (e) {
+        console.error(`[shader ${deckId}] compile error:`, e);
+      }
+      cached = { program, src: fragmentSrc };
+      this.shaderPrograms.set(deckId, cached);
+    }
+    if (!cached.program) return;
+
+    const fbo = this.fbos.get(deckId);
+    if (!fbo) return;
+
+    fbo.bind();
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    gl.useProgram(cached.program);
+    gl.bindVertexArray(quadVAO);
+
+    const p = cached.program;
+    gl.uniform1f(gl.getUniformLocation(p, 'u_time'), time);
+    gl.uniform2f(gl.getUniformLocation(p, 'u_resolution'), fbo.width, fbo.height);
+    gl.uniform1f(gl.getUniformLocation(p, 'u_bass'), 0);
+    gl.uniform1f(gl.getUniformLocation(p, 'u_mid'), 0);
+    gl.uniform1f(gl.getUniformLocation(p, 'u_high'), 0);
+    for (const [name, value] of Object.entries(customUniforms)) {
+      const loc = gl.getUniformLocation(p, name);
+      if (loc !== null) gl.uniform1f(loc, value);
+    }
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.bindVertexArray(null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
   // Alpha-composite all deck FBOs back-to-front onto the output canvas.

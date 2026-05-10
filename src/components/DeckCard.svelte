@@ -3,6 +3,7 @@
   import { session, updateDeck, removeDeck, setMasterBpm } from "../lib/state/session";
   import { seekDeck, getDeckTime, getPhase, getVideoEl } from "../lib/renderer/seekBus";
   import { nudgePhaseToMaster } from "../lib/audio/phaseNudge";
+  import { BUILT_IN_SHADERS } from "../lib/renderer/shaders";
   import type { Deck } from "../lib/state/types";
 
   let { deck }: { deck: Deck } = $props();
@@ -131,11 +132,20 @@
         <span class="duration">{formatDuration(deck.source.duration)}</span>
       </span>
     {:else if deck.source?.type === "shader"}
-      <div class="preview-placeholder">✦ shader</div>
+      <div class="preview-placeholder shader-name">✦ {deck.source.name ?? 'Shader'}</div>
     {:else}
       <div class="preview-placeholder empty">— no source —</div>
     {/if}
-    <button class="load-btn" onclick={loadVideo}>Load Video</button>
+    <div class="source-btns">
+      <button class="load-btn" onclick={loadVideo}>Video</button>
+      {#each BUILT_IN_SHADERS as shader}
+        <button
+          class="load-btn"
+          class:shader-active={deck.source?.type === 'shader' && deck.source.name === shader.name}
+          onclick={() => updateDeck(deck.id, { source: { type: 'shader', fragmentSrc: shader.src, uniforms: {}, name: shader.name } })}
+        >{shader.name}</button>
+      {/each}
+    </div>
   </div>
 
   <div class="transport">
@@ -404,6 +414,23 @@
 </div>
 
 <style>
+  .source-btns {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .shader-name {
+    color: #7ec8e3;
+    font-size: 14px;
+  }
+
+  :global(.load-btn.shader-active) {
+    border-color: #7ec8e3;
+    color: #7ec8e3;
+  }
+
   .eq-active { color: #f5a623; }
 
   .gain-row {

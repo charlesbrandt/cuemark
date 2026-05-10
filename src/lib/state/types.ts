@@ -1,6 +1,6 @@
 export type DeckSource =
   | { type: "video"; filePath: string; duration: number }
-  | { type: "shader"; fragmentSrc: string; uniforms: Record<string, number> }
+  | { type: "shader"; fragmentSrc: string; uniforms: Record<string, number>; name?: string }
   | null;
 
 export interface DeckEQ {
