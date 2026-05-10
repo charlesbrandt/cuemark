@@ -1,17 +1,27 @@
 <script lang="ts">
-  import { setCrossfader, setCrossfaderTargets, setCrossfaderMapping } from "../lib/state/session";
-  import type { Deck, CrossfaderTarget } from "../lib/state/types";
+  import {
+    setCrossfader,
+    setCrossfaderTargets,
+    setCrossfaderMapping,
+    setCrossfaderAudioCurve,
+    setCrossfaderVisualCurve,
+  } from "../lib/state/session";
+  import type { Deck, CrossfaderTarget, CrossfaderCurve } from "../lib/state/types";
 
   let {
     mapping,
     decks,
     crossfaderValue,
     crossfaderTargets,
+    audioCurve,
+    visualCurve,
   }: {
     mapping: { left: string; right: string };
     decks: Deck[];
     crossfaderValue: number;
     crossfaderTargets: CrossfaderTarget[];
+    audioCurve: CrossfaderCurve;
+    visualCurve: CrossfaderCurve;
   } = $props();
 
   function toggleTarget(target: CrossfaderTarget) {
@@ -51,6 +61,7 @@
       <option value={deck.id}>{deck.id}</option>
     {/each}
   </select>
+
   <label class="cf-target">
     <input
       type="checkbox"
@@ -58,6 +69,16 @@
       onchange={() => toggleTarget("opacity")}
     /> Visual
   </label>
+  <select
+    class="cf-select"
+    value={visualCurve}
+    onchange={(e) => setCrossfaderVisualCurve(e.currentTarget.value as CrossfaderCurve)}
+  >
+    <option value="linear">Linear</option>
+    <option value="equal-power">Equal Power</option>
+    <option value="cut">Cut</option>
+  </select>
+
   <label class="cf-target">
     <input
       type="checkbox"
@@ -65,6 +86,15 @@
       onchange={() => toggleTarget("volume")}
     /> Audio
   </label>
+  <select
+    class="cf-select"
+    value={audioCurve}
+    onchange={(e) => setCrossfaderAudioCurve(e.currentTarget.value as CrossfaderCurve)}
+  >
+    <option value="linear">Linear</option>
+    <option value="equal-power">Equal Power</option>
+    <option value="cut">Cut</option>
+  </select>
 </div>
 
 <style>

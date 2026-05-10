@@ -1,5 +1,5 @@
 import { writable, get } from "svelte/store";
-import type { Session, Deck, CrossfaderTarget } from "./types";
+import type { Session, Deck, CrossfaderTarget, CrossfaderCurve } from "./types";
 
 function makeDeck(index: number): Deck {
   return {
@@ -29,6 +29,8 @@ const initial: Session = {
   crossfaderMapping: { left: "deck-0", right: "deck-1" },
   crossfaderValue: 0.5,
   crossfaderTargets: ["opacity", "volume"],
+  audioCurve: "equal-power",
+  visualCurve: "linear",
   effects: [],
 };
 
@@ -63,22 +65,42 @@ export function setMasterVolume(value: number) {
   session.update((s) => ({ ...s, masterVolume: value }));
 }
 
+function applyCurve(v: number, curve: CrossfaderCurve): [number, number] {
+  switch (curve) {
+    case "equal-power":
+      return [Math.cos(v * Math.PI * 0.5), Math.sin(v * Math.PI * 0.5)];
+    case "cut":
+      // both sources at full until well past center; quick drop on their respective far sides
+      return [
+        Math.min(1.0, Math.max(0.0, (0.75 - v) / 0.25)),
+        Math.min(1.0, Math.max(0.0, (v - 0.25) / 0.25)),
+      ];
+    default: // linear
+      return [1.0 - v, v];
+  }
+}
+
 // value: 0.0 (full left) → 1.0 (full right)
 export function setCrossfader(value: number) {
-  session.update((s) => ({
-    ...s,
-    crossfaderValue: value,
-    decks: s.decks.map((d) => {
-      const isLeft = d.id === s.crossfaderMapping.left;
-      const isRight = d.id === s.crossfaderMapping.right;
-      if (!isLeft && !isRight) return d;
-      const level = isLeft ? 1.0 - value : value;
-      const patch: Partial<Deck> = {};
-      if (s.crossfaderTargets.includes("opacity")) patch.opacity = level;
-      if (s.crossfaderTargets.includes("volume")) patch.volume = level;
-      return { ...d, ...patch };
-    }),
-  }));
+  session.update((s) => {
+    const [leftAudio, rightAudio] = applyCurve(value, s.audioCurve);
+    const [leftVisual, rightVisual] = applyCurve(value, s.visualCurve);
+    return {
+      ...s,
+      crossfaderValue: value,
+      decks: s.decks.map((d) => {
+        const isLeft = d.id === s.crossfaderMapping.left;
+        const isRight = d.id === s.crossfaderMapping.right;
+        if (!isLeft && !isRight) return d;
+        const patch: Partial<Deck> = {};
+        if (s.crossfaderTargets.includes("volume"))
+          patch.volume = isLeft ? leftAudio : rightAudio;
+        if (s.crossfaderTargets.includes("opacity"))
+          patch.opacity = isLeft ? leftVisual : rightVisual;
+        return { ...d, ...patch };
+      }),
+    };
+  });
 }
 
 export function setCrossfaderTargets(targets: CrossfaderTarget[]) {
@@ -87,6 +109,14 @@ export function setCrossfaderTargets(targets: CrossfaderTarget[]) {
 
 export function setCrossfaderMapping(left: string, right: string) {
   session.update((s) => ({ ...s, crossfaderMapping: { left, right } }));
+}
+
+export function setCrossfaderAudioCurve(curve: CrossfaderCurve) {
+  session.update((s) => ({ ...s, audioCurve: curve }));
+}
+
+export function setCrossfaderVisualCurve(curve: CrossfaderCurve) {
+  session.update((s) => ({ ...s, visualCurve: curve }));
 }
 
 export function setMasterBpm(bpm: number | null) {

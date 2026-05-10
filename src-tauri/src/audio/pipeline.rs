@@ -480,9 +480,9 @@ impl DeckAudioPipeline {
         Ok(())
     }
 
-    /// Pre-fader trim (0–1). Effective audio = gain × volume.
+    /// Pre-fader trim (0–4). Values above 1.0 boost quiet tracks. Effective audio = gain × volume.
     pub fn set_gain(&mut self, gain: f32) -> Result<(), String> {
-        self.gain = gain.clamp(0.0, 1.0);
+        self.gain = gain.clamp(0.0, 4.0);
         self.apply_volume();
         Ok(())
     }

@@ -107,12 +107,12 @@
     </button>
   </div>
 
-  <div class="gain-row" title="Pre-fader trim — normalize source level between tracks">
+  <div class="gain-row" title="Pre-fader trim — boost quiet tracks above 1.0 (max 4.0 ≈ +12 dB)">
     <span>Gain</span>
     <input
       type="range"
       min="0"
-      max="1"
+      max="4"
       step="0.01"
       value={deck.gain}
       oninput={(e) => updateDeck(deck.id, { gain: +e.currentTarget.value })}

@@ -405,5 +405,7 @@
     decks={$session.decks}
     crossfaderValue={$session.crossfaderValue}
     crossfaderTargets={$session.crossfaderTargets}
+    audioCurve={$session.audioCurve}
+    visualCurve={$session.visualCurve}
   />
 </div>

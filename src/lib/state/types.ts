@@ -14,7 +14,7 @@ export interface Deck {
   source: DeckSource;
   playing: boolean;
   playbackRate: number;   // 0.25–4.0
-  gain: number;           // 0–1 pre-fader trim (normalize between tracks)
+  gain: number;           // 0–4 pre-fader trim; >1.0 boosts quiet tracks (~+12 dB max)
   volume: number;         // 0–1 post-fader level (driven by crossfader)
   opacity: number;        // 0–1 compositor weight
   loop: boolean;
@@ -42,6 +42,11 @@ export interface Effect {
 
 export type CrossfaderTarget = "opacity" | "volume";
 
+// linear: simple 1-v / v — quiet dip at center
+// equal-power: cos/sin curve — constant perceived loudness (industry standard)
+// cut: both sources at full until well past center, then quick drop (battle/scratch style)
+export type CrossfaderCurve = "linear" | "equal-power" | "cut";
+
 export interface Session {
   decks: Deck[];          // ordered array; render back-to-front
   masterVolume: number;
@@ -52,5 +57,7 @@ export interface Session {
   };
   crossfaderValue: number;              // 0.0 (full left) – 1.0 (full right)
   crossfaderTargets: CrossfaderTarget[]; // which deck properties the crossfader drives
+  audioCurve: CrossfaderCurve;
+  visualCurve: CrossfaderCurve;
   effects: Effect[];      // global post-process chain
 }
