@@ -105,13 +105,13 @@ export class Compositor {
   }
 
   // Render a GLSL shader into the deck's FBO. Compiles and caches the program on first call
-  // or when fragmentSrc changes. u_bass/u_mid/u_high are placeholders (0) until audio-reactive
-  // uniforms are wired; custom uniforms from deck.source.uniforms are set as float uniforms.
+  // or when fragmentSrc changes. Custom uniforms from deck.source.uniforms are set as float uniforms.
   renderShader(
     deckId: string,
     fragmentSrc: string,
     customUniforms: Record<string, number>,
     time: number,
+    analysis: { bass: number; mid: number; high: number },
   ) {
     const { gl, quadVAO } = this;
 
@@ -142,9 +142,9 @@ export class Compositor {
     const p = cached.program;
     gl.uniform1f(gl.getUniformLocation(p, 'u_time'), time);
     gl.uniform2f(gl.getUniformLocation(p, 'u_resolution'), fbo.width, fbo.height);
-    gl.uniform1f(gl.getUniformLocation(p, 'u_bass'), 0);
-    gl.uniform1f(gl.getUniformLocation(p, 'u_mid'), 0);
-    gl.uniform1f(gl.getUniformLocation(p, 'u_high'), 0);
+    gl.uniform1f(gl.getUniformLocation(p, 'u_bass'), analysis.bass);
+    gl.uniform1f(gl.getUniformLocation(p, 'u_mid'), analysis.mid);
+    gl.uniform1f(gl.getUniformLocation(p, 'u_high'), analysis.high);
     for (const [name, value] of Object.entries(customUniforms)) {
       const loc = gl.getUniformLocation(p, name);
       if (loc !== null) gl.uniform1f(loc, value);

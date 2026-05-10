@@ -67,9 +67,16 @@
 - `FBO.renderShader(src, uniforms)`: compile + link fragment shader, draw fullscreen quad
 - Uniforms: `u_time`, `u_resolution`, `u_bass`, `u_mid`, `u_high`
 
-### audio-reactive shader uniforms
-- `AudioAnalyzer.read()` feeds analysis each frame → compositor passes to shader FBOs
-- Waveform as 1D texture (optional enhancement)
+### audio-reactive shader uniforms [done]
+- GStreamer `spectrum` element (32 bands, ~30 fps) inserted after `pitch` in each deck pipeline
+- Bus thread parses spectrum messages and emits `audio-fft` Tauri events; frontend combines
+  max-across-decks into `{ bass, mid, high }` and passes to `compositor.renderShader()`
+- All three bands wired as `u_bass`, `u_mid`, `u_high` uniforms — confirmed responding to music
+- Bug fixed: spectrum magnitude is `GstValueList` (`gst::List`), not `GstValueArray` (`gst::Array`);
+  the mismatch silently dropped every message before this was corrected
+- `ShaderAnalyzer` (Web Audio API fallback, `src/lib/audio/shaderAnalyzer.ts`) written but not
+  connected — kept as dead code for now; GStreamer path is authoritative
+- Band weights / sensitivity tuning deferred — current linear dBFS mapping is functional
 
 ### built-in shader library
 - Plasma / color wash

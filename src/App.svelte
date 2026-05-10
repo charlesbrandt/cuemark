@@ -43,8 +43,13 @@
     const bpm = tapTempo(tapTimestamps);
     if (bpm !== null) setMasterBpm(bpm);
   }
+  type BandAnalysis = { bass: number; mid: number; high: number };
+
   let canvas: HTMLCanvasElement;
   let compositor = $state<Compositor | undefined>(undefined);
+  // Per-deck FFT analysis received from GStreamer spectrum bus messages via Tauri events.
+  const deckAnalysis = new Map<string, BandAnalysis>();
+  let fftUnlisten: (() => void) | undefined;
   // Hidden <video> elements keyed by deck id; lives outside Svelte reactivity
   const videoEls = new Map<string, HTMLVideoElement>();
   // Per-deck in-flight play() promises; prevents overlapping play() calls that abort each other
@@ -89,6 +94,16 @@
   onMount(async () => {
     midiUnlisten = await startMidiListener();
     compositor = new Compositor(canvas);
+    let fftEventCount = 0;
+    fftUnlisten = await listen<{ deckId: string; bass: number; mid: number; high: number }>(
+      'audio-fft',
+      (event) => {
+        deckAnalysis.set(event.payload.deckId, event.payload);
+        if (fftEventCount++ < 5) {
+          console.log('[audio-fft]', event.payload);
+        }
+      },
+    );
     rafId = requestAnimationFrame(frame);
 
     // When a deck reaches EOS, mark it stopped so syncVideoElements doesn't auto-restart it.
@@ -118,6 +133,7 @@
     dragDropUnlisten?.();
     eosUnlisten?.();
     cancelAnimationFrame(rafId);
+    fftUnlisten?.();
     for (const [id, v] of videoEls) {
       v.pause();
       v.remove();
@@ -282,14 +298,28 @@
     }
   }
 
+  const shaderDebugLogged = new Set<string>();
+
   // RAF render loop: upload video frames → composite; sync video to audio clock
   function frame() {
     if (compositor) {
       const { decks } = get(session);
       const timeSecs = performance.now() / 1000;
+      // Combine per-deck FFT data from GStreamer spectrum events: max across all playing decks.
+      let bass = 0, mid = 0, high = 0;
+      for (const a of deckAnalysis.values()) {
+        bass = Math.max(bass, a.bass);
+        mid = Math.max(mid, a.mid);
+        high = Math.max(high, a.high);
+      }
+      const analysis: BandAnalysis = { bass, mid, high };
       for (const deck of decks) {
         if (deck.source?.type === 'shader') {
-          compositor.renderShader(deck.id, deck.source.fragmentSrc, deck.source.uniforms, timeSecs);
+          if (!shaderDebugLogged.has(deck.id)) {
+            shaderDebugLogged.add(deck.id);
+            console.log(`[shader ${deck.id}] first render — deckAnalysis size=${deckAnalysis.size} analysis=`, analysis);
+          }
+          compositor.renderShader(deck.id, deck.source.fragmentSrc, deck.source.uniforms, timeSecs, analysis);
         } else if (deck.source?.type === 'video') {
           const v = videoEls.get(deck.id);
           const fbo = compositor.getFBO(deck.id);

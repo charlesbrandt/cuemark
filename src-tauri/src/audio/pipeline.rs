@@ -1,15 +1,12 @@
 /// Per-deck GStreamer audio pipeline.
 ///
 /// Topology:
-///   uridecodebin → queue(max-buffers=2) → audioconvert → audioresample → pitch → volume → pipewiresink
+///   uridecodebin → queue(max-buffers=2) → audioconvert → audioresample
+///     → capsfilter(48kHz) → pitch → [spectrum] → output_queue → volume → pipewiresink
 ///
-/// `pitch` (gst-plugins-bad / soundtouch) provides tempo control via a `tempo` property that
-/// can be set at any time without a seek or pipeline flush. Rate changes from the MIDI fader
-/// call set_rate(), which sets the property directly — no seeks, no async gates, no dropout.
-///
-/// `pipewiresink` with an empty `target-object` routes to the system default.
-/// When a specific device is set via `set_device()`, the pipeline is rebuilt against that
-/// PipeWire node name (as reported by `pactl list sinks`).
+/// `spectrum` (gst-plugins-good) is inserted inline after `pitch` when available.
+/// It is a passthrough transform — it adds no latency. The bus thread reads its messages
+/// and emits "audio-fft" Tauri events at ~30 fps for audio-reactive shader uniforms.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 type EosCallback = Arc<dyn Fn() + Send + Sync>;
 
 use gstreamer::{self as gst, glib, prelude::*};
+use tauri::Emitter;
+use super::analysis;
 
 fn make_el(factory: &str) -> Result<gst::Element, String> {
     gst::ElementFactory::make(factory)
@@ -134,6 +133,8 @@ pub struct DeckAudioPipeline {
     playing: bool,
     /// Called by the bus thread when EOS fires. Used to notify the frontend.
     eos_callback: Option<EosCallback>,
+    /// AppHandle for emitting audio-fft Tauri events from the bus thread.
+    app: Option<tauri::AppHandle>,
 }
 
 impl DeckAudioPipeline {
@@ -148,11 +149,16 @@ impl DeckAudioPipeline {
             rate: 1.0,
             playing: false,
             eos_callback: None,
+            app: None,
         }
     }
 
     pub fn set_eos_callback(&mut self, f: impl Fn() + Send + Sync + 'static) {
         self.eos_callback = Some(Arc::new(f));
+    }
+
+    pub fn set_app(&mut self, app: tauri::AppHandle) {
+        self.app = Some(app);
     }
 
     pub fn load(&mut self, file_path: &str) -> Result<(), String> {
@@ -177,6 +183,29 @@ impl DeckAudioPipeline {
         // to assign a non-power-of-two quantum (e.g. 3969) to the stream, producing xruns.
         let rate_caps    = make_el("capsfilter")?;
         let pitch        = make_el("pitch")?;
+        // spectrum is a passthrough transform that emits FFT bus messages at ~30 fps
+        // for audio-reactive shader uniforms. Optional: skip gracefully if the
+        // gstreamer1.0-plugins-good package is absent.
+        let spectrum_opt: Option<gst::Element> = make_el("spectrum").ok().map(|s| {
+            s.set_property("bands", 32u32);
+            s.set_property("interval", 33_333_333u64); // 33ms ≈ 30 fps
+            s.set_property("threshold", -80i32);
+            s.set_property("post-messages", true);
+            s.set_property("multi-channel", false);
+            if s.has_property("message-magnitude-list", None) {
+                s.set_property("message-magnitude-list", true);
+            }
+            s
+        });
+        if spectrum_opt.is_none() {
+            eprintln!(
+                "[audio/{}] spectrum element not available — audio-fft events disabled. \
+                 Install gstreamer1.0-plugins-good.",
+                self.deck_id
+            );
+        } else {
+            eprintln!("[audio/{}] spectrum element ready (32 bands, ~30 fps)", self.deck_id);
+        }
         // output_queue buffers pitch's variable-sized output chunks (soundtouch produces
         // non-uniform sizes at non-1.0 tempos). Without this, the PipeWire pull callback
         // can starve when soundtouch hasn't yet produced a full 1024-sample quantum.
@@ -203,12 +232,21 @@ impl DeckAudioPipeline {
         pipeline
             .add_many([&src, &queue, &convert, &resample, &rate_caps, &pitch, &output_queue, &volume, &sink])
             .map_err(|e| format!("[{}] pipeline add_many: {e}", self.deck_id))?;
+        if let Some(ref s) = spectrum_opt {
+            pipeline.add(s).map_err(|e| format!("[{}] pipeline add spectrum: {e}", self.deck_id))?;
+        }
 
         queue.link(&convert).map_err(|e| format!("queue→audioconvert: {e}"))?;
         convert.link(&resample).map_err(|e| format!("audioconvert→audioresample: {e}"))?;
         resample.link(&rate_caps).map_err(|e| format!("audioresample→capsfilter: {e}"))?;
         rate_caps.link(&pitch).map_err(|e| format!("capsfilter→pitch: {e}"))?;
-        pitch.link(&output_queue).map_err(|e| format!("pitch→output_queue: {e}"))?;
+        // pitch → [spectrum →] output_queue
+        if let Some(ref s) = spectrum_opt {
+            pitch.link(s).map_err(|e| format!("pitch→spectrum: {e}"))?;
+            s.link(&output_queue).map_err(|e| format!("spectrum→output_queue: {e}"))?;
+        } else {
+            pitch.link(&output_queue).map_err(|e| format!("pitch→output_queue: {e}"))?;
+        }
         output_queue.link(&volume).map_err(|e| format!("output_queue→volume: {e}"))?;
         volume.link(&sink).map_err(|e| format!("volume→sink: {e}"))?;
 
@@ -241,9 +279,13 @@ impl DeckAudioPipeline {
         let at_eos_thread = at_eos.clone();
         let at_error = Arc::new(AtomicBool::new(false));
         let at_error_thread = at_error.clone();
+        // Logs the first received spectrum message so we can confirm the signal path.
+        let fft_logged = Arc::new(AtomicBool::new(false));
+        let fft_logged_thread = fft_logged.clone();
         let bus_thread = bus.clone();
         let deck_id_log = self.deck_id.clone();
         let eos_cb = self.eos_callback.clone();
+        let app_handle = self.app.clone();
 
         std::thread::spawn(move || {
             for msg in bus_thread.iter_timed(None) {
@@ -274,6 +316,56 @@ impl DeckAudioPipeline {
                             eprintln!("[bus/{}] pipeline: {:?} → {:?} (pending {:?})",
                                 deck_id_log, s.old(), s.current(), s.pending());
                         }
+                    }
+                    gst::MessageView::Element(_) => {
+                        let Some(structure) = msg.structure() else { continue };
+                        if structure.name() != "spectrum" { continue; }
+                        let Some(ref app) = app_handle else { continue };
+
+                        // magnitude is a GstValueList (gst::List) of gfloat values in dBFS.
+                        // Note: GstValueList != GstValueArray — gst::Array would silently fail here.
+                        let Ok(magnitude) = structure.get::<gst::List>("magnitude") else {
+                            eprintln!("[bus/{}] spectrum: no magnitude field; structure={}", deck_id_log, structure);
+                            continue
+                        };
+                        let bands: Vec<f32> = magnitude
+                            .as_slice()
+                            .iter()
+                            .filter_map(|v| v.get::<f32>().ok())
+                            .collect();
+
+                        let n = bands.len();
+                        if n < 4 { continue; }
+
+                        // Map dBFS (-80..0) to linear 0..1
+                        let to_linear = |db: f32| ((db + 80.0) / 80.0).clamp(0.0, 1.0);
+                        // With 32 bands at 48 kHz, each band ≈ 750 Hz.
+                        // Bass 0–1500 Hz: bands 0–1; Mid 1500–7500 Hz: bands 2–9; High: rest.
+                        let bass_end = (n * 2 / 32).max(1);
+                        let mid_end = (n * 10 / 32).max(bass_end + 1);
+                        let avg = |slice: &[f32]| -> f32 {
+                            if slice.is_empty() { return 0.0; }
+                            slice.iter().copied().map(to_linear).sum::<f32>() / slice.len() as f32
+                        };
+
+                        let bass  = avg(&bands[..bass_end]);
+                        let mid   = avg(&bands[bass_end..mid_end]);
+                        let high  = avg(&bands[mid_end..]);
+
+                        if !fft_logged_thread.swap(true, Ordering::Relaxed) {
+                            eprintln!(
+                                "[bus/{}] first audio-fft: {} bands  bass={:.3} mid={:.3} high={:.3}",
+                                deck_id_log, n, bass, mid, high
+                            );
+                        }
+
+                        let _ = app.emit("audio-fft", analysis::AudioFftEvent {
+                            deck_id: deck_id_log.clone(),
+                            bass,
+                            mid,
+                            high,
+                            bands: bands.iter().copied().map(to_linear).collect(),
+                        });
                     }
                     _ => {}
                 }

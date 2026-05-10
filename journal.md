@@ -546,3 +546,26 @@ two taps. A ✕ button clears the master BPM.
   `currentTime >= loopOut`. Handler is re-assigned on every `$effect` run so it always
   captures the latest in/out values.
 - Waveform shows a green-tinted region + edge lines when loop is active in both modes.
+
+## Audio-reactive shader uniforms — bug fix (2026-05-09)
+
+The shader visualizations (`u_bass`, `u_mid`, `u_high`) were not responding to music despite
+the GStreamer `spectrum` element being present in each deck pipeline.
+
+**Root cause**: `pipeline.rs` used `structure.get::<gst::Array>("magnitude")` to extract the
+FFT magnitude data from the spectrum bus message. GStreamer's spectrum element posts magnitude
+as a `GstValueList`, which maps to `gst::List` in gstreamer-rs — not `gst::Array` (`GstValueArray`).
+These are distinct GLib types. The type mismatch caused every `let Ok(magnitude)` to fail silently
+(hitting `continue`), so the bus thread never emitted any `audio-fft` Tauri events. The frontend
+`deckAnalysis` map stayed empty and all shaders received `bass=0 mid=0 high=0` every frame.
+
+**Fix**: changed `gst::Array` → `gst::List` in the `MessageView::Element` arm.
+
+**Also found**: `src/lib/audio/shaderAnalyzer.ts` was written as a Web Audio API alternative
+(analysis-only AudioContext tapping the muted `<video>` elements) but was never imported in
+`App.svelte`. Left as dead code — the GStreamer path is the right approach since it uses the
+actual audio being played rather than a re-decode through the browser.
+
+Band sensitivity is functional but coarse; the linear dBFS-to-linear mapping and the
+bass/mid/high frequency splits can be tuned in future once there's more performance time to
+evaluate what looks good.

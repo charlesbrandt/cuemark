@@ -68,6 +68,7 @@ pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, deck_id: 
             });
             p
         });
+    pipeline.set_app(app.clone());
     pipeline.load(&file_path)
 }
 

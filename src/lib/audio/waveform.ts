@@ -72,14 +72,12 @@ export async function analyzeFile(filePath: string): Promise<AnalysisResult> {
   if (!res.ok) throw new Error(`HTTP ${res.status} fetching waveform: ${url}`);
   const arrayBuffer = await res.arrayBuffer();
 
-  const audioCtx = new AudioContext();
-  try {
-    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-    const peaks = computeWaveform(audioBuffer);
-    const { detectBpm } = await import('./bpm');
-    const bpm = detectBpm(peaks, PEAKS_PER_SECOND);
-    return { peaks, bpm };
-  } finally {
-    audioCtx.close();
-  }
+  // OfflineAudioContext decodes in memory without registering a PipeWire sink.
+  // Length=1 is a placeholder — decodeAudioData ignores it and returns the full buffer.
+  const audioCtx = new OfflineAudioContext(2, 1, 48000);
+  const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+  const peaks = computeWaveform(audioBuffer);
+  const { detectBpm } = await import('./bpm');
+  const bpm = detectBpm(peaks, PEAKS_PER_SECOND);
+  return { peaks, bpm };
 }
