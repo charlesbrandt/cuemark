@@ -232,6 +232,7 @@ formula negates the delta so lower combined → rate > 1.0.
 | Jog wheel R | `(0xB2, 10)` | JogNudge deck-1 |
 | Crossfader | `(0xB0, 0)` | Crossfader (deck-0 ↔ deck-1 opacity) |
 | Master volume | `(0xB0, 3)` | MasterVolume |
+| Headphone volume | `(0xB0, 4)` MSB | CueGain |
 | Hot cues L (1–4) | `(0x96, 0–3)` | HotCue deck-0 index 0–3 |
 | Hot cues R (1–4) | `(0x97, 0–3)` | HotCue deck-1 index 0–3 |
 | Shift + Hot cues L (1–4) | `(0x96, 8–11)` | HotCueSet deck-0 index 0–3 (stamp current time) |
@@ -241,7 +242,7 @@ formula negates the delta so lower combined → rate > 1.0.
 MIDI. Instead, Shift+pad sends a different note number on the same channel (note += 8). No host-side
 shift-state tracking is needed; the shifted notes map directly to `HotCueSet` bindings.
 
-Intentionally unmapped: Headphone cue `(0x91/92,12)`, Bass/filter toggle `(0x90,1)`, Headphone volume `(0xB0,4)`, mode-switch buttons `(0x91,15/16)`.
+Intentionally unmapped: Bass/filter toggle `(0x90,1)`, mode-switch buttons `(0x91,15/16)`.
 
 Phase 2: MIDI learn mode (click control in UI, wiggle knob to map).
 

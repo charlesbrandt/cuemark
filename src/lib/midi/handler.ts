@@ -2,6 +2,7 @@ import { listen } from "@tauri-apps/api/event";
 import { updateDeck, getDeck, setCrossfader, setMasterVolume, session } from "../state/session";
 import { seekDeck, getDeckTime, getPhase } from "../renderer/seekBus";
 import { nudgePhaseToMaster } from "../audio/phaseNudge";
+import { cueGain } from "../audio/audioSettings";
 import { get } from "svelte/store";
 
 // Must match the Rust MidiAction enum (snake_case tag + camelCase fields from serde)
@@ -15,6 +16,7 @@ export interface MidiAction {
     | "jog_nudge"
     | "crossfader"
     | "master_volume"
+    | "cue_gain"
     | "cue_jump"
     | "hot_cue"
     | "hot_cue_set"
@@ -27,34 +29,46 @@ export interface MidiAction {
   index?: number;
 }
 
+// Remap a MIDI-side deck ID ("deck-0"/"deck-1") to the configured software deck.
+// The Rust map hardcodes "deck-0" for the left controller channel and "deck-1" for
+// the right; midiMapping lets the user reassign without touching the Rust map.
+function midiDeckId(hardcoded: string | undefined): string | undefined {
+  if (!hardcoded) return hardcoded;
+  const m = get(session).midiMapping;
+  if (hardcoded === "deck-0") return m.left;
+  if (hardcoded === "deck-1") return m.right;
+  return hardcoded;
+}
+
 // Per-deck jog state: saves the rate that was active before jog started so it can be restored.
 const jogBaseRate: Record<string, number> = {};
 const jogTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 
 export async function startMidiListener(): Promise<() => void> {
   const unlisten = await listen<MidiAction>("midi-action", ({ payload: a }) => {
+    const deckId = midiDeckId(a.deck_id);
     switch (a.type) {
       case "deck_play_toggle": {
-        if (!a.deck_id) break;
-        const d = getDeck(a.deck_id);
+        if (!deckId) break;
+        const d = getDeck(deckId);
         if (d) updateDeck(d.id, { playing: !d.playing });
         break;
       }
       case "deck_gain":
-        if (a.deck_id && a.value !== undefined)
-          updateDeck(a.deck_id, { gain: a.value });
+        if (deckId && a.value !== undefined)
+          updateDeck(deckId, { gain: a.value });
         break;
       case "deck_volume":
-        if (a.deck_id && a.value !== undefined)
-          updateDeck(a.deck_id, { volume: a.value });
+        if (deckId && a.value !== undefined)
+          updateDeck(deckId, { volume: a.value });
         break;
       case "deck_opacity":
-        if (a.deck_id && a.value !== undefined)
-          updateDeck(a.deck_id, { opacity: a.value });
+        if (deckId && a.value !== undefined)
+          updateDeck(deckId, { opacity: a.value });
         break;
       case "deck_playback_rate":
-        if (a.deck_id && a.value !== undefined)
-          updateDeck(a.deck_id, { playbackRate: a.value });
+        if (deckId && a.value !== undefined)
+          updateDeck(deckId, { playbackRate: a.value });
         break;
       case "crossfader":
         if (a.value !== undefined) setCrossfader(a.value);
@@ -62,9 +76,12 @@ export async function startMidiListener(): Promise<() => void> {
       case "master_volume":
         if (a.value !== undefined) setMasterVolume(a.value);
         break;
+      case "cue_gain":
+        if (a.value !== undefined) cueGain.set(a.value);
+        break;
       case "cue_jump": {
-        if (!a.deck_id) break;
-        const d = getDeck(a.deck_id);
+        if (!deckId) break;
+        const d = getDeck(deckId);
         if (d) {
           seekDeck(d.id, d.cuePoint);
           updateDeck(d.id, { playing: false });
@@ -72,24 +89,24 @@ export async function startMidiListener(): Promise<() => void> {
         break;
       }
       case "loop_toggle": {
-        if (!a.deck_id) break;
-        const d = getDeck(a.deck_id);
+        if (!deckId) break;
+        const d = getDeck(deckId);
         if (d) updateDeck(d.id, { loop: !d.loop });
         break;
       }
       case "hot_cue": {
-        if (!a.deck_id || a.index === undefined) break;
-        const d = getDeck(a.deck_id);
+        if (!deckId || a.index === undefined) break;
+        const d = getDeck(deckId);
         if (!d) break;
         const t = d.hotCues[a.index];
         if (t !== undefined && !isNaN(t)) seekDeck(d.id, t);
         break;
       }
       case "hot_cue_set": {
-        if (!a.deck_id || a.index === undefined) break;
-        const d = getDeck(a.deck_id);
+        if (!deckId || a.index === undefined) break;
+        const d = getDeck(deckId);
         if (!d) break;
-        const now = getDeckTime(a.deck_id);
+        const now = getDeckTime(deckId);
         if (now !== null) {
           const cues = [...d.hotCues];
           cues[a.index] = now;
@@ -98,11 +115,9 @@ export async function startMidiListener(): Promise<() => void> {
         break;
       }
       case "jog_nudge": {
-        if (!a.deck_id || a.value === undefined) break;
-        const deckId = a.deck_id;
+        if (!deckId || a.value === undefined) break;
         const d = getDeck(deckId);
         if (!d) break;
-        // Save rate before first jog event so we can restore it after jog stops.
         if (!(deckId in jogBaseRate)) jogBaseRate[deckId] = d.playbackRate;
         const nudged = Math.max(0.25, Math.min(4.0, d.playbackRate + a.value * 0.02));
         updateDeck(d.id, { playbackRate: nudged });
@@ -115,8 +130,8 @@ export async function startMidiListener(): Promise<() => void> {
         break;
       }
       case "sync_toggle": {
-        if (!a.deck_id) break;
-        const d = getDeck(a.deck_id);
+        if (!deckId) break;
+        const d = getDeck(deckId);
         const s = get(session);
         const masterBpm = s.bpm;
         if (!d || d.bpm === null || masterBpm === null) {
@@ -125,8 +140,6 @@ export async function startMidiListener(): Promise<() => void> {
         }
         updateDeck(d.id, { playbackRate: masterBpm / d.bpm });
 
-        // If both this deck and a reference deck have downbeats set, also seek to align
-        // beat phase. Works while paused so decks can be pre-aligned before pressing play.
         if (d.downbeat !== null) {
           const ref = s.decks.find(r => r.id !== d.id && r.bpm !== null && r.downbeat !== null);
           if (ref) {
@@ -149,14 +162,14 @@ export async function startMidiListener(): Promise<() => void> {
         break;
       }
       case "headphone_cue": {
-        if (!a.deck_id) break;
-        const d = getDeck(a.deck_id);
+        if (!deckId) break;
+        const d = getDeck(deckId);
         if (d) updateDeck(d.id, { cueEnabled: !d.cueEnabled });
         break;
       }
       case "phase_nudge": {
-        if (!a.deck_id) break;
-        nudgePhaseToMaster(a.deck_id);
+        if (!deckId) break;
+        nudgePhaseToMaster(deckId);
         break;
       }
     }

@@ -20,6 +20,7 @@ pub enum MidiAction {
     JogNudge { deck_id: String, value: f32 },
     Crossfader { value: f32 },
     MasterVolume { value: f32 },
+    CueGain { value: f32 },
     CueJump { deck_id: String },
     HotCue { deck_id: String, index: u8 },
     HotCueSet { deck_id: String, index: u8 },
@@ -44,6 +45,7 @@ pub enum ControlBinding {
     DeckPlaybackRateLsb { deck_id: String },
     Crossfader,
     MasterVolume,
+    CueGain,
     CueJump { deck_id: String },
     HotCue { deck_id: String, index: u8 },
     HotCueSet { deck_id: String, index: u8 },
@@ -128,6 +130,8 @@ fn hercules_starlight_map() -> MidiMap {
     m.insert((0xB0, 0),  ControlBinding::Crossfader);
     // Master volume: 14-bit pair — CC 3 (MSB) mapped; CC 35 (LSB) ignored
     m.insert((0xB0, 3),  ControlBinding::MasterVolume);
+    // Headphone volume knob: 14-bit pair — CC 4 (MSB) mapped; CC 36 (LSB) ignored
+    m.insert((0xB0, 4),  ControlBinding::CueGain);
     // Headphone CUE buttons (Note On, velocity > 0 = press)
     m.insert((0x91, 12), ControlBinding::HeadphoneCue { deck_id: "deck-0".into() });
     m.insert((0x92, 12), ControlBinding::HeadphoneCue { deck_id: "deck-1".into() });
@@ -135,7 +139,6 @@ fn hercules_starlight_map() -> MidiMap {
     //   (0x90, 3)  = Shift button — controller remaps pads in firmware; no host tracking needed
     //   (0x90, 1)  = Bass/filter toggle
     //   (0x91, 15) = Hot-cue mode btn  (0x91, 16) = Loop mode btn
-    //   (0xB0, 4)  = Headphone volume (CC 4 MSB; CC 36 LSB)
 
     m
 }
@@ -151,6 +154,7 @@ fn is_continuous(binding: Option<&ControlBinding>, status: u8) -> bool {
             | ControlBinding::DeckVolume { .. }
             | ControlBinding::Crossfader
             | ControlBinding::MasterVolume
+            | ControlBinding::CueGain
             | ControlBinding::JogWheel { .. },
         ) => true,
         None => (status & 0xF0) == 0xB0, // unmapped CC — throttle too
@@ -182,6 +186,7 @@ fn resolve_action(binding: &ControlBinding, data2: u8) -> Option<MidiAction> {
         }
         ControlBinding::Crossfader => Some(MidiAction::Crossfader { value: v }),
         ControlBinding::MasterVolume => Some(MidiAction::MasterVolume { value: v }),
+        ControlBinding::CueGain => Some(MidiAction::CueGain { value: v }),
         ControlBinding::CueJump { deck_id } => {
             (data2 > 0).then_some(MidiAction::CueJump { deck_id: deck_id.clone() })
         }

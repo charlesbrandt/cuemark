@@ -55,6 +55,11 @@ export interface Session {
     left: string;         // deck id
     right: string;        // deck id
   };
+  /** Which software deck the left/right sides of the MIDI controller address. */
+  midiMapping: {
+    left: string;         // deck id driven by left controller channel
+    right: string;        // deck id driven by right controller channel
+  };
   crossfaderValue: number;              // 0.0 (full left) – 1.0 (full right)
   crossfaderTargets: CrossfaderTarget[]; // which deck properties the crossfader drives
   audioCurve: CrossfaderCurve;

@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { listAudioDevices, type AudioDevice } from "../lib/audio/pipeline";
   import { mainOutputDeviceIds, cueOutputDeviceId, cueGain } from "../lib/audio/audioSettings";
+  import { session, setMidiMapping } from "../lib/state/session";
 
   let devices = $state<AudioDevice[]>([]);
   let error = $state("");
@@ -20,6 +21,9 @@
       checked ? [...ids, id] : ids.filter(x => x !== id)
     );
   }
+
+  let midiMapping = $derived($session.midiMapping);
+  let decks = $derived($session.decks);
 </script>
 
 <div class="audio-settings">
@@ -30,8 +34,8 @@
   {:else if devices.length === 0}
     <span class="hint">No audio sinks found — is PipeWire/PulseAudio running?</span>
   {:else}
-    <div class="device-group">
-      <span class="group-label">Main</span>
+    <div class="settings-row">
+      <span class="row-label">Main</span>
       <div class="device-checks">
         <label class="device-check">
           <input
@@ -54,31 +58,50 @@
       </div>
     </div>
 
-    <label class="device-label">
-      Headphones
+    <div class="settings-row">
+      <span class="row-label">🎧</span>
       <select bind:value={$cueOutputDeviceId}>
         <option value="">— none —</option>
         {#each devices as d (d.id)}
           <option value={d.id}>{d.label}</option>
         {/each}
       </select>
-    </label>
-
-    {#if $cueOutputDeviceId}
-      <label class="device-label">
-        Cue vol
+      {#if $cueOutputDeviceId}
+        <span class="row-label" style="margin-left:8px">Vol</span>
         <input type="range" min="0" max="1" step="0.01" bind:value={$cueGain} />
         <span class="gain-val">{$cueGain.toFixed(2)}</span>
-      </label>
-    {/if}
+      {/if}
+    </div>
   {/if}
+
+  <div class="settings-row">
+    <span class="row-label">MIDI</span>
+    <span class="side-label">L</span>
+    <select
+      value={midiMapping.left}
+      onchange={(e) => setMidiMapping(e.currentTarget.value, midiMapping.right)}
+    >
+      {#each decks as d (d.id)}
+        <option value={d.id}>{d.id}</option>
+      {/each}
+    </select>
+    <span class="side-label" style="margin-left:8px">R</span>
+    <select
+      value={midiMapping.right}
+      onchange={(e) => setMidiMapping(midiMapping.left, e.currentTarget.value)}
+    >
+      {#each decks as d (d.id)}
+        <option value={d.id}>{d.id}</option>
+      {/each}
+    </select>
+  </div>
 </div>
 
 <style>
   .audio-settings {
     display: flex;
-    align-items: center;
-    gap: 12px;
+    flex-direction: column;
+    gap: 6px;
     padding: 8px 16px;
     background: #161616;
     border-top: 2px solid #f5a623;
@@ -93,6 +116,24 @@
     letter-spacing: 0.08em;
     font-size: 10px;
     text-transform: uppercase;
+  }
+
+  .settings-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .row-label {
+    color: #888;
+    flex-shrink: 0;
+    min-width: 32px;
+  }
+
+  .side-label {
+    color: #666;
+    font-size: 10px;
     flex-shrink: 0;
   }
 
@@ -104,17 +145,6 @@
   .error {
     color: #cc5555;
     font-style: italic;
-  }
-
-  .device-group {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .group-label {
-    color: #888;
-    flex-shrink: 0;
   }
 
   .device-checks {
@@ -137,13 +167,6 @@
     cursor: pointer;
   }
 
-  .device-label {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    color: #888;
-  }
-
   select {
     background: #1a1a1a;
     border: 1px solid #2e2e2e;
@@ -153,7 +176,7 @@
     font-size: 11px;
     padding: 2px 4px;
     cursor: pointer;
-    max-width: 200px;
+    max-width: 220px;
   }
 
   select:focus {

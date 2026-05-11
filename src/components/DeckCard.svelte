@@ -173,9 +173,9 @@
     <button
       class:active={deck.cueEnabled}
       onclick={() => updateDeck(deck.id, { cueEnabled: !deck.cueEnabled })}
-      title="Headphone cue — route pre-fader signal to headphone output"
+      title="Send to headphones"
     >
-      CUE
+      🎧
     </button>
     {#if deck.source?.type === "video"}
       <button

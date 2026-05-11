@@ -27,6 +27,7 @@ const initial: Session = {
   masterVolume: 1.0,
   bpm: null,
   crossfaderMapping: { left: "deck-0", right: "deck-1" },
+  midiMapping: { left: "deck-0", right: "deck-1" },
   crossfaderValue: 0.5,
   crossfaderTargets: ["opacity", "volume"],
   audioCurve: "equal-power",
@@ -121,4 +122,8 @@ export function setCrossfaderVisualCurve(curve: CrossfaderCurve) {
 
 export function setMasterBpm(bpm: number | null) {
   session.update((s) => ({ ...s, bpm }));
+}
+
+export function setMidiMapping(left: string, right: string) {
+  session.update((s) => ({ ...s, midiMapping: { left, right } }));
 }
