@@ -61,23 +61,34 @@
   function autoSize(node: HTMLCanvasElement, _filePath: string | null | undefined) {
     const wrapper = node.parentElement!;
     const dpr = window.devicePixelRatio || 1;
+    // Read CSS height once at setup. The waveform canvas height is fixed by CSS
+    // (height: 72px). We must NOT set node.style.height inside the ResizeObserver
+    // callback because the wrapper height is derived from the canvas height —
+    // setting it would resize the wrapper, firing the observer again → infinite loop.
+    const cssH = parseFloat(getComputedStyle(node).height) || 72;
     let rafId = 0;
+
     function resize() {
-      const rect = wrapper.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) {
-        node.width = Math.round(rect.width * dpr);
-        node.height = Math.round(rect.height * dpr);
-        node.style.width = rect.width + 'px';
-        node.style.height = rect.height + 'px';
+      const w = wrapper.getBoundingClientRect().width;
+      if (w > 0) {
+        node.width = Math.round(w * dpr);
+        node.height = Math.round(cssH * dpr);
+        node.style.width = w + 'px';
+        // height is CSS-controlled — do not touch node.style.height
       }
     }
-    const ro = new ResizeObserver(resize);
+
+    // RAF-debounced: calling resize() synchronously inside a ResizeObserver callback
+    // triggers "ResizeObserver loop completed with undelivered notifications" because
+    // the DOM mutation can fire another ResizeObserver entry before the loop finishes.
+    const ro = new ResizeObserver(() => {
+      cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(resize);
+    });
     ro.observe(wrapper);
-    resize();
-    rafId = requestAnimationFrame(resize); // re-measure after layout flush
+    resize(); // sync call for immediate initial sizing
+
     return {
-      // Called when the filePath parameter changes (track load). Defers to next frame
-      // so layout has settled before measuring — initial resize may have gotten width=0.
       update(_: string | null | undefined) {
         cancelAnimationFrame(rafId);
         rafId = requestAnimationFrame(resize);
