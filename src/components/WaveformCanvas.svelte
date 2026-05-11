@@ -47,32 +47,47 @@
   });
 
   // Keep canvas pixel buffer sized to its CSS layout size × DPR.
-  // Observe the WRAPPER div, not the canvas itself — the wrapper's size is set by the
-  // flex layout, while the canvas default width (300px) can cause getBoundingClientRect
-  // to return 300 on the first ResizeObserver callback before CSS width:100% resolves.
-  // Also track deck.source.filePath so the effect re-runs on track load — the initial
-  // resize() call may have gotten width=0 if layout hadn't resolved yet, and WebKitGTK
-  // doesn't reliably apply width:100% from scoped CSS to canvas, so we also set it inline.
-  $effect(() => {
-    const _filePath = deck.source?.type === 'video' ? deck.source.filePath : null;
-    if (!canvas) return;
-    const c = canvas;
-    const wrapper = c.parentElement!;
+  //
+  // Implemented as a use: action rather than a $effect so that:
+  //   1. The ResizeObserver is stable across track loads (not torn down on source changes)
+  //   2. No reactive-dependency tricks are needed — the action parameter drives update()
+  //   3. No svelte-check false positives about unused variables
+  //
+  // The action observes the WRAPPER div (the canvas's parentElement), not the canvas itself —
+  // the canvas intrinsic width defaults to 300px before JS sets it, so observing the canvas
+  // would return 300 on the first callback before flex layout resolves.
+  // Inline styles (style.width/height) are always used instead of CSS width:100% because
+  // WebKitGTK does not reliably apply scoped CSS width to canvas elements inside flex children.
+  function autoSize(node: HTMLCanvasElement, _filePath: string | null | undefined) {
+    const wrapper = node.parentElement!;
     const dpr = window.devicePixelRatio || 1;
+    let rafId = 0;
     function resize() {
       const rect = wrapper.getBoundingClientRect();
       if (rect.width > 0 && rect.height > 0) {
-        c.width = Math.round(rect.width * dpr);
-        c.height = Math.round(rect.height * dpr);
-        c.style.width = rect.width + 'px';
-        c.style.height = rect.height + 'px';
+        node.width = Math.round(rect.width * dpr);
+        node.height = Math.round(rect.height * dpr);
+        node.style.width = rect.width + 'px';
+        node.style.height = rect.height + 'px';
       }
     }
     const ro = new ResizeObserver(resize);
     ro.observe(wrapper);
-    resize(); // sync immediately in case ResizeObserver fires asynchronously
-    return () => ro.disconnect();
-  });
+    resize();
+    rafId = requestAnimationFrame(resize); // re-measure after layout flush
+    return {
+      // Called when the filePath parameter changes (track load). Defers to next frame
+      // so layout has settled before measuring — initial resize may have gotten width=0.
+      update(_: string | null | undefined) {
+        cancelAnimationFrame(rafId);
+        rafId = requestAnimationFrame(resize);
+      },
+      destroy() {
+        ro.disconnect();
+        cancelAnimationFrame(rafId);
+      },
+    };
+  }
 
   $effect(() => {
     if (!canvas) return;
@@ -303,6 +318,7 @@
 
 <div class="waveform-wrap">
   <canvas
+    use:autoSize={deck.source?.type === 'video' ? deck.source.filePath : null}
     bind:this={canvas}
     class="waveform-canvas"
     onclick={handleClick}
