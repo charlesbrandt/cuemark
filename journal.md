@@ -1,3 +1,69 @@
+# 2026.05.10 — multi-channel cue routing for DJControl Starlight
+
+## Context
+
+The Headphones cue output was routing to the Master output (FL+FR) of the DJControl Starlight
+even when the user selected the Rear / Headphones output (RL+RR).
+
+## Root cause
+
+The DJControl Starlight uses the ALSA `surround40` profile, which PipeWire exposes as a single
+4-channel `Audio/Sink` node (`analog-surround-40`) with channel layout FL,FR,RL,RR.
+Channels 0+1 (FL,FR) = Master output; channels 2+3 (RL,RR) = Headphones output.
+
+Three approaches were tried, with only the third working:
+
+### Attempt 1: `audio.position` in pipewiresink stream-properties — FAILED
+
+Setting `audio.position=RL,RR` in `stream-properties` has no effect on routing. Stream-properties
+are node metadata; PipeWire's session manager (WirePlumber) does not use them to decide which
+sink ports to connect to.
+
+### Attempt 2: GStreamer caps channel-mask relabeling (2-channel) — FAILED
+
+Adding `audioconvert (identity 2×2 matrix) → capsfilter(channel-mask=0x30 = RL+RR)` before
+`pipewiresink`. The audio passed through without silence but WirePlumber still connected the
+stereo stream to the first pair (FL,FR = Master). WirePlumber ignores channel-position labels
+when routing a stereo stream to a multi-channel sink — it always connects to ports 0+1.
+
+### Attempt 3: N-channel stream with silence in non-target channels — IMPLEMENTED
+
+The working approach: match the sink's full channel count (4). Output a 4-channel GStreamer
+stream where the target channels carry audio and all other channels are silent. WirePlumber
+sees a 4:4 channel count match and creates a 1:1 port connection, so silence goes to
+ports 0+1 (Master) and audio goes to ports 2+3 (Headphones).
+
+## Implementation
+
+**`devices.rs`**:
+- `parse_pw_dump` reads `audio.position` from each PipeWire sink node.
+- Sinks with >2 channels are expanded into one entry per adjacent stereo pair.
+- Device ID format: `node_name@target_pair!full_layout`
+  e.g. `alsa_output.usb-...-surround-40@RL,RR!FL,FR,RL,RR`
+- The `!full_layout` suffix tells the pipeline how many channels the sink has and in
+  which order, so it can place the audio in the right buffer positions.
+
+**`pipeline.rs`** (`compute_cue_remap`):
+- Parses `target!full_layout` from the device ID.
+- Computes a GStreamer channel-mask bitmask for the full layout.
+- Finds each target channel's buffer index by counting set bits below it in the mask.
+- Builds an N×2 mix-matrix: target rows get [1,0] or [0,1]; all other rows are [0,0].
+- For Starlight Rear (RL,RR on FL,FR,RL,RR): matrix rows = [[0,0],[0,0],[1,0],[0,1]].
+
+**`pipeline.rs`** (`load()`):
+- When cue device has `@target!full`, inserts `audioconvert(mix-matrix) → capsfilter`
+  between `cue_volume` and `cue_queue` in the cue branch.
+- `audioconvert`'s mix-matrix must be set explicitly — GStreamer's default matrix for
+  cross-position conversions (FL→RL) is all-zeros (silence), not identity.
+
+## Key PipeWire insight
+
+WirePlumber routes based on channel *count* match before channel *position* match:
+- Stereo (2-ch) → 4-ch sink: always connects to ports 0+1, ignores position labels.
+- 4-ch → 4-ch sink: 1:1 port mapping by position. This is the mechanism that works.
+
+---
+
 # 2026.05.05 — waveform clock sync, PipeWire xrun cascade fixes
 
 ## Problems

@@ -50,7 +50,11 @@
   // Observe the WRAPPER div, not the canvas itself — the wrapper's size is set by the
   // flex layout, while the canvas default width (300px) can cause getBoundingClientRect
   // to return 300 on the first ResizeObserver callback before CSS width:100% resolves.
+  // Also track deck.source.filePath so the effect re-runs on track load — the initial
+  // resize() call may have gotten width=0 if layout hadn't resolved yet, and WebKitGTK
+  // doesn't reliably apply width:100% from scoped CSS to canvas, so we also set it inline.
   $effect(() => {
+    const _filePath = deck.source?.type === 'video' ? deck.source.filePath : null;
     if (!canvas) return;
     const c = canvas;
     const wrapper = c.parentElement!;
@@ -60,6 +64,8 @@
       if (rect.width > 0 && rect.height > 0) {
         c.width = Math.round(rect.width * dpr);
         c.height = Math.round(rect.height * dpr);
+        c.style.width = rect.width + 'px';
+        c.style.height = rect.height + 'px';
       }
     }
     const ro = new ResizeObserver(resize);
@@ -322,7 +328,10 @@
   }
   .waveform-canvas {
     display: block;
-    width: 100%;
+    /* width is always set via c.style.width in resize() — do not put width:100% here.
+       WebKitGTK does not reliably apply scoped CSS width to canvas elements inside
+       flex children, causing the canvas to render at 300px default width.
+       height:72px is a pre-JS fallback only; resize() overwrites it via c.style.height. */
     height: 72px;
     cursor: crosshair;
     background: #080d18;

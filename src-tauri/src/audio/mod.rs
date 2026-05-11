@@ -17,9 +17,11 @@ use self::record::{RecordFormat, RecordingSink};
 /// Central audio state, held behind a Mutex in Tauri's managed state.
 pub struct AudioManager {
     pipelines: HashMap<String, DeckAudioPipeline>,
-    /// PipeWire sink name for the main output (empty = system default).
+    /// PipeWire sink names for the main outputs (empty vec = single system-default output).
     /// Passed to new pipelines at load time and applied to existing ones on change.
-    main_device: String,
+    main_devices: Vec<String>,
+    /// PipeWire sink name for the headphone cue output (empty = no cue output).
+    cue_device: String,
     mixer: MasterMix,
     record: RecordingSink,
 }
@@ -29,7 +31,8 @@ impl AudioManager {
         gstreamer::init().expect("GStreamer init failed");
         Self {
             pipelines: HashMap::new(),
-            main_device: String::new(),
+            main_devices: Vec::new(),
+            cue_device: String::new(),
             mixer: MasterMix::new(),
             record: RecordingSink::new(),
         }
@@ -54,13 +57,15 @@ pub fn list_audio_devices(_state: State<'_, AudioState>) -> Vec<AudioDevice> {
 #[tauri::command]
 pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, deck_id: String, file_path: String) -> Result<(), String> {
     let mut mgr = state.lock().unwrap();
-    let main_device = mgr.main_device.clone();
+    let main_devices = mgr.main_devices.clone();
+    let cue_device = mgr.cue_device.clone();
     let pipeline = mgr
         .pipelines
         .entry(deck_id.clone())
         .or_insert_with(|| {
             let mut p = DeckAudioPipeline::new(&deck_id);
-            p.device = main_device;
+            p.devices = main_devices;
+            p.cue_device = cue_device;
             let app_clone = app.clone();
             let did = deck_id.clone();
             p.set_eos_callback(move || {
@@ -138,13 +143,15 @@ pub fn audio_set_master_volume(state: State<'_, AudioState>, volume: f32) -> Res
 }
 
 #[tauri::command]
-pub fn audio_set_main_device(state: State<'_, AudioState>, device_id: String) -> Result<(), String> {
+pub fn audio_set_main_devices(state: State<'_, AudioState>, device_ids: Vec<String>) -> Result<(), String> {
     let mut mgr = state.lock().unwrap();
-    mgr.main_device = device_id.clone();
-    mgr.mixer.set_main_device(&device_id)?;
+    mgr.main_devices = device_ids.clone();
+    // MasterMix uses the first device as its primary target (or empty = default).
+    let primary = device_ids.first().map(|s| s.as_str()).unwrap_or("");
+    mgr.mixer.set_main_device(primary)?;
     for pipeline in mgr.pipelines.values_mut() {
-        if let Err(e) = pipeline.set_device(&device_id) {
-            eprintln!("[audio] set_device failed for {}: {e}", pipeline.deck_id);
+        if let Err(e) = pipeline.set_devices(&device_ids) {
+            eprintln!("[audio] set_devices failed for {}: {e}", pipeline.deck_id);
         }
     }
     Ok(())
@@ -152,12 +159,27 @@ pub fn audio_set_main_device(state: State<'_, AudioState>, device_id: String) ->
 
 #[tauri::command]
 pub fn audio_set_cue_device(state: State<'_, AudioState>, device_id: String) -> Result<(), String> {
-    state.lock().unwrap().mixer.set_cue_device(&device_id)
+    let mut mgr = state.lock().unwrap();
+    mgr.cue_device = device_id.clone();
+    mgr.mixer.set_cue_device(&device_id)?;
+    for pipeline in mgr.pipelines.values_mut() {
+        if let Err(e) = pipeline.set_cue_device(&device_id) {
+            eprintln!("[audio] set_cue_device failed for {}: {e}", pipeline.deck_id);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub fn audio_set_cue_gain(state: State<'_, AudioState>, gain: f32) -> Result<(), String> {
-    state.lock().unwrap().mixer.set_cue_gain(gain)
+    let mut mgr = state.lock().unwrap();
+    mgr.mixer.set_cue_gain(gain)?;
+    for pipeline in mgr.pipelines.values_mut() {
+        if let Err(e) = pipeline.set_cue_gain(gain) {
+            eprintln!("[audio] set_cue_gain failed for {}: {e}", pipeline.deck_id);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]

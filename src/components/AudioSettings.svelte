@@ -1,9 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listAudioDevices, type AudioDevice } from "../lib/audio/pipeline";
-  import { mainOutputDeviceId, cueOutputDeviceId, cueGain } from "../lib/audio/audioSettings";
-
-  let { onMainDeviceChange }: { onMainDeviceChange: (deviceId: string) => void } = $props();
+  import { mainOutputDeviceIds, cueOutputDeviceId, cueGain } from "../lib/audio/audioSettings";
 
   let devices = $state<AudioDevice[]>([]);
   let error = $state("");
@@ -16,6 +14,12 @@
       console.error("[AudioSettings] device enumeration failed:", e);
     }
   });
+
+  function toggleMainDevice(id: string, checked: boolean) {
+    mainOutputDeviceIds.update(ids =>
+      checked ? [...ids, id] : ids.filter(x => x !== id)
+    );
+  }
 </script>
 
 <div class="audio-settings">
@@ -26,18 +30,29 @@
   {:else if devices.length === 0}
     <span class="hint">No audio sinks found — is PipeWire/PulseAudio running?</span>
   {:else}
-    <label class="device-label">
-      Main
-      <select
-        bind:value={$mainOutputDeviceId}
-        onchange={() => onMainDeviceChange($mainOutputDeviceId)}
-      >
-        <option value="">Default</option>
+    <div class="device-group">
+      <span class="group-label">Main</span>
+      <div class="device-checks">
+        <label class="device-check">
+          <input
+            type="checkbox"
+            checked={$mainOutputDeviceIds.includes("")}
+            onchange={(e) => toggleMainDevice("", e.currentTarget.checked)}
+          />
+          Default
+        </label>
         {#each devices as d (d.id)}
-          <option value={d.id}>{d.label}</option>
+          <label class="device-check">
+            <input
+              type="checkbox"
+              checked={$mainOutputDeviceIds.includes(d.id)}
+              onchange={(e) => toggleMainDevice(d.id, e.currentTarget.checked)}
+            />
+            {d.label}
+          </label>
         {/each}
-      </select>
-    </label>
+      </div>
+    </div>
 
     <label class="device-label">
       Headphones
@@ -89,6 +104,37 @@
   .error {
     color: #cc5555;
     font-style: italic;
+  }
+
+  .device-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .group-label {
+    color: #888;
+    flex-shrink: 0;
+  }
+
+  .device-checks {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .device-check {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    color: #999;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .device-check input[type="checkbox"] {
+    accent-color: #f5a623;
+    cursor: pointer;
   }
 
   .device-label {

@@ -23,15 +23,16 @@ Domain: cuemark.com (Charles Brandt's former DJ name)
 ```
 GStreamer (Rust, per deck):
   uridecodebin → queue(2buf) → audioconvert → audioresample
-    → capsfilter(48kHz) → pitch(tempo) → output_queue(500ms) → volume → pipewiresink / autoaudiosink
-                                                                               ↑               ↑
-                                                                 device-specific sink    system default
+    → capsfilter(48kHz) → pitch(tempo) → output_queue(500ms) → tee
+                                                                  ├─ volume₀ → sink₀  ┐ one branch per main device
+                                                                  ├─ volume₁ → sink₁  ┘ (≥1; empty → system default)
+                                                                  └─ cue_valve → cue_volume → cue_queue → cue_sink
 ```
 
 `AudioManager` (held in Tauri managed state as `Mutex<AudioManager>`) owns all `DeckAudioPipeline` instances.
 Tauri commands (`audio_load`, `audio_play`, `audio_pause`, `audio_seek`, `audio_set_rate`, `audio_set_gain`,
 `audio_set_volume`, `audio_set_eq`, `audio_set_cue`, `audio_get_position`, `audio_set_master_volume`,
-`audio_set_main_device`, `audio_set_cue_device`, `audio_set_cue_gain`, `audio_record_start/stop`) expose the
+`audio_set_main_devices`, `audio_set_cue_device`, `audio_set_cue_gain`, `audio_record_start/stop`) expose the
 pipeline to the frontend. The frontend wrapper lives in `src/lib/audio/pipeline.ts`.
 
 **Audio is the master clock.** The `<video>` element is muted and used only for frame decode. In the RAF loop,
@@ -75,6 +76,17 @@ pipeline state machine entirely.
 **Preroll**: `load()` waits synchronously (up to 5 s) for the pipeline to reach `PAUSED` before returning,
 so callers can seek and play immediately without an extra wait.
 
+**Multiple sinks and `async=false`**: Every `GstBaseSink` with `async=true` (the default) must receive a
+preroll buffer before the pipeline can report PAUSED — it blocks the READY→PAUSED state transition until
+that buffer arrives. In a `tee` topology with N real sinks, GStreamer requires *all* of them to preroll
+simultaneously, but the tee pushes to each pad sequentially in one thread, so they can deadlock each other.
+**Rule: only one sink per pipeline should have `async=true`.** All additional sinks must be set to
+`async=false` before being linked. With `async=false`, a sink skips preroll and starts accepting buffers
+when the pipeline reaches PLAYING, synchronized to the clock provided by the `async=true` sink.
+This applies to every branch: the cue sink already uses `async=false`; secondary main output sinks do too.
+Symptom of getting this wrong: `[bus/<deck>] pipeline: Null → Ready (pending Paused)` followed by
+`[audio/<deck>] preroll still pending after 5s timeout` with no further state-change log lines.
+
 ### Rendering pipeline
 
 ```
@@ -98,20 +110,21 @@ sync with layout. Use `imageSmoothingQuality = 'high'` on 2D contexts.
 **Gotcha**: assigning `canvas.width` or `canvas.height` resets all 2D context state, including
 `imageSmoothingQuality` — re-apply it after every resize.
 
-**WaveformCanvas ResizeObserver — observe the wrapper, not the canvas**: The `ResizeObserver` in
-`WaveformCanvas.svelte` observes the *wrapper div*, not the canvas itself. A canvas's default CSS
-width is 300 px; observing the canvas directly causes the first callback to return `width=300` before
-the flex layout resolves, producing a mismatched pixel buffer. Observing the wrapper div (whose size
-is set by the flex container) gives the correct layout width immediately. Call `resize()` synchronously
-after setting up the observer to catch cases where the observer fires asynchronously.
+**Canvas sizing rule — always use JS, never rely on scoped CSS width**: WebKitGTK does not reliably
+apply `width: 100%` from scoped Svelte CSS (or from global `app.css`) to a `<canvas>` inside a flex
+child component. The canvas falls back to its 300 px intrinsic default, making waveforms appear
+smooshed to the left and preview thumbnails blurry. The fix applied throughout this codebase:
 
-**Svelte CSS scoping for canvas elements**: Canvas layout styles (especially `width: 100%`) must be
-declared in the component's own `<style>` block, not in global `app.css`. Global selectors apply
-correctly in theory, but in practice the Svelte/WebKit combination does not reliably apply
-`width: 100%` to a `<canvas>` from a global stylesheet when the canvas is inside a flex container
-in a child component — the canvas falls back to its 300 px default CSS width, making waveforms
-appear smooshed to the left and any absolute-positioned overlays misaligned. Rule: scope canvas
-styles to the component that owns the canvas.
+1. **Set `c.style.width` and `c.style.height` in the `resize()` function** — inline styles always
+   win over CSS classes, bypassing any scoping ambiguity.
+2. **Never put `width: X` in CSS for canvas elements** — leave canvas width to JS only.
+3. **For WaveformCanvas**: observe the *wrapper div*, not the canvas — a canvas's default CSS width
+   is 300 px, so observing the canvas directly returns `width=300` before flex layout resolves.
+   Also include `deck.source.filePath` as a reactive dependency in the resize `$effect` so the
+   effect re-runs on track load (the initial call may have run with `width=0` before layout).
+4. **For DeckCard preview**: observe the canvas itself via `entry.contentRect` (not a sync
+   `getBoundingClientRect()` call) so aspect-ratio resolves before we measure. Set inline styles
+   from the `contentRect` values.
 
 **MIDI-driven `syncVideoElements` must be rAF-throttled**: MIDI CC events arrive as separate
 Tauri IPC macro-tasks, so `queueMicrotask` does not coalesce them. The 14-bit tempo fader can
@@ -264,7 +277,7 @@ cuemark/
         analyzer.ts             # AudioAnalyzer — Web Audio API FFT (waveform analysis only; not used for playback)
         waveform.ts             # computeWaveform() at 30 peaks/sec + pre-built amplitude color LUTs; analyzeFile() returns { peaks, bpm }
         bpm.ts                  # detectBpm(peaks, peaksPerSecond) — energy-onset histogram; tapTempo(timestamps[])
-        audioSettings.ts        # Svelte stores: mainOutputDeviceId, cueOutputDeviceId, cueGain
+        audioSettings.ts        # Svelte stores: mainOutputDeviceIds, cueOutputDeviceId, cueGain
       midi/
         handler.ts              # Tauri IPC listener → session mutations
     components/

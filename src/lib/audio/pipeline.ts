@@ -93,9 +93,9 @@ export function audioSetMasterVolume(volume: number): Promise<void> {
   return invoke("audio_set_master_volume", { volume });
 }
 
-/** Set the PipeWire sink (by pactl sink name) for the main output. */
-export function audioSetMainDevice(deviceId: string): Promise<void> {
-  return invoke("audio_set_main_device", { deviceId });
+/** Set one or more PipeWire sinks for the main output. Empty array = system default only. */
+export function audioSetMainDevices(deviceIds: string[]): Promise<void> {
+  return invoke("audio_set_main_devices", { deviceIds });
 }
 
 /** Set the PipeWire sink for the headphone cue output. */

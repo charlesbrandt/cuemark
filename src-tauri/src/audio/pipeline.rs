@@ -2,11 +2,14 @@
 ///
 /// Topology:
 ///   uridecodebin → queue(max-buffers=2) → audioconvert → audioresample
-///     → capsfilter(48kHz) → pitch → [spectrum] → output_queue → volume → pipewiresink
+///     → capsfilter(48kHz) → pitch → [spectrum] → output_queue → tee
+///         ├─ volume₀ → sink₀  ┐
+///         ├─ volume₁ → sink₁  ┤  one branch per main output device (≥1; empty → system default)
+///         └─ cue_valve → cue_volume → cue_queue → pipewiresink(cue) | fakesink
 ///
-/// `spectrum` (gst-plugins-good) is inserted inline after `pitch` when available.
-/// It is a passthrough transform — it adds no latency. The bus thread reads its messages
-/// and emits "audio-fft" Tauri events at ~30 fps for audio-reactive shader uniforms.
+/// The cue branch is always wired. `cue_valve` (drop-buffers=true when cue is off)
+/// gates it without blocking the tee. A `fakesink` is used when no cue device is
+/// selected so the pipeline loads successfully regardless of headphone availability.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,13 +57,99 @@ fn file_to_uri(path: &str) -> String {
 /// On a PipeWire+pipewire-pulse system, `autoaudiosink` picks `pulsesink` and routes
 /// audio through extra layers with additional buffering.
 /// Direct `pipewiresink` removes that hop and keeps latency predictable.
+/// Map a PipeWire channel name to its GStreamer audio channel-mask bit position.
+fn pw_channel_to_gst_bit(ch: &str) -> Option<u32> {
+    match ch {
+        "FL"            => Some(0),
+        "FR"            => Some(1),
+        "FC"            => Some(2),
+        "LFE" | "LFE1"  => Some(3),
+        "RL"            => Some(4),
+        "RR"            => Some(5),
+        "SL"            => Some(10),
+        "SR"            => Some(11),
+        _ => None,
+    }
+}
+
+/// Pre-computed routing info for the cue channel-remap branch.
+struct CueRemap {
+    /// Number of output channels for the GStreamer capsfilter.
+    out_channels: i32,
+    /// GStreamer audio channel-mask bitmask for the capsfilter.
+    channel_mask: u64,
+    /// Mix-matrix rows: one [left_coeff, right_coeff] pair per output channel.
+    /// audioconvert interprets rows as output channels and columns as input channels.
+    matrix_rows: Vec<[f32; 2]>,
+}
+
+/// Build a CueRemap from the `target!full_layout` suffix of a device ID.
+///
+/// Strategy: instead of trying to re-label a 2-channel stereo stream (WirePlumber
+/// ignores channel-position labels on stereo→multi-channel connections and always
+/// routes to the first pair), we output an N-channel stream matching the sink's full
+/// channel count. PipeWire then does a 1:1 port connection, and the silence/audio
+/// values in each channel end up in the correct physical output.
+fn compute_cue_remap(target: &str, full_layout: &str) -> Option<CueRemap> {
+    if target == "FL,FR" || full_layout.is_empty() {
+        return None; // default front pair — no remap needed
+    }
+
+    let all_channels: Vec<&str> = full_layout.split(',').map(str::trim).collect();
+    let n = all_channels.len();
+    if n <= 2 {
+        return None;
+    }
+
+    let target_chs: Vec<&str> = target.split(',').map(str::trim).collect();
+
+    // Compute GStreamer channel-mask covering all channels in the full layout.
+    let mut mask: u64 = 0;
+    for &ch in &all_channels {
+        let bit = pw_channel_to_gst_bit(ch)?;
+        mask |= 1u64 << bit;
+    }
+
+    // For each target channel, find its buffer index within the full layout.
+    // Index = number of set bits in mask that are strictly below this channel's bit.
+    let target_indices: Vec<usize> = target_chs.iter()
+        .map(|&ch| {
+            let bit = pw_channel_to_gst_bit(ch)? as u64;
+            if mask & (1 << bit) == 0 { return None; }
+            Some((0..bit).filter(|&b| mask & (1 << b) != 0).count())
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    // Build N×2 mix-matrix: most rows are silence; target rows get left/right audio.
+    let mut matrix_rows = vec![[0.0f32, 0.0f32]; n];
+    for (pair_idx, &ch_idx) in target_indices.iter().enumerate() {
+        if ch_idx < n && pair_idx < 2 {
+            matrix_rows[ch_idx][pair_idx] = 1.0;
+        }
+    }
+
+    eprintln!(
+        "[audio/cue] remap: target={target} full={full_layout} n_ch={n} mask={mask:#x} idx={target_indices:?}"
+    );
+    Some(CueRemap { out_channels: n as i32, channel_mask: mask, matrix_rows })
+}
+
 fn make_sink(device: &str, deck_id: &str) -> Result<gst::Element, String> {
+    // Device string may encode a stereo-pair target: "node-name@CH1,CH2".
+    // Strip the @suffix here — the actual channel remapping is done via GStreamer caps
+    // inserted before this sink by the caller (pipewiresink uses caps channel positions
+    // for PipeWire port routing, not stream-property metadata).
+    let node_name = match device.find('@') {
+        Some(at) => &device[..at],
+        None => device,
+    };
+
     const BUFFER_TIME_US: i64 = 50_000;
     const LATENCY_TIME_US: i64 = 10_000;
 
     if let Ok(sink) = gst::ElementFactory::make("pipewiresink").build() {
-        if !device.is_empty() {
-            sink.set_property("target-object", device);
+        if !node_name.is_empty() {
+            sink.set_property("target-object", node_name);
         }
         let stream_props = gst::Structure::builder("props")
             .field("node.latency", "1024/48000")
@@ -68,7 +157,7 @@ fn make_sink(device: &str, deck_id: &str) -> Result<gst::Element, String> {
         sink.set_property("stream-properties", &stream_props);
         eprintln!(
             "[audio/{}] sink: pipewiresink target={:?} node.latency=1024/48000 (~21ms)",
-            deck_id, device
+            deck_id, node_name
         );
         return Ok(sink);
     }
@@ -109,7 +198,12 @@ fn make_sink(device: &str, deck_id: &str) -> Result<gst::Element, String> {
 
 struct PipelineInner {
     pipeline: gst::Pipeline,
-    volume_el: gst::Element,
+    /// One volume element per main output device (gain × vol applied to all).
+    volume_els: Vec<gst::Element>,
+    /// Cue branch volume — gain × cue_gain, independent of the crossfader.
+    cue_volume_el: gst::Element,
+    /// Valve that gates the cue branch; drop-buffers=true when cue is off.
+    cue_valve_el: gst::Element,
     /// soundtouch pitch element — `tempo` property controls playback speed without pitch shift.
     pitch_el: gst::Element,
     /// Held so we can call set_flushing(true) to stop the bus monitor thread on drop/reload.
@@ -124,9 +218,16 @@ pub struct DeckAudioPipeline {
     pub deck_id: String,
     inner: Option<PipelineInner>,
     pub(super) file_path: Option<String>,
-    pub(super) device: String,
+    /// PipeWire sink names for the main outputs. Empty vec = single system-default output.
+    pub(super) devices: Vec<String>,
+    /// PipeWire sink name for the headphone cue output. Empty = use fakesink (no cue output).
+    pub(super) cue_device: String,
     gain: f32,
     vol: f32,
+    /// Independent gain for the cue/headphone branch (0–4).
+    cue_gain: f32,
+    /// True when the headphone cue branch is open (valve passing buffers).
+    cue_enabled: bool,
     /// Current tempo multiplier. Re-applied to the pitch element after each load.
     rate: f64,
     /// True when the user has pressed play (intent). Retained across device rebuilds.
@@ -143,9 +244,12 @@ impl DeckAudioPipeline {
             deck_id: deck_id.to_string(),
             inner: None,
             file_path: None,
-            device: String::new(),
+            devices: Vec::new(),
+            cue_device: String::new(),
             gain: 1.0,
             vol: 1.0,
+            cue_gain: 1.0,
+            cue_enabled: false,
             rate: 1.0,
             playing: false,
             eos_callback: None,
@@ -210,8 +314,91 @@ impl DeckAudioPipeline {
         // non-uniform sizes at non-1.0 tempos). Without this, the PipeWire pull callback
         // can starve when soundtouch hasn't yet produced a full 1024-sample quantum.
         let output_queue = make_el("queue")?;
-        let volume       = make_el("volume")?;
-        let sink         = make_sink(&self.device, &self.deck_id)?;
+
+        // One (volume, sink) pair per main output device. Empty devices list = single default.
+        let main_devs: Vec<String> = if self.devices.is_empty() {
+            vec![String::new()]
+        } else {
+            self.devices.clone()
+        };
+        let mut volume_els: Vec<gst::Element> = Vec::with_capacity(main_devs.len());
+        let mut main_sinks: Vec<gst::Element> = Vec::with_capacity(main_devs.len());
+        for (i, dev) in main_devs.iter().enumerate() {
+            let vol = make_el("volume")?;
+            let snk = make_sink(dev, &format!("{}/{}", self.deck_id, i))?;
+            // Only the primary sink (i=0) participates in preroll — it controls the
+            // pipeline's READY→PAUSED state transition. Secondary sinks use async=false
+            // so they don't block preroll; they join at PLAYING time using the primary's clock.
+            if i > 0 {
+                snk.set_property("async", false);
+            }
+            volume_els.push(vol);
+            main_sinks.push(snk);
+        }
+
+        // ── Cue branch ────────────────────────────────────────────────────────────
+        // tee splits post-pitch audio into main and cue branches.
+        let tee       = make_el("tee")?;
+        // valve gates the cue branch; drop-buffers=true means it returns GST_FLOW_OK
+        // immediately without passing any data, so the tee never blocks on this branch.
+        let cue_valve  = make_el("valve")?;
+        let cue_volume = make_el("volume")?;
+        // Small queue so pipewiresink's pull callback always finds data when cue is active.
+        let cue_queue  = make_el("queue")?;
+        // Use a real sink only when a device is configured; fakesink otherwise so that
+        // the pipeline loads cleanly even when no headphone device is selected.
+        let cue_sink = if self.cue_device.is_empty() {
+            eprintln!("[audio/{}-cue] no device set — cue output routed to fakesink", self.deck_id);
+            let fs = make_el("fakesink")?;
+            fs.set_property("sync", false);
+            fs
+        } else {
+            make_sink(&self.cue_device, &format!("{}-cue", self.deck_id))?
+        };
+        // The cue branch is a monitoring output. async=false means it never participates in
+        // pipeline preroll, so the valve dropping all buffers (cue off) doesn't block the
+        // pipeline from completing PAUSED — only the main sink controls preroll timing.
+        cue_sink.set_property("async", false);
+
+        // Optional channel remapping for multi-channel sinks (e.g. DJControl Starlight Rear).
+        //
+        // WirePlumber (PipeWire session manager) always routes stereo streams to the first pair
+        // of a multi-channel sink regardless of channel-position labels in the GStreamer caps.
+        // The fix: output an N-channel stream (matching the sink's full channel count) with audio
+        // only in the target channels and silence elsewhere. PipeWire does a 1:1 port connection
+        // for same-count streams, so audio ends up exactly in the right physical output.
+        //
+        // Device ID format: `node@target!full_layout` e.g. `alsa_out...@RL,RR!FL,FR,RL,RR`
+        let cue_channel_remap: Option<(gst::Element, gst::Element)> = {
+            let remap = self.cue_device.find('@').and_then(|at| {
+                let after = &self.cue_device[at + 1..];
+                let bang = after.find('!')?;
+                let target = &after[..bang];
+                let full   = &after[bang + 1..];
+                compute_cue_remap(target, full)
+            });
+
+            if let Some(r) = remap {
+                let ch_conv = make_el("audioconvert")?;
+
+                // N×2 mix-matrix: routes the two input (stereo) channels into the correct
+                // output channel slots; all other output channels stay at 0 (silence).
+                let matrix_arrays: Vec<gst::Array> = r.matrix_rows.iter()
+                    .map(|row| gst::Array::new([row[0], row[1]]))
+                    .collect();
+                ch_conv.set_property("mix-matrix", gst::Array::new(matrix_arrays));
+
+                let ch_caps = make_el("capsfilter")?;
+                ch_caps.set_property("caps", &gst::Caps::builder("audio/x-raw")
+                    .field("channels", r.out_channels)
+                    .field("channel-mask", gst::Bitmask(r.channel_mask))
+                    .build());
+
+                Some((ch_conv, ch_caps))
+            } else {
+                None
+            }
+        };
 
         let caps_48k = gst::Caps::builder("audio/x-raw")
             .field("rate", 48_000i32)
@@ -219,21 +406,38 @@ impl DeckAudioPipeline {
         rate_caps.set_property("caps", &caps_48k);
 
         src.set_property("uri", file_to_uri(file_path));
-        volume.set_property("volume", (self.gain * self.vol) as f64);
+        for vol in &volume_els {
+            vol.set_property("volume", (self.gain * self.vol) as f64);
+        }
         pitch.set_property("tempo", self.rate as f32);
         queue.set_property("max-size-buffers", 2u32);
         queue.set_property("max-size-bytes", 0u32);
         queue.set_property("max-size-time", 0u64);
-        // Time-based output queue: hold up to 200ms worth of post-pitch audio.
+        // Time-based output queue: hold up to 500ms worth of post-pitch audio.
         output_queue.set_property("max-size-buffers", 0u32);
         output_queue.set_property("max-size-bytes", 0u32);
         output_queue.set_property("max-size-time", 500_000_000u64); // 500ms in nanoseconds
 
+        cue_valve.set_property("drop", !self.cue_enabled);
+        cue_volume.set_property("volume", (self.gain * self.cue_gain) as f64);
+        cue_queue.set_property("max-size-buffers", 2u32);
+        cue_queue.set_property("max-size-bytes", 0u32);
+        cue_queue.set_property("max-size-time", 0u64);
+
         pipeline
-            .add_many([&src, &queue, &convert, &resample, &rate_caps, &pitch, &output_queue, &volume, &sink])
+            .add_many([&src, &queue, &convert, &resample, &rate_caps, &pitch, &output_queue,
+                       &tee, &cue_valve, &cue_volume, &cue_queue, &cue_sink])
             .map_err(|e| format!("[{}] pipeline add_many: {e}", self.deck_id))?;
+        for (vol, snk) in volume_els.iter().zip(main_sinks.iter()) {
+            pipeline.add(vol).map_err(|e| format!("[{}] pipeline add volume: {e}", self.deck_id))?;
+            pipeline.add(snk).map_err(|e| format!("[{}] pipeline add sink: {e}", self.deck_id))?;
+        }
         if let Some(ref s) = spectrum_opt {
             pipeline.add(s).map_err(|e| format!("[{}] pipeline add spectrum: {e}", self.deck_id))?;
+        }
+        if let Some((ref ch_conv, ref ch_caps)) = cue_channel_remap {
+            pipeline.add(ch_conv).map_err(|e| format!("[{}] pipeline add cue ch_conv: {e}", self.deck_id))?;
+            pipeline.add(ch_caps).map_err(|e| format!("[{}] pipeline add cue ch_caps: {e}", self.deck_id))?;
         }
 
         queue.link(&convert).map_err(|e| format!("queue→audioconvert: {e}"))?;
@@ -247,8 +451,35 @@ impl DeckAudioPipeline {
         } else {
             pitch.link(&output_queue).map_err(|e| format!("pitch→output_queue: {e}"))?;
         }
-        output_queue.link(&volume).map_err(|e| format!("output_queue→volume: {e}"))?;
-        volume.link(&sink).map_err(|e| format!("volume→sink: {e}"))?;
+        output_queue.link(&tee).map_err(|e| format!("output_queue→tee: {e}"))?;
+
+        // tee → main branches (one per configured output device)
+        for (vol, snk) in volume_els.iter().zip(main_sinks.iter()) {
+            let tee_pad = tee.request_pad_simple("src_%u")
+                .ok_or_else(|| format!("[{}] tee: could not request main src pad", self.deck_id))?;
+            let vol_sink_pad = vol.static_pad("sink")
+                .ok_or_else(|| format!("[{}] volume: no sink pad", self.deck_id))?;
+            tee_pad.link(&vol_sink_pad).map_err(|e| format!("tee→volume: {e}"))?;
+            vol.link(snk).map_err(|e| format!("volume→sink: {e}"))?;
+        }
+
+        // tee → cue branch
+        let tee_cue_pad = tee.request_pad_simple("src_%u")
+            .ok_or_else(|| format!("[{}] tee: could not request cue src pad", self.deck_id))?;
+        let cue_valve_sink_pad = cue_valve.static_pad("sink")
+            .ok_or_else(|| format!("[{}] cue_valve: no sink pad", self.deck_id))?;
+        tee_cue_pad.link(&cue_valve_sink_pad)
+            .map_err(|e| format!("tee→cue_valve: {e}"))?;
+        cue_valve.link(&cue_volume).map_err(|e| format!("cue_valve→cue_volume: {e}"))?;
+        // cue_volume → [ch_conv → ch_caps →] cue_queue → cue_sink
+        if let Some((ref ch_conv, ref ch_caps)) = cue_channel_remap {
+            cue_volume.link(ch_conv).map_err(|e| format!("cue_volume→ch_conv: {e}"))?;
+            ch_conv.link(ch_caps).map_err(|e| format!("ch_conv→ch_caps: {e}"))?;
+            ch_caps.link(&cue_queue).map_err(|e| format!("ch_caps→cue_queue: {e}"))?;
+        } else {
+            cue_volume.link(&cue_queue).map_err(|e| format!("cue_volume→cue_queue: {e}"))?;
+        }
+        cue_queue.link(&cue_sink).map_err(|e| format!("cue_queue→cue_sink: {e}"))?;
 
         let queue_weak = queue.downgrade();
         let deck_id = self.deck_id.clone();
@@ -397,17 +628,54 @@ impl DeckAudioPipeline {
             eprintln!("[audio/{}] duration={:.3}s", self.deck_id, dur);
         }
 
-        self.inner = Some(PipelineInner { pipeline, volume_el: volume, pitch_el: pitch, bus, at_eos, at_error });
+        self.inner = Some(PipelineInner {
+            pipeline,
+            volume_els,
+            cue_volume_el: cue_volume,
+            cue_valve_el: cue_valve,
+            pitch_el: pitch,
+            bus,
+            at_eos,
+            at_error,
+        });
         Ok(())
     }
 
-    /// Switch output to a different PipeWire sink.
+    /// Switch main outputs to a new set of PipeWire sinks.
     ///
     /// PipeWire's `pipewiresink` does not support runtime target changes, so the
     /// pipeline must be torn down and rebuilt. Playback position and play/pause
     /// state are restored after the rebuild.
-    pub fn set_device(&mut self, device: &str) -> Result<(), String> {
-        self.device = device.to_string();
+    pub fn set_devices(&mut self, devices: &[String]) -> Result<(), String> {
+        self.devices = devices.to_vec();
+        let file_path = match self.file_path.clone() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let position = self.position().unwrap_or(0.0);
+        let was_playing = self
+            .inner
+            .as_ref()
+            .map(|i| i.pipeline.current_state() == gst::State::Playing)
+            .unwrap_or(false);
+
+        self.load(&file_path)?;
+
+        if position > 0.01 {
+            let _ = self.seek(position);
+        }
+        if was_playing {
+            self.play()?;
+        }
+
+        Ok(())
+    }
+
+    /// Switch cue/headphone output to a different PipeWire sink.
+    /// Requires a pipeline rebuild for the same reason as set_devices.
+    pub fn set_cue_device(&mut self, device: &str) -> Result<(), String> {
+        self.cue_device = device.to_string();
         let file_path = match self.file_path.clone() {
             Some(p) => p,
             None => return Ok(()),
@@ -494,11 +762,21 @@ impl DeckAudioPipeline {
         Ok(())
     }
 
+    /// Independent gain for the cue/headphone output (0–4).
+    pub fn set_cue_gain(&mut self, gain: f32) -> Result<(), String> {
+        self.cue_gain = gain.clamp(0.0, 4.0);
+        if let Some(inner) = &self.inner {
+            inner.cue_volume_el.set_property("volume", (self.gain * self.cue_gain) as f64);
+        }
+        Ok(())
+    }
+
     fn apply_volume(&self) {
         if let Some(inner) = &self.inner {
-            inner
-                .volume_el
-                .set_property("volume", (self.gain * self.vol) as f64);
+            for vol in &inner.volume_els {
+                vol.set_property("volume", (self.gain * self.vol) as f64);
+            }
+            inner.cue_volume_el.set_property("volume", (self.gain * self.cue_gain) as f64);
         }
     }
 
@@ -507,8 +785,13 @@ impl DeckAudioPipeline {
         Ok(())
     }
 
-    /// Gate cue branch. No-op until cue tee branch is added.
-    pub fn set_cue_enabled(&self, _enabled: bool) -> Result<(), String> {
+    /// Open or close the headphone cue branch via the valve gate.
+    pub fn set_cue_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        self.cue_enabled = enabled;
+        if let Some(inner) = &self.inner {
+            inner.cue_valve_el.set_property("drop", !enabled);
+            eprintln!("[audio/{}] cue {}", self.deck_id, if enabled { "ON" } else { "OFF" });
+        }
         Ok(())
     }
 

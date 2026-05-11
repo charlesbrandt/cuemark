@@ -9,7 +9,7 @@
   import {
     audioLoad, audioUnload, audioPlay, audioPause,
     audioSeek, audioSetRate, audioSetGain, audioSetVolume,
-    audioSetCue, audioSetMasterVolume, audioSetMainDevice,
+    audioSetCue, audioSetMasterVolume, audioSetMainDevices,
     audioSetCueDevice, audioSetCueGain,
   } from "./lib/audio/pipeline";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -20,7 +20,7 @@
   import Crossfader from "./components/Crossfader.svelte";
   import WaveformCanvas from "./components/WaveformCanvas.svelte";
   import AudioSettings from "./components/AudioSettings.svelte";
-  import { cueOutputDeviceId, cueGain } from "./lib/audio/audioSettings";
+  import { mainOutputDeviceIds, cueOutputDeviceId, cueGain } from "./lib/audio/audioSettings";
   import type { Deck } from "./lib/state/types";
   import { audioGetPosition } from "./lib/audio/pipeline";
 
@@ -71,6 +71,11 @@
   // Sync master volume to Rust audio pipeline
   $effect(() => {
     audioSetMasterVolume($session.masterVolume).catch(console.error);
+  });
+
+  // Sync main output devices to Rust audio pipeline (runs on init with persisted value)
+  $effect(() => {
+    audioSetMainDevices($mainOutputDeviceIds).catch(console.error);
   });
 
   // Sync headphone output device to Rust audio pipeline
@@ -380,9 +385,7 @@
   <canvas bind:this={canvas} width={1920} height={1080} style="display:none"></canvas>
 
   {#if showAudioSettings}
-    <AudioSettings
-      onMainDeviceChange={(id) => audioSetMainDevice(id).catch(console.error)}
-    />
+    <AudioSettings />
   {/if}
 
   <div class="waveform-stack">

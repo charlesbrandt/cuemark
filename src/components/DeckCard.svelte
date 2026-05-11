@@ -24,14 +24,21 @@
     ctx.imageSmoothingQuality = "high";
 
     // Keep canvas buffer sized to its actual rendered pixels so it isn't upscaled blurry.
+    // deck-preview has width:100% + aspect-ratio:16/9 in global CSS; observe the canvas
+    // itself and use entry.contentRect (the CSS-laid-out size) rather than a sync
+    // getBoundingClientRect() call, which would fire before aspect-ratio resolves.
     const dpr = window.devicePixelRatio || 1;
     const ro = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const { width, height } = entry.contentRect;
-        canvas.width = Math.round(width * dpr);
-        canvas.height = Math.round(height * dpr);
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = "high";
+        if (width > 0 && height > 0) {
+          canvas.width = Math.round(width * dpr);
+          canvas.height = Math.round(height * dpr);
+          canvas.style.width = width + 'px';
+          canvas.style.height = height + 'px';
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = "high";
+        }
       }
     });
     ro.observe(canvas);
@@ -181,7 +188,7 @@
         onclick={() => { const t = getDeckTime(deck.id); if (t !== null) updateDeck(deck.id, { cuePoint: t }); }}
         title="Set cue point at current position"
       >
-        Cue
+        SET
       </button>
     {/if}
   </div>
