@@ -74,7 +74,10 @@
         node.width = Math.round(w * dpr);
         node.height = Math.round(cssH * dpr);
         node.style.width = w + 'px';
-        // height is CSS-controlled — do not touch node.style.height
+        // Must set inline style.height: WebKitGTK uses the canvas.height *attribute*
+        // (buffer size = cssH * dpr) for CSS layout when no inline style is present,
+        // making the canvas render at dpr× its intended height. The inline style wins.
+        node.style.height = cssH + 'px';
       }
     }
 
