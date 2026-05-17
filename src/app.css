@@ -15,6 +15,30 @@ body {
   height: 100vh;
 }
 
+/* ── Main layout: content + optional sidebar ──────────── */
+.main-layout {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.main-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.queue-sidebar {
+  width: 300px;
+  flex-shrink: 0;
+  border-left: 1px solid #2a2a2a;
+  overflow-y: auto;
+  background: #111;
+}
+
 /* ── Toolbar ──────────────────────────────────────────── */
 .toolbar {
   display: flex;

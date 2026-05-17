@@ -61,6 +61,12 @@ export default defineConfig({
     port: 1420,
     strictPort: true,
     host: "localhost",
+    proxy: {
+      "/digger-api": {
+        target: "http://localhost:8200",
+        rewrite: (path) => path.replace(/^\/digger-api/, ""),
+      },
+    },
     watch: {
       ignored: ["**/src-tauri/**"],
     },

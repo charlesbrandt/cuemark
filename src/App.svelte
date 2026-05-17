@@ -20,6 +20,7 @@
   import Crossfader from "./components/Crossfader.svelte";
   import WaveformCanvas from "./components/WaveformCanvas.svelte";
   import AudioSettings from "./components/AudioSettings.svelte";
+  import DiggerQueue from "./components/DiggerQueue.svelte";
   import { mainOutputDeviceIds, cueOutputDeviceId, cueGain } from "./lib/audio/audioSettings";
   import type { Deck } from "./lib/state/types";
   import { audioGetPosition } from "./lib/audio/pipeline";
@@ -34,6 +35,7 @@
   let tapTimestamps: number[] = [];
   let tapResetTimer: ReturnType<typeof setTimeout> | undefined;
   let showAudioSettings = $state(false);
+  let showDiggerQueue = $state(false);
 
   function handleTap() {
     const now = Date.now();
@@ -361,6 +363,11 @@
       class:active={showAudioSettings}
       onclick={() => { showAudioSettings = !showAudioSettings; }}
     >Audio</button>
+    <button
+      class="output-btn"
+      class:active={showDiggerQueue}
+      onclick={() => { showDiggerQueue = !showDiggerQueue; }}
+    >Queue</button>
     <span class="bpm">{$session.bpm ? `${$session.bpm} BPM` : "—"}</span>
     <button class="tap-btn" onclick={handleTap}>TAP</button>
     {#if $session.bpm !== null}
@@ -384,31 +391,41 @@
   <!-- Compositor renders here; hidden from control window — visible only in Output Window -->
   <canvas bind:this={canvas} width={1920} height={1080} style="display:none"></canvas>
 
-  {#if showAudioSettings}
-    <AudioSettings />
-  {/if}
+  <div class="main-layout">
+    <div class="main-content">
+      {#if showAudioSettings}
+        <AudioSettings />
+      {/if}
 
-  <div class="waveform-stack">
-    {#each $session.decks as deck (deck.id)}
-      <div class="waveform-row">
-        <span class="waveform-label">{deck.id}</span>
-        <WaveformCanvas {deck} onBpmDetected={(bpm) => updateDeck(deck.id, { bpm })} />
+      <div class="waveform-stack">
+        {#each $session.decks as deck (deck.id)}
+          <div class="waveform-row">
+            <span class="waveform-label">{deck.id}</span>
+            <WaveformCanvas {deck} onBpmDetected={(bpm) => updateDeck(deck.id, { bpm })} />
+          </div>
+        {/each}
       </div>
-    {/each}
-  </div>
 
-  <div class="decks" style="--deck-count: {$session.decks.length}">
-    {#each $session.decks as deck (deck.id)}
-      <DeckCard {deck} />
-    {/each}
-  </div>
+      <div class="decks" style="--deck-count: {$session.decks.length}">
+        {#each $session.decks as deck (deck.id)}
+          <DeckCard {deck} />
+        {/each}
+      </div>
 
-  <Crossfader
-    mapping={$session.crossfaderMapping}
-    decks={$session.decks}
-    crossfaderValue={$session.crossfaderValue}
-    crossfaderTargets={$session.crossfaderTargets}
-    audioCurve={$session.audioCurve}
-    visualCurve={$session.visualCurve}
-  />
+      <Crossfader
+        mapping={$session.crossfaderMapping}
+        decks={$session.decks}
+        crossfaderValue={$session.crossfaderValue}
+        crossfaderTargets={$session.crossfaderTargets}
+        audioCurve={$session.audioCurve}
+        visualCurve={$session.visualCurve}
+      />
+    </div>
+
+    {#if showDiggerQueue}
+      <aside class="queue-sidebar">
+        <DiggerQueue />
+      </aside>
+    {/if}
+  </div>
 </div>
