@@ -203,7 +203,7 @@
   <div class="bpm-row">
     <span class="bpm-value">
       {#if deck.bpm !== null}
-        {deck.bpm} BPM
+        {deck.bpm} <span class="bpm-effective" title="Current BPM at {deck.playbackRate.toFixed(2)}× rate">→ {(deck.bpm * deck.playbackRate).toFixed(1)}</span> BPM
       {:else}
         — BPM
       {/if}
@@ -478,6 +478,11 @@
     color: #aaa;
     font-variant-numeric: tabular-nums;
     min-width: 60px;
+  }
+
+  .bpm-effective {
+    color: #f5a623;
+    font-variant-numeric: tabular-nums;
   }
 
   .bpm-btn {
