@@ -10,7 +10,7 @@ Domain: cuemark.com (Charles Brandt's former DJ name)
 - **Tauri** (Rust backend + WebKit frontend) — cross-platform, Wayland-native on Linux via GTK4
 - **WebGL** — GPU-accelerated rendering, FBO-per-deck compositing
 - **GStreamer** (Rust, `gstreamer` + `gstreamer-audio` crates, `features = ["v1_18"]` required) — audio playback, gain/EQ, device routing, headphone cue mix, recording. Each deck has its own `DeckAudioPipeline` (uridecodebin → queue → audioconvert → audioresample → capsfilter(48kHz) → pitch → output_queue → volume → pipewiresink/autoaudiosink). Audio is the master clock; video element syncs to it.
-- **Web Audio API** — waveform peak extraction + FFT analysis for BPM detection and audio-reactive visuals (not used for playback)
+- **Web Audio API** — FFT analysis for BPM detection and audio-reactive visuals (not used for playback or waveform peak extraction — that runs in Rust via `audio_analyze_file` to avoid VA-API corruption)
 - **GLSL shaders** — effects and audio-reactive visualizations
 - **Rust `midir` crate** — MIDI input (Web MIDI API unreliable in WebKitGTK); events piped to frontend via Tauri IPC
 - **`<video>` element → 2D canvas → texImage2D** — video decode into WebGL texture via a scratch canvas intermediary (direct video→texImage2D triggers SIGTRAP assertion failures in WebKitGTK; see `fbo.ts`). The `<video>` element is **muted** — audio is owned by the GStreamer pipeline.
@@ -76,6 +76,37 @@ pipeline state machine entirely.
 **Preroll**: `load()` waits synchronously (up to 5 s) for the pipeline to reach `PAUSED` before returning,
 so callers can seek and play immediately without an extra wait.
 
+**`uridecodebin` must skip video decoder factories**: `uridecodebin` internally uses `decodebin3`,
+which attempts to decode *every* stream in a container — including video — even when only audio pads
+are connected. For video+audio containers, `decodebin3` instantiates the VA-API hardware video decoder
+(`vaav1dec` / `vaah264dec`), which can fail and emit a pipeline ERROR. That ERROR also corrupts the
+VA-API driver state for the entire process, breaking the `<video>` element and waveform analysis for
+the rest of the session. Fix in `pipeline.rs` `load()`, using the `autoplug-select` signal:
+```rust
+src.connect("autoplug-select", false, |values| {
+    let factory = values.get(3).and_then(|v| v.get::<gst::ElementFactory>().ok())?;
+    let klass = factory.metadata("klass").unwrap_or_default();
+    let is_video_decoder = klass.contains("Decoder") && klass.contains("Video");
+    let result_int = if is_video_decoder { 2i32 } else { 0i32 }; // SKIP=2, TRY=0
+    let enum_class = glib::Type::from_name("GstAutoplugSelectResult")
+        .and_then(glib::EnumClass::with_type)?;
+    enum_class.to_value(result_int)
+});
+```
+**Why factory klass, not caps**: stream caps like `video/quicktime` describe the *container* (MP4/MOV
+demuxer), not just the video track inside. A caps-based check accidentally skips the demuxer itself,
+preventing the file from opening. Checking `klass.contains("Decoder") && klass.contains("Video")`
+skips only actual video decoder elements.
+**Why `autoplug-select` not `autoplug-continue`**: returning `false` from `autoplug-continue` exposes
+the encoded video pad with nothing downstream to accept it → `not-linked` ERROR crashes the pipeline.
+`autoplug-select` returning SKIP (2) causes `decodebin` to try the next factory candidate, and when
+all are exhausted it emits an `unknown-type` WARNING (benign) — not an ERROR.
+**Return type pitfall**: the signal requires a `GstAutoplugSelectResult` enum value, not a plain `i32`.
+Use `glib::EnumClass::with_type` and `to_value()` — returning a raw integer fails at runtime with a
+type mismatch error.
+Symptom if missing: `[bus/<deck>] ERROR: No valid frames decoded … GstVaAV1Dec:vaav1dec0` followed by
+subsequent tracks showing waveform `—` and blank video previews for the rest of the session.
+
 **Multiple sinks and `async=false`**: Every `GstBaseSink` with `async=true` (the default) must receive a
 preroll buffer before the pipeline can report PAUSED — it blocks the READY→PAUSED state transition until
 that buffer arrives. In a `tee` topology with N real sinks, GStreamer requires *all* of them to preroll
@@ -97,6 +128,27 @@ Symptom of getting this wrong: `[bus/<deck>] pipeline: Null → Ready (pending P
 ```
 
 Each FBO renders at full output resolution. Compositor alpha-blends decks back-to-front by `opacity`.
+
+**`WEBKIT_DISABLE_DMABUF_RENDERER=1` is required**: When WebKit's `<video>` element decodes video via
+VA-API hardware (h264, AV1, VP9), the decoded frames are stored in DMA-BUF / VA-API surfaces. When
+`drawImage(video)` is called on a 2D canvas, these surfaces don't transfer to CPU-side pixel reads
+correctly — the canvas gets colorful random static instead of the video frame. Setting this env var
+forces WebKit to use a CPU-side compositing path for video frames, which handles color-space
+conversion correctly. Set before `cuemark_lib::run()` in `main.rs`:
+```rust
+std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+```
+Symptom if missing: video deck preview shows colorful noise (random RGB static) instead of the video.
+Note: this affects all WebKit rendering, not just video. There's a small GPU compositing performance
+cost but it's imperceptible at VJ workloads.
+
+**Waveform analysis runs in Rust, not `decodeAudioData`**: WebKit's `OfflineAudioContext.decodeAudioData()`
+routes through a GStreamer pipeline in the WebKitWebProcess (a separate process). That internal pipeline
+also instantiates VA-API video decoders for video+audio containers — the same corruption path as the
+audio pipeline, but in a process we can't control. The fix: `analyzeFile()` in `waveform.ts` calls the
+`audio_analyze_file` Tauri command instead of `decodeAudioData`. The Rust implementation in
+`analysis.rs` (`compute_peaks()`) uses the same `autoplug-select` factory klass guard as
+`DeckAudioPipeline` and returns 30 peaks/sec via `appsink`. The `gstreamer-app` crate is required.
 
 **WebGL Y-flip**: HTML canvas Y=0 is top; WebGL texture Y=0 is bottom. `UNPACK_FLIP_Y_WEBGL=true`
 corrects this on upload so video appears right-side up.
@@ -276,7 +328,7 @@ cuemark/
       audio/
         pipeline.ts             # Typed TS wrappers around all Rust audio Tauri commands (audioLoad, audioPlay, …)
         analyzer.ts             # AudioAnalyzer — Web Audio API FFT (waveform analysis only; not used for playback)
-        waveform.ts             # computeWaveform() at 30 peaks/sec + pre-built amplitude color LUTs; analyzeFile() returns { peaks, bpm }
+        waveform.ts             # analyzeFile() → calls audio_analyze_file Tauri command (Rust/GStreamer); computeWaveform() for AudioBuffer; amplitude color LUTs
         bpm.ts                  # detectBpm(peaks, peaksPerSecond) — energy-onset histogram; tapTempo(timestamps[])
         audioSettings.ts        # Svelte stores: mainOutputDeviceIds, cueOutputDeviceId, cueGain
       midi/
@@ -357,12 +409,22 @@ npm run check          # TypeScript + Svelte type check
 cd src-tauri && cargo check   # Rust type check only
 ```
 
-System dependencies required for the GStreamer audio backend:
-```
+**Dev server lifecycle**: `cargo tauri dev` watches frontend files and hot-reloads them instantly.
+Rust changes (`src-tauri/`) require a full recompile — Tauri detects them and rebuilds automatically,
+but **the old binary keeps running until the rebuild finishes and the window restarts**.
+If managing the dev server from Claude Code: kill the background process before making Rust changes,
+then restart after. A change that was edited but never recompiled has no effect at runtime.
+
+**First-time / new machine setup** (in addition to Rust + Node toolchains):
+```bash
+# GStreamer dev headers — runtime packages alone aren't enough
 sudo apt install \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
   gstreamer1.0-pipewire   # optional: enables device-specific routing
+
+npm install                              # JS deps (node_modules not committed)
+cargo install tauri-cli --version "^2"  # CLI subcommand; compiles from source (~5 min)
 ```
 
 ## Adding or re-calibrating a MIDI controller
@@ -384,7 +446,7 @@ To map a new controller or verify an existing one:
 Media library management lives in a **separate project** (`~/repos/digger`).
 Cuemark does not embed a media browser — Digger owns that concern.
 
-**What Digger provides** (FastAPI REST at `http://localhost:8000` by default):
+**What Digger provides** (FastAPI REST at `http://localhost:8200` by default):
 
 | Endpoint | Used for |
 |---|---|
@@ -416,6 +478,7 @@ Project-specific skills live in `skills/`. Load one with `/audio-debugging` (or 
 | Skill | When to load |
 |---|---|
 | `audio-debugging` | GStreamer bus errors, rate-change issues, layered/detuned audio, pipeline recovery |
+| `run-app` | Launch and monitor the app; stop/restart for Rust changes; read log patterns |
 
 ## Constraints
 

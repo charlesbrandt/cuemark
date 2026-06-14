@@ -18,3 +18,4 @@ midir = "0.9"
 tauri-plugin-dialog = "2"
 gstreamer = { version = "0.23", features = ["v1_18"] }
 gstreamer-audio = "0.23"
+gstreamer-app = "0.23"

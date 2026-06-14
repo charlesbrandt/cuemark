@@ -30,7 +30,7 @@ fn make_el(factory: &str) -> Result<gst::Element, String> {
 ///
 /// Each byte is examined individually so multi-byte UTF-8 sequences (e.g. 'ç' → 0xC3 0xA7)
 /// are percent-encoded as %C3%A7 rather than pushed as `char` values (which produces mojibake).
-fn file_to_uri(path: &str) -> String {
+pub(super) fn file_to_uri(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 7);
     out.push_str("file://");
     for byte in path.bytes() {
@@ -406,6 +406,25 @@ impl DeckAudioPipeline {
         rate_caps.set_property("caps", &caps_48k);
 
         src.set_property("uri", file_to_uri(file_path));
+        // Prevent video decoders from being instantiated. autoplug-select returning SKIP
+        // for a factory causes decodebin to try the next one; when all factories for a
+        // stream type are exhausted it fires unknown-type (WARNING, not ERROR) and
+        // abandons that stream cleanly. autoplug-continue returning false leaves the pad
+        // exposed but unlinked, causing a not-linked ERROR that crashes the pipeline.
+        // Values: 0=TRY, 1=EXPOSE, 2=SKIP.
+        src.connect("autoplug-select", false, |values| {
+            // Skip video decoder factories so vaav1dec (and friends) are never instantiated.
+            // Check the factory klass rather than the stream caps: caps like "video/quicktime"
+            // describe the container, not just video tracks, so a caps-based check would also
+            // skip the MP4/MOV demuxer and prevent the file from being opened at all.
+            let factory = values.get(3).and_then(|v| v.get::<gst::ElementFactory>().ok())?;
+            let klass = factory.metadata("klass").unwrap_or_default();
+            let is_video_decoder = klass.contains("Decoder") && klass.contains("Video");
+            let result_int = if is_video_decoder { 2i32 } else { 0i32 }; // SKIP=2, TRY=0
+            let enum_class = glib::Type::from_name("GstAutoplugSelectResult")
+                .and_then(glib::EnumClass::with_type)?;
+            enum_class.to_value(result_int)
+        });
         for vol in &volume_els {
             vol.set_property("volume", (self.gain * self.vol) as f64);
         }

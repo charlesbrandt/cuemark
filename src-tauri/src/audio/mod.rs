@@ -199,3 +199,11 @@ pub fn audio_record_start(
 pub fn audio_record_stop(state: State<'_, AudioState>) -> Result<(), String> {
     state.lock().unwrap().record.stop()
 }
+
+/// Compute waveform peaks for a file entirely in Rust, bypassing WebKit's
+/// `decodeAudioData` path which triggers vaav1dec on video+audio containers
+/// and corrupts VA-API driver state.
+#[tauri::command]
+pub fn audio_analyze_file(file_path: String) -> Result<Vec<f32>, String> {
+    analysis::compute_peaks(&file_path)
+}

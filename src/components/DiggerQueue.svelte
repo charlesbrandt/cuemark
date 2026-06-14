@@ -3,7 +3,7 @@
   import { session, updateDeck } from '../lib/state/session';
   import {
     search, randomTrack, getQueue, addToQueue, removeFromQueue, queueNext,
-    getCuemarkPayload, setDiggerBaseUrl,
+    getCuemarkPayload, setDiggerBaseUrl, getDiggerBaseUrl,
     type DiggerTrack, type DiggerQueueItem,
   } from '../lib/digger/api';
 
@@ -13,7 +13,7 @@
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
   let error = $state<string | null>(null);
   let loading = $state(false);
-  let baseUrl = $state('http://localhost:8200');
+  let baseUrl = $state(getDiggerBaseUrl());
   let showUrlInput = $state(false);
 
   const decks = $derived($session.decks);

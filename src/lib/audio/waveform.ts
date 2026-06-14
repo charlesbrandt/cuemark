@@ -63,20 +63,11 @@ export interface AnalysisResult {
 }
 
 export async function analyzeFile(filePath: string): Promise<AnalysisResult> {
-  const encoded = filePath.split('/').map(encodeURIComponent).join('/');
-  const url = import.meta.env.DEV
-    ? '/media' + encoded
-    : 'media://localhost' + encoded;
-
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status} fetching waveform: ${url}`);
-  const arrayBuffer = await res.arrayBuffer();
-
-  // OfflineAudioContext decodes in memory without registering a PipeWire sink.
-  // Length=1 is a placeholder — decodeAudioData ignores it and returns the full buffer.
-  const audioCtx = new OfflineAudioContext(2, 1, 48000);
-  const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-  const peaks = computeWaveform(audioBuffer);
+  const { audioAnalyzeFile } = await import('./pipeline');
+  // Rust decodes audio with video decoders disabled, avoiding the vaav1dec VA-API
+  // corruption that decodeAudioData triggers on video+audio containers in WebKitGTK.
+  const raw = await audioAnalyzeFile(filePath);
+  const peaks = new Float32Array(raw);
   const { detectBpm } = await import('./bpm');
   const bpm = detectBpm(peaks, PEAKS_PER_SECOND);
   return { peaks, bpm };

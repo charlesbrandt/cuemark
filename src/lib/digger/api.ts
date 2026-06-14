@@ -27,12 +27,20 @@ export interface CuemarkPayload {
   hotCues: number[];
 }
 
-// In dev: requests proxy through Vite to http://localhost:8200 (bypasses CORS).
-// In production: set a full URL via setDiggerBaseUrl() from app settings.
-let _baseUrl = '/digger-api';
+const STORAGE_KEY = 'cuemark:diggerBaseUrl';
+
+// Load persisted URL; fall back to Vite proxy path for dev if nothing stored.
+let _baseUrl: string = (() => {
+  try {
+    return localStorage.getItem(STORAGE_KEY) ?? '/digger-api';
+  } catch {
+    return '/digger-api';
+  }
+})();
 
 export function setDiggerBaseUrl(url: string) {
   _baseUrl = url.replace(/\/$/, '');
+  try { localStorage.setItem(STORAGE_KEY, _baseUrl); } catch {}
 }
 
 export function getDiggerBaseUrl(): string {

@@ -149,6 +149,7 @@ pub fn run() {
             audio::audio_set_cue_gain,
             audio::audio_record_start,
             audio::audio_record_stop,
+            audio::audio_analyze_file,
         ])
         .setup(|app| {
             midi::spawn_listener(app.handle().clone())?;

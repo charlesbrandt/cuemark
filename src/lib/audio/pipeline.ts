@@ -118,3 +118,11 @@ export function audioRecordStart(outputPath: string, format: RecordFormat): Prom
 export function audioRecordStop(): Promise<void> {
   return invoke("audio_record_stop");
 }
+
+// ── Waveform analysis ─────────────────────────────────────────────────────────
+
+/** Decode audio in Rust and return peak amplitudes at 30/sec. Avoids decodeAudioData
+ *  which triggers vaav1dec on video+audio containers in WebKitGTK. */
+export function audioAnalyzeFile(filePath: string): Promise<number[]> {
+  return invoke("audio_analyze_file", { filePath });
+}
