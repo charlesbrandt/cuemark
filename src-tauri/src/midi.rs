@@ -222,7 +222,7 @@ pub fn spawn_listener(app: AppHandle) -> Result<(), Box<dyn std::error::Error>> 
     let midi_map = Arc::new(hercules_starlight_map());
     std::thread::spawn(move || {
         if let Err(e) = run_midi_loop(&app, &midi_map) {
-            eprintln!("[midi] listener error: {e}");
+            log::error!("[midi] listener error: {e}");
         }
     });
     Ok(())
@@ -245,9 +245,9 @@ fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>) -> Result<(), Box<dyn
             Some(p) => p,
             None => {
                 let ports2 = midi_in.ports();
-                eprintln!("[midi] Hercules Starlight not found. Available ports:");
+                log::warn!("[midi] Hercules Starlight not found. Available ports:");
                 for p in &ports2 {
-                    eprintln!("  {}", midi_in.port_name(p).unwrap_or_default());
+                    log::warn!("  {}", midi_in.port_name(p).unwrap_or_default());
                 }
                 return Ok(());
             }
@@ -255,7 +255,7 @@ fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>) -> Result<(), Box<dyn
     };
 
     let port_name = midi_in.port_name(&port)?;
-    println!("[midi] connected to: {port_name}");
+    log::info!("[midi] connected to: {port_name}");
 
     let app = app.clone();
     let map = Arc::clone(midi_map);
@@ -296,12 +296,12 @@ fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>) -> Result<(), Box<dyn
             };
 
             if should_log {
-                eprintln!("[midi] {msg_type} ch{channel:02}  status=0x{:02X}  d1={:3}  d2={:3}",
+                log::info!("[midi] {msg_type} ch{channel:02}  status=0x{:02X}  d1={:3}  d2={:3}",
                     msg[0], msg[1], msg[2]);
             }
 
             let Some(binding) = map.get(&key) else {
-                if should_log { eprintln!("[midi]   (unmapped)"); }
+                if should_log { log::info!("[midi]   (unmapped)"); }
                 return;
             };
 
@@ -330,10 +330,10 @@ fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>) -> Result<(), Box<dyn
             };
 
             if let Some(action) = action {
-                if should_log { eprintln!("[midi]   => {:?}", action); }
+                if should_log { log::info!("[midi]   => {:?}", action); }
                 let _ = app.emit("midi-action", action);
             } else if should_log {
-                eprintln!("[midi]   (no action)");
+                log::info!("[midi]   (no action)");
             }
         },
         (),

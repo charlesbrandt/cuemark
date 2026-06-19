@@ -142,6 +142,42 @@ Symptom if missing: video deck preview shows colorful noise (random RGB static) 
 Note: this affects all WebKit rendering, not just video. There's a small GPU compositing performance
 cost but it's imperceptible at VJ workloads.
 
+**This GPU's VA-API DMA-BUF export is fundamentally broken — demote the hardware decoder, don't just
+hide the symptom**: confirmed via `GST_DEBUG=2`: `driver bug: fd size (3670016) is bigger than object
+descriptor size (3194880)` plus `Cannot map/copy External OES textures` from WebKit's GL compositor.
+This single underlying bug surfaces two different ways depending on `WEBKIT_DISABLE_DMABUF_RENDERER`:
+- **Unset**: hardware VA-API decode succeeds, but the corrupted DMA-BUF frame renders as a solid
+  garbage color (e.g. solid blue) in both the `<video>` element and any `drawImage()` canvas read.
+- **Set to `1`**: WebKit's decoder autoplugging for that codec fails outright with *no* software
+  fallback — `<video>` never fires `loadedmetadata`, `error.code === 4` (`MEDIA_ERR_SRC_NOT_SUPPORTED`),
+  preview stays solid black. This is what broke H.264 playback even though `avdec_h264` is installed
+  and works fine via plain `gst-launch-1.0` — WebKitGTK's own autoplugging logic, not a missing system
+  package.
+
+Fix: demote the VA-API decoder's GStreamer rank to 0 for every affected codec, forcing `decodebin` to
+fall through to the software decoder (`av1dec`/aom for AV1, `avdec_h264`/libav for H.264) — this avoids
+the broken DMA-BUF path entirely and works correctly with `WEBKIT_DISABLE_DMABUF_RENDERER=1` still set:
+```rust
+std::env::set_var(
+    "GST_PLUGIN_FEATURE_RANK",
+    "vaav1dec:0,vaapiav1dec:0,vah264dec:0,vaapih264dec:0",
+);
+```
+If VP9 or HEVC show the same black-screen (`FormatError`/code 4) or solid-garbage-color symptom, add
+their `va*dec`/`vaapi*dec` factory names here too — check with `gst-inspect-1.0 | grep -i <codec>`.
+
+**Debugging tip — `std::env::set_var` calls in `main.rs` cannot be overridden from the outside**: to
+test "what if this env var weren't set," editing/commenting the `main.rs` line and rebuilding is
+required — launching the binary with a different value of the same var in the shell has no effect,
+since the Rust call runs after the process starts and unconditionally overwrites it.
+
+**Debugging tip — WebKit's own GStreamer warnings don't reach the Tauri log file**: `tauri-plugin-log`
+only captures our own Rust `log::` call sites. WebKit's internal media pipeline (the separate
+`WebKitWebProcess`) logs straight to stderr via its own GStreamer instance. To see decoder-level errors
+(`FormatError`, `No decoder available for type ...`, DMA-BUF driver warnings), launch the binary
+directly from a terminal with `WEBKIT_DEBUG=Media GST_DEBUG=2 ./path/to/cuemark 2>&1 | tee /tmp/out.log`
+rather than relying on `~/.local/share/com.cuemark.app/logs/cuemark.log`.
+
 **Waveform analysis runs in Rust, not `decodeAudioData`**: WebKit's `OfflineAudioContext.decodeAudioData()`
 routes through a GStreamer pipeline in the WebKitWebProcess (a separate process). That internal pipeline
 also instantiates VA-API video decoders for video+audio containers — the same corruption path as the
@@ -427,6 +463,39 @@ npm install                              # JS deps (node_modules not committed)
 cargo install tauri-cli --version "^2"  # CLI subcommand; compiles from source (~5 min)
 ```
 
+## Logging
+
+`tauri-plugin-log` is wired up unconditionally in `lib.rs` `run()` (not gated to debug builds), at
+`LevelFilter::Info`, targeting both stdout and the platform log directory. All backend `eprintln!`/
+`println!` call sites (audio pipeline, MIDI, device enumeration, analysis) use `log::info!`/`warn!`/
+`error!` instead, so output lands in the log file regardless of how the app was launched — including
+from a desktop launcher with no attached terminal.
+
+Log file: `~/.local/share/com.cuemark.app/logs/cuemark.log` (rotates per Tauri's default log plugin
+behavior). Tail it live to see MIDI events, GStreamer bus messages, and pipeline state changes:
+```bash
+tail -f ~/.local/share/com.cuemark.app/logs/cuemark.log
+```
+
+## Desktop launcher (GNOME)
+
+Mirrors the Fieldnote pattern: build a release binary, symlink it onto `PATH`, and hand-write a
+`.desktop` entry pointing at the symlink — no `.deb` packaging needed.
+
+```bash
+npm run tauri build -- --no-bundle    # npm run build + cargo build --release, no installer packaging
+ln -sf "$(pwd)/src-tauri/target/release/cuemark" ~/.local/bin/cuemark
+mkdir -p ~/.local/share/icons/hicolor/{32x32,128x128}/apps
+cp src-tauri/icons/32x32.png ~/.local/share/icons/hicolor/32x32/apps/cuemark.png
+cp src-tauri/icons/128x128.png ~/.local/share/icons/hicolor/128x128/apps/cuemark.png
+update-desktop-database ~/.local/share/applications/
+```
+
+The `.desktop` file lives at `~/.local/share/applications/cuemark.desktop` (`Exec=cuemark`, relying on
+`~/.local/bin` being on `PATH`). After any Rust or frontend change meant for the launcher build, rerun
+`npm run tauri build -- --no-bundle` — the symlink means no reinstall step is needed, just relaunch from
+the app grid (or `gtk-launch cuemark`) to pick up the new binary.
+
 ## Adding or re-calibrating a MIDI controller
 
 To map a new controller or verify an existing one:
@@ -479,6 +548,7 @@ Project-specific skills live in `skills/`. Load one with `/audio-debugging` (or 
 |---|---|
 | `audio-debugging` | GStreamer bus errors, rate-change issues, layered/detuned audio, pipeline recovery |
 | `run-app` | Launch and monitor the app; stop/restart for Rust changes; read log patterns |
+| `verify-ui` | Screenshot/click/inspect the real webview headlessly via tauri-driver + Xvfb, without touching the user's live desktop session |
 
 ## Constraints
 

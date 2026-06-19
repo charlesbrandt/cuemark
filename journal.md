@@ -635,3 +635,59 @@ actual audio being played rather than a re-decode through the browser.
 Band sensitivity is functional but coarse; the linear dBFS-to-linear mapping and the
 bass/mid/high frequency splits can be tuned in future once there's more performance time to
 evaluate what looks good.
+
+---
+
+# 2026.06.19 — H.264 video black screen: VA-API DMA-BUF export is broken on this GPU
+
+## Bug
+
+Loading any normal H.264 file showed a black deck preview (sound + waveform worked fine).
+WebKit's internal media player logged `FormatError`, `MediaError.code = 4` (`MEDIA_ERR_SRC_NOT_SUPPORTED`).
+`gst-launch-1.0 playbin` on the same file, same user, same system decoded it fine via `vah264dec`
+— so this wasn't a missing-codec problem, despite first appearances.
+
+## Root cause
+
+The previously-applied AV1 fix (`WEBKIT_DISABLE_DMABUF_RENDERER=1`, see the 2026-06-13ish VA-API
+corruption entry) papers over a deeper problem: this GPU/driver's VA-API DMA-BUF export is genuinely
+broken — `GST_DEBUG=2` shows `driver bug: fd size (3670016) is bigger than object descriptor size
+(3194880)` and WebKit's GL compositor logs `Cannot map/copy External OES textures`. That single bug
+shows up two different ways depending on `WEBKIT_DISABLE_DMABUF_RENDERER`:
+
+- **Unset**: hardware VA-API decode succeeds, but the corrupted DMA-BUF frame renders as a solid
+  garbage color (confirmed: solid blue) instead of real video, in both `<video>` and `drawImage()`.
+- **Set to `1`** (what was shipped): WebKit's own decoder autoplugging for that codec fails outright
+  with no software fallback — `<video>` never decodes, black screen, `FormatError`. This is what broke
+  every H.264 file even though `avdec_h264`/`vah264dec`/`vaapih264dec`/`openh264dec` are all installed
+  and confirmed working outside WebKit.
+
+## Fix
+
+Extend the existing AV1 rank-demotion pattern to H.264:
+```rust
+std::env::set_var(
+    "GST_PLUGIN_FEATURE_RANK",
+    "vaav1dec:0,vaapiav1dec:0,vah264dec:0,vaapih264dec:0",
+);
+```
+This forces `decodebin` (in both our own audio pipeline and WebKit's internal player) to fall through
+to the software decoder (`avdec_h264`, libav), bypassing the broken VA-API DMA-BUF path entirely.
+Confirmed fixed by loading the real file in the actual app, with `WEBKIT_DISABLE_DMABUF_RENDERER=1`
+still set.
+
+## Debugging method notes (for next time)
+
+- **WebKit's own GStreamer logs don't reach `tauri-plugin-log`** — that only captures our own Rust
+  `log::` call sites. To see WebKit's internal decoder errors, launch the binary directly from a
+  terminal: `WEBKIT_DEBUG=Media GST_DEBUG=2 ./target/debug/cuemark 2>&1 | tee /tmp/out.log`.
+- **`std::env::set_var` in `main.rs` cannot be overridden externally** — it runs after the process
+  starts and unconditionally clobbers whatever the shell passed in. To test "what if this var weren't
+  set," you have to comment out the line and rebuild — not just omit it from the launch command. Wasted
+  a full test cycle on this before catching it.
+- **`tauri-driver`/`WebKitWebDriver` (the `verify-ui` skill) disables WebKit's sandbox itself** for
+  automation, regardless of `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS`. It cannot be used to A/B test
+  sandbox-related hypotheses — both "sandboxed" and "unsandboxed" runs through that path are actually
+  unsandboxed. Direct terminal launch is required for that kind of test.
+- Used `media://localhost/<urlencoded-path>` directly via WebDriver's `/execute/sync` to test `<video>`
+  decode in isolation, without needing the native file-picker dialog or a session-store debug hook.

@@ -124,7 +124,7 @@
     ctx.fillRect(0, 0, W, H);
 
     const hasSource = deck.source?.type === 'video';
-    const duration = deck.source?.type === 'video' ? (deck.source.duration || 1) : 1;
+    const duration = deck.source?.type === 'video' ? deck.source.duration : 0;
     const currentTime = getDeckTime(deck.id) ?? 0;
 
     if (!hasSource) {
@@ -134,6 +134,20 @@
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText('— no source —', W / 2, mid);
+      return;
+    }
+
+    // Duration arrives asynchronously from the <video> element's loadedmetadata event,
+    // after this deck's source/playing state may already be set. Drawing with a stale
+    // duration of 0 would put the playhead at the far right (currentTime / fallback),
+    // which then snaps back once the real duration lands — skip drawing until it's known.
+    if (!duration) {
+      const dpr = window.devicePixelRatio || 1;
+      ctx.fillStyle = '#333';
+      ctx.font = `${Math.round(11 * dpr)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('loading…', W / 2, mid);
       return;
     }
 

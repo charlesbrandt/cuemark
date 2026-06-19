@@ -50,6 +50,19 @@ sudo apt-get install \
 > **Note**: `pactl` (from `pulseaudio-utils`) is **not** required. Cuemark uses
 > `pw-dump` (from `pipewire-bin`) for device enumeration.
 
+### Development: headless UI verification (optional)
+
+Lets an agent or CI drive the actual app window (click elements, read the DOM, take
+screenshots of the canvas-rendered video/waveform) without a real display, via
+[`tauri-driver`](https://github.com/tauri-apps/tauri/tree/dev/crates/tauri-driver)
+(WebDriver) + Xvfb. Not needed to build or run cuemark normally — only for automated
+visual verification. See `skills/verify-ui/SKILL.md` for the full workflow.
+
+```sh
+sudo apt-get install xvfb webkit2gtk-driver
+cargo install tauri-driver
+```
+
 ## Running
 
 ```sh

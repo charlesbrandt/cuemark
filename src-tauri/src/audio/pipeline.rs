@@ -128,7 +128,7 @@ fn compute_cue_remap(target: &str, full_layout: &str) -> Option<CueRemap> {
         }
     }
 
-    eprintln!(
+    log::info!(
         "[audio/cue] remap: target={target} full={full_layout} n_ch={n} mask={mask:#x} idx={target_indices:?}"
     );
     Some(CueRemap { out_channels: n as i32, channel_mask: mask, matrix_rows })
@@ -155,14 +155,14 @@ fn make_sink(device: &str, deck_id: &str) -> Result<gst::Element, String> {
             .field("node.latency", "1024/48000")
             .build();
         sink.set_property("stream-properties", &stream_props);
-        eprintln!(
+        log::info!(
             "[audio/{}] sink: pipewiresink target={:?} node.latency=1024/48000 (~21ms)",
             deck_id, node_name
         );
         return Ok(sink);
     }
 
-    eprintln!(
+    log::warn!(
         "[audio/{}] pipewiresink unavailable (apt install gstreamer1.0-pipewire); \
          falling back to autoaudiosink",
         deck_id
@@ -187,7 +187,7 @@ fn make_sink(device: &str, deck_id: &str) -> Result<gst::Element, String> {
             .unwrap_or_else(|| "?".to_string());
         let bt: i64 = child.property("buffer-time");
         let lt: i64 = child.property("latency-time");
-        eprintln!(
+        log::info!(
             "[audio/{}] sink: {} buffer-time={}us latency-time={}us",
             deck_id_owned, factory, bt, lt
         );
@@ -265,7 +265,7 @@ impl DeckAudioPipeline {
         self.app = Some(app);
     }
 
-    pub fn load(&mut self, file_path: &str) -> Result<(), String> {
+    pub fn load(&mut self, file_path: &str) -> Result<Option<f64>, String> {
         self.file_path = Some(file_path.to_string());
 
         if let Some(ref inner) = self.inner {
@@ -302,13 +302,13 @@ impl DeckAudioPipeline {
             s
         });
         if spectrum_opt.is_none() {
-            eprintln!(
+            log::warn!(
                 "[audio/{}] spectrum element not available — audio-fft events disabled. \
                  Install gstreamer1.0-plugins-good.",
                 self.deck_id
             );
         } else {
-            eprintln!("[audio/{}] spectrum element ready (32 bands, ~30 fps)", self.deck_id);
+            log::info!("[audio/{}] spectrum element ready (32 bands, ~30 fps)", self.deck_id);
         }
         // output_queue buffers pitch's variable-sized output chunks (soundtouch produces
         // non-uniform sizes at non-1.0 tempos). Without this, the PipeWire pull callback
@@ -348,7 +348,7 @@ impl DeckAudioPipeline {
         // Use a real sink only when a device is configured; fakesink otherwise so that
         // the pipeline loads cleanly even when no headphone device is selected.
         let cue_sink = if self.cue_device.is_empty() {
-            eprintln!("[audio/{}-cue] no device set — cue output routed to fakesink", self.deck_id);
+            log::warn!("[audio/{}-cue] no device set — cue output routed to fakesink", self.deck_id);
             let fs = make_el("fakesink")?;
             fs.set_property("sync", false);
             fs
@@ -519,7 +519,7 @@ impl DeckAudioPipeline {
             };
             if sink_pad.is_linked() { return; }
             if let Err(e) = pad.link(&sink_pad) {
-                eprintln!("[audio/{deck_id}] pad link error: {e}");
+                log::error!("[audio/{deck_id}] pad link error: {e}");
             }
         });
 
@@ -541,16 +541,16 @@ impl DeckAudioPipeline {
             for msg in bus_thread.iter_timed(None) {
                 match msg.view() {
                     gst::MessageView::Eos(_) => {
-                        eprintln!("[bus/{}] EOS", deck_id_log);
+                        log::info!("[bus/{}] EOS", deck_id_log);
                         at_eos_thread.store(true, Ordering::Relaxed);
                         if let Some(cb) = &eos_cb { cb(); }
                     }
                     gst::MessageView::Error(e) => {
-                        eprintln!("[bus/{}] ERROR: {} (debug: {:?})", deck_id_log, e.error(), e.debug());
+                        log::error!("[bus/{}] ERROR: {} (debug: {:?})", deck_id_log, e.error(), e.debug());
                         at_error_thread.store(true, Ordering::Relaxed);
                     }
                     gst::MessageView::Warning(w) => {
-                        eprintln!("[bus/{}] WARNING: {} (debug: {:?})", deck_id_log, w.error(), w.debug());
+                        log::warn!("[bus/{}] WARNING: {} (debug: {:?})", deck_id_log, w.error(), w.debug());
                     }
                     gst::MessageView::AsyncDone(_) => {
                         let pos_ms = msg.src()
@@ -558,12 +558,12 @@ impl DeckAudioPipeline {
                             .and_then(|p| p.query_position::<gst::ClockTime>())
                             .map(|t| t.mseconds())
                             .unwrap_or(0);
-                        eprintln!("[bus/{}] async-done  pos={}ms", deck_id_log, pos_ms);
+                        log::info!("[bus/{}] async-done  pos={}ms", deck_id_log, pos_ms);
                     }
                     gst::MessageView::StateChanged(s) => {
                         let src = msg.src().map(|e| e.name().to_string()).unwrap_or_default();
                         if src.starts_with("pipeline") {
-                            eprintln!("[bus/{}] pipeline: {:?} → {:?} (pending {:?})",
+                            log::info!("[bus/{}] pipeline: {:?} → {:?} (pending {:?})",
                                 deck_id_log, s.old(), s.current(), s.pending());
                         }
                     }
@@ -575,7 +575,7 @@ impl DeckAudioPipeline {
                         // magnitude is a GstValueList (gst::List) of gfloat values in dBFS.
                         // Note: GstValueList != GstValueArray — gst::Array would silently fail here.
                         let Ok(magnitude) = structure.get::<gst::List>("magnitude") else {
-                            eprintln!("[bus/{}] spectrum: no magnitude field; structure={}", deck_id_log, structure);
+                            log::warn!("[bus/{}] spectrum: no magnitude field; structure={}", deck_id_log, structure);
                             continue
                         };
                         let bands: Vec<f32> = magnitude
@@ -603,7 +603,7 @@ impl DeckAudioPipeline {
                         let high  = avg(&bands[mid_end..]);
 
                         if !fft_logged_thread.swap(true, Ordering::Relaxed) {
-                            eprintln!(
+                            log::info!(
                                 "[bus/{}] first audio-fft: {} bands  bass={:.3} mid={:.3} high={:.3}",
                                 deck_id_log, n, bass, mid, high
                             );
@@ -620,7 +620,7 @@ impl DeckAudioPipeline {
                     _ => {}
                 }
             }
-            eprintln!("[bus/{}] monitor thread exiting", deck_id_log);
+            log::info!("[bus/{}] monitor thread exiting", deck_id_log);
         });
 
         pipeline
@@ -635,7 +635,7 @@ impl DeckAudioPipeline {
                 return Err(format!("[{}] preroll failed", self.deck_id));
             }
             Ok(gst::StateChangeSuccess::Async) => {
-                eprintln!("[audio/{}] preroll still pending after 5s timeout", self.deck_id);
+                log::warn!("[audio/{}] preroll still pending after 5s timeout", self.deck_id);
             }
             _ => {}
         }
@@ -644,7 +644,7 @@ impl DeckAudioPipeline {
             .query_duration::<gst::ClockTime>()
             .map(|d| d.nseconds() as f64 / 1_000_000_000.0);
         if let Some(dur) = duration {
-            eprintln!("[audio/{}] duration={:.3}s", self.deck_id, dur);
+            log::info!("[audio/{}] duration={:.3}s", self.deck_id, dur);
         }
 
         self.inner = Some(PipelineInner {
@@ -657,7 +657,7 @@ impl DeckAudioPipeline {
             at_eos,
             at_error,
         });
-        Ok(())
+        Ok(duration)
     }
 
     /// Switch main outputs to a new set of PipeWire sinks.
@@ -809,7 +809,7 @@ impl DeckAudioPipeline {
         self.cue_enabled = enabled;
         if let Some(inner) = &self.inner {
             inner.cue_valve_el.set_property("drop", !enabled);
-            eprintln!("[audio/{}] cue {}", self.deck_id, if enabled { "ON" } else { "OFF" });
+            log::info!("[audio/{}] cue {}", self.deck_id, if enabled { "ON" } else { "OFF" });
         }
         Ok(())
     }

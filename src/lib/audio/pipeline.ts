@@ -21,7 +21,12 @@ export function listAudioDevices(): Promise<AudioDevice[]> {
 
 // ── Per-deck lifecycle ────────────────────────────────────────────────────────
 
-export function audioLoad(deckId: string, filePath: string): Promise<void> {
+// Returns the track duration in seconds as determined by the GStreamer audio
+// pipeline. This is the only reliable duration source when the system lacks a
+// video decoder for the file's codec (e.g. AV1/H264) — the muted <video>
+// element's loadedmetadata never fires in that case, but audio-only decode
+// still succeeds and GStreamer can query the demuxed duration directly.
+export function audioLoad(deckId: string, filePath: string): Promise<number | null> {
   return invoke("audio_load", { deckId, filePath });
 }
 

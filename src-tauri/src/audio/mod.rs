@@ -55,7 +55,7 @@ pub fn list_audio_devices(_state: State<'_, AudioState>) -> Vec<AudioDevice> {
 }
 
 #[tauri::command]
-pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, deck_id: String, file_path: String) -> Result<(), String> {
+pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, deck_id: String, file_path: String) -> Result<Option<f64>, String> {
     let mut mgr = state.lock().unwrap();
     let main_devices = mgr.main_devices.clone();
     let cue_device = mgr.cue_device.clone();
@@ -151,7 +151,7 @@ pub fn audio_set_main_devices(state: State<'_, AudioState>, device_ids: Vec<Stri
     mgr.mixer.set_main_device(primary)?;
     for pipeline in mgr.pipelines.values_mut() {
         if let Err(e) = pipeline.set_devices(&device_ids) {
-            eprintln!("[audio] set_devices failed for {}: {e}", pipeline.deck_id);
+            log::error!("[audio] set_devices failed for {}: {e}", pipeline.deck_id);
         }
     }
     Ok(())
@@ -164,7 +164,7 @@ pub fn audio_set_cue_device(state: State<'_, AudioState>, device_id: String) -> 
     mgr.mixer.set_cue_device(&device_id)?;
     for pipeline in mgr.pipelines.values_mut() {
         if let Err(e) = pipeline.set_cue_device(&device_id) {
-            eprintln!("[audio] set_cue_device failed for {}: {e}", pipeline.deck_id);
+            log::error!("[audio] set_cue_device failed for {}: {e}", pipeline.deck_id);
         }
     }
     Ok(())
@@ -176,7 +176,7 @@ pub fn audio_set_cue_gain(state: State<'_, AudioState>, gain: f32) -> Result<(),
     mgr.mixer.set_cue_gain(gain)?;
     for pipeline in mgr.pipelines.values_mut() {
         if let Err(e) = pipeline.set_cue_gain(gain) {
-            eprintln!("[audio] set_cue_gain failed for {}: {e}", pipeline.deck_id);
+            log::error!("[audio] set_cue_gain failed for {}: {e}", pipeline.deck_id);
         }
     }
     Ok(())

@@ -231,7 +231,17 @@
         console.log(`[${deck.id}] setting src:`, src);
         v.src = src;
         v.load();
-        audioLoad(deck.id, filePath).catch(console.error);
+        // The <video> element's loadedmetadata never fires when WebKitGTK lacks a decoder
+        // for the file's video codec (e.g. AV1/H264) — but the audio-only GStreamer pipeline
+        // still decodes fine and knows the real duration. Use it as a fallback so the
+        // waveform isn't stuck waiting on a duration that will never arrive from the video
+        // element. Don't clobber a duration loadedmetadata already supplied.
+        audioLoad(deck.id, filePath).then((duration) => {
+          const s = get(session).decks.find((d) => d.id === deckId)?.source;
+          if (duration && s?.type === "video" && s.filePath === filePath && !s.duration) {
+            updateDeck(deckId, { source: { type: "video", filePath, duration } });
+          }
+        }).catch(console.error);
         // Reset audio state tracker so the next sync re-applies play/pause to the new pipeline.
         lastAudioPlaying.delete(deck.id);
         // Report state after a short delay so we can see if the network request started

@@ -124,6 +124,6 @@ pub fn compute_peaks(file_path: &str) -> Result<Vec<f32>, String> {
     }
 
     let _ = pipeline.set_state(gst::State::Null);
-    eprintln!("[analysis] peaks={} for {}", peaks.len(), file_path);
+    log::info!("[analysis] peaks={} for {}", peaks.len(), file_path);
     Ok(peaks)
 }

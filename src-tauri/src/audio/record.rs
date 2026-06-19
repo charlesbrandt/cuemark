@@ -60,7 +60,7 @@ impl RecordingSink {
         self.format = format;
         self.active = true;
         // Step 8: build encoder chain and link to tee.
-        eprintln!("[record] start recording to {:?} ({})", self.output_path, self.format);
+        log::info!("[record] start recording to {:?} ({})", self.output_path, self.format);
         Ok(())
     }
 
@@ -70,7 +70,7 @@ impl RecordingSink {
             return Err("not recording".into());
         }
         self.active = false;
-        eprintln!("[record] stop recording");
+        log::info!("[record] stop recording");
         // Step 8: send EOS, wait for pipeline drain, unlink from tee.
         Ok(())
     }

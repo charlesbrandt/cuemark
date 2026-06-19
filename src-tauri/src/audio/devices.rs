@@ -21,7 +21,7 @@ pub fn list_audio_devices() -> Vec<AudioDevice> {
     match query_pactl() {
         Ok(devs) => devs,
         Err(e) => {
-            eprintln!("[audio/devices] device enumeration failed: {e}");
+            log::error!("[audio/devices] device enumeration failed: {e}");
             vec![]
         }
     }
