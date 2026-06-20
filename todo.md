@@ -124,7 +124,26 @@ Cuemark does not embed a file browser — Digger feeds cuemark.
 - Graceful degradation: if Digger is unreachable, show a notice; drag-and-drop and
   manual load still work unaffected
 
----
+### evaluate: stream media through Digger directly (vs. local mount)
+- Right now cuemark requires the file to already be locally readable (mount, e.g. the
+  `t7` CIFS share — see journal.md 2026-06-19 entry) since GStreamer/WebKit read straight
+  from the filesystem path Digger returns; Digger itself never serves the media bytes
+  — see `CLAUDE.md`'s boundary rule "Cuemark calls Digger; Digger never calls cuemark"
+- Open question: should Digger proxy/stream media content itself (e.g. an
+  `GET /tracks/{id}/stream` endpoint) so cuemark doesn't need direct filesystem/CIFS
+  access to the library at all?
+- Concern: this adds a network round-trip per frame/seek on top of the home-network CIFS
+  mount cuemark already depends on — likely too fragile away from home network (the
+  exact scenario CIFS already struggles with), so may not be worth the implementation
+  cost vs. just keeping the mount-based approach
+- Alternative worth evaluating instead/alongside: a "Pack Crate" feature — explicitly
+  select a set of upcoming tracks (e.g. a planned setlist) and download+cache them
+  locally ahead of a gig, so cuemark doesn't need any network/mount access during a
+  performance away from home
+  - Needs to track which tracks were *also* loaded ad-hoc while offline/away from home
+    (e.g. dragged in directly, not from a Pack), so they can be reconciled back into
+    Digger's library/markers once back on the home network
+- Not started — no code yet; flagged here for a future build/no-build decision
 
 ## Batch F — MIDI expansion
 
