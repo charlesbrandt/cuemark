@@ -235,6 +235,21 @@ wrong." Fix needs **both** `!s.duration` (catches the real initial placeholder, 
 `!Number.isFinite(s.duration)` (catches `Infinity`/`NaN`) — swapping one check for the other instead
 of combining them breaks the other case.
 
+**Every `drawImage(video, ...)` call site needs its own `videoWidth`/`videoHeight === 0` guard —
+they don't share one.** `fbo.ts`'s `uploadVideoFrame()` already guarded against drawing a video
+element with no video track (audio-only files, e.g. `.mp3`, loaded into a `'video'`-type deck).
+`DeckCard.svelte`'s separate preview-canvas draw loop (its own `requestAnimationFrame`, drawing
+straight to a 2D canvas for the per-deck thumbnail) did not have this guard, and WebKitGTK throws
+`SecurityError` from `drawImage()` when the source video element has `readyState >= 2` but
+`videoWidth === 0` (no video track) — Chrome silently no-ops in this case, WebKitGTK doesn't.
+Symptom: console shows `readyState=4 ... error=none` (the file loaded fine) immediately followed
+by `SecurityError: The operation is insecure` at `texImage2D`/`drawImage`, only when the loaded
+file has no video stream. Fixed by adding the same `video.videoWidth > 0 && video.videoHeight > 0`
+check (plus a try/catch, since a render loop dying from one bad frame is the same `requestAnimationFrame`
+abort-on-throw failure mode as the cross-origin tainting bug above) in `DeckCard.svelte`. **Any new
+canvas/texture draw site that reads from a `<video>` element needs this same guard independently —
+it is not centralized.**
+
 ---
 
 ## Known failure modes
