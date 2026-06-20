@@ -62,6 +62,18 @@ sudo apt-get install \
 > **Note**: `pactl` (from `pulseaudio-utils`) is **not** required. Cuemark uses
 > `pw-dump` (from `pipewire-bin`) for device enumeration.
 
+**Verify the runtime plugins actually landed** — the build compiles and the app
+launches fine even if `gstreamer1.0-plugins-bad` is missing, since that's a runtime
+plugin lookup, not a link-time dependency. The failure only shows up when you try to
+play a track: it loads (filename shows in the deck card) but never plays, with no
+error visible outside the WebKit devtools console. Confirm before reporting a fresh
+install as working:
+```sh
+gst-inspect-1.0 pitch   # soundtouch tempo element, from plugins-bad
+```
+If this prints "No such element or plugin", re-run the `gstreamer1.0-plugins-bad`
+install above.
+
 ### Development: headless UI verification (optional)
 
 Lets an agent or CI drive the actual app window (click elements, read the DOM, take

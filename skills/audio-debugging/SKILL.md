@@ -213,6 +213,35 @@ If a file fails to load and the path contains special characters, check `file_to
 `load()` preroll failure path calls `bus.set_flushing(true)` + `set_state(Null)` before early return.
 `Drop` impl does the same. If you see CRITICAL warnings on teardown, check these paths.
 
+### Fresh machine: tracks load (filename shows) but never play, no waveform, black video preview
+
+Confirmed root cause on a clean Ubuntu install (2026-06-19): `gstreamer1.0-plugins-bad` was never
+installed — only `libgstreamer-plugins-bad1.0-0` (the runtime *library*, pulled in transitively) was
+present, not the actual plugin package. This is a silent failure: `cargo build`/`cargo tauri dev`
+compile and launch fine, because the Rust code only links against `gstreamer`/`gstreamer-audio`
+headers, not against specific plugin .so files — the missing element is only discovered at pipeline
+construction time, deep in `load()`.
+
+Two independent symptoms, same one cause:
+- Rust audio pipeline: `GStreamer element 'pitch' not found: Failed to find element factory with name
+  'pitch'` in the WebKit devtools console (right-click deck → Inspect Element → Console — this does
+  **not** appear in `cargo tauri dev`'s terminal output or `~/.local/share/com.cuemark.app/logs/cuemark.log`,
+  since it's a JS-side `console.error` from a rejected `audioLoad()` promise, not a Rust `log::` call).
+  Pipeline construction throws before `inner` is ever set → "no pipeline loaded" / "no audio pipeline
+  for deck" on every subsequent call → no waveform (waveform analysis also goes through the Rust
+  pipeline, not `decodeAudioData` — see CLAUDE.md).
+- `<video>` element: `NotSupportedError`, `error.code === 4` — WebKit's own internal GStreamer instance
+  also needs `h264parse` (also shipped in `plugins-bad`) to demux H.264-in-MP4, so it fails too. Looks
+  identical to the unrelated VA-API DMA-BUF black-screen bug (see journal.md 2026-06-19 entry) but has
+  a different fix — don't reach for the VA-API rank-demotion fix first; check `gst-inspect-1.0 pitch`
+  before assuming it's the GPU driver issue.
+
+Fix: `sudo apt-get install gstreamer1.0-plugins-bad`, then **fully restart** the app (`cargo tauri dev`
+caches the GStreamer plugin registry per-process — a frontend hot-reload is not enough, kill and
+relaunch). Verify with `gst-inspect-1.0 pitch` before relaunching. See `run-app` skill's prerequisites
+section, which now lists this as a separate "runtime plugins" install step from the build-time
+`-dev` headers, since the two are easy to conflate.
+
 ---
 
 ## Bus message guide

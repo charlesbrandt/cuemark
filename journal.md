@@ -691,3 +691,50 @@ still set.
   unsandboxed. Direct terminal launch is required for that kind of test.
 - Used `media://localhost/<urlencoded-path>` directly via WebDriver's `/execute/sync` to test `<video>`
   decode in isolation, without needing the native file-picker dialog or a session-store debug hook.
+
+---
+
+# 2026.06.19 — Fresh machine setup: missing `gstreamer1.0-plugins-bad` looks identical to the VA-API bug
+
+## Bug
+
+On a brand-new machine (Framework laptop, AMD Phoenix1 iGPU — different hardware than the VA-API
+DMA-BUF entry above), loading any track showed the filename in the deck card but: no audio, no
+waveform (stuck on "loading…"), and a black video preview. `cargo tauri dev` built and launched with
+no errors in the terminal or in `~/.local/share/com.cuemark.app/logs/cuemark.log`.
+
+## Root cause
+
+`gstreamer1.0-plugins-bad` was never installed — `apt` had pulled in `libgstreamer-plugins-bad1.0-0`
+(the runtime library) transitively as a dependency of something else, which is enough to satisfy the
+Rust build's link step, but the actual GStreamer *plugin* `.so` files (the package's real payload)
+were absent. `cargo build` has no way to detect this — plugin lookup is runtime-only, inside
+`load()`. Two symptoms, one cause: the `pitch` (soundtouch) element used by our own audio pipeline,
+and `h264parse`, used by WebKit's own internal player to demux H.264-in-MP4, are both in this one
+package.
+
+The error only surfaced in the WebKit devtools JS console (`GStreamer element 'pitch' not found`,
+`<video>` `NotSupportedError` code 4) — not in any Rust `log::` output, since pipeline construction
+fails before any of our `log::info!`/`error!` call sites run, and the JS-side `console.error` calls in
+`syncVideoElements`/`audioLoad().catch()` never reach the terminal or the tauri-plugin-log file.
+
+**This looks deceptively like the VA-API DMA-BUF bug above** (black preview, otherwise-working
+build) but is a completely different root cause with a completely different fix — don't reach for the
+`GST_PLUGIN_FEATURE_RANK` rank-demotion fix on a fresh-machine symptom. Run `gst-inspect-1.0 pitch`
+first; if that's missing, it's this bug, not the GPU driver one.
+
+## Fix
+
+```bash
+sudo apt-get install gstreamer1.0-plugins-bad
+```
+Then fully kill and relaunch `cargo tauri dev` — GStreamer's plugin registry is scanned once per
+process at startup; a Vite hot-reload doesn't pick up newly-installed plugins.
+
+`README.md` already listed `gstreamer1.0-plugins-bad` in its runtime-plugins block, but the
+`run-app` skill's prerequisites section only listed build-time `-dev` headers, so an agent following
+just that skill could build and launch the app successfully and never notice the runtime plugins were
+missing. Added the runtime-plugins install + a `gst-inspect-1.0 pitch` verification step to
+`skills/run-app/SKILL.md`, a verification step to `README.md`, and a "Known failure modes" entry to
+`skills/audio-debugging/SKILL.md` describing both symptoms together so they're not chased as two
+separate bugs next time.

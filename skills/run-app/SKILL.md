@@ -33,6 +33,28 @@ sudo apt-get install -y \
   libayatana-appindicator3-dev librsvg2-dev \
   libasound2-dev
 ```
+
+**Also required, separately — GStreamer *runtime* plugins** (the build links fine
+without these; the app compiles and launches, but playback silently fails at
+runtime, which makes this easy to miss on a fresh machine):
+```bash
+sudo apt-get install -y \
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+  gstreamer1.0-libav gstreamer1.0-pipewire
+```
+Verify before declaring a fresh-machine setup done:
+```bash
+gst-inspect-1.0 pitch    # soundtouch tempo element — from plugins-bad
+```
+**Symptom if `gstreamer1.0-plugins-bad` is missing**: tracks appear to load (filename
+shows in the deck card) but nothing plays. Devtools console (right-click → Inspect
+Element → Console) shows `GStreamer element 'pitch' not found` and `no pipeline
+loaded` — the Rust `DeckAudioPipeline` fails to construct, so there's no audio *and*
+no waveform. The `<video>` element also fails with `NotSupportedError` (code 4)
+because `h264parse` (also in plugins-bad) is unavailable to WebKit's own internal
+GStreamer pipeline, so the preview stays black too. Both symptoms share this one
+root cause — don't chase them as separate bugs.
 `libasound2-dev` is needed by the `alsa-sys` crate (pulled in by `midir` for MIDI on Linux); it's the most common missing package on fresh machines.
 
 Also confirm the Tauri CLI is installed (`cargo tauri` is a cargo subcommand, not bundled with `cargo`):
