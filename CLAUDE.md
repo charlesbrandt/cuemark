@@ -14,7 +14,16 @@ Domain: cuemark.com (Charles Brandt's former DJ name)
 - **GLSL shaders** — effects and audio-reactive visualizations
 - **Rust `midir` crate** — MIDI input (Web MIDI API unreliable in WebKitGTK); events piped to frontend via Tauri IPC
 - **`<video>` element → 2D canvas → texImage2D** — video decode into WebGL texture via a scratch canvas intermediary (direct video→texImage2D triggers SIGTRAP assertion failures in WebKitGTK; see `fbo.ts`). The `<video>` element is **muted** — audio is owned by the GStreamer pipeline.
-- **Vite dev middleware** — in dev mode, local video files are served as `http://localhost:1420/media/<abs-path>` by a Node.js middleware in `vite.config.ts`; GStreamer's `souphttpsrc` speaks plain HTTP fine. In production the Rust `media://` custom scheme is used instead. Never use `asset://` or `file://` from an `http:` origin — WebKit blocks them silently.
+- **Local HTTP media server** — WebKitGTK's GStreamer media backend cannot reliably resolve custom URI
+  schemes (`media://`, `asset://`) for `<video>` elements: confirmed empirically (instant `FormatError`,
+  no GStreamer pipeline ever constructed, regardless of codec or `WEBKIT_DISABLE_DMABUF_RENDERER`). Both
+  dev and prod instead serve local video files over plain HTTP, which `souphttpsrc`/WebKit handle natively:
+  - **Dev**: a Node.js middleware in `vite.config.ts` serves `http://localhost:1420/media/<abs-path>`.
+  - **Prod**: `src-tauri/src/media_server.rs` runs a `tiny_http` server on an ephemeral `127.0.0.1` port
+    (Range-request support for seeking), started in `lib.rs` `run()` and exposed to the frontend via the
+    `media_server_port` Tauri command. `App.svelte` fetches the port once in `onMount` and builds
+    `http://127.0.0.1:<port>/<abs-path>` for video `src`.
+  Never use `asset://` or `file://` from an `http:` origin — WebKit blocks them silently.
 
 ## Architecture
 

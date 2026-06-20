@@ -1,11 +1,11 @@
 pub mod audio;
+pub mod media_server;
 pub mod midi;
 
-use std::io::{Read, Seek, SeekFrom};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 // Decode %XX sequences in a URL path component
-fn url_decode(s: &str) -> String {
+pub(crate) fn url_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -25,7 +25,7 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn mime_from_path(path: &str) -> &'static str {
+pub(crate) fn mime_from_path(path: &str) -> &'static str {
     match path.rsplit('.').next().map(|s| s.to_lowercase()).as_deref() {
         Some("mp4") | Some("m4v") => "video/mp4",
         Some("webm") => "video/webm",
@@ -38,7 +38,7 @@ fn mime_from_path(path: &str) -> &'static str {
 }
 
 // Parse "bytes=start-end" or "bytes=start-" HTTP Range header
-fn parse_range(header: &str, file_size: u64) -> Option<(u64, u64)> {
+pub(crate) fn parse_range(header: &str, file_size: u64) -> Option<(u64, u64)> {
     let rest = header.strip_prefix("bytes=")?;
     let (start_s, end_s) = rest.split_once('-')?;
     let start: u64 = start_s.parse().ok()?;
@@ -50,60 +50,12 @@ fn parse_range(header: &str, file_size: u64) -> Option<(u64, u64)> {
     Some((start, end))
 }
 
-fn serve_media(request: tauri::http::Request<Vec<u8>>) -> tauri::http::Response<Vec<u8>> {
-    let file_path = url_decode(request.uri().path());
-    let range_hdr = request
-        .headers()
-        .get("range")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-
-    let mut file = match std::fs::File::open(&file_path) {
-        Ok(f) => f,
-        Err(e) => {
-            return tauri::http::Response::builder()
-                .status(404)
-                .header("Access-Control-Allow-Origin", "*")
-                .body(format!("not found: {e}").into_bytes())
-                .unwrap();
-        }
-    };
-    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let mime = mime_from_path(&file_path);
-
-    if let Some((start, end)) = range_hdr.as_deref().and_then(|h| parse_range(h, file_size)) {
-        let length = end - start + 1;
-        let mut buf = vec![0u8; length as usize];
-        if file.seek(SeekFrom::Start(start)).is_err() || file.read_exact(&mut buf).is_err() {
-            return tauri::http::Response::builder()
-                .status(500)
-                .header("Access-Control-Allow-Origin", "*")
-                .body(b"read error".to_vec())
-                .unwrap();
-        }
-        tauri::http::Response::builder()
-            .status(206)
-            .header("Content-Type", mime)
-            .header("Content-Range", format!("bytes {start}-{end}/{file_size}"))
-            .header("Content-Length", length.to_string())
-            .header("Accept-Ranges", "bytes")
-            .header("Access-Control-Allow-Origin", "*")
-            .body(buf)
-            .unwrap()
-    } else {
-        // Non-range GET: return full file (initial probe; GStreamer uses Range for seeks)
-        let mut buf = Vec::new();
-        let _ = file.read_to_end(&mut buf);
-        tauri::http::Response::builder()
-            .status(200)
-            .header("Content-Type", mime)
-            .header("Content-Length", file_size.to_string())
-            .header("Accept-Ranges", "bytes")
-            .header("Access-Control-Allow-Origin", "*")
-            .body(buf)
-            .unwrap()
-    }
+#[tauri::command]
+fn media_server_port(state: tauri::State<MediaServerPort>) -> u16 {
+    state.0
 }
+
+struct MediaServerPort(u16);
 
 #[tauri::command]
 fn open_output_window(app: tauri::AppHandle) -> Result<(), String> {
@@ -136,13 +88,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(audio::AudioState::new(audio::AudioManager::new()))
-        .register_asynchronous_uri_scheme_protocol("media", |_app, request, responder| {
-            std::thread::spawn(move || {
-                responder.respond(serve_media(request));
-            });
-        })
+        .manage(MediaServerPort(media_server::start()))
         .invoke_handler(tauri::generate_handler![
             open_output_window,
+            media_server_port,
             audio::list_audio_devices,
             audio::audio_load,
             audio::audio_unload,

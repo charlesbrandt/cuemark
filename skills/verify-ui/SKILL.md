@@ -154,3 +154,11 @@ kill $(cat /tmp/xvfb.pid) 2>/dev/null; rm -f /tmp/xvfb.pid
   corruption from the lock contention, not a real missing dependency). Retrying
   cleanly resolved it. If it happens, check no other cargo process is running
   before suspecting the code.
+- **Not just sandbox A/B testing — anything where main-thread responsiveness matters is unreliable
+  through this path.** A 2026-06-20 session debugging a render-loop freeze (WebKit's own
+  `WatchDogQueue` watchdog killing the renderer under CPU load — see `audio-debugging` skill) needed
+  a direct terminal launch of the real binary (`run-app` skill's launcher section) specifically
+  because `tauri-driver` automation changes timing/load characteristics enough that the bug may not
+  reproduce the same way. When in doubt for *any* timing- or load-sensitive bug (not just sandbox
+  questions), prefer a direct terminal launch over this skill and use the production `devtools`/
+  `withGlobalTauri` setup to get a real devtools console on the actual binary instead.

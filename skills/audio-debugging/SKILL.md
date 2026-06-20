@@ -170,6 +170,73 @@ mid-rate-change and an earlier call resolved late).
 
 ---
 
+## Video serving and WebKit canvas/render-loop debugging (2026-06-20)
+
+**Production video no longer uses a custom URI scheme.** `media://` never worked reliably for
+`<video>` in WebKitGTK (confirmed: instant `FormatError`, zero GStreamer pipeline construction,
+codec-independent — see journal.md 2026-06-20). Both dev and prod now serve local video files over
+plain HTTP: dev via the Vite middleware in `vite.config.ts`, prod via `src-tauri/src/media_server.rs`
+(a `tiny_http` server on an ephemeral `127.0.0.1` port). If video loads but the deck preview is
+black again, first suspect the local HTTP server (is `media_server_port` resolving? is the file
+path correct?) — not codec/decoder issues.
+
+**Cross-origin canvas tainting can silently kill the entire render loop.** The `<video>` element's
+`src` is a different origin (`http://127.0.0.1:<port>`) than the page (`tauri://localhost`). Without
+`v.crossOrigin = "anonymous"` (set in `App.svelte` right after creating the element, before `src`),
+any canvas read of the video (`drawImage`/`texImage2D` in `fbo.ts`) throws `SecurityError`. Because
+this throw happens inside the `requestAnimationFrame` callback in `App.svelte`, it aborts *before*
+the trailing `requestAnimationFrame(frame)` reschedule — the entire render loop dies silently after
+one bad frame. Symptom: video/audio keep playing (separate codepaths), but the Output Window stops
+updating and the waveform playhead/position freezes, with no console error visible unless devtools
+happened to be open at the exact moment. **Every HTTP response from `media_server.rs`, success or
+error (404/500), must carry `Access-Control-Allow-Origin`** — a browser permanently marks a media
+resource's CORS-taint flag the moment *any* request for it lacks the header, even a transient error
+under load, and that taint never clears even once later requests succeed. If the canvas pipeline
+worked earlier in a session and then silently breaks again with no code change, suspect taint
+accumulation from an intermittent server-side gap, not a regression in whatever you just touched.
+
+**`WatchDogQueue` trap = WebKit's own renderer crashed, not an app hang.** A gray, frozen-looking
+window that still plays audio (GStreamer/Rust pipeline is independent of the JS render loop) usually
+means `WebKitWebProcess` itself died. Check `pgrep -af WebKitWebProcess` — if it's gone while the main
+`cuemark` process is alive and idle, `dmesg | grep WatchDogQueue` (needs `sudo`) will show
+`traps: WatchDogQueue[pid] trap int3 ... libglib-2.0.so` — WebKit's internal main-thread
+responsiveness watchdog deliberately self-trapped because the JS main thread was blocked too long.
+Tauri/wry doesn't currently detect or recover from this; the window stays frozen until killed and
+relaunched. Root cause was an unbounded backlog in `outputBus.ts`'s `postFrame()` (no backpressure —
+fixed with an in-flight guard) compounding with genuinely heavy per-frame work (WebGL composite +
+canvas capture + cross-process `postMessage` for two simultaneous decks).
+
+**Debugging WebKit's *internal* GStreamer pipeline requires a global `GST_DEBUG` threshold, not just
+named categories.** `GST_DEBUG=uridecodebin:5,decodebin:5` shows plenty for our own Rust process but
+nothing for `WebKitWebProcess` — categories not explicitly listed default to `NONE`, and WebKit's own
+categories (`webkitmediaplayer`, etc.) aren't in a list built for our pipeline. Use
+`GST_DEBUG=2,webkitmediaplayer:7,uridecodebin:5,decodebin:5,...` (leading global number) to see both.
+Also: `WEBKIT_DEBUG` (any channel, even definitely-valid ones like `Network`) is fully non-functional
+on this machine's webkit2gtk build ("Unknown logging channel" for everything) — don't waste time on
+it here. And each `gst_init()` call gets its own debug clock starting at `0:00:00.000`; use the `pid`
+field in the log line (the number right after the timestamp), not the timestamp itself, to tell which
+process a line came from when merging logs from our pipeline and WebKit's.
+
+**Production builds need `devtools` + `withGlobalTauri` to be debuggable at all.** Both are enabled
+permanently in `Cargo.toml`/`tauri.conf.json` now. Without `devtools`, there's no right-click →
+Inspect Element on a release build, so `console.error`/`console.log` (where most real signal lives —
+CORS errors, taint SecurityErrors) is invisible. Without `withGlobalTauri`, `window.__TAURI__`
+doesn't exist, so you can't call `window.__TAURI__.core.invoke('audio_get_position', { deckId:
+'deck-0' })` directly from the console to bisect "frontend bug vs. backend bug" without adding
+temporary instrumentation.
+
+**`video.duration === Infinity` for non-fast-start MP4s breaks naive "not yet known" guards.**
+Common for YouTube-downloaded files where the `moov` atom is at the end of the file. `Infinity` is
+truthy in JS, so a guard written as `!s.duration` (meant to mean "we don't have a real duration yet,
+apply the GStreamer-derived fallback") never fires once `Infinity` lands there. Downstream,
+`WaveformCanvas`'s `playheadX = (currentTime / duration) * W` evaluates to `0` for any `currentTime`
+when `duration` is `Infinity` — looks exactly like "playhead frozen at the start," not "duration is
+wrong." Fix needs **both** `!s.duration` (catches the real initial placeholder, `0`) and
+`!Number.isFinite(s.duration)` (catches `Infinity`/`NaN`) — swapping one check for the other instead
+of combining them breaks the other case.
+
+---
+
 ## Known failure modes
 
 ### `set_rate →` log lines stop but MIDI events keep firing
@@ -270,5 +337,18 @@ To see every event, remove the key from `log_throttle` or set threshold to 0.
 | `src-tauri/src/audio/pipeline.rs` | Per-deck GStreamer pipeline, bus monitor, tempo/pitch element |
 | `src-tauri/src/audio/mod.rs` | AudioManager, Tauri command handlers |
 | `src-tauri/src/midi.rs` | MIDI event loop, log throttle, 14-bit rate decoding |
-| `src/App.svelte` | Video element creation (muted), rAF-throttled syncVideoElements |
+| `src-tauri/src/media_server.rs` | Local HTTP server for prod video serving (replaces `media://`) |
+| `src/App.svelte` | Video element creation (muted, crossOrigin), rAF-throttled syncVideoElements, render loop |
+| `src/lib/renderer/outputBus.ts` | Output Window frame capture/transport — has backpressure guard |
 | `journal.md` | Session notes — decisions and symptoms from past debugging |
+
+## VA-API hardware decode status (as of 2026-06-20)
+
+`src-tauri/src/main.rs` sets `GST_PLUGIN_FEATURE_RANK` to demote specific VA-API decoders to rank 0,
+forcing software decode fallback for codecs where this GPU's DMA-BUF export was confirmed broken.
+**Current state: only AV1 (`vaav1dec`/`vaapiav1dec`) is demoted.** H.264 hardware decode was
+re-enabled 2026-06-20 after a `mesa-va-drivers`/`webkit2gtk` update and confirmed working (real
+video, no corruption, lower CPU than dual software decode). If a black-screen or solid-garbage-color
+symptom returns for H.264, or shows up freshly for AV1/VP9/HEVC, re-add the codec's `va*dec`/
+`vaapi*dec` factory name to the rank string in `main.rs` — see the comment there and the
+2026-06-19/2026-06-20 journal entries for the full history before assuming it's fixed for good.

@@ -816,11 +816,15 @@ impl DeckAudioPipeline {
 
     /// Current playback position in seconds. None if no pipeline is loaded.
     pub fn position(&self) -> Option<f64> {
+        // A negative position is never meaningful to callers (the waveform's playhead
+        // math divides by duration and draws off-canvas on a negative result) — clamp
+        // defensively even though sampled query_position output (2000+ samples across
+        // play/pause/seek/rate-change) never showed one in practice.
         self.inner
             .as_ref()?
             .pipeline
             .query_position::<gst::ClockTime>()
-            .map(|t| t.nseconds() as f64 / 1_000_000_000.0)
+            .map(|t| (t.nseconds() as f64 / 1_000_000_000.0).max(0.0))
     }
 }
 

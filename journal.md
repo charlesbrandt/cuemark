@@ -738,3 +738,203 @@ missing. Added the runtime-plugins install + a `gst-inspect-1.0 pitch` verificat
 `skills/run-app/SKILL.md`, a verification step to `README.md`, and a "Known failure modes" entry to
 `skills/audio-debugging/SKILL.md` describing both symptoms together so they're not chased as two
 separate bugs next time.
+
+---
+
+# 2026.06.20 — Launcher build was never tested end-to-end: media:// scheme, canvas tainting, frozen output, Infinity duration
+
+## Context
+
+Task started as "rebuild cuemark for the launcher" (`npm run tauri build -- --no-bundle`). The
+launcher binary uses the production code path (`tauri://localhost` + whatever URI scheme the
+frontend picks for video), which is fundamentally different from `cargo tauri dev`'s path (Vite
+dev server, HTTP `/media` middleware). Every prior debugging session — including the H.264
+black-screen fix earlier today — was verified under `cargo tauri dev` or via `tauri-driver`
+(WebDriver), neither of which exercises the production `media://` scheme. Tonight was the first
+time the actual launcher binary got real use, and it surfaced four separate, previously-latent bugs.
+
+## Bug 1 — `media://` custom URI scheme doesn't work for `<video>` in WebKitGTK, full stop
+
+**Symptom**: black video preview in the production/launcher build only. `cargo tauri dev` was fine.
+WebKit's `MediaPlayerPrivateGStreamer` logs `FormatError` ~10ms after `load()` is called, with
+**zero** GStreamer pipeline construction (`GST_DEBUG=2,uridecodebin:5,decodebin:5` — confirmed via
+`gst-launch-1.0` filter — showed no `uridecodebin`/`decodebin` trace for the WebKitWebProcess pid at
+all). The `WEBKIT_DISABLE_DMABUF_RENDERER` / VA-API rank-demotion fix from earlier today was a red
+herring — confirmed by temporarily removing it entirely and reproducing the identical instant
+`FormatError`, codec-independent.
+
+**Root cause**: this was already flagged in `vite.config.ts`'s own comment ("custom URI schemes
+like media:// don't work reliably with GStreamer in WebKitGTK dev mode") and in this journal's
+2026.04.26 entry, but the conclusion drawn back then — "production will use the Rust `media://`
+custom scheme" — was never actually verified against a real production build. It doesn't work in
+production any more than in dev mode; dev mode just had the Vite HTTP workaround already in place.
+
+**Fix**: `src-tauri/src/media_server.rs` (new) — a `tiny_http` server bound to an ephemeral
+`127.0.0.1` port, with Range support for seeking, started in `lib.rs` `run()`. Exposed to the
+frontend via a new `media_server_port` Tauri command. `App.svelte` now builds video `src` as
+`http://127.0.0.1:<port>/<abs-path>` in production (mirroring dev mode's already-proven HTTP
+approach) instead of `media://localhost/<abs-path>`. The `media://` scheme registration and
+`serve_media()` handler in `lib.rs` were removed entirely — dead code now that nothing uses them.
+
+## Bug 2 — cross-origin video taints the WebGL compositor canvas, permanently, on ANY CORS-header gap
+
+**Symptom**: per-deck video previews showed real video (they `drawImage` straight from `<video>`,
+never read back), but the Output Window stayed black and the waveform playhead/position froze.
+`createImageBitmap()` on the hidden 1920×1080 compositor canvas (the one `composite()`/`postFrame()`
+read from) threw `SecurityError: The operation is insecure.` This exception, thrown inside the
+`requestAnimationFrame` callback in `App.svelte`, aborts the function *before* the trailing
+`rafId = requestAnimationFrame(frame)` line runs — silently killing the entire render loop after
+one bad frame. Everything downstream of that loop (waveform position polling, Output Window
+frames) stops dead, while audio (a separate GStreamer/Rust pipeline) keeps playing — easy to
+mistake for "the waveform is stuck" rather than "the whole render loop died."
+
+**Root cause #1**: the `<video>` element never had `crossOrigin` set. Once video moved to
+`http://127.0.0.1:<port>` (a different origin than `tauri://localhost`), any canvas read of it
+(`drawImage` + `texImage2D` in `fbo.ts`) taints the canvas without `video.crossOrigin = "anonymous"`,
+even though the server already sent `Access-Control-Allow-Origin: *`. Fixed in `App.svelte`: set
+`v.crossOrigin = "anonymous"` right after creating the element, before `src`/`load()`.
+
+**Root cause #2 (recurrence after fix #1)**: `media_server.rs`'s error response branches (404 file-
+not-found, 500 read-error) were missing `Access-Control-Allow-Origin` — only the success paths had
+it. **A browser permanently marks a media resource's "origin-clean" flag false the moment any single
+request for it comes back without a valid CORS header — even a transient error under load — and
+that taint never clears, even once later requests succeed with correct headers.** Under two
+simultaneous decks doing frequent audio-clock-driven `v.currentTime` snaps (Range requests), an
+occasional 404/500 (or, separately, a malformed/out-of-bounds Range header that would underflow the
+`u64` length subtraction — also fixed, by clamping `start <= end` before computing `length`) was
+enough to permanently re-taint the canvas mid-session, well after the first fix had been verified
+working. Fix: every response branch, success or error, now carries the CORS header.
+
+**Lesson for next time**: when a `<video>`/canvas pipeline appears to work, then silently breaks
+again later in the same session with no code change, suspect CORS-taint accumulation from an
+intermittent server-side response gap — not a regression in the part you just fixed.
+
+## Bug 3 — `postFrame()` had no backpressure, causing WebKitWebProcess to deadlock/crash under load
+
+**Symptom**: once bug 2 was partially fixed, the app would run fine for a while, then the whole
+window froze gray (audio kept playing — GStreamer pipeline, unaffected). `ps`/`/proc` showed
+`WebKitWebProcess` at ~75% CPU on a `futex` wait — a genuine main-thread stall, not a crash, not an
+OOM (`ulimit -c` was 0 so no core dump; `dmesg` needed `sudo` so couldn't confirm OOM directly).
+After adding backpressure the freeze became rarer but still eventually happened; this time
+`WebKitWebProcess` actually disappeared from the process list. `dmesg` (with the user's `sudo`)
+showed the actual cause: `traps: WatchDogQueue[pid] trap int3 ... in libglib-2.0.so` — **WebKit's
+own internal main-thread responsiveness watchdog deliberately killed the renderer process** because
+the main thread stayed blocked too long. Tauri/wry doesn't currently detect/recover from a crashed
+WebKitWebProcess, so the host GTK window is left showing its last frame forever.
+
+**Root cause**: `outputBus.ts`'s `postFrame()` fired a new `createImageBitmap()` + cross-process
+`postMessage()` every single `rAF` tick with no in-flight guard. Two decks doing simultaneous
+software-decode-adjacent work (WebGL composite, canvas capture, structured-clone IPC to the second
+window) could fall behind their own capture rate, queuing an unbounded backlog of pending bitmaps
+that starved the main thread.
+
+**Fix**: added an `inFlight` boolean guard in `postFrame()` — skip capturing a new frame while the
+previous capture+send hasn't resolved yet. Same pattern as the existing `pendingPos` guard for
+`audioGetPosition` polling in `App.svelte`.
+
+**This did not fully eliminate the freeze** — it became much rarer, but two decks of 1080p video
+plus full compositing plus per-frame IPC is still genuinely CPU-heavy. See Bug 4 / VA-API note below
+for what *did* meaningfully reduce load.
+
+## Bug 4 — VA-API DMA-BUF bug for H.264 appears fixed after a mesa/webkit2gtk update — re-enabled
+
+The 2026-06-19 entry above demoted `vah264dec`/`vaapih264dec` to rank 0 because hardware H.264 decode
+produced corrupted DMA-BUF frames (solid garbage color) on this GPU/driver. Tonight, after noticing
+heavy CPU/fan load with two decks software-decoding 1080p H.264 simultaneously, re-tested with H.264
+hardware decode re-enabled (`GST_PLUGIN_FEATURE_RANK` now only demotes `vaav1dec`/`vaapiav1dec`).
+System had since picked up `mesa-va-drivers` 25.2.8 and `webkit2gtk` 2.52.3 via normal `apt` updates.
+Result: real video, no garbage-color corruption, noticeably lower CPU than dual software decode, no
+freeze/crash across extended two-deck stress testing. Decision: keep H.264 hardware decode enabled
+permanently. AV1 was not re-tested and stays demoted — re-test it the same way (temporarily comment
+out the `vaav1dec`/`vaapiav1dec` entries, rebuild via `npm run tauri build -- --no-bundle`, NOT plain
+`cargo build` — see gotcha below — and load a real AV1 file) before assuming it's fixed too.
+
+## Bug 5 — `video.duration === Infinity` is truthy in JS, breaking a `!duration` "not yet known" guard
+
+**Symptom**: after Bugs 1–3 were fixed, video/audio/Output-Window all worked, but the waveform
+playhead stayed pinned at the very start of the track regardless of real playback position. Track
+duration displayed as "Infinity:NaN" in the deck card.
+
+**Root cause**: these are YouTube-downloaded MP4s, commonly not "fast-start" (the `moov` atom with
+duration metadata sits at the end of the file rather than the front). WebKit reports
+`video.duration === Infinity` until/unless it can determine real duration from the container, which
+for these files may never resolve. `App.svelte`'s `onloadedmetadata` handler unconditionally stored
+`v.duration` into `deck.source.duration` — including `Infinity`. The deliberate fallback further down
+(`audioLoad()`'s real GStreamer-derived duration overwrites a not-yet-known value) was guarded by
+`!s.duration`, intended to mean "we don't have a real duration yet" — but `!Infinity` is `false` in
+JS (`Infinity` is a truthy number), so the fallback silently never fired once the bad value landed.
+Downstream, `WaveformCanvas`'s `playheadX = (currentTime / duration) * W` computes `0` for any
+`currentTime` when `duration` is `Infinity` — permanently pinning the playhead at the left edge,
+which looks exactly like "frozen at the beginning," not "showing a wrong but moving position."
+
+**First attempted fix was itself a regression**: changed the `onloadedmetadata` guard to only store
+`v.duration` when `Number.isFinite(v.duration)`, and naively swapped the audioLoad fallback's guard
+from `!s.duration` to `!Number.isFinite(s.duration)` — but the *initial* placeholder duration for a
+freshly-loaded deck is `0` (falsy, but `Number.isFinite(0) === true`), so the fallback stopped firing
+for the normal "duration not loaded yet" case too, breaking the waveform entirely (showed
+"loading..." forever instead of a wrong-but-present render). Correct fix needs **both** conditions:
+`!s.duration || !Number.isFinite(s.duration)`.
+
+**Lesson for next time**: `Infinity`/`NaN` sentinels for "unknown" values are a recurring trap in JS
+specifically because `!value` treats `0` as unknown but not `Infinity`, and `Number.isFinite(value)`
+treats `0` as known but not as unknown. A guard meant to mean "we don't have a usable value yet"
+almost always needs both checks combined, not one swapped for the other.
+
+## Debugging methodology notes (durable, for next time)
+
+- **`WEBKIT_DEBUG` is fully non-functional on this machine's webkit2gtk build** — confirmed by
+  trying definitely-valid channel names (`Network`, not just `Media`); all return "Unknown logging
+  channel." This Ubuntu package was compiled with WebKit's internal logging disabled. Don't waste
+  time trying different channel names — it's not going to work on this system.
+- **`GST_DEBUG` *does* reach WebKitWebProcess's internal GStreamer pipeline, but only with a global
+  numeric threshold, not category names alone.** `GST_DEBUG=uridecodebin:5,decodebin:5` (named
+  categories only) showed nothing for WebKitWebProcess's pid even though it showed plenty for our
+  own Rust process — because unlisted categories default to `NONE` when you only specify named
+  categories, and WebKit's own categories (`webkitmediaplayer`, etc.) weren't in the list. Prefix
+  with a global numeric default, e.g. `GST_DEBUG=2,webkitmediaplayer:7,uridecodebin:5,decodebin:5`,
+  to see both your own pipeline's named-category detail *and* WebKit's at the global level.
+  Also note: each `gst_init()` call gets its own debug clock starting at `0:00:00.000` — timestamps
+  across different processes in the same merged log are NOT comparable; use the `pid` field (the
+  number right after the timestamp) to attribute lines to a process, not the clock value.
+- **Production builds need `devtools` (Cargo feature on `tauri`) and `withGlobalTauri: true`
+  (`tauri.conf.json`) to be debuggable at all.** Without `devtools`, there's no right-click →
+  Inspect Element, meaning zero visibility into frontend `console.log`/`console.error` — which is
+  where most of tonight's real signal came from (CORS errors, taint SecurityErrors, raw IPC test
+  calls). Without `withGlobalTauri`, `window.__TAURI__` doesn't exist, so you can't invoke Tauri
+  commands directly from the devtools console to test backend behavior in isolation
+  (`window.__TAURI__.core.invoke('audio_get_position', { deckId: 'deck-0' })...`) — extremely useful
+  for bisecting "is this a frontend bug or a backend bug" without instrumenting code. Both are now
+  enabled permanently in this project specifically because of how much they helped tonight.
+- **`tauri build` vs plain `cargo build`, AGAIN** — re-hit the exact gotcha already documented in
+  `skills/verify-ui/SKILL.md`: a plain `cargo build --release` (used once tonight to save a few
+  seconds while iterating on a Rust-only change) bakes in the unmodified `tauri.conf.json`, which
+  still has `devUrl` pointing at the Vite dev server — the resulting binary tries to load
+  `http://localhost:1420/` and shows "Could not connect to localhost: Connection refused" instead of
+  the bundled frontend. Only `npm run tauri build -- --no-bundle` (the Tauri CLI pipeline) clears
+  `devUrl` before compiling. This bit twice in one night despite being documented — worth a stronger
+  reminder in `run-app`'s launcher-build section too, not just `verify-ui`.
+- **A "gray, frozen, but still-running window with audio still playing" is WebKitWebProcess having
+  crashed, not the whole app hanging.** Check `pgrep -af WebKitWebProcess` — if it's gone while the
+  main `cuemark` process is still alive and idle, the renderer died (likely WebKit's own
+  `WatchDogQueue` int3 self-trap on main-thread unresponsiveness — see Bug 3) and Tauri isn't
+  reloading it. `dmesg | grep WatchDogQueue` (needs `sudo`) confirms this specific cause.
+- Background-launching the app from a terminal for debugging (rather than the desktop launcher) was
+  flaky when combining `nohup ... & disown; sleep; pgrep` in a single shell invocation alongside a
+  sandbox override — would silently fail to launch (no process, no error) more often than not. A
+  tiny wrapper script (`#!/bin/bash` + `export FOO=bar` + `exec /path/to/cuemark`) invoked via
+  `nohup ./wrapper.sh > log 2>&1 < /dev/null & disown` in its own separate tool call was reliable;
+  cramming everything into one inline command frequently wasn't.
+
+## Files touched
+
+| File | Change |
+|---|---|
+| `src-tauri/src/media_server.rs` | New — local HTTP server replacing the broken `media://` scheme |
+| `src-tauri/src/lib.rs` | Removed `media://` scheme handler/`serve_media`; added `media_server_port` command + managed state |
+| `src-tauri/src/main.rs` | H.264 hardware decode re-enabled (AV1 still demoted); comment rewritten with 2026-06-20 re-test result |
+| `src-tauri/src/audio/pipeline.rs` | `position()` clamps to `>= 0.0` defensively (raw GStreamer values never observed negative across 2000+ sampled calls, but cheap to guard) |
+| `src-tauri/Cargo.toml` | Added `tiny_http`; added `devtools` feature on `tauri` |
+| `src-tauri/tauri.conf.json` | Added `withGlobalTauri: true` |
+| `src/App.svelte` | Video `src` uses local HTTP server in prod; `v.crossOrigin = "anonymous"`; fixed `Infinity`-duration guards (twice — first attempt regressed the normal "not loaded yet" case) |
+| `src/lib/renderer/outputBus.ts` | `postFrame()` gained an in-flight backpressure guard |
+| `CLAUDE.md` | Rewrote the video-serving section to document the local HTTP server (dev + prod) instead of `media://` |

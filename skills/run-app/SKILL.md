@@ -186,3 +186,33 @@ are picked up automatically. Launch via the Windows/Super key → type "Cuemark"
 **After any Rust or frontend change meant for the launcher build**: rerun
 `npm run tauri build -- --no-bundle` — the symlink means no reinstall step, just relaunch
 from the app grid (or `gtk-launch cuemark`) to pick up the new binary.
+
+**Always use `npm run tauri build -- --no-bundle` for this, never plain `cargo build --release`.**
+A plain `cargo build` bakes in the unmodified `tauri.conf.json`, which still points `devUrl` at the
+Vite dev server — the resulting binary shows "Could not connect to localhost: Connection refused"
+instead of loading the bundled frontend. Only the Tauri CLI build pipeline clears `devUrl` first.
+Hit this twice in one night (2026-06-20) despite it being documented in `verify-ui`'s SKILL.md too —
+it's an easy one to reach for by habit when only a Rust file changed.
+
+## Debugging the production/launcher build specifically
+
+The launcher binary exercises a genuinely different code path than `cargo tauri dev` — most notably
+video serving (`media_server.rs` vs. Vite's dev middleware) and the production `withGlobalTauri`/
+`devtools` setup. Bugs that only reproduce in the launcher build, not in `cargo tauri dev`, are real
+and not "just a build artifact" — see journal.md's 2026-06-20 entry for a full session where this
+was the case for several stacked bugs at once.
+
+- **`devtools` (Cargo feature on `tauri`) and `withGlobalTauri: true` (`tauri.conf.json`) are both
+  enabled permanently.** Right-click → Inspect Element works on the release binary; the devtools
+  console can call `window.__TAURI__.core.invoke('command_name', { ...args })` directly to test
+  backend behavior without adding temporary frontend instrumentation.
+- **A gray, unresponsive window that's still playing audio** means `WebKitWebProcess` crashed (its
+  own internal main-thread watchdog self-trapped — see `audio-debugging` skill), not that the whole
+  app hung. `pgrep -af WebKitWebProcess` — if it's gone while `cuemark` is still alive and idle,
+  that's confirmed; `dmesg | grep WatchDogQueue` (needs `sudo`) shows the trap.
+- **Launching the release binary directly from a terminal for debugging** (rather than via the
+  desktop launcher) sometimes silently failed to start when combining `nohup ... & disown; sleep;
+  pgrep` in one inline command alongside a sandbox override — no process, no error. A tiny wrapper
+  script (`export FOO=bar`, `exec /path/to/cuemark`) launched via its own separate
+  `nohup ./wrapper.sh > log 2>&1 < /dev/null & disown` call was reliable; cramming it all into one
+  command often wasn't.

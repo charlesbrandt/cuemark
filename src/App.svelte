@@ -69,6 +69,11 @@
   // toggle arriving in that window finds v.paused=true, matches neither branch, and
   // audioPause is never called — leaving GStreamer playing with the deck appearing frozen.
   const lastAudioPlaying = new Map<string, boolean>();
+  // WebKitGTK's GStreamer media backend can't resolve the custom media:// scheme for
+  // <video> elements (confirmed: instant FormatError, no pipeline ever built). Production
+  // serves video over a local-only HTTP server instead — same mechanism dev mode already
+  // uses via the Vite middleware. Fetched once at startup; null until then.
+  let mediaServerPort: number | null = null;
 
   // Sync master volume to Rust audio pipeline
   $effect(() => {
@@ -99,6 +104,9 @@
   });
 
   onMount(async () => {
+    if (!import.meta.env.DEV) {
+      mediaServerPort = await invoke<number>('media_server_port');
+    }
     midiUnlisten = await startMidiListener();
     compositor = new Compositor(canvas);
     let fftEventCount = 0;
@@ -189,12 +197,13 @@
     for (const deck of decks) {
       if (deck.source?.type !== "video") continue;
       const filePath = deck.source.filePath;
-      // Dev: serve via Vite HTTP middleware so GStreamer's souphttpsrc can reach it.
-      // Prod: use the Rust media:// custom scheme (bundled app, no Vite server).
+      // Dev: serve via Vite's HTTP middleware (localhost:1420/media/<abs-path>).
+      // Prod: serve via our own local HTTP server (see media_server.rs) — the custom
+      // media:// scheme doesn't work reliably with WebKitGTK's GStreamer media backend.
       const encodedPath = filePath.split('/').map(encodeURIComponent).join('/');
       const src = import.meta.env.DEV
         ? '/media' + encodedPath
-        : 'media://localhost' + encodedPath;
+        : `http://127.0.0.1:${mediaServerPort}${encodedPath}`;
 
       let v = videoEls.get(deck.id);
       if (!v) {
@@ -202,6 +211,10 @@
         v = document.createElement("video");
         v.style.cssText = "position:fixed;top:-9999px;width:1px;height:1px;pointer-events:none";
         v.muted = true; // audio is handled by Rust/GStreamer; video element is for decode only
+        // Video is served cross-origin (http://127.0.0.1:<port> vs. tauri://localhost in prod).
+        // Without this, drawImage/texImage2D reads in fbo.ts taint the canvas with a
+        // SecurityError, silently killing the compositor's render loop after one frame.
+        v.crossOrigin = "anonymous";
         document.body.appendChild(v);
         registerVideoEl(deck.id, v);
         videoEls.set(deck.id, v);
@@ -213,7 +226,12 @@
       v.onloadedmetadata = () => {
         console.log(`[${deckId}] loadedmetadata fired, duration:`, v!.duration);
         const s = get(session).decks.find((d) => d.id === deckId)?.source;
-        if (s?.type === "video" && s.filePath === filePath) {
+        // v.duration is Infinity for non-fast-start MP4s (moov atom at the end of the
+        // file) until enough of the file has streamed — Infinity is truthy in JS, so
+        // storing it here would permanently block the audioLoad duration fallback below
+        // (`!s.duration` never matches Infinity) and pins the waveform playhead at x=0
+        // forever (currentTime / Infinity = 0). Only accept a real, finite duration.
+        if (s?.type === "video" && s.filePath === filePath && Number.isFinite(v!.duration)) {
           updateDeck(deckId, { source: { type: "video", filePath, duration: v!.duration } });
         }
       };
@@ -238,7 +256,7 @@
         // element. Don't clobber a duration loadedmetadata already supplied.
         audioLoad(deck.id, filePath).then((duration) => {
           const s = get(session).decks.find((d) => d.id === deckId)?.source;
-          if (duration && s?.type === "video" && s.filePath === filePath && !s.duration) {
+          if (duration && s?.type === "video" && s.filePath === filePath && (!s.duration || !Number.isFinite(s.duration))) {
             updateDeck(deckId, { source: { type: "video", filePath, duration } });
           }
         }).catch(console.error);
