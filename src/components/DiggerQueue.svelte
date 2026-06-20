@@ -192,6 +192,10 @@
 
 <style>
   .digger-panel {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
     background: #1a1a1a;
     border-bottom: 1px solid #333;
     padding: 6px 10px;
@@ -204,6 +208,7 @@
     align-items: center;
     gap: 6px;
     margin-bottom: 6px;
+    flex-shrink: 0;
   }
 
   .digger-title {
@@ -230,6 +235,7 @@
     display: flex;
     gap: 4px;
     margin-bottom: 6px;
+    flex-shrink: 0;
   }
 
   .url-input {
@@ -246,12 +252,14 @@
     color: #e06c75;
     font-size: 11px;
     margin-bottom: 4px;
+    flex-shrink: 0;
   }
 
   .search-row {
     display: flex;
     gap: 4px;
     margin-bottom: 6px;
+    flex-shrink: 0;
   }
 
   .search-input {
@@ -278,7 +286,8 @@
 
   .results-list,
   .queue-list {
-    max-height: 180px;
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
   }
 
