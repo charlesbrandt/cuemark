@@ -134,6 +134,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(audio::AudioState::new(audio::AudioManager::new()))
         .register_asynchronous_uri_scheme_protocol("media", |_app, request, responder| {
             std::thread::spawn(move || {

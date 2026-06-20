@@ -47,6 +47,22 @@ export function getDiggerBaseUrl(): string {
   return _baseUrl;
 }
 
+// Digger's docker-compose runs the API on :8200 and the Svelte UI on :5173
+// (see ~/repos/digger/docker-compose.yml). The proxy path used in dev
+// (`/digger-api`, see vite.config.ts) targets the API on localhost:8200,
+// so map that case to the UI port directly rather than trying to resolve
+// the proxy target at runtime.
+export function getDiggerWebUrl(): string {
+  if (_baseUrl === '/digger-api') return 'http://localhost:5173';
+  try {
+    const url = new URL(_baseUrl);
+    url.port = '5173';
+    return url.origin;
+  } catch {
+    return 'http://localhost:5173';
+  }
+}
+
 export async function search(q: string, hasFile = true, limit = 50): Promise<DiggerTrack[]> {
   const params = new URLSearchParams({ q, has_file: String(hasFile), limit: String(limit) });
   const r = await fetch(`${_baseUrl}/search?${params}`);

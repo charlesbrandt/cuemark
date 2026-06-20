@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { openUrl } from '@tauri-apps/plugin-opener';
   import { session, updateDeck } from '../lib/state/session';
   import {
     search, randomTrack, getQueue, addToQueue, removeFromQueue, queueNext,
-    getCuemarkPayload, setDiggerBaseUrl, getDiggerBaseUrl,
+    getCuemarkPayload, setDiggerBaseUrl, getDiggerBaseUrl, getDiggerWebUrl,
     type DiggerTrack, type DiggerQueueItem,
   } from '../lib/digger/api';
 
@@ -102,6 +103,10 @@
     }
   }
 
+  function openDiggerWeb() {
+    openUrl(getDiggerWebUrl()).catch((e) => { error = String(e); });
+  }
+
   function applyBaseUrl() {
     setDiggerBaseUrl(baseUrl || '/digger-api');
     showUrlInput = false;
@@ -116,6 +121,7 @@
 <div class="digger-panel">
   <div class="digger-header">
     <span class="digger-title">Digger Queue</span>
+    <button class="icon-btn" onclick={openDiggerWeb} title="Open Digger in browser">↗</button>
     <button class="icon-btn" onclick={refreshQueue} title="Refresh">↻</button>
     <button class="icon-btn" onclick={() => { showUrlInput = !showUrlInput; }} title="Settings">⚙</button>
   </div>
