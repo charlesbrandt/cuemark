@@ -47,7 +47,17 @@
     function draw() {
       const video = getVideoEl(deck.id);
       if (video && video.readyState >= 2) {
-        ctx!.drawImage(video, 0, 0, canvas.width, canvas.height);
+        // Audio-only files (e.g. .mp3) loaded into a 'video' deck have videoWidth/Height
+        // of 0 — no video track. WebKitGTK throws SecurityError from drawImage() in this
+        // case (rather than silently no-op'ing like Chrome), which would otherwise abort
+        // this rAF loop permanently on the next throw. Skip the draw and guard the call.
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          try {
+            ctx!.drawImage(video, 0, 0, canvas.width, canvas.height);
+          } catch (e) {
+            console.error(`[${deck.id}] preview drawImage failed:`, e);
+          }
+        }
         currentTime = video.currentTime;
         if (video.duration && isFinite(video.duration)) videoDuration = video.duration;
       }
