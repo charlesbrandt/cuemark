@@ -26,10 +26,22 @@ Built with [Tauri](https://tauri.app) (Rust + WebKit), WebGL, and GStreamer/Pipe
 Install all build and runtime dependencies in one shot:
 
 ```sh
+# Tauri build dependencies (WebKit, GTK, SSL, icon rendering, system tray)
+sudo apt-get install \
+  libwebkit2gtk-4.1-dev \
+  libgtk-3-dev \
+  libssl-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev
+
 # GStreamer dev headers (required to compile the Rust GStreamer bindings)
 sudo apt-get install \
   libgstreamer1.0-dev \
   libgstreamer-plugins-base1.0-dev
+
+# ALSA dev headers (required by the midir MIDI crate on Linux)
+sudo apt-get install \
+  libasound2-dev
 
 # GStreamer runtime plugins
 sudo apt-get install \
