@@ -239,8 +239,16 @@ throttle gate so `syncVideoElements` runs at most once per rendered frame (≤ 6
 ```typescript
 type DeckSource =
   | { type: 'video'; filePath: string; duration: number }
-  | { type: 'shader'; fragmentSrc: string; uniforms: Record<string, number> }
   | null
+
+// Global visualization layer — NOT a DeckSource. Composited above all decks in the
+// output stage (see "Visualization layer" below), with its own opacity. Selecting a
+// visualization never touches deck state or audio.
+interface Visualization {
+  fragmentSrc: string
+  uniforms: Record<string, number>
+  name?: string
+}
 
 interface Deck {
   id: string              // 'deck-0', 'deck-1', etc. — no hardcoded limit
@@ -271,6 +279,8 @@ interface Session {
   crossfaderValue: number              // 0.0 (full left) – 1.0 (full right)
   crossfaderTargets: CrossfaderTarget[] // 'opacity' | 'volume' — what the fader drives
   effects: Effect[]       // global post-process chain
+  visualization: Visualization | null   // global layer, composited above all decks
+  visualizationOpacity: number          // 0–1; default 0.5 so video stays visible underneath
 }
 
 interface AudioAnalysis {
@@ -345,14 +355,41 @@ Phase 2: MIDI learn mode (click control in UI, wiggle knob to map).
 
 ## Deck sources
 
-Two modes per deck:
+Decks are video-only — `DeckSource` is `{ type: 'video'; filePath; duration } | null`.
+Load a file, loop, control playback rate. `<video>` element → WebGL texture.
 
-1. **Video clip** — load a file, loop, control playback rate. `<video>` element → WebGL texture.
-2. **Shader visualization** — fullscreen GLSL quad with uniforms:
-   - `u_time: float`
-   - `u_bass: float`, `u_mid: float`, `u_high: float` (from AudioAnalysis)
-   - `u_resolution: vec2`
-   - Any custom uniforms declared in the shader
+## Visualization layer
+
+Shader visualizations (Plasma, Tunnel, Particles, Feedback, Scope, …) are **not** a deck
+source. They live as a single global layer on `Session.visualization` (`fragmentSrc`,
+`uniforms`, `name`) with its own `Session.visualizationOpacity` (default `0.5`, so deck
+video stays visible underneath — turn it up to 1.0 for visualization-only).
+
+**Why this is a separate layer, not a per-deck source (architecture decision, 2026-06-21)**:
+the original design let a deck's source switch between `'video'` and `'shader'`. Selecting
+a visualization on a deck replaced that deck's source, and `syncVideoElements()` in
+`App.svelte` treats any non-video source as "tear this deck down" — it called
+`audioUnload()`, killing music playback the instant a visualization was picked. Since VJs
+want visualizations *blended over* a playing track, not swapped in for it, the fix is
+structural: visualizations never touch deck state at all.
+
+**Rendering**: `Compositor` (`src/lib/renderer/compositor.ts`) holds one extra `DeckFBO`
+(`vizFbo`) and one cached GLSL program (`vizProgram`) outside the per-deck `fbos`/
+`shaderPrograms` maps — there is always at most one active visualization, so no map is
+needed. `renderVisualization(fragmentSrc, uniforms, time, analysis)` renders into `vizFbo`
+exactly like `renderShader()` does for a deck. `composite(decks, visualizationOpacity)`
+blends all deck FBOs back-to-front as before, then — if `visualizationOpacity > 0` — blits
+`vizFbo` on top as a final pass using the same shared blit shader. Driven from `App.svelte`'s
+`frame()` loop, which renders the visualization once per frame (if `session.visualization`
+is set) before calling `composite()`, independent of the per-deck video-upload loop.
+
+Standard uniforms fed to every visualization shader: `u_time`, `u_resolution`,
+`u_bass`/`u_mid`/`u_high` (from `AudioAnalysis`, max-across-playing-decks), plus any custom
+uniforms declared on `Visualization.uniforms`.
+
+**UI**: controls live in `src/components/VisualizationPanel.svelte` (shader picker + opacity
+slider), toggled from a toolbar button in `App.svelte` — mirrors the existing `Audio`/`Queue`
+panel-toggle pattern. `DeckCard.svelte` no longer has any shader-picker UI.
 
 ## Directory structure
 
@@ -382,6 +419,7 @@ cuemark/
       DeckCard.svelte           # Per-deck controls: transport, hot cues, BPM/Master/Sync, loop in/out + bar presets, sliders
       Crossfader.svelte         # Hardware crossfader UI — deck selectors (left/right), slider, Visual/Audio toggles
       WaveformCanvas.svelte     # Per-deck waveform: overview + zoom (16s window); loop region highlight; fires onBpmDetected callback
+      VisualizationPanel.svelte # Global visualization shader picker + opacity slider (toggled from toolbar)
   src-tauri/                    # Rust backend (Tauri 2)
     src/
       main.rs                   # Binary entry point
@@ -400,7 +438,6 @@ cuemark/
     build.rs
     Cargo.toml
     tauri.conf.json
-  shaders/                      # Built-in GLSL visualizations (Phase 2)
   index.html
   package.json
   vite.config.ts
@@ -419,9 +456,9 @@ cuemark/
 - Fullscreen output to display 2
 
 ### Phase 2 — Audio-reactive visuals
-- Shader source type on a deck
+- Global visualization layer (composited above all decks, see "Visualization layer" above)
 - FFT uniforms fed to shader (bass/mid/high, waveform)
-- Built-in shaders: plasma, tunnel, particle field
+- Built-in shaders: plasma, tunnel, particle field, feedback, scope
 - BPM detection
 
 ### Phase 3 — Polish

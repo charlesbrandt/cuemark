@@ -1,7 +1,14 @@
 export type DeckSource =
   | { type: "video"; filePath: string; duration: number }
-  | { type: "shader"; fragmentSrc: string; uniforms: Record<string, number>; name?: string }
   | null;
+
+// Global visualization layer, composited above all decks in the output stage —
+// not tied to any single deck, so selecting one never interrupts deck playback.
+export interface Visualization {
+  fragmentSrc: string;
+  uniforms: Record<string, number>;
+  name?: string;
+}
 
 export interface DeckEQ {
   low: number;   // ±12 dB low shelf  @ 250 Hz
@@ -65,4 +72,6 @@ export interface Session {
   audioCurve: CrossfaderCurve;
   visualCurve: CrossfaderCurve;
   effects: Effect[];      // global post-process chain
+  visualization: Visualization | null; // global layer, composited above all decks
+  visualizationOpacity: number;        // 0–1 — how it blends over the deck output
 }

@@ -50,9 +50,9 @@ export class Compositor {
   private quadVAO: WebGLVertexArrayObject;
   // One FBO per deck; keyed by deck id. Created/destroyed as decks are added/removed.
   private fbos = new Map<string, DeckFBO>();
-  // Compiled shader programs for shader-source decks. Cached by deck id; recompiled when
-  // fragmentSrc changes. program=null means compilation failed — skip rendering.
-  private shaderPrograms = new Map<string, { program: WebGLProgram | null; src: string }>();
+  // Single global visualization layer — composited above all decks, not tied to a deck id.
+  private vizFbo: DeckFBO;
+  private vizProgram: { program: WebGLProgram | null; src: string } | null = null;
 
   readonly width: number;
   readonly height: number;
@@ -65,6 +65,7 @@ export class Compositor {
     this.height = canvas.height;
     this.blitProgram = linkProgram(gl, VERT_SRC, FRAG_BLIT);
     this.quadVAO = this.buildQuad();
+    this.vizFbo = new DeckFBO(gl, this.width, this.height);
   }
 
   private buildQuad(): WebGLVertexArrayObject {
@@ -88,9 +89,6 @@ export class Compositor {
       if (!deckIds.includes(id)) {
         this.fbos.get(id)!.destroy();
         this.fbos.delete(id);
-        const cached = this.shaderPrograms.get(id);
-        if (cached?.program) this.gl.deleteProgram(cached.program);
-        this.shaderPrograms.delete(id);
       }
     }
     for (const id of deckIds) {
@@ -104,10 +102,9 @@ export class Compositor {
     return this.fbos.get(deckId);
   }
 
-  // Render a GLSL shader into the deck's FBO. Compiles and caches the program on first call
-  // or when fragmentSrc changes. Custom uniforms from deck.source.uniforms are set as float uniforms.
-  renderShader(
-    deckId: string,
+  // Render the global visualization shader into its own FBO (not a deck's). Composited
+  // above all decks in composite() — selecting a visualization never touches deck audio/video.
+  renderVisualization(
     fragmentSrc: string,
     customUniforms: Record<string, number>,
     time: number,
@@ -115,23 +112,21 @@ export class Compositor {
   ) {
     const { gl, quadVAO } = this;
 
-    let cached = this.shaderPrograms.get(deckId);
+    let cached = this.vizProgram;
     if (!cached || cached.src !== fragmentSrc) {
       if (cached?.program) gl.deleteProgram(cached.program);
       let program: WebGLProgram | null = null;
       try {
         program = linkProgram(gl, VERT_SRC, fragmentSrc);
       } catch (e) {
-        console.error(`[shader ${deckId}] compile error:`, e);
+        console.error('[visualization] compile error:', e);
       }
       cached = { program, src: fragmentSrc };
-      this.shaderPrograms.set(deckId, cached);
+      this.vizProgram = cached;
     }
     if (!cached.program) return;
 
-    const fbo = this.fbos.get(deckId);
-    if (!fbo) return;
-
+    const fbo = this.vizFbo;
     fbo.bind();
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -155,9 +150,10 @@ export class Compositor {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
-  // Alpha-composite all deck FBOs back-to-front onto the output canvas.
-  // Decks with opacity=0 are skipped. No deck count is hardcoded here.
-  composite(decks: Array<{ id: string; opacity: number }>) {
+  // Alpha-composite all deck FBOs back-to-front onto the output canvas, then blend the
+  // global visualization layer (if active) on top. Decks with opacity=0 are skipped.
+  // No deck count is hardcoded here.
+  composite(decks: Array<{ id: string; opacity: number }>, visualizationOpacity = 0) {
     const { gl, blitProgram, quadVAO } = this;
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -181,6 +177,14 @@ export class Compositor {
       gl.bindTexture(gl.TEXTURE_2D, fbo.texture);
       gl.uniform1i(uTex, 0);
       gl.uniform1f(uOpacity, opacity);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+
+    if (visualizationOpacity > 0) {
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.vizFbo.texture);
+      gl.uniform1i(uTex, 0);
+      gl.uniform1f(uOpacity, visualizationOpacity);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
 

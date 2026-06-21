@@ -1,5 +1,5 @@
 import { writable, get } from "svelte/store";
-import type { Session, Deck, CrossfaderTarget, CrossfaderCurve } from "./types";
+import type { Session, Deck, CrossfaderTarget, CrossfaderCurve, Visualization } from "./types";
 
 function makeDeck(index: number): Deck {
   return {
@@ -33,6 +33,8 @@ const initial: Session = {
   audioCurve: "equal-power",
   visualCurve: "linear",
   effects: [],
+  visualization: null,
+  visualizationOpacity: 0.5,
 };
 
 export const session = writable<Session>(initial);
@@ -126,4 +128,12 @@ export function setMasterBpm(bpm: number | null) {
 
 export function setMidiMapping(left: string, right: string) {
   session.update((s) => ({ ...s, midiMapping: { left, right } }));
+}
+
+export function setVisualization(visualization: Visualization | null) {
+  session.update((s) => ({ ...s, visualization }));
+}
+
+export function setVisualizationOpacity(value: number) {
+  session.update((s) => ({ ...s, visualizationOpacity: value }));
 }

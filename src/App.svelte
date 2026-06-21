@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import { get } from "svelte/store";
   import { session, addDeck, updateDeck, setMasterBpm } from "./lib/state/session";
+  import VisualizationPanel from "./components/VisualizationPanel.svelte";
   import { tapTempo } from "./lib/audio/bpm";
   import { startMidiListener } from "./lib/midi/handler";
   import { Compositor } from "./lib/renderer/compositor";
@@ -36,6 +37,7 @@
   let tapResetTimer: ReturnType<typeof setTimeout> | undefined;
   let showAudioSettings = $state(false);
   let showDiggerQueue = $state(false);
+  let showVisualizationPanel = $state(false);
 
   function handleTap() {
     const now = Date.now();
@@ -333,12 +335,10 @@
     }
   }
 
-  const shaderDebugLogged = new Set<string>();
-
   // RAF render loop: upload video frames → composite; sync video to audio clock
   function frame() {
     if (compositor) {
-      const { decks } = get(session);
+      const { decks, visualization, visualizationOpacity } = get(session);
       const timeSecs = performance.now() / 1000;
       // Combine per-deck FFT data from GStreamer spectrum events: max across all playing decks.
       let bass = 0, mid = 0, high = 0;
@@ -349,13 +349,7 @@
       }
       const analysis: BandAnalysis = { bass, mid, high };
       for (const deck of decks) {
-        if (deck.source?.type === 'shader') {
-          if (!shaderDebugLogged.has(deck.id)) {
-            shaderDebugLogged.add(deck.id);
-            console.log(`[shader ${deck.id}] first render — deckAnalysis size=${deckAnalysis.size} analysis=`, analysis);
-          }
-          compositor.renderShader(deck.id, deck.source.fragmentSrc, deck.source.uniforms, timeSecs, analysis);
-        } else if (deck.source?.type === 'video') {
+        if (deck.source?.type === 'video') {
           const v = videoEls.get(deck.id);
           const fbo = compositor.getFBO(deck.id);
           if (v && fbo) fbo.uploadVideoFrame(v);
@@ -374,7 +368,12 @@
           }
         }
       }
-      compositor.composite(decks);
+      // Global visualization layer — rendered separately from decks and composited above
+      // them, so picking a visualization never interrupts deck audio/video.
+      if (visualization) {
+        compositor.renderVisualization(visualization.fragmentSrc, visualization.uniforms, timeSecs, analysis);
+      }
+      compositor.composite(decks, visualization ? visualizationOpacity : 0);
       postFrame(canvas);
     }
     rafId = requestAnimationFrame(frame);
@@ -396,6 +395,11 @@
       class:active={showDiggerQueue}
       onclick={() => { showDiggerQueue = !showDiggerQueue; }}
     >Queue</button>
+    <button
+      class="output-btn"
+      class:active={showVisualizationPanel}
+      onclick={() => { showVisualizationPanel = !showVisualizationPanel; }}
+    >Visualization</button>
     <span class="bpm">{$session.bpm ? `${$session.bpm} BPM` : "—"}</span>
     <button class="tap-btn" onclick={handleTap}>TAP</button>
     {#if $session.bpm !== null}
@@ -423,6 +427,10 @@
     <div class="main-content">
       {#if showAudioSettings}
         <AudioSettings />
+      {/if}
+
+      {#if showVisualizationPanel}
+        <VisualizationPanel />
       {/if}
 
       <div class="waveform-stack">

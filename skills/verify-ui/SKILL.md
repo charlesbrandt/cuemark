@@ -144,9 +144,10 @@ kill $(cat /tmp/xvfb.pid) 2>/dev/null; rm -f /tmp/xvfb.pid
 - **One session at a time**: `tauri-driver` does not multiplex; creating a second
   session before deleting the first will hang or error.
 - **GStreamer/audio still runs for real** inside Xvfb — if the verification task
-  doesn't need audio, prefer testing decks with `shader` sources or check what
-  happens with no PipeWire sink available rather than risk audio device contention
-  with the user's real session.
+  doesn't need audio, prefer leaving decks empty (no source loaded) or using only the
+  global visualization layer (`Session.visualization` — no deck/audio involvement) rather
+  than risk audio device contention with the user's real session. (Decks are video-only;
+  there is no shader deck source anymore — visualizations are a separate global layer.)
 - **Don't run a `cargo build`/`cargo check` concurrently with the `cargo tauri build`
   in step 1** — both write to the same `target/` directory, and a concurrent debug
   build racing the release/driver build observed a one-off "unresolved crate" error

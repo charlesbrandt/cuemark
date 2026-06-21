@@ -66,16 +66,31 @@
 
 ## Batch D — Shader visuals (Phase 2)
 
-### shader deck source [done]
-- `DeckSource` type has `{ type: 'shader'; fragmentSrc: string; uniforms: ... }`
-- DeckCard: Plasma and Tunnel buttons alongside Load Video; active shader highlighted in preview
-- `Compositor.renderShader()`: compiles + caches GLSL program per deck, renders fullscreen quad into FBO each RAF frame
+### shader deck source [superseded, 2026-06-21 — see "global visualization layer" below]
+- Originally `DeckSource` had `{ type: 'shader'; fragmentSrc: string; uniforms: ... }` and DeckCard
+  exposed Plasma/Tunnel buttons that replaced a deck's source. Problem: selecting a visualization
+  on a deck made `syncVideoElements()` treat it as "no video source" and call `audioUnload()`,
+  stopping the music. Removed entirely — decks are video-only now (`DeckSource` is
+  `{ type: 'video'; ... } | null`).
+
+### global visualization layer [done]
+- Visualization moved off `Deck`/`DeckSource` entirely onto `Session.visualization` (single slot:
+  `{ fragmentSrc, uniforms, name } | null`) + `Session.visualizationOpacity` (default `0.5`)
+- `Compositor` gained a dedicated `vizFbo`/`vizProgram` (outside the per-deck maps — only one
+  visualization is ever active) and `renderVisualization()`, mirroring `renderShader()`
+- `composite(decks, visualizationOpacity)` blends all deck FBOs back-to-front as before, then
+  blits the visualization FBO on top as a final pass if `visualizationOpacity > 0`
+- New `VisualizationPanel.svelte` (shader picker + opacity slider), toggled from a toolbar button
+  in `App.svelte`; `DeckCard.svelte`'s shader buttons removed
+- Result: picking a visualization never touches deck/audio state — it's a pure compositor overlay
+- `Compositor.renderVisualization()`: compiles + caches a single GLSL program (no per-deck map
+  needed — only one visualization is ever active), renders fullscreen quad into `vizFbo` each RAF frame
 - Uniforms: `u_time`, `u_resolution`, `u_bass`, `u_mid`, `u_high`; `a_pos` bound at location 0 so all programs share the same quadVAO
 
 ### audio-reactive shader uniforms [done]
 - GStreamer `spectrum` element (32 bands, ~30 fps) inserted after `pitch` in each deck pipeline
 - Bus thread parses spectrum messages and emits `audio-fft` Tauri events; frontend combines
-  max-across-decks into `{ bass, mid, high }` and passes to `compositor.renderShader()`
+  max-across-decks into `{ bass, mid, high }` and passes to `compositor.renderVisualization()`
 - All three bands wired as `u_bass`, `u_mid`, `u_high` uniforms — confirmed responding to music
 - Bug fixed: spectrum magnitude is `GstValueList` (`gst::List`), not `GstValueArray` (`gst::Array`);
   the mismatch silently dropped every message before this was corrected

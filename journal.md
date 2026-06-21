@@ -938,3 +938,37 @@ almost always needs both checks combined, not one swapped for the other.
 | `src/App.svelte` | Video `src` uses local HTTP server in prod; `v.crossOrigin = "anonymous"`; fixed `Infinity`-duration guards (twice — first attempt regressed the normal "not loaded yet" case) |
 | `src/lib/renderer/outputBus.ts` | `postFrame()` gained an in-flight backpressure guard |
 | `CLAUDE.md` | Rewrote the video-serving section to document the local HTTP server (dev + prod) instead of `media://` |
+
+## Visualizations decoupled from deck source (2026-06-21)
+
+Selecting a built-in shader (Plasma, Tunnel, etc.) used to set a deck's `source` to
+`{ type: 'shader', ... }`. `App.svelte`'s `syncVideoElements()` treated any non-video source
+as "this deck has no video" and called `audioUnload()` — so picking a visualization on a
+playing deck silently killed the music. Not viable for live VJ use, where a visualization
+should layer *over* a playing track, not replace it.
+
+**Fix is structural, not a guard clause**: visualizations moved entirely off `Deck`/
+`DeckSource` onto a new global `Session.visualization` (single slot) +
+`Session.visualizationOpacity` (default `0.5`, so deck video stays visible underneath).
+`Compositor` gained one extra `vizFbo`/cached program (outside the per-deck maps — only one
+visualization is ever active) and `renderVisualization()`; `composite()` blends it as a final
+pass above all decks. The old per-deck `Compositor.renderShader()` and its `shaderPrograms`
+map became dead code once decks went video-only and were deleted outright rather than left
+unused. New `VisualizationPanel.svelte` (shader picker + opacity slider) replaces the
+shader-button row that used to live in `DeckCard.svelte`.
+
+Full design details live in `CLAUDE.md` under "Visualization layer". `todo.md`'s Batch D
+entry for the old per-deck shader source is marked `[superseded]` rather than deleted, to
+keep the history of *why* the data model changed.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `src/lib/state/types.ts` | `DeckSource` narrowed to video-only; added `Visualization` type, `Session.visualization`/`visualizationOpacity` |
+| `src/lib/state/session.ts` | Added `setVisualization()`/`setVisualizationOpacity()`; default opacity `0.5` |
+| `src/lib/renderer/compositor.ts` | Removed per-deck `renderShader()`/`shaderPrograms`; added `vizFbo`/`vizProgram`/`renderVisualization()`; `composite()` takes a `visualizationOpacity` param |
+| `src/App.svelte` | `frame()` renders the visualization layer separately from decks; new toolbar toggle for `VisualizationPanel` |
+| `src/components/VisualizationPanel.svelte` | New — shader picker + opacity slider |
+| `src/components/DeckCard.svelte` | Removed shader-picker buttons and shader preview branch |
+| `skills/verify-ui/SKILL.md` | Updated stale advice to test with `shader` deck sources to avoid audio — no longer exists |
