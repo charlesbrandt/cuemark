@@ -229,6 +229,19 @@ fire 200+ events/second. Calling `v.play()` or setting `v.playbackRate` that fre
 GStreamer's pipeline and causes playback to stall. Solution: use `requestAnimationFrame` as the
 throttle gate so `syncVideoElements` runs at most once per rendered frame (≤ 60/s).
 
+**Every per-frame RAF loop must gate its expensive work on an actual-change check, not just
+playback intent**: `App.svelte`'s `frame()`, `WaveformCanvas.svelte`, and `DeckCard.svelte`'s
+preview each ran full-resolution `drawImage`/`texImage2D`/`createImageBitmap` unconditionally
+every tick, regardless of whether the deck was playing. A paused video still re-uploads and
+re-composites an identical frame 60×/sec forever — confirmed in production: a real session with
+two paused decks loaded sat at 97-99% `WebKitWebProcess` CPU before this fix, ~2.4% after.
+The pattern used throughout: track the last-seen value that actually determines a different
+output (`video.currentTime` for frame uploads/canvas draws; a signature of
+id/source/opacity/visualization-opacity for the composite+`postFrame()` call) and skip the
+work when it's unchanged from the previous tick. `scripts/perf-idle-test.sh` is an automated
+regression test for this — re-run it after touching the render loop, `WaveformCanvas`, or the
+`DeckCard` preview.
+
 ### Dual output
 
 - Window 1 (control): deck previews, crossfader, media browser, MIDI status
@@ -595,6 +608,10 @@ Project-specific skills live in `skills/`. Load one with `/audio-debugging` (or 
 | `audio-debugging` | GStreamer bus errors, rate-change issues, layered/detuned audio, pipeline recovery |
 | `run-app` | Launch and monitor the app; stop/restart for Rust changes; read log patterns |
 | `verify-ui` | Screenshot/click/inspect the real webview headlessly via tauri-driver + Xvfb, without touching the user's live desktop session |
+
+`scripts/perf-idle-test.sh` automates a CPU regression check on top of `verify-ui`'s setup —
+samples `WebKitWebProcess` CPU% across empty/paused/playing scenarios. Run it after touching
+the render loop (`App.svelte` `frame()`), `WaveformCanvas`, or `DeckCard`'s preview canvas.
 
 ## Constraints
 

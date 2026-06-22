@@ -972,3 +972,78 @@ keep the history of *why* the data model changed.
 | `src/components/VisualizationPanel.svelte` | New — shader picker + opacity slider |
 | `src/components/DeckCard.svelte` | Removed shader-picker buttons and shader preview branch |
 | `skills/verify-ui/SKILL.md` | Updated stale advice to test with `shader` deck sources to avoid audio — no longer exists |
+
+## Idle CPU regression: full-resolution per-frame work ran regardless of playback state (2026-06-21)
+
+User noticed `WebKitWebProcess` sitting at ~6% CPU with the app fully idle. Investigation
+(via an `Explore` subagent across `App.svelte`, `WaveformCanvas.svelte`, `DeckCard.svelte`)
+found the real-world severity was far worse than the idle screenshot suggested: the user's
+**already-running production instance**, which had two video decks loaded and paused, was
+pegged at **97-99% CPU** — a direct reproduction of the bug, found by accident while
+comparing before/after.
+
+### Root cause
+
+Three independent RAF loops did real per-frame work — full-resolution `drawImage`/
+`texImage2D`/`createImageBitmap` — unconditionally every tick, with no check for whether
+the underlying video frame, deck state, or composited output had actually changed:
+
+1. **`App.svelte` `frame()`** — uploaded every video deck's current frame to its FBO texture
+   (`DeckFBO.uploadVideoFrame()`, full-res `drawImage` + `texImage2D`) every tick regardless
+   of `deck.playing`, then called `compositor.composite()` + `postFrame()` (full-res
+   `createImageBitmap` + cross-window `postMessage`) every tick regardless of whether
+   anything visual changed.
+2. **`WaveformCanvas.svelte`** — redrew the whole waveform canvas (gradients, fills, text)
+   at 60fps per deck forever, including the `— no source —` placeholder state with zero
+   decks loaded.
+3. **`DeckCard.svelte`** preview thumbnail — same full-res `drawImage` every tick regardless
+   of pause state.
+
+None of these had anything to do with whether the frame on screen needed to be different
+from the last one — a paused video re-uploads and re-composites an identical frame 60
+times a second forever.
+
+### Fix
+
+Each loop now gates its expensive work on an actual-change check:
+- `App.svelte`: `lastUploadedTime` map skips `uploadVideoFrame()` when `video.currentTime`
+  hasn't moved; a `dirty` flag (set by an advancing video frame, the always-animating
+  visualization layer, or a `lastFrameSig` signature change covering opacity/source/
+  visualization-opacity) gates `composite()` + `postFrame()`.
+- `WaveformCanvas.svelte`: draws once reactively on any relevant state change; only keeps
+  a continuous RAF loop running while `deck.playing` (for the moving playhead).
+- `DeckCard.svelte`: tracks `lastDrawnTime`, skips `drawImage()` when the video frame
+  hasn't advanced (still catches a seek made while paused).
+
+Verified empirically via `pidstat` before/after: empty idle dropped from ~6% to ~2%; the
+real production case (two paused decks) dropped from ~97-99% to ~2.4%. A deck actually
+playing still costs real CPU (~130% in headless testing, software video decode — see
+"VA-API DMA-BUF" section above for why this GPU never uses hardware decode anyway), which
+is expected and unaffected by this fix — only paused/idle states were the problem.
+
+### Automated regression test added
+
+`scripts/perf-idle-test.sh` drives the real compiled binary headlessly via `tauri-driver`
++ `Xvfb` (see `skills/verify-ui/SKILL.md`) and samples `WebKitWebProcess` CPU% across five
+scenarios (empty, one animating visualization, one/two paused video decks, one playing video
+deck), printing a results table. Re-run after touching the render loop, `WaveformCanvas`, or
+`DeckCard` preview to catch this class of regression before it reaches a live show.
+
+This needed a new dev-only `window.__cuemarkDebug` hook (`App.svelte`, exposing
+`updateDeck`/`addDeck`/`removeDeck`/`getSession`) so the headless test can load/play/pause
+decks directly — WebDriver cannot reach the native file picker or OS drag-and-drop (a
+limitation `skills/verify-ui/SKILL.md` had already flagged but left unimplemented).
+**Gating on `import.meta.env.DEV` alone does not work for this binary**: `cargo tauri build
+--debug` still runs `vite build` (production frontend build, `DEV=false`) regardless of the
+Rust profile, so the hook is also gated on `VITE_ENABLE_DEBUG_HOOK=1`, an explicit opt-in
+env var passed only when building the test binary — it is never present in a real build the
+user runs for a show.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `src/App.svelte` | Skip `uploadVideoFrame()`/`composite()`/`postFrame()` when nothing changed; dev-only `window.__cuemarkDebug` hook behind `VITE_ENABLE_DEBUG_HOOK` |
+| `src/components/WaveformCanvas.svelte` | Redraw once on state change; only loop continuously while `deck.playing` |
+| `src/components/DeckCard.svelte` | Skip preview `drawImage()` when `video.currentTime` hasn't advanced |
+| `scripts/perf-idle-test.sh` | New — headless `tauri-driver` CPU regression test across idle/paused/playing scenarios |

@@ -20,7 +20,7 @@ cargo install tauri-driver
 Verify before starting a session:
 ```sh
 which Xvfb tauri-driver
-dpkg -L webkit2gtk-driver | grep WebKitWebDriver
+dpkg -L webkit2gtk-driver | grep -E '/WebKitWebDriver$'
 ```
 If any of these are missing, stop and tell the user — don't try to work around it.
 
@@ -61,7 +61,7 @@ echo $! > /tmp/xvfb.pid
 ## 3. Start tauri-driver on that display
 
 ```sh
-WEBKIT_DRIVER=$(dpkg -L webkit2gtk-driver | grep WebKitWebDriver)
+WEBKIT_DRIVER=$(dpkg -L webkit2gtk-driver | grep -E '/WebKitWebDriver$')
 DISPLAY=:99 tauri-driver --port 4444 --native-driver "$WEBKIT_DRIVER" > /tmp/tauri-driver.log 2>&1 &
 echo $! > /tmp/tauri-driver.pid
 sleep 1
@@ -106,18 +106,33 @@ curl -s -X POST http://localhost:4444/session/$SESSION/execute/sync \
   -d '{"script":"return document.querySelectorAll(\".waveform-canvas\").length","args":[]}'
 ```
 
-### Caveat: native dialogs and drag-and-drop are out of reach
+### Native dialogs and drag-and-drop are out of reach — use the debug hook instead
 
 WebDriver only controls the webview's DOM/JS — it cannot interact with the native
 GTK "Open File" dialog or simulate OS-level drag-and-drop onto the window. Loading a
-track for a screenshot test therefore can't go through the file picker or drag-drop
-UI. The workaround is to call the session store directly via `/execute/sync`, but
-that requires the store's mutators (`updateDeck`, etc.) to be reachable from `window`
-— they currently are not exposed. If a test needs to load a real track, either:
-- add a small dev-only hook (e.g. `window.__cuemarkDebug = { updateDeck }` in
-  `App.svelte`, gated behind `import.meta.env.DEV`) the first time this is needed, or
-- ask the user whether they want that hook added permanently for this purpose.
-Don't add it speculatively — wait until a verification task actually needs it.
+track or toggling playback for a test therefore can't go through the file picker or
+drag-drop UI.
+
+`App.svelte`'s `onMount` exposes `window.__cuemarkDebug = { updateDeck, addDeck,
+removeDeck, getSession }` for exactly this — call session mutators directly via
+`/execute/sync`:
+```sh
+curl -s -X POST http://localhost:4444/session/$SESSION/execute/sync \
+  -H "Content-Type: application/json" \
+  -d '{"script":"window.__cuemarkDebug.updateDeck(\"deck-0\", {source:{type:\"video\",filePath:\"/path/to.mp4\",duration:0}, playing:false}); return window.__cuemarkDebug.getSession().decks[0].source","args":[]}'
+```
+
+**This hook is gated behind `VITE_ENABLE_DEBUG_HOOK=1`, not just `import.meta.env.DEV`**
+— `cargo tauri build --debug` (step 1 above) still runs `vite build`, which always sets
+`DEV=false` regardless of the Rust profile. Without the env var the hook silently isn't
+in `dist/`, `window.__cuemarkDebug` is `undefined` in the WebDriver session, and the
+build for real use never has the hook at all. Build for testing with:
+```sh
+VITE_ENABLE_DEBUG_HOOK=1 cargo tauri build --debug --no-bundle
+```
+Sanity-check before trusting a test run: `grep -q '__cuemarkDebug' dist/assets/*.js`
+should match. See `scripts/perf-idle-test.sh` for a full working example (loads/plays/
+pauses decks headlessly to sample CPU% per scenario).
 
 ## 6. Tear down
 
@@ -130,6 +145,18 @@ kill $(cat /tmp/xvfb.pid) 2>/dev/null; rm -f /tmp/xvfb.pid
 
 ## Gotchas
 
+- **`dpkg -L webkit2gtk-driver | grep WebKitWebDriver` matches two lines**, not one — the
+  binary (`/usr/bin/WebKitWebDriver`) and its man page (`/usr/share/man/man1/
+  WebKitWebDriver.1.gz`, which also contains the string). `$WEBKIT_DRIVER` then holds both
+  paths newline-joined, and `tauri-driver --native-driver "$WEBKIT_DRIVER"` fails immediately
+  with `can not find the supplied binary path /usr/bin/WebKitWebDriver\n/usr/share/man/...`.
+  Anchor the pattern: `grep -E '/WebKitWebDriver$'`.
+- **Sampling CPU% for a perf comparison**: use `pidstat -p <pid> 1 <seconds>`, not `ps -p
+  <pid> -o %cpu` — `ps`'s `%cpu` is averaged over the process's entire lifetime, so it drifts
+  toward whatever the load was right after launch and takes a long time to reflect a change
+  in current behavior. `pidstat`'s per-second samples (the `Average:` row's 7th data column,
+  i.e. `awk '/^Average:/{print $8}'`) are point-in-time and correct for "what is this process
+  doing right now."
 - **`WebKitWebDriver` runs unsandboxed by default** — it disables WebKit's bubblewrap sandbox itself
   for automation purposes, regardless of `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS`. This means you
   cannot use a tauri-driver session to A/B test sandbox-related hypotheses (e.g. "does GPU device
