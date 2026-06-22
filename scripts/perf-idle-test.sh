@@ -4,7 +4,7 @@
 # Drives the real compiled binary headlessly via tauri-driver + Xvfb (see
 # skills/verify-ui/SKILL.md) and samples WebKitWebProcess CPU% across a fixed
 # set of scenarios (no decks, one paused video deck, one playing video deck,
-# two paused video decks, one shader deck). Useful for catching regressions
+# two paused video decks, one animating visualization layer). Useful for catching regressions
 # like the one fixed 2026-06-21: continuous full-resolution frame
 # upload/capture running every RAF tick regardless of playback state.
 #
@@ -127,11 +127,14 @@ echo "=== Scenario: empty (no decks loaded) ==="
 js "window.__cuemarkDebug.updateDeck('deck-0', {source: null, playing: false}); window.__cuemarkDebug.updateDeck('deck-1', {source: null, playing: false});" >/dev/null
 run_scenario "empty"
 
-echo "=== Scenario: one shader deck animating ==="
+echo "=== Scenario: global visualization layer animating ==="
+# Visualizations are a global Session.visualization layer (composited above all decks),
+# not a per-deck DeckSource — there is no 'shader' deck source type anymore (see
+# CLAUDE.md "Visualization layer"). Drive it via setVisualization()/setVisualizationOpacity().
 SHADER='#version 300 es\nprecision highp float;\nuniform float u_time;\nout vec4 fragColor;\nvoid main(){ fragColor = vec4(0.5+0.5*sin(u_time), 0.0, 0.0, 1.0); }'
-js "window.__cuemarkDebug.updateDeck('deck-0', {source: {type:'shader', fragmentSrc:\"$SHADER\", uniforms:{}}, playing: true});" >/dev/null
-run_scenario "shader-deck-animating"
-js "window.__cuemarkDebug.updateDeck('deck-0', {source: null, playing: false});" >/dev/null
+js "window.__cuemarkDebug.setVisualization({fragmentSrc: \"$SHADER\", uniforms: {}}); window.__cuemarkDebug.setVisualizationOpacity(1.0);" >/dev/null
+run_scenario "visualization-layer-animating"
+js "window.__cuemarkDebug.setVisualization(null); window.__cuemarkDebug.setVisualizationOpacity(0.5);" >/dev/null
 
 if [ -n "$VIDEO_FILE" ]; then
   echo "=== Scenario: one video deck loaded, paused ==="
