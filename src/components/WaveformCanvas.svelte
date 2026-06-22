@@ -103,9 +103,15 @@
     };
   }
 
+  // Only the playhead needs continuous redraws, and only while the deck is actually
+  // advancing. Reading deck.playing here means this effect re-runs (and redraws once)
+  // on every other reactive change too — zoom toggle, peaks arriving, cue edits, etc. —
+  // without needing a 60fps loop to pick those up while paused/idle.
   $effect(() => {
     if (!canvas) return;
     const c = canvas;
+    draw(c);
+    if (!deck.playing) return;
     let rafId: number;
     function loop() { draw(c); rafId = requestAnimationFrame(loop); }
     rafId = requestAnimationFrame(loop);

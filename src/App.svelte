@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { get } from "svelte/store";
-  import { session, addDeck, updateDeck, setMasterBpm } from "./lib/state/session";
+  import { session, addDeck, removeDeck, updateDeck, setMasterBpm } from "./lib/state/session";
   import VisualizationPanel from "./components/VisualizationPanel.svelte";
   import { tapTempo } from "./lib/audio/bpm";
   import { startMidiListener } from "./lib/midi/handler";
@@ -71,6 +71,16 @@
   // toggle arriving in that window finds v.paused=true, matches neither branch, and
   // audioPause is never called — leaving GStreamer playing with the deck appearing frozen.
   const lastAudioPlaying = new Map<string, boolean>();
+  // Last video.currentTime uploaded to each deck's FBO texture. uploadVideoFrame() does a
+  // full-resolution drawImage + texImage2D — skip it when the frame hasn't advanced (paused)
+  // to avoid burning CPU/GPU every RAF tick while idle. Still catches seeks made while paused
+  // since currentTime changes even with playing=false.
+  const lastUploadedTime = new Map<string, number>();
+  // Signature of the last composited frame's static inputs (deck id/source/opacity).
+  // Used to skip the composite()+postFrame() GPU readback entirely when nothing visual
+  // changed and nothing is animating — otherwise that full-resolution capture + cross-window
+  // postMessage runs forever at 60fps even with zero decks loaded.
+  let lastFrameSig = '';
   // WebKitGTK's GStreamer media backend can't resolve the custom media:// scheme for
   // <video> elements (confirmed: instant FormatError, no pipeline ever built). Production
   // serves video over a local-only HTTP server instead — same mechanism dev mode already
@@ -106,6 +116,21 @@
   });
 
   onMount(async () => {
+    // Dev-only hook so headless WebDriver perf/UI tests can mutate session state
+    // directly (load decks, toggle playback) without going through the native file
+    // picker or OS drag-and-drop, neither of which WebDriver can reach. `vite build`
+    // (used even for `cargo tauri build --debug`, the binary tauri-driver launches)
+    // sets DEV=false regardless of Rust profile, so test runs must also pass
+    // VITE_ENABLE_DEBUG_HOOK=1 to the build to get this — it is never present in a
+    // normal production build the user runs for a live show.
+    if (import.meta.env.DEV || import.meta.env.VITE_ENABLE_DEBUG_HOOK === '1') {
+      (window as unknown as Record<string, unknown>).__cuemarkDebug = {
+        updateDeck,
+        addDeck,
+        removeDeck,
+        getSession: () => get(session),
+      };
+    }
     if (!import.meta.env.DEV) {
       mediaServerPort = await invoke<number>('media_server_port');
     }
@@ -348,11 +373,18 @@
         high = Math.max(high, a.high);
       }
       const analysis: BandAnalysis = { bass, mid, high };
+      // Any shader deck (continuous u_time animation) or a video frame that actually
+      // advanced/seeked this tick makes the composited output stale.
+      let dirty = false;
       for (const deck of decks) {
         if (deck.source?.type === 'video') {
           const v = videoEls.get(deck.id);
           const fbo = compositor.getFBO(deck.id);
-          if (v && fbo) fbo.uploadVideoFrame(v);
+          if (v && fbo && v.currentTime !== lastUploadedTime.get(deck.id)) {
+            lastUploadedTime.set(deck.id, v.currentTime);
+            fbo.uploadVideoFrame(v);
+            dirty = true;
+          }
           // Audio is the master clock. One in-flight IPC per deck prevents stale
           // out-of-order responses from snapping currentTime backward mid-rate-change.
           if (deck.playing && v && !pendingPos.get(deck.id)) {
@@ -369,12 +401,25 @@
         }
       }
       // Global visualization layer — rendered separately from decks and composited above
-      // them, so picking a visualization never interrupts deck audio/video.
+      // them, so picking a visualization never interrupts deck audio/video. It animates
+      // continuously (u_time), same as a per-deck shader used to, so it always marks the
+      // frame dirty.
       if (visualization) {
+        dirty = true;
         compositor.renderVisualization(visualization.fragmentSrc, visualization.uniforms, timeSecs, analysis);
       }
-      compositor.composite(decks, visualization ? visualizationOpacity : 0);
-      postFrame(canvas);
+      // Catch changes that don't come from per-frame video/visualization advancement:
+      // opacity (crossfader), source swaps, deck add/remove, visualization toggle.
+      const sig = `${visualization ? visualizationOpacity : 0}|` +
+        decks.map((d) => `${d.id}:${d.source?.type}:${d.opacity}`).join('|');
+      if (sig !== lastFrameSig) {
+        lastFrameSig = sig;
+        dirty = true;
+      }
+      if (dirty) {
+        compositor.composite(decks, visualization ? visualizationOpacity : 0);
+        postFrame(canvas);
+      }
     }
     rafId = requestAnimationFrame(frame);
   }

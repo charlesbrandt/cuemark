@@ -42,19 +42,26 @@
     });
     ro.observe(canvas);
 
+    // drawImage here is full-resolution and runs alongside the main compositor's own
+    // texture upload — skip it while paused and the frame hasn't moved (idle CPU sink
+    // otherwise). lastDrawnTime still catches a seek made while paused.
+    let lastDrawnTime = -1;
     let rafId: number;
     function draw() {
       const video = getVideoEl(deck.id);
       if (video && video.readyState >= 2) {
-        // Audio-only files (e.g. .mp3) loaded into a 'video' deck have videoWidth/Height
-        // of 0 — no video track. WebKitGTK throws SecurityError from drawImage() in this
-        // case (rather than silently no-op'ing like Chrome), which would otherwise abort
-        // this rAF loop permanently on the next throw. Skip the draw and guard the call.
-        if (video.videoWidth > 0 && video.videoHeight > 0) {
-          try {
-            ctx!.drawImage(video, 0, 0, canvas.width, canvas.height);
-          } catch (e) {
-            console.error(`[${deck.id}] preview drawImage failed:`, e);
+        if (video.currentTime !== lastDrawnTime) {
+          lastDrawnTime = video.currentTime;
+          // Audio-only files (e.g. .mp3) loaded into a 'video' deck have videoWidth/Height
+          // of 0 — no video track. WebKitGTK throws SecurityError from drawImage() in this
+          // case (rather than silently no-op'ing like Chrome), which would otherwise abort
+          // this rAF loop permanently on the next throw. Skip the draw and guard the call.
+          if (video.videoWidth > 0 && video.videoHeight > 0) {
+            try {
+              ctx!.drawImage(video, 0, 0, canvas.width, canvas.height);
+            } catch (e) {
+              console.error(`[${deck.id}] preview drawImage failed:`, e);
+            }
           }
         }
         currentTime = video.currentTime;
