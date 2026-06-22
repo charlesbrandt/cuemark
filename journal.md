@@ -1047,3 +1047,55 @@ user runs for a show.
 | `src/components/WaveformCanvas.svelte` | Redraw once on state change; only loop continuously while `deck.playing` |
 | `src/components/DeckCard.svelte` | Skip preview `drawImage()` when `video.currentTime` hasn't advanced |
 | `scripts/perf-idle-test.sh` | New — headless `tauri-driver` CPU regression test across idle/paused/playing scenarios |
+
+# 2026.06.22 — Queue panel default-on + live updates via Digger WebSocket
+
+## Context
+
+Two related requests: (1) the Digger queue panel should be visible on launch instead of
+requiring a toolbar toggle, and the window should be wider so decks aren't squeezed by it;
+(2) the queue panel should reflect changes made elsewhere in Digger (its own UI, another
+client) without the user manually hitting refresh — and without polling.
+
+## UI defaults
+
+- `showDiggerQueue` in `App.svelte`: `false` → `true`
+- `src-tauri/tauri.conf.json` main window: `width` `1280` → `1600`
+
+## Live updates: WebSocket, not polling
+
+Digger had no push mechanism at all (confirmed: no SSE/WebSocket/pub-sub anywhere in
+`~/repos/digger`). Polling was explicitly ruled out, so this required adding a push
+endpoint to Digger itself — a cross-repo change, not just a cuemark-side fix.
+
+Added `GET /queue/ws` to `~/repos/digger/api.py`: a WebSocket endpoint that broadcasts
+`{"type": "queue_changed"}` to every connected client after any commit that mutates
+`queue_items` (add tracks, add playlist, remove item, clear, consume via `/queue/next`,
+source-disable cascade delete). Still respects the existing boundary rule "cuemark calls
+Digger, Digger never calls cuemark" — cuemark opens the connection, Digger only ever
+responds on a connection someone else initiated.
+
+**Sync endpoints can't `await` a send directly**: all the queue mutation endpoints in
+`api.py` are plain `def`s (run in starlette's threadpool), not `async def`s. Broadcasting
+from them requires `asyncio.run_coroutine_threadsafe(coro, loop)`, which needs a reference
+to the *running* event loop — captured once via `@app.on_event("startup")` into a module
+global (`_main_loop`), since a sync function has no event loop of its own to call
+`get_running_loop()` against.
+
+Cuemark side: `subscribeQueueChanges()` (`src/lib/digger/api.ts`) opens the socket,
+reconnects with a fixed 3s backoff on drop, and calls a refetch callback on every
+`queue_changed` message. `DiggerQueue.svelte` subscribes on mount and resubscribes if the
+user changes the Digger base URL in settings. The dev Vite proxy for `/digger-api` needed
+`ws: true` added (`vite.config.ts`) — Vite's proxy doesn't forward WebSocket upgrades by
+default even though it already proxies the REST calls on the same path.
+
+## Files touched
+
+| File | Change |
+|---|---|
+| `src/App.svelte` | `showDiggerQueue` defaults to `true` |
+| `src-tauri/tauri.conf.json` | main window width 1280→1600 |
+| `vite.config.ts` | `ws: true` on the `/digger-api` proxy entry |
+| `src/lib/digger/api.ts` | new `subscribeQueueChanges()` — WebSocket client with reconnect |
+| `src/components/DiggerQueue.svelte` | subscribes on mount; resubscribes on base-URL change |
+| `~/repos/digger/api.py` | new `GET /queue/ws` endpoint + `_broadcast_queue_changed()`, wired into all queue-mutation commit points |

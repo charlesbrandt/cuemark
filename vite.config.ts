@@ -65,6 +65,7 @@ export default defineConfig({
       "/digger-api": {
         target: "http://localhost:8200",
         rewrite: (path) => path.replace(/^\/digger-api/, ""),
+        ws: true,
       },
     },
     watch: {

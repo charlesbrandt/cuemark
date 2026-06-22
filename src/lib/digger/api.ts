@@ -109,6 +109,44 @@ export async function getCuemarkPayload(trackId: number): Promise<CuemarkPayload
   return r.json();
 }
 
+// Pushes from Digger's /queue/ws so the panel updates when the queue changes from
+// elsewhere (Digger's own UI, another client) — avoids polling. Reconnects with a
+// fixed 3s backoff if the socket drops (e.g. Digger restarts).
+export function subscribeQueueChanges(onChange: () => void): () => void {
+  let ws: WebSocket | null = null;
+  let closed = false;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function wsUrl(): string {
+    if (_baseUrl.startsWith('/')) {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      return `${proto}://${location.host}${_baseUrl}/queue/ws`;
+    }
+    return `${_baseUrl.replace(/^http/, 'ws')}/queue/ws`;
+  }
+
+  function connect() {
+    if (closed) return;
+    ws = new WebSocket(wsUrl());
+    ws.onmessage = (e) => {
+      try {
+        if (JSON.parse(e.data)?.type === 'queue_changed') onChange();
+      } catch {}
+    };
+    ws.onclose = () => {
+      if (!closed) retryTimer = setTimeout(connect, 3000);
+    };
+    ws.onerror = () => ws?.close();
+  }
+  connect();
+
+  return () => {
+    closed = true;
+    clearTimeout(retryTimer);
+    ws?.close();
+  };
+}
+
 export async function pushMarker(
   trackId: number,
   positionMs: number,

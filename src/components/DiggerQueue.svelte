@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { session, updateDeck } from '../lib/state/session';
   import {
     search, randomTrack, getQueue, addToQueue, removeFromQueue, queueNext,
     getCuemarkPayload, setDiggerBaseUrl, getDiggerBaseUrl, getDiggerWebUrl,
+    subscribeQueueChanges,
     type DiggerTrack, type DiggerQueueItem,
   } from '../lib/digger/api';
 
@@ -19,7 +20,19 @@
 
   const decks = $derived($session.decks);
 
-  onMount(() => { refreshQueue(); });
+  let unsubscribeQueue: (() => void) | undefined;
+
+  function resubscribe() {
+    unsubscribeQueue?.();
+    unsubscribeQueue = subscribeQueueChanges(refreshQueue);
+  }
+
+  onMount(() => {
+    refreshQueue();
+    resubscribe();
+  });
+
+  onDestroy(() => { unsubscribeQueue?.(); });
 
   async function refreshQueue() {
     try {
@@ -111,6 +124,7 @@
     setDiggerBaseUrl(baseUrl || '/digger-api');
     showUrlInput = false;
     refreshQueue();
+    resubscribe();
   }
 
   function trackLabel(item: { title: string; artist: string }): string {

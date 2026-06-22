@@ -117,11 +117,15 @@ Media library management lives in `~/repos/digger` (FastAPI + SQLite, `http://lo
 Cuemark does not embed a file browser — Digger feeds cuemark.
 
 ### play queue
-- Sidebar panel: ordered list of upcoming tracks
+- Sidebar panel: ordered list of upcoming tracks [done] — shown by default now
+  (`showDiggerQueue` defaults `true`; window widened 1280→1600 to compensate)
 - Items can be added from: Digger `GET /queue/next` suggestion, Digger search results, or
   OS drag-and-drop into the queue (not into a deck directly)
 - Load to deck: clicking an item calls `GET /tracks/{id}/cuemark` → loads filePath +
   cuePoint + hotCues[] onto the target deck
+- Live updates when the queue changes from Digger's own UI [done, 2026-06-22] — added
+  `GET /queue/ws` to Digger (`api.py`); cuemark's `DiggerQueue.svelte` subscribes via
+  `subscribeQueueChanges()` instead of polling; see CLAUDE.md "Integration: Digger"
 - Drag-to-reorder; remove items from queue
 - Auto-advance option: when a deck's clip ends, auto-load next queue item to that deck
 

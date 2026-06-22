@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { get } from "svelte/store";
-  import { session, addDeck, removeDeck, updateDeck, setMasterBpm } from "./lib/state/session";
+  import { session, addDeck, removeDeck, updateDeck, setMasterBpm, setVisualization, setVisualizationOpacity } from "./lib/state/session";
   import VisualizationPanel from "./components/VisualizationPanel.svelte";
   import { tapTempo } from "./lib/audio/bpm";
   import { startMidiListener } from "./lib/midi/handler";
@@ -36,7 +36,7 @@
   let tapTimestamps: number[] = [];
   let tapResetTimer: ReturnType<typeof setTimeout> | undefined;
   let showAudioSettings = $state(false);
-  let showDiggerQueue = $state(false);
+  let showDiggerQueue = $state(true);
   let showVisualizationPanel = $state(false);
 
   function handleTap() {
@@ -128,6 +128,8 @@
         updateDeck,
         addDeck,
         removeDeck,
+        setVisualization,
+        setVisualizationOpacity,
         getSession: () => get(session),
       };
     }
