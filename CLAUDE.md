@@ -555,6 +555,11 @@ The `.desktop` file lives at `~/.local/share/applications/cuemark.desktop` (`Exe
 `npm run tauri build -- --no-bundle` — the symlink means no reinstall step is needed, just relaunch from
 the app grid (or `gtk-launch cuemark`) to pick up the new binary.
 
+**Running launcher binary does not block the release build**: unlike `cargo tauri dev` (which owns the
+dev binary and must be killed before Rust changes take effect), a launcher instance running from
+`~/.local/bin/cuemark` can stay alive during `npm run tauri build -- --no-bundle`. The build overwrites
+the binary on disk; the running process keeps using its already-loaded image until the user relaunches.
+
 ## Adding or re-calibrating a MIDI controller
 
 To map a new controller or verify an existing one:
