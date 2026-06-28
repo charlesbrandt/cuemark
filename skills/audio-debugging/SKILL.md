@@ -83,12 +83,24 @@ let stream_props = gst::Structure::builder("props")
 sink.set_property("stream-properties", &stream_props);
 ```
 
-**pw-top diagnostics** — run `pw-top` in another terminal while audio is playing:
+**pw-top diagnostics** — two modes:
+
+```bash
+# Batch mode — point-in-time snapshot, scriptable (use from Claude Code tool calls or scripts)
+pw-top -b | grep -E "cuemark|ERR"
+
+# Interactive mode — live-updating table in a terminal (use when watching a live session)
+pw-top
+```
+
+Column reference:
 - `S` column: `R` = running (producing audio), `I` = idle/paused
 - `QUANT / RATE`: both cuemark pipewiresink streams should show `1024 / 48000` (~21ms); if one shows a
   non-standard quantum (e.g. 3969 / 44100), the capsfilter didn't apply (deck was loaded before a Rust rebuild — re-load the track)
 - `ERR`: PipeWire xrun count for this stream; brief bursts are normal; sustained growth means pipeline starvation
 - Two `+ cuemark` streams expected: our two pipewiresink decks; WebKit video element pipeline appears as a separate stream
+
+**Use `pw-top -b` to diagnose a live audio-stop** — run it while the app is showing symptoms (audio silent, UI still active). The ERR count on the 48kHz cuemark stream tells you immediately whether you have an xrun cascade (thousands) vs a pipeline logic bug (ERR near zero). No need to restart first.
 
 ---
 
