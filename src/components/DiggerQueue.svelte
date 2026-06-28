@@ -193,6 +193,7 @@
         {#each queue as item (item.id)}
           <div class="queue-row">
             <span class="track-label">{trackLabel(item)}</span>
+            {#if item.bpm != null}<span class="bpm-badge">{Math.round(item.bpm)}</span>{/if}
             <div class="queue-actions">
               {#each decks as deck (deck.id)}
                 <button
@@ -332,6 +333,14 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-size: 12px;
+  }
+
+  .bpm-badge {
+    color: #666;
+    font-size: 10px;
+    flex-shrink: 0;
+    min-width: 24px;
+    text-align: right;
   }
 
   .queue-actions {

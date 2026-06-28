@@ -432,10 +432,13 @@ impl DeckAudioPipeline {
         queue.set_property("max-size-buffers", 2u32);
         queue.set_property("max-size-bytes", 0u32);
         queue.set_property("max-size-time", 0u64);
-        // Time-based output queue: hold up to 500ms worth of post-pitch audio.
+        // Time-based output queue: absorb soundtouch's variable-sized output chunks
+        // (~82ms WSOLA window) while keeping tempo-change latency audibly tight.
+        // 100ms gives ~5× the PipeWire quantum (21ms) of headroom; 500ms caused
+        // up to 500ms of old-rate audio to drain before the new tempo was audible.
         output_queue.set_property("max-size-buffers", 0u32);
         output_queue.set_property("max-size-bytes", 0u32);
-        output_queue.set_property("max-size-time", 500_000_000u64); // 500ms in nanoseconds
+        output_queue.set_property("max-size-time", 100_000_000u64); // 100ms in nanoseconds
 
         cue_valve.set_property("drop", !self.cue_enabled);
         cue_volume.set_property("volume", (self.gain * self.cue_gain) as f64);

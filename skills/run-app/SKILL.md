@@ -133,6 +133,62 @@ kill $(cat /tmp/cuemark-dev.pid) 2>/dev/null; rm -f /tmp/cuemark-dev.pid
 | `HMR update` / `page reload` | Frontend hot-reload fired |
 | `Watching … for changes` | Tauri watching Rust source; will rebuild on next `.rs` save |
 
+## Performance pitfalls / common causes of freezes
+
+### HMR cascade hang — batch all App.svelte edits into one pass
+Each HMR reload of App.svelte (the root Svelte component) tears down and rebuilds every
+GStreamer audio pipeline and re-runs full waveform analysis for every loaded track. Three
+rapid HMR reloads in 11 seconds caused a full app hang confirmed in session 2026-06-27.
+
+**Rule: make all edits to App.svelte in a single editing pass, then let HMR fire once.**
+If multiple logical changes are needed, stage them all in memory and apply with one Edit/Write
+call rather than incremental edits. This applies only to App.svelte — child component HMR
+is lightweight and can be done incrementally.
+
+### MIDI audio lag — root cause chain (two layers)
+
+**Layer 1: rAF latency in `syncVideoElements`**
+`syncVideoElements` is rAF-gated (~16ms). Putting audio IPC there adds up to 16ms before
+GStreamer changes rate. Fix: `v.playbackRate` stays there (WebKitGTK rebuilds pipeline on
+each write — must throttle). `audioSetRate/Gain/Volume` must NOT live there.
+
+**Layer 2: Svelte store saturation (the harder problem)**
+`session` is a coarse-grained `writable<Session>`. Every `updateDeck()` call (200+/sec from
+the tempo fader) creates new Session + Deck objects and fires ALL reactive subscribers:
+every `$effect`, `compositor.syncDecks()`, component re-renders. A `$effect` with a
+last-value guard reduces IPC call rate, but the JS thread still processes 200 store
+mutations/sec — confirmed to cause visible UI display lag even after moving IPC out of rAF.
+
+**Current fix: `src/lib/audio/audioSync.ts`**
+Module-level idempotent sync functions (`syncRate`, `syncGain`, `syncVolume`) with shared Maps.
+The MIDI handler (`handler.ts`) calls them **directly** before any store update:
+```
+MIDI → syncRate(id, val)          ← immediate IPC, no Svelte involved
+     → queueDeckPatch(id, patch)  ← rAF-throttled store update for display (60fps)
+```
+App.svelte has a `$effect` that also calls `syncRate/syncGain/syncVolume` — this handles
+UI-slider-triggered rate changes. The shared Maps prevent duplicate IPC calls.
+
+**Rule: for continuous high-frequency controls (rate/gain/volume/crossfader) — bypass the
+Svelte store for the audio path. Call `audioSync.ts` directly from the MIDI handler.
+Use last-value guard Maps (in `$effect`) only for infrequent controls (cue toggle, play/pause).**
+
+Symptom of getting this wrong: visible UI lag for the value display even when audio responds.
+Both audio lag and UI display lag together = JS thread saturated by store reactive cascades.
+
+### `output_queue` buffer limits tempo-change response
+The GStreamer pipeline has an `output_queue` between the `pitch` element and `pipewiresink`.
+When `set_property("tempo")` is called, soundtouch immediately processes future audio at
+the new rate — but old-rate audio already in the queue must drain first. At 500ms (the
+original value), this caused up to 500ms of audible lag on tempo fader moves.
+Current value: 100ms (~5× the PipeWire quantum). If audio xruns appear after a rate change,
+bump this slightly — but keep it under ~150ms or the lag becomes perceptible again.
+
+### Debug `console.log` in syncVideoElements
+A `console.log('[syncVideoElements]', ...)` call in the per-frame function emits at rAF
+rate (60/sec). Remove any debug logging from `syncVideoElements`, `frame()`, or other
+RAF-loop functions before leaving them in place.
+
 ## Known WebKitGTK quirks
 
 - **Video canvas noise**: If deck preview shows random colored static instead of video, `WEBKIT_DISABLE_DMABUF_RENDERER=1` is missing from `main.rs`. This env var must be set before `cuemark_lib::run()` to prevent VA-API DMA-BUF surfaces from being misread by 2D canvas.

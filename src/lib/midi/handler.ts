@@ -2,8 +2,50 @@ import { listen } from "@tauri-apps/api/event";
 import { updateDeck, getDeck, setCrossfader, setMasterVolume, session } from "../state/session";
 import { seekDeck, getDeckTime, getPhase } from "../renderer/seekBus";
 import { nudgePhaseToMaster } from "../audio/phaseNudge";
+import { syncRate, syncGain, syncVolume } from "../audio/audioSync";
 import { cueGain } from "../audio/audioSettings";
 import { get } from "svelte/store";
+
+// Buffers the latest deck patch for continuous MIDI controls (rate, gain, volume)
+// and flushes them once per rAF. This decouples the audio path (immediate, via syncRate/…)
+// from the Svelte store update (display only — capped at 60fps to prevent 200 reactive
+// re-renders/sec from saturating the JS thread and lagging the UI).
+const _pendingPatches = new Map<string, Record<string, unknown>>();
+let _patchFlushPending = false;
+
+function queueDeckPatch(deckId: string, patch: Record<string, unknown>) {
+  const existing = _pendingPatches.get(deckId) ?? {};
+  _pendingPatches.set(deckId, { ...existing, ...patch });
+  if (!_patchFlushPending) {
+    _patchFlushPending = true;
+    requestAnimationFrame(() => {
+      _patchFlushPending = false;
+      for (const [id, p] of _pendingPatches) {
+        updateDeck(id, p as Parameters<typeof updateDeck>[1]);
+      }
+      _pendingPatches.clear();
+    });
+  }
+}
+
+// Same pattern for crossfader — setCrossfader() updates both deck volumes/opacities,
+// which is expensive at 200/sec. Audio volume is synced directly; UI updates at rAF rate.
+let _pendingCrossfader: number | undefined;
+let _crossfaderFlushPending = false;
+
+function queueCrossfader(value: number) {
+  _pendingCrossfader = value;
+  if (!_crossfaderFlushPending) {
+    _crossfaderFlushPending = true;
+    requestAnimationFrame(() => {
+      _crossfaderFlushPending = false;
+      if (_pendingCrossfader !== undefined) {
+        setCrossfader(_pendingCrossfader);
+        _pendingCrossfader = undefined;
+      }
+    });
+  }
+}
 
 // Must match the Rust MidiAction enum (snake_case tag + camelCase fields from serde)
 export interface MidiAction {
@@ -55,23 +97,33 @@ export async function startMidiListener(): Promise<() => void> {
         break;
       }
       case "deck_gain":
-        if (deckId && a.value !== undefined)
-          updateDeck(deckId, { gain: a.value });
+        if (deckId && a.value !== undefined) {
+          syncGain(deckId, a.value);              // audio: immediate
+          queueDeckPatch(deckId, { gain: a.value }); // UI: rAF-throttled
+        }
         break;
       case "deck_volume":
-        if (deckId && a.value !== undefined)
-          updateDeck(deckId, { volume: a.value });
+        if (deckId && a.value !== undefined) {
+          syncVolume(deckId, a.value);
+          queueDeckPatch(deckId, { volume: a.value });
+        }
         break;
       case "deck_opacity":
         if (deckId && a.value !== undefined)
-          updateDeck(deckId, { opacity: a.value });
+          updateDeck(deckId, { opacity: a.value }); // visual only — store is fine
         break;
       case "deck_playback_rate":
-        if (deckId && a.value !== undefined)
-          updateDeck(deckId, { playbackRate: a.value });
+        if (deckId && a.value !== undefined) {
+          syncRate(deckId, a.value);               // audio: immediate, no Svelte overhead
+          queueDeckPatch(deckId, { playbackRate: a.value }); // UI: rAF-throttled
+        }
         break;
       case "crossfader":
-        if (a.value !== undefined) setCrossfader(a.value);
+        // Throttle to rAF — setCrossfader() recomputes volumes+opacities for all decks,
+        // creating new Session+Deck objects and triggering full Svelte re-renders. At 100+
+        // events/sec this saturates the JS thread. 16ms display lag is imperceptible for
+        // a visual/audio fader sweep. Audio volume lag is tolerable at 60fps.
+        if (a.value !== undefined) queueCrossfader(a.value);
         break;
       case "master_volume":
         if (a.value !== undefined) setMasterVolume(a.value);
@@ -120,12 +172,16 @@ export async function startMidiListener(): Promise<() => void> {
         if (!d) break;
         if (!(deckId in jogBaseRate)) jogBaseRate[deckId] = d.playbackRate;
         const nudged = Math.max(0.25, Math.min(4.0, d.playbackRate + a.value * 0.02));
+        syncRate(d.id, nudged);
         updateDeck(d.id, { playbackRate: nudged });
         clearTimeout(jogTimers[deckId]);
         jogTimers[deckId] = setTimeout(() => {
           const base = jogBaseRate[deckId];
           delete jogBaseRate[deckId];
-          if (base !== undefined) updateDeck(deckId, { playbackRate: base });
+          if (base !== undefined) {
+            syncRate(deckId, base);
+            updateDeck(deckId, { playbackRate: base });
+          }
         }, 150);
         break;
       }

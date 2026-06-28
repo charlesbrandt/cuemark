@@ -9,10 +9,10 @@
   import { invoke } from "@tauri-apps/api/core";
   import {
     audioLoad, audioUnload, audioPlay, audioPause,
-    audioSeek, audioSetRate, audioSetGain, audioSetVolume,
-    audioSetCue, audioSetMasterVolume, audioSetMainDevices,
+    audioSeek, audioSetCue, audioSetMasterVolume, audioSetMainDevices,
     audioSetCueDevice, audioSetCueGain,
   } from "./lib/audio/pipeline";
+  import { syncRate, syncGain, syncVolume, clearDeckAudioSync } from "./lib/audio/audioSync";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { listen } from "@tauri-apps/api/event";
   import { registerVideoEl, unregisterVideoEl, setDeckAudioTime } from "./lib/renderer/seekBus";
@@ -71,6 +71,8 @@
   // toggle arriving in that window finds v.paused=true, matches neither branch, and
   // audioPause is never called — leaving GStreamer playing with the deck appearing frozen.
   const lastAudioPlaying = new Map<string, boolean>();
+  // Per-deck audio rate/gain/volume are synced via audioSync.ts (module-level Maps shared
+  // with handler.ts). No per-component Maps needed here.
   // Last video.currentTime uploaded to each deck's FBO texture. uploadVideoFrame() does a
   // full-resolution drawImage + texImage2D — skip it when the frame hasn't advanced (paused)
   // to avoid burning CPU/GPU every RAF tick while idle. Still catches seeks made while paused
@@ -87,9 +89,15 @@
   // uses via the Vite middleware. Fetched once at startup; null until then.
   let mediaServerPort: number | null = null;
 
-  // Sync master volume to Rust audio pipeline
+  // Sync master volume to Rust audio pipeline. Guard: $session is coarse-grained — ANY
+  // mutation (MIDI rate/gain/volume events) re-runs this effect, so only call IPC on change.
+  let _lastMasterVolume: number | undefined;
   $effect(() => {
-    audioSetMasterVolume($session.masterVolume).catch(console.error);
+    const vol = $session.masterVolume;
+    if (vol !== _lastMasterVolume) {
+      _lastMasterVolume = vol;
+      audioSetMasterVolume(vol).catch(console.error);
+    }
   });
 
   // Sync main output devices to Rust audio pipeline (runs on init with persisted value)
@@ -108,10 +116,29 @@
     audioSetCueGain($cueGain).catch(console.error);
   });
 
-  // Sync deck cueEnabled flags to Rust audio pipeline
+  // Sync deck cueEnabled flags to Rust audio pipeline.
+  // Guard against the coarse $session store: any MIDI update (crossfader,
+  // volume, rate) re-triggers this effect even when cueEnabled is unchanged —
+  // without the guard that floods IPC at MIDI event rates and stalls the UI.
+  const _prevCueStates = new Map<string, boolean>();
   $effect(() => {
     for (const deck of $session.decks) {
-      audioSetCue(deck.id, deck.cueEnabled).catch(console.error);
+      if (_prevCueStates.get(deck.id) !== deck.cueEnabled) {
+        _prevCueStates.set(deck.id, deck.cueEnabled);
+        audioSetCue(deck.id, deck.cueEnabled).catch(console.error);
+      }
+    }
+  });
+
+  // Sync per-deck audio rate/gain/volume via the shared audioSync module.
+  // This $effect handles UI slider changes (store update → effect → IPC).
+  // MIDI-sourced changes are handled DIRECTLY in handler.ts (no store involved);
+  // the module-level Maps in audioSync.ts prevent duplicate IPC calls here.
+  $effect(() => {
+    for (const deck of $session.decks) {
+      syncRate(deck.id, deck.playbackRate);
+      syncGain(deck.id, deck.gain);
+      syncVolume(deck.id, deck.volume);
     }
   });
 
@@ -207,7 +234,6 @@
   });
 
   function syncVideoElements(decks: Deck[]) {
-    console.log('[syncVideoElements]', decks.map(d => `${d.id}=${d.source?.type ?? 'null'}`));
     // Remove elements for decks that are gone or no longer have a video source
     for (const [id, v] of videoEls) {
       const deck = decks.find((d) => d.id === id);
@@ -220,6 +246,7 @@
         playPromises.delete(id);
         lastPlaybackRate.delete(id);
         lastAudioPlaying.delete(id);
+        clearDeckAudioSync(id);
       }
     }
 
@@ -315,8 +342,6 @@
         v.ontimeupdate = null;
       }
 
-      audioSetGain(deck.id, deck.gain).catch(console.error);
-      audioSetVolume(deck.id, deck.volume).catch(console.error);
       // v.volume=0 survives WebKitGTK pipeline rebuilds (it's a JS property, not pipeline state).
       // v.muted=true is belt-and-suspenders but can be lost on playbackRate-triggered rebuilds.
       // Both together ensure no audio bleed even during the brief rebuild window.
@@ -332,8 +357,6 @@
         v.volume = 0;
         v.muted = true;
       }
-      audioSetRate(deck.id, deck.playbackRate).catch(console.error);
-
       // Video element: sync play/pause based on element state.
       if (deck.playing && v.paused && !playPromises.has(deck.id)) {
         const p = v.play().catch((e) => {

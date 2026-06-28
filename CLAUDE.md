@@ -32,7 +32,7 @@ Domain: cuemark.com (Charles Brandt's former DJ name)
 ```
 GStreamer (Rust, per deck):
   uridecodebin → queue(2buf) → audioconvert → audioresample
-    → capsfilter(48kHz) → pitch(tempo) → output_queue(500ms) → tee
+    → capsfilter(48kHz) → pitch(tempo) → output_queue(100ms) → tee
                                                                   ├─ volume₀ → sink₀  ┐ one branch per main device
                                                                   ├─ volume₁ → sink₁  ┘ (≥1; empty → system default)
                                                                   └─ cue_valve → cue_volume → cue_queue → cue_sink
@@ -73,8 +73,12 @@ to the ongoing audio stream in-place. The `tempo` property accepts 0.1–4.0 (1.
 
 **PipeWire quantum**: the `capsfilter(rate=48000)` ensures pipewiresink always negotiates at 48000 Hz,
 matching PipeWire's native graph rate. Without it, 44100 Hz source files produce a non-power-of-two quantum
-(e.g. 3969) in PipeWire → scheduling irregularities → xruns. The `output_queue(500ms)` after `pitch` absorbs
-soundtouch's variable output chunk sizes so pipewiresink's pull callback always finds buffered data.
+(e.g. 3969) in PipeWire → scheduling irregularities → xruns. The `output_queue(100ms)` after `pitch` absorbs
+soundtouch's variable output chunk sizes (~82ms WSOLA window) so pipewiresink's pull callback always
+finds buffered data. **Keep this at 100ms or below**: 500ms was tried originally but caused audible
+tempo-change lag — when `set_property("tempo")` fires, up to `output_queue` worth of old-rate audio
+must drain before the new tempo is heard. 100ms gives ~5× the PipeWire quantum (21ms) of headroom
+with imperceptible latency.
 
 Earlier approaches using `FLUSH | ACCURATE` seeks, `INSTANT_RATE_CHANGE`, and `scaletempo` were all tried
 and abandoned — see `journal.md` for the full history. The core problem was that any seek-based approach
@@ -241,6 +245,41 @@ id/source/opacity/visualization-opacity for the composite+`postFrame()` call) an
 work when it's unchanged from the previous tick. `scripts/perf-idle-test.sh` is an automated
 regression test for this — re-run it after touching the render loop, `WaveformCanvas`, or the
 `DeckCard` preview.
+**Audio IPC for rate/gain/volume must NOT live in `syncVideoElements`** — that function is
+rAF-gated (runs at most once per animation frame, up to 16ms delay). `v.playbackRate` stays
+there (WebKitGTK rebuilds its GStreamer pipeline on each write — must be rAF-throttled).
+
+**The `session` store is coarse-grained — bypass it for the audio path entirely.**
+`session` is a Svelte `writable<Session>`. Any call to `updateDeck()` (including every MIDI
+tempo/gain/volume event at 200+/sec) creates new Session + Deck objects and notifies ALL
+subscribers: every `$effect`, `compositor.syncDecks()`, and component re-renders. This
+saturates the JS thread, lagging both audio AND UI. Two symptoms confirmed:
+- 3,431 redundant `audio_set_cue` calls in 90 seconds from crossfader touching session state
+- Visible UI display lag for the tempo fader value even after moving audio IPC to a `$effect`
+
+**Fix: `src/lib/audio/audioSync.ts`** — module-level idempotent sync functions (`syncRate`,
+`syncGain`, `syncVolume`) with shared Maps. The MIDI handler calls them directly (before any
+store update); the App.svelte `$effect` calls the same functions for UI-slider-triggered
+changes. The module-level Maps prevent duplicate IPC calls regardless of which path fires first:
+```
+MIDI event → syncRate(id, value)          ← immediate, no Svelte involved
+           → queueDeckPatch(id, {rate})   ← rAF-throttled for display only (60fps)
+
+UI slider  → updateDeck() → $effect → syncRate(id, value)  ← fires, IPC sent
+                                                             (MIDI path didn't set it)
+```
+For continuous controls (rate, gain, volume, crossfader): the MIDI handler uses
+`queueDeckPatch()` / `queueCrossfader()` which buffer the latest value and flush to the store
+once per rAF — capping Svelte re-renders at 60fps instead of 200/sec.
+`v.playbackRate` stays in `syncVideoElements` (WebKitGTK rebuild risk). `audioSetMasterVolume`
+uses a scalar last-value guard (`_lastMasterVolume`) since it reads one field, not a per-deck Map.
+
+**`$effect` reading `$session.decks` fires at MIDI event rates**: any effect that reads
+`$session.decks` re-runs on every session mutation. For rare events (cue toggle, play/pause)
+a last-value Map guard is sufficient. For high-frequency continuous controls (rate/gain/volume)
+the guard is not enough — the JS thread still processes every store update. Those must go
+through `audioSync.ts` directly from the MIDI handler, not via the store at all.
+`audioSetCue` still uses the guard-only pattern (it fires infrequently, on button press).
 
 ### Dual output
 
