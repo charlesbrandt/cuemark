@@ -7,6 +7,10 @@ const els = new Map<string, HTMLVideoElement>();
 // The waveform reads these rather than video.currentTime, which drifts between
 // IPC-driven snaps when tempo ≠ 1.0.
 const audioTimes = new Map<string, number>();
+// When a seek is in flight, holds the target position so the RAF loop can
+// filter out stale pre-seek GStreamer position responses. Heavy videos can take
+// >1s to complete a seek; during that time audioGetPosition returns the old position.
+const pendingSeekTarget = new Map<string, number>();
 
 export function registerVideoEl(deckId: string, el: HTMLVideoElement) {
   els.set(deckId, el);
@@ -15,12 +19,19 @@ export function registerVideoEl(deckId: string, el: HTMLVideoElement) {
 export function unregisterVideoEl(deckId: string) {
   els.delete(deckId);
   audioTimes.delete(deckId);
+  pendingSeekTarget.delete(deckId);
 }
 
 export function seekDeck(deckId: string, time: number) {
   const el = els.get(deckId);
   if (el) el.currentTime = time;
-  audioTimes.set(deckId, time); // immediate waveform update before IPC resolves
+  // Delete rather than set: getDeckTime falls back to v.currentTime (which equals `time`
+  // immediately after the seek above). Setting to `time` would block the fallback and
+  // leave the waveform stuck at the seek position if the GStreamer IPC gets stuck in
+  // the EOS→seek→play transition.
+  audioTimes.delete(deckId);
+  // Record seek target so the RAF loop can ignore stale pre-seek IPC responses.
+  pendingSeekTarget.set(deckId, time);
   audioSeek(deckId, time).catch(console.error);
 }
 
@@ -38,6 +49,16 @@ export function getDeckTime(deckId: string): number | null {
 
 export function getVideoEl(deckId: string): HTMLVideoElement | undefined {
   return els.get(deckId);
+}
+
+// Returns the pending seek target if a seek is in progress, undefined otherwise.
+export function getPendingSeekTarget(deckId: string): number | undefined {
+  return pendingSeekTarget.get(deckId);
+}
+
+// Clears the pending seek flag once the first valid post-seek IPC arrives.
+export function clearPendingSeekTarget(deckId: string): void {
+  pendingSeekTarget.delete(deckId);
 }
 
 // Returns the deck's current beat phase in [0, 1) relative to its downbeat anchor.
