@@ -113,13 +113,32 @@ GTK "Open File" dialog or simulate OS-level drag-and-drop onto the window. Loadi
 track or toggling playback for a test therefore can't go through the file picker or
 drag-drop UI.
 
-`App.svelte`'s `onMount` exposes `window.__cuemarkDebug = { updateDeck, addDeck,
-removeDeck, getSession }` for exactly this — call session mutators directly via
-`/execute/sync`:
+`App.svelte`'s `onMount` exposes `window.__cuemarkDebug` for exactly this — call
+session mutators and audio IPC helpers directly via WebDriver:
+
+| Method | Sync/Async | Purpose |
+|---|---|---|
+| `updateDeck(id, patch)` | sync | Mutate session state (source, playing, rate, …) |
+| `addDeck()` / `removeDeck(id)` | sync | Add or remove decks |
+| `setVisualization(v)` / `setVisualizationOpacity(n)` | sync | Drive the global visualization layer |
+| `getSession()` | sync | Read current session snapshot |
+| `getVideoTime(deckId)` | sync | Returns `video.currentTime` for the deck's `<video>` element |
+| `getAudioTime(deckId)` | sync | Returns `getDeckTime(deckId)` — the waveform's content-position clock (rate-corrected from GStreamer) |
+| `seek(deckId, time)` | sync | Seeks the deck to `time` seconds; sets `pendingSeekTarget` to filter stale pre-seek GStreamer IPC responses; clears `audioTimes` so `getDeckTime` falls back to `v.currentTime` immediately |
+| `measureAudioIpc(deckId, rate, reps=20)` | **async** | Sequential `audio_set_rate` round-trips → `{min,p50,p99,max,mean}` ms |
+| `simulateMidiRateBurst(deckId, count=200, intervalMs=5)` | **async** | Fire-and-forget rate changes at MIDI speed → `{fired, durationMs}` |
+
+Use `/execute/sync` for sync methods, `/execute/async` for the async ones (they return Promises):
 ```sh
+# Sync example — load a track
 curl -s -X POST http://localhost:4444/session/$SESSION/execute/sync \
   -H "Content-Type: application/json" \
   -d '{"script":"window.__cuemarkDebug.updateDeck(\"deck-0\", {source:{type:\"video\",filePath:\"/path/to.mp4\",duration:0}, playing:false}); return window.__cuemarkDebug.getSession().decks[0].source","args":[]}'
+
+# Async example — measure IPC latency
+curl -s -X POST http://localhost:4444/session/$SESSION/execute/async \
+  -H "Content-Type: application/json" \
+  -d '{"script":"const done=arguments[0]; window.__cuemarkDebug.measureAudioIpc(\"deck-0\",1.0,20).then(r=>done(JSON.stringify(r)))","args":[]}'
 ```
 
 **This hook is gated behind `VITE_ENABLE_DEBUG_HOOK=1`, not just `import.meta.env.DEV`**
@@ -131,8 +150,21 @@ build for real use never has the hook at all. Build for testing with:
 VITE_ENABLE_DEBUG_HOOK=1 cargo tauri build --debug --no-bundle
 ```
 Sanity-check before trusting a test run: `grep -q '__cuemarkDebug' dist/assets/*.js`
-should match. See `scripts/perf-idle-test.sh` for a full working example (loads/plays/
-pauses decks headlessly to sample CPU% per scenario).
+should match.
+
+Two scripts use this hook as their test driver:
+
+- **`scripts/perf-idle-test.sh [video]`** — CPU regression. Mutates session state (load/play/pause
+  decks, enable visualization layer) and samples `WebKitWebProcess` CPU% via `pidstat` across each
+  scenario. Run after touching the render loop, `WaveformCanvas`, or `DeckCard` preview canvas.
+- **`scripts/latency-test.sh <video>`** — Full deck workflow. Loads a track, waits for the waveform
+  canvas to have non-black pixels, confirms `video.currentTime` advances, times `audio_set_rate` IPC
+  round-trips (min/p50/p99/max/mean), fires a 200-event burst at 200 Hz while sampling CPU, then runs
+  two position-correctness checks: step 7 verifies that position advances ~6 s in 3 real seconds at
+  2× rate (catches the `contentPosTracker` wall-clock bug), and step 8 verifies that
+  `getAudioTime`/`getVideoTime` agree within 500 ms (catches waveform drift from `seekBus.ts` stale
+  values). Run after touching the MIDI handler, `audioSync.ts`, `seekBus.ts`, or the GStreamer audio
+  pipeline.
 
 ## 6. Tear down
 
@@ -175,6 +207,21 @@ kill $(cat /tmp/xvfb.pid) 2>/dev/null; rm -f /tmp/xvfb.pid
   global visualization layer (`Session.visualization` — no deck/audio involvement) rather
   than risk audio device contention with the user's real session. (Decks are video-only;
   there is no shader deck source anymore — visualizations are a separate global layer.)
+- **Shell `js_sync`/`js_async` helpers must use `jq --arg` to build the JSON body** —
+  embedding `$1` directly via `"{\"script\":\"$1\",\"args\":[]}"` breaks silently when
+  the script contains `"` characters (e.g. `filePath:"..."`): those quotes aren't escaped
+  in the JSON string, producing malformed JSON that WebDriver rejects without any error
+  (the call just returns nothing). The affected helper and everything downstream fails
+  quietly with empty values. Fix: use `jq -n --arg script "$1" '{"script":$script,"args":[]}'`
+  to construct the body — `jq --arg` always produces valid JSON regardless of quotes or
+  backslashes in the value. This applies to any shell WebDriver helper that takes a script
+  string as a variable.
+- **`/execute/async` Promise chains must include `.catch()`** — if the Promise rejects
+  (e.g. `audio_set_rate` fails because no pipeline exists) and the `.then()` handler never
+  calls `arguments[0](result)`, WebDriver waits until its script timeout (30 s default)
+  before returning an error. Add `.catch(e => done(JSON.stringify({error: String(e)})))` to
+  every async chain that calls `done` — this converts rejections into an immediate response
+  instead of a 30-second hang.
 - **Don't run a `cargo build`/`cargo check` concurrently with the `cargo tauri build`
   in step 1** — both write to the same `target/` directory, and a concurrent debug
   build racing the release/driver build observed a one-off "unresolved crate" error
@@ -182,6 +229,18 @@ kill $(cat /tmp/xvfb.pid) 2>/dev/null; rm -f /tmp/xvfb.pid
   corruption from the lock contention, not a real missing dependency). Retrying
   cleanly resolved it. If it happens, check no other cargo process is running
   before suspecting the code.
+- **`latency-test.sh` step 7: rate-then-seek, not seek-then-rate.** When the test needs to both change
+  `playbackRate` and seek, it must set the rate first (and pause ~200 ms for the WebKit pipeline rebuild
+  to settle), then seek. If the seek fires while the rebuild is still running, the new WebKit pipeline
+  re-reads GStreamer's position mid-seek (still the pre-seek value) and writes it back into `v.currentTime`,
+  silently undoing the seek — `getVideoTime()` then returns the pre-seek position even after a full second
+  of sleep. The `pendingSeekTarget` filter in the RAF loop is a safety net for programmatic seeks, but the
+  correct fix for test scripts is ordering: rate change → settle → seek.
+- **`latency-test.sh` step 6 burst timeout on heavy videos.** JS `setInterval` is throttled by the browser
+  under CPU load; a heavy H.264 music video can slow 5 ms ticks to ~150 ms, making a 200-event burst take
+  ~30 s. The script sets the WebDriver script timeout to 60 s before the burst call and restores it
+  afterward. The CPU > 80% failure for heavy content is expected (video decoder alone uses ~70% CPU) — use
+  a light DJ clip to verify the 80% threshold if needed.
 - **Not just sandbox A/B testing — anything where main-thread responsiveness matters is unreliable
   through this path.** A 2026-06-20 session debugging a render-loop freeze (WebKit's own
   `WatchDogQueue` watchdog killing the renderer under CPU load — see `audio-debugging` skill) needed
