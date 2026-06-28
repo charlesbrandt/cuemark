@@ -429,3 +429,35 @@ video, no corruption, lower CPU than dual software decode). If a black-screen or
 symptom returns for H.264, or shows up freshly for AV1/VP9/HEVC, re-add the codec's `va*dec`/
 `vaapi*dec` factory name to the rank string in `main.rs` — see the comment there and the
 2026-06-19/2026-06-20 journal entries for the full history before assuming it's fixed for good.
+
+## Clipping / muddy output — gain chain and master volume
+
+**Symptom**: output sounds clipped or distorted even when per-deck volume and gain sliders are
+turned down. Master volume slider appears to have no effect.
+
+**Root cause confirmed 2026-06-28**: `MasterMix.set_master_volume()` (`mixer.rs`) is a stub — it
+stores the value but never applies it to GStreamer. `MasterMix` is scaffolding for a future
+shared-audiomixer topology; its `_main_pipeline` is always `None`. The actual master volume is now
+implemented in `AudioManager` directly (see below).
+
+**Gain chain per deck** (as of 2026-06-28):
+
+```
+GStreamer volume element = gain × vol × master_volume
+```
+
+- `gain` — pre-fader trim (0–4, default 1.0); UI slider in DeckCard
+- `vol` — post-fader level (0–1, default 1.0); driven by crossfader or UI slider
+- `master_volume` — global factor (0–1, default 1.0); set via `audio_set_master_volume` IPC
+
+`master_volume` is stored in `AudioManager.master_volume` and propagated to all active deck
+pipelines via `set_master_volume_factor()`. New pipelines inherit it at `audio_load` time.
+
+**PipeWire summing**: each `DeckAudioPipeline` has its own `pipewiresink`; PipeWire sums all
+streams at hardware level. With N decks at gain=1, vol=1, master=1 you can get up to N× summed
+amplitude. Reduce master volume if two fully-loaded decks clip: pulling to ~0.6 gives ~4 dB of
+headroom for two simultaneous sources.
+
+**What is still a stub** (2026-06-28):
+- `MasterMix` in `mixer.rs` — the shared audiomixer topology hasn't been built
+- `set_eq()` in `pipeline.rs` — EQ sliders show in the UI but do nothing to GStreamer

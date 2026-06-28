@@ -1,3 +1,48 @@
+# 2026.06.28 — fix master volume (was a no-op stub)
+
+## Problem
+
+Audio sounded clipped/muddy even after adjusting per-deck volume and gain. The master volume
+slider and any MIDI master volume knob appeared to do nothing.
+
+## Root cause
+
+`audio_set_master_volume` called `MasterMix.set_master_volume()`, which is a stub — it stores the
+value but contains only `// Step 2: apply to GStreamer volume element.` and never touches GStreamer.
+`MasterMix` has `_main_pipeline: Option<gst::Pipeline>` but it is always `None` — the shared
+audiomixer topology it was sketched for hasn't been built yet.
+
+The second contributing factor: each `DeckAudioPipeline` has its own `pipewiresink`, so PipeWire
+sums all playing decks at the hardware mixer level. With two decks both at `gain=1.0, vol=1.0`,
+PipeWire sums them for up to +6 dB, which clips loud content.
+
+## Fix
+
+`master_volume: f32` field added to `DeckAudioPipeline` (default 1.0, `pub(super)` so
+`AudioManager` can set it). `apply_volume()` now computes `gain × vol × master_volume`.
+New `set_master_volume_factor(&mut self, factor: f32)` method wraps the field update + apply call.
+
+`AudioManager` gains its own `master_volume: f32` field. `audio_set_master_volume` (in `mod.rs`)
+now bypasses the `MasterMix` stub entirely: it clamps, stores in `mgr.master_volume`, and iterates
+`mgr.pipelines.values_mut()` calling `set_master_volume_factor()` — the same pattern as
+`audio_set_main_devices` and `audio_set_cue_device`. New pipelines created via `audio_load` inherit
+`mgr.master_volume` immediately (set before `or_insert_with` stores the pipeline).
+
+`MasterMix` itself is untouched — it remains a stub for the future shared-audiomixer topology.
+
+## Files touched
+
+| File | Change |
+|---|---|
+| `src-tauri/src/audio/pipeline.rs` | `master_volume` field; `apply_volume()` uses `gain×vol×master_volume`; `set_master_volume_factor()` |
+| `src-tauri/src/audio/mod.rs` | `AudioManager.master_volume` field; `audio_set_master_volume` iterates pipelines; `audio_load` seeds new pipelines with current master_volume |
+
+## What's still a stub
+
+`MasterMix` (`mixer.rs`) — the shared audiomixer pipeline topology (audiomixer → volume → tee →
+pipewiresink + record tap) is not built. `set_cue_gain()` in `MasterMix` is also a no-op.
+EQ (`set_eq()` in pipeline.rs) is also a stub — EQ sliders show in UI but do nothing.
+
 # 2026.05.10 — multi-channel cue routing for DJControl Starlight
 
 ## Context

@@ -232,7 +232,7 @@ interface Deck {
   playing: boolean
   playbackRate: number    // 0.25–4.0
   gain: number            // 0–1 pre-fader trim (normalize source level between tracks)
-  volume: number          // 0–1 post-fader level (driven by crossfader); effective audio = gain × volume
+  volume: number          // 0–1 post-fader level (driven by crossfader); effective audio = gain × volume × masterVolume
   opacity: number         // 0–1 visual compositor weight
   loop: boolean
   cuePoint: number        // seconds
@@ -346,7 +346,7 @@ cuemark/
       audio/                    # GStreamer audio backend
         mod.rs                  # AudioManager (Mutex-wrapped), AudioState type, all Tauri command handlers
         pipeline.rs             # DeckAudioPipeline — per-deck GStreamer graph (uridecodebin→volume→sink)
-        mixer.rs                # MasterMix — master volume + cue routing
+        mixer.rs                # MasterMix — stub for future shared audiomixer topology (not yet active)
         devices.rs              # list_audio_devices() — PipeWire/PulseAudio sink enumeration
         analysis.rs             # Audio analysis (FFT, peak detection)
         record.rs               # RecordingSink — audio recording (Opus/FLAC)

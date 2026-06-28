@@ -224,6 +224,8 @@ pub struct DeckAudioPipeline {
     pub(super) cue_device: String,
     gain: f32,
     vol: f32,
+    /// Master volume factor applied on top of gain×vol (0–1). Set by AudioManager.
+    pub(super) master_volume: f32,
     /// Independent gain for the cue/headphone branch (0–4).
     cue_gain: f32,
     /// True when the headphone cue branch is open (valve passing buffers).
@@ -248,6 +250,7 @@ impl DeckAudioPipeline {
             cue_device: String::new(),
             gain: 1.0,
             vol: 1.0,
+            master_volume: 1.0,
             cue_gain: 1.0,
             cue_enabled: false,
             rate: 1.0,
@@ -796,10 +799,15 @@ impl DeckAudioPipeline {
     fn apply_volume(&self) {
         if let Some(inner) = &self.inner {
             for vol in &inner.volume_els {
-                vol.set_property("volume", (self.gain * self.vol) as f64);
+                vol.set_property("volume", (self.gain * self.vol * self.master_volume) as f64);
             }
-            inner.cue_volume_el.set_property("volume", (self.gain * self.cue_gain) as f64);
+            inner.cue_volume_el.set_property("volume", (self.gain * self.cue_gain * self.master_volume) as f64);
         }
+    }
+
+    pub fn set_master_volume_factor(&mut self, factor: f32) {
+        self.master_volume = factor.clamp(0.0, 1.0);
+        self.apply_volume();
     }
 
     /// EQ bands in dB. No-op until equalizer-3bands element is added.

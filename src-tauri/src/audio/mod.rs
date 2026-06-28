@@ -22,6 +22,9 @@ pub struct AudioManager {
     main_devices: Vec<String>,
     /// PipeWire sink name for the headphone cue output (empty = no cue output).
     cue_device: String,
+    /// Master volume factor (0–1). Applied to all deck pipelines as a multiplier on top of
+    /// gain×vol. Stored here so new pipelines pick it up at load time.
+    master_volume: f32,
     mixer: MasterMix,
     record: RecordingSink,
 }
@@ -33,6 +36,7 @@ impl AudioManager {
             pipelines: HashMap::new(),
             main_devices: Vec::new(),
             cue_device: String::new(),
+            master_volume: 1.0,
             mixer: MasterMix::new(),
             record: RecordingSink::new(),
         }
@@ -59,6 +63,7 @@ pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, deck_id: 
     let mut mgr = state.lock().unwrap();
     let main_devices = mgr.main_devices.clone();
     let cue_device = mgr.cue_device.clone();
+    let master_volume = mgr.master_volume;
     let pipeline = mgr
         .pipelines
         .entry(deck_id.clone())
@@ -66,6 +71,7 @@ pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, deck_id: 
             let mut p = DeckAudioPipeline::new(&deck_id);
             p.devices = main_devices;
             p.cue_device = cue_device;
+            p.master_volume = master_volume;
             let app_clone = app.clone();
             let did = deck_id.clone();
             p.set_eos_callback(move || {
@@ -139,7 +145,13 @@ pub fn audio_get_position(state: State<'_, AudioState>, deck_id: String) -> Opti
 
 #[tauri::command]
 pub fn audio_set_master_volume(state: State<'_, AudioState>, volume: f32) -> Result<(), String> {
-    state.lock().unwrap().mixer.set_master_volume(volume)
+    let mut mgr = state.lock().unwrap();
+    let factor = volume.clamp(0.0, 1.0);
+    mgr.master_volume = factor;
+    for pipeline in mgr.pipelines.values_mut() {
+        pipeline.set_master_volume_factor(factor);
+    }
+    Ok(())
 }
 
 #[tauri::command]
