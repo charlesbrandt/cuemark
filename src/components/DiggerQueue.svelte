@@ -103,6 +103,14 @@
 
   async function loadToDeck(item: DiggerQueueItem, deckId: string) {
     try {
+      const deck = decks.find(d => d.id === deckId);
+      if (deck?.playing && deck?.source) {
+        const label = deck.source.type === 'video'
+          ? deck.source.filePath.split('/').pop()
+          : deck.id;
+        const ok = confirm(`${deckId.replace('deck-', 'D')} is playing "${label}". Load anyway?`);
+        if (!ok) return;
+      }
       const payload = await getCuemarkPayload(item.track_id);
       if (!payload.filePath) { error = 'No local file for this track'; return; }
       updateDeck(deckId, {

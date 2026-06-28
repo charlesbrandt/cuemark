@@ -135,6 +135,20 @@ kill $(cat /tmp/cuemark-dev.pid) 2>/dev/null; rm -f /tmp/cuemark-dev.pid
 
 ## Performance pitfalls / common causes of freezes
 
+### UI freeze on first track load — mutex held during GStreamer preroll
+
+**Symptom**: dropping a file onto a deck causes the UI to freeze for 1–5 seconds, after which everything works normally.
+
+**Root cause**: `audio_load` (`src-tauri/src/audio/mod.rs`) previously held `Mutex<AudioManager>` for the full duration of `pipeline.load()`, which blocks waiting for GStreamer preroll (up to 5 s). Every other audio command — `audio_get_position`, `audio_set_volume`, `audio_play`, etc. — blocked on the same mutex during that window, making the app unresponsive.
+
+**Fix applied (2026-06-28)**: `audio_load` now removes the pipeline from the map, releases the mutex, runs preroll, then re-inserts the pipeline. Other commands can proceed freely during preroll; if they look up the deck while it's being loaded they simply get a "no pipeline" response (which is correct — there's nothing to query yet).
+
+**`audio_analyze_file`** was also changed from a synchronous command (implicitly blocking a Tokio blocking thread) to an explicit `async` command using `spawn_blocking`, keeping the threading model transparent.
+
+**Verification**: after the fix, a `cue ON` command arrived at 21:11:15 (8 s into a load), while waveform analysis was still running and only completed at 21:11:27 — confirming the mutex was released promptly after preroll and other commands could proceed normally.
+
+**If the freeze returns**: check `audio_load` in `mod.rs` — the mutex must be released (the `{}` block must close) before `pipeline.load(&file_path)` is called.
+
 ### HMR cascade hang — batch all App.svelte edits into one pass
 Each HMR reload of App.svelte (the root Svelte component) tears down and rebuilds every
 GStreamer audio pipeline and re-runs full waveform analysis for every loaded track. Three

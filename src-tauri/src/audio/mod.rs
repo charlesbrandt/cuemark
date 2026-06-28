@@ -60,14 +60,16 @@ pub fn list_audio_devices(_state: State<'_, AudioState>) -> Vec<AudioDevice> {
 
 #[tauri::command]
 pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, deck_id: String, file_path: String) -> Result<Option<f64>, String> {
-    let mut mgr = state.lock().unwrap();
-    let main_devices = mgr.main_devices.clone();
-    let cue_device = mgr.cue_device.clone();
-    let master_volume = mgr.master_volume;
-    let pipeline = mgr
-        .pipelines
-        .entry(deck_id.clone())
-        .or_insert_with(|| {
+    // Pull the pipeline out of the map before calling load() so the mutex is not held
+    // during GStreamer preroll (which can block for up to 5 seconds). Without this,
+    // every other audio command (audio_get_position, audio_play, …) waits on the mutex
+    // for the full preroll duration, making the UI unresponsive on first track load.
+    let mut pipeline = {
+        let mut mgr = state.lock().unwrap();
+        let main_devices = mgr.main_devices.clone();
+        let cue_device = mgr.cue_device.clone();
+        let master_volume = mgr.master_volume;
+        mgr.pipelines.remove(&deck_id).unwrap_or_else(|| {
             let mut p = DeckAudioPipeline::new(&deck_id);
             p.devices = main_devices;
             p.cue_device = cue_device;
@@ -78,9 +80,17 @@ pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, deck_id: 
                 let _ = app_clone.emit("deck-eos", did.clone());
             });
             p
-        });
+        })
+        // mutex released here
+    };
+
     pipeline.set_app(app.clone());
-    pipeline.load(&file_path)
+    let result = pipeline.load(&file_path); // preroll runs without holding the mutex
+
+    // Re-insert the pipeline (even on error, to preserve the object for future loads).
+    state.lock().unwrap().pipelines.insert(deck_id, pipeline);
+
+    result
 }
 
 #[tauri::command]
@@ -215,7 +225,13 @@ pub fn audio_record_stop(state: State<'_, AudioState>) -> Result<(), String> {
 /// Compute waveform peaks for a file entirely in Rust, bypassing WebKit's
 /// `decodeAudioData` path which triggers vaav1dec on video+audio containers
 /// and corrupts VA-API driver state.
+///
+/// Async so the Tauri IPC thread is not blocked during the full-file GStreamer decode.
+/// `spawn_blocking` runs compute_peaks on a dedicated OS thread so it doesn't starve
+/// the async executor.
 #[tauri::command]
-pub fn audio_analyze_file(file_path: String) -> Result<Vec<f32>, String> {
-    analysis::compute_peaks(&file_path)
+pub async fn audio_analyze_file(file_path: String) -> Result<Vec<f32>, String> {
+    tauri::async_runtime::spawn_blocking(move || analysis::compute_peaks(&file_path))
+        .await
+        .map_err(|e| e.to_string())?
 }

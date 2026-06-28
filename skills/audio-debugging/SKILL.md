@@ -316,6 +316,34 @@ it is not centralized.**
 
 ## Known failure modes
 
+### UI freeze on first track load (mutex held during preroll)
+
+**Symptom**: the app feels completely unresponsive for 1–5 seconds immediately after dropping a file onto a deck. After the freeze everything works normally.
+
+**Root cause**: `audio_load` in `mod.rs` was holding `Mutex<AudioManager>` for the entire duration of `pipeline.load()`. GStreamer preroll — the `pipeline.state(Some(gst::ClockTime::from_seconds(5)))` call at the end of `load()` — can block for up to 5 seconds (typically 0.5–2 s). Any other audio command that needed the mutex (`audio_get_position`, `audio_play`, `audio_set_volume`, …) blocked for the full preroll duration.
+
+**Fix**: `audio_load` now removes the pipeline from the map, releases the mutex inside a scoped block, runs `pipeline.load()` without holding any lock, then re-acquires the mutex briefly to re-insert the pipeline. The pattern:
+
+```rust
+// In mod.rs audio_load:
+let mut pipeline = {
+    let mut mgr = state.lock().unwrap();
+    mgr.pipelines.remove(&deck_id).unwrap_or_else(|| { /* create new */ })
+    // mutex released here ↑
+};
+
+let result = pipeline.load(&file_path); // preroll runs WITHOUT holding the mutex
+
+state.lock().unwrap().pipelines.insert(deck_id, pipeline);
+result
+```
+
+While the pipeline is out of the map, other commands that look up `deck_id` will get a "no pipeline for deck" error — correct behaviour, since there is nothing to query during a load.
+
+**`audio_analyze_file`** was also changed from a sync command (`pub fn`) to `pub async fn` with an explicit `spawn_blocking`. The sync version implicitly consumed a Tokio blocking thread for the full GStreamer audio decode; the async version makes the threading contract explicit.
+
+**If the freeze returns**: open `src-tauri/src/audio/mod.rs`, find `audio_load`. Confirm the `state.lock()` guard closes (`}`) **before** `pipeline.load()` is called. If the lock is still held during `load()`, preroll will re-introduce the freeze.
+
 ### `set_rate →` log lines stop but MIDI events keep firing
 
 With the pitch element, `set_rate()` has no guards — if MIDI events are arriving but no `set_rate →`
