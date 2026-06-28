@@ -85,9 +85,11 @@ echo "Session: $SESSION"
 sleep 2 # let the app finish onMount before we start poking at __cuemarkDebug
 
 js() {
+  local body
+  body=$(jq -n --arg script "$1" '{"script":$script,"args":[]}')
   curl -s -X POST "http://localhost:$DRIVER_PORT/session/$SESSION/execute/sync" \
     -H "Content-Type: application/json" \
-    -d "{\"script\":\"$1\",\"args\":[]}" | jq -r '.value // empty'
+    -d "$body" | jq -r '.value // empty'
 }
 
 # Resolve the WebKitWebProcess child of *this* launched binary, not any other
