@@ -21,9 +21,22 @@ The Starlight uses separate MIDI channels per deck — do **not** mask the chann
 For volume/crossfader, mapping the MSB only (7-bit = 128 steps) is sufficient.
 For the **tempo fader**, map **both** MSB (CC 8) and LSB (CC 40): the MSB barely moves for small
 slider adjustments — the real fine data is in the LSB. Both are combined via `rate_from_14bit(msb, lsb)`:
-14-bit center = 8192 (MSB=64) → 1.0×; full range ±50% (0.5–1.5×).
+14-bit center = 8192 (MSB=64) → 1.0×; Rust emits a fixed ±50% range (0.5–1.5×).
 **Direction**: the Starlight sends *higher* values for negative pitch (pushing down = faster). The
 formula negates the delta so lower combined → rate > 1.0.
+
+**Tempo range rescaling (frontend)**: The Rust `rate_from_14bit` always emits a ±50% rate; the
+frontend rescales to the user-configured range (`tempoRange` store in `audioSettings.ts`, default ±20%):
+```ts
+const delta = (a.value - 1.0) / 0.5;       // recover normalized delta (-1..1) from Rust's ±50% value
+const range = get(tempoRange) / 100;         // e.g. 0.20 for ±20%
+const scaled = 1.0 + delta * range;          // full fader throw = ±tempoRange%
+```
+The `tempoRange` setting is persisted via `persistentWritable("cuemark:tempoRange", 20)` and
+exposed in the Audio Settings panel (`AudioSettings.svelte`) as a `<select>` with preset values
+(±4/6/8/10/16/20/50/100%). The DeckCard rate slider `min`/`max` are reactive to `$tempoRange`
+so the UI slider and MIDI fader always agree on range. **Do not change `rate_from_14bit` in Rust**
+to implement different ranges — the rescaling lives in `handler.ts` `deck_playback_rate` case.
 
 ## Control map
 

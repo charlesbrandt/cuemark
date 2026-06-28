@@ -3,6 +3,7 @@
   import { session, updateDeck, removeDeck, setMasterBpm } from "../lib/state/session";
   import { seekDeck, getDeckTime, getPhase, getVideoEl } from "../lib/renderer/seekBus";
   import { nudgePhaseToMaster } from "../lib/audio/phaseNudge";
+  import { tempoRange } from "../lib/audio/audioSettings";
   import type { Deck } from "../lib/state/types";
 
   let { deck }: { deck: Deck } = $props();
@@ -390,12 +391,12 @@
       />
     </label>
     <label>
-      <span>Rate <strong>{deck.playbackRate.toFixed(2)}×</strong></span>
+      <span>Rate <strong>{deck.playbackRate.toFixed(3)}×</strong></span>
       <input
         type="range"
-        min="0.5"
-        max="1.5"
-        step="0.01"
+        min={1 - $tempoRange / 100}
+        max={1 + $tempoRange / 100}
+        step="0.001"
         value={deck.playbackRate}
         oninput={(e) => updateDeck(deck.id, { playbackRate: +e.currentTarget.value })}
       />

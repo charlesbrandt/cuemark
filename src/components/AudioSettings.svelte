@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listAudioDevices, type AudioDevice } from "../lib/audio/pipeline";
-  import { mainOutputDeviceIds, cueOutputDeviceId, cueGain } from "../lib/audio/audioSettings";
+  import { mainOutputDeviceIds, cueOutputDeviceId, cueGain, tempoRange } from "../lib/audio/audioSettings";
   import { session, setMidiMapping } from "../lib/state/session";
 
   let devices = $state<AudioDevice[]>([]);
@@ -75,6 +75,21 @@
   {/if}
 
   <div class="settings-row">
+    <span class="row-label">Tempo</span>
+    <select bind:value={$tempoRange}>
+      <option value={4}>±4%</option>
+      <option value={6}>±6%</option>
+      <option value={8}>±8%</option>
+      <option value={10}>±10%</option>
+      <option value={16}>±16%</option>
+      <option value={20}>±20%</option>
+      <option value={50}>±50%</option>
+      <option value={100}>±100%</option>
+    </select>
+    <span class="hint-inline">fader &amp; slider range</span>
+  </div>
+
+  <div class="settings-row">
     <span class="row-label">MIDI</span>
     <span class="side-label">L</span>
     <select
@@ -139,6 +154,11 @@
 
   .hint {
     color: #887755;
+    font-style: italic;
+  }
+
+  .hint-inline {
+    color: #555;
     font-style: italic;
   }
 

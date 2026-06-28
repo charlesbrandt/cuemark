@@ -35,3 +35,6 @@ export const cueOutputDeviceId = persistentWritable<string>("cuemark:cueOutputDe
 
 /** Headphone / cue monitor master gain (0–1). Persisted across restarts. */
 export const cueGain = persistentWritable<number>("cuemark:cueGain", 1.0);
+
+/** MIDI fader and UI rate slider range as ±percentage (1–100). Default ±20%. Persisted across restarts. */
+export const tempoRange = persistentWritable<number>("cuemark:tempoRange", 20);

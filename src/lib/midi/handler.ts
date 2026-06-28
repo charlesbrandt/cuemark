@@ -3,7 +3,7 @@ import { updateDeck, getDeck, setCrossfader, setMasterVolume, session } from "..
 import { seekDeck, getDeckTime, getPhase } from "../renderer/seekBus";
 import { nudgePhaseToMaster } from "../audio/phaseNudge";
 import { syncRate, syncGain, syncVolume } from "../audio/audioSync";
-import { cueGain } from "../audio/audioSettings";
+import { cueGain, tempoRange } from "../audio/audioSettings";
 import { get } from "svelte/store";
 
 // Buffers the latest deck patch for continuous MIDI controls (rate, gain, volume)
@@ -114,8 +114,13 @@ export async function startMidiListener(): Promise<() => void> {
         break;
       case "deck_playback_rate":
         if (deckId && a.value !== undefined) {
-          syncRate(deckId, a.value);               // audio: immediate, no Svelte overhead
-          queueDeckPatch(deckId, { playbackRate: a.value }); // UI: rAF-throttled
+          // Rust always emits rate = 1.0 + delta*0.5 (±50% throw). Rescale delta to the
+          // user-configured range so the full fader throw maps to exactly ±tempoRange%.
+          const delta = (a.value - 1.0) / 0.5;
+          const range = get(tempoRange) / 100;
+          const scaled = 1.0 + delta * range;
+          syncRate(deckId, scaled);               // audio: immediate, no Svelte overhead
+          queueDeckPatch(deckId, { playbackRate: scaled }); // UI: rAF-throttled
         }
         break;
       case "crossfader":
