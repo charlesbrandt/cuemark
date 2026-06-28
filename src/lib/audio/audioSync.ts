@@ -18,7 +18,8 @@ const gainMap   = new Map<string, number>();
 const volumeMap = new Map<string, number>();
 
 export function syncRate(deckId: string, rate: number): void {
-  if (rateMap.get(deckId) === rate) return;
+  const last = rateMap.get(deckId) ?? -1;
+  if (Math.abs(rate - last) < 0.005) return;
   rateMap.set(deckId, rate);
   audioSetRate(deckId, rate).catch(console.error);
 }

@@ -31,7 +31,7 @@ Then read `journal.md` for the most recent session notes.
 
 ```
 uridecodebin → queue(max-buffers=2) → audioconvert → audioresample
-  → capsfilter(rate=48000) → pitch(tempo) → output_queue(500ms) → volume → pipewiresink
+  → capsfilter(rate=48000) → pitch(tempo) → output_queue(100ms) → volume → pipewiresink
 ```
 
 **`pitch` element** (soundtouch, `gst-plugins-bad`) — sets playback tempo without pitch change via the
@@ -47,10 +47,12 @@ file sample rate. Without this, 44100 Hz source files cause pipewiresink to nego
 PipeWire, which assigns a non-power-of-two quantum (e.g. 3969 samples) → scheduling irregularities →
 xruns. `audioresample` handles the actual conversion; capsfilter just locks the contract.
 
-**`output_queue`** (after pitch) — 500ms time-based buffer between soundtouch and pipewiresink.
+**`output_queue`** (after pitch) — 100ms time-based buffer between soundtouch and pipewiresink.
 soundtouch produces variable-sized output chunks at non-1.0 tempos. Without buffering, PipeWire's pull
 callback can fire before soundtouch has accumulated a full 1024-sample quantum → xrun. Time-based limit
-(no buffer-count or byte limit) so it fills only when soundtouch is momentarily slow.
+(no buffer-count or byte limit) so it fills only when soundtouch is momentarily slow. **Keep at 100ms
+or below** — 500ms was tried and caused audible lag after tempo changes (old-rate audio must drain before
+the new tempo is heard).
 
 ---
 
@@ -136,8 +138,17 @@ is one more xrun.
 
 **Three causes, ordered by likelihood:**
 
-1. **`v.playbackRate` written too frequently** (most common) — see WebKitGTK section above.
-   Symptom: ERR climbs during active tempo fader movement.
+1. **14-bit fader LSB triggering duplicate writes** (most common) — each fader position fires
+   CC N (MSB) then CC N+32 (LSB), each emitting a `DeckPlaybackRate` action with a slightly
+   different value (~0.002–0.004 apart). A strict `===` guard lets both fire through:
+   - `v.playbackRate` written twice → two WebKit GStreamer pipeline rebuilds per fader position
+   - `audio_set_rate` IPC called twice → two soundtouch `tempo` property sets per fader position
+   Both double CPU pressure on the streaming thread. Observed: 5,788 xruns and audio silence
+   within ~4 minutes of tempo fader use on a loaded machine.
+   Fix: `Math.abs(rate - last) < 0.005` in `lastPlaybackRate` check (`syncVideoElements`, App.svelte)
+   and in `syncRate` (`audioSync.ts`). Use `pw-top -b` to get a snapshot of ERR counts mid-session
+   to confirm the cascade before restarting.
+   Symptom: ERR climbs steadily during tempo fader sweeps; audio drops after extended fader use.
 
 2. **Source file at non-native sample rate** — deck loaded before the Rust capsfilter was compiled in,
    or capsfilter negotiation failed. Symptom: `pw-top` shows the deck at 44100 Hz / QUANT=3969.
@@ -154,19 +165,58 @@ in ERROR until the user re-loads the track.
 
 ## Waveform position clock
 
-The waveform reads position from `getDeckTime(deckId)` in `seekBus.ts`, which returns an audio-clock
-cache (`audioTimes` map) rather than `video.currentTime`. This avoids the jump artifact that occurred
-when the video drifted (at non-1× tempo) and was then snapped by the RAF loop.
+The waveform reads position from `getDeckTime(deckId)` in `seekBus.ts`. When playing, that returns
+the `audioTimes` map (IPC-driven content position). When paused or right after a seek (before any IPC
+resolves), it falls back to `els.get(deckId)?.currentTime`.
 
-**Cache update path**: RAF loop → `audioGetPosition(deckId)` IPC → `setDeckAudioTime(id, pos)` →
-`audioTimes.set()` → `getDeckTime()` returns it.
+### `query_position` returns wall-clock, not content time
 
-**One in-flight IPC per deck**: `pendingPos` map in `App.svelte` prevents stale out-of-order IPC
-responses from overwriting a newer position with an older one (was observed when GStreamer was busy
-mid-rate-change and an earlier call resolved late).
+GStreamer's `query_position` always returns stream time based on the GStreamer segment rate.
+The soundtouch `pitch` element sets its `tempo` property in-place — it never issues a rate-seek —
+so the GStreamer segment rate always stays 1.0 regardless of `deck.playbackRate`. At 2× tempo,
+`audioPos` (from `query_position`) advances at 1× wall-clock while content actually advances 2×.
 
-**Seek writes the cache immediately**: `seekDeck()` calls `audioTimes.set(id, time)` before the async
-`audioSeek` IPC resolves, so the waveform shows the new position instantly on click.
+**`contentPosTracker` in `App.svelte`** converts wall-clock IPC position to content position by
+integrating per-frame deltas at `deck.playbackRate`:
+
+```
+contentPos += (audioPos - prev.audioPos) × playbackRate
+```
+
+A delta > 500 ms between consecutive IPC responses is treated as a seek: in that case `audioPos`
+directly IS the correct content position (GStreamer returns the seek target immediately once the seek
+completes), so it is used as-is and `contentPosTracker` is re-anchored from there.
+
+**`resolvedRate` is read at IPC resolution time**, not at the moment the IPC is dispatched. If the
+rate changed while the call was in flight (e.g. a 2× → 1× change arriving while a 2× delta is
+integrating), the start-rate would overshoot `contentPos` by `IPC-latency × rate-diff`. Reading the
+rate from the Svelte store at the moment the Promise resolves avoids this.
+
+### `pendingSeekTarget` filter (stale pre-seek IPC responses)
+
+On a heavy video, GStreamer can take > 1 s to flush and re-preroll after a seek, during which
+`query_position` keeps returning the pre-seek position. Without filtering, the RAF loop computes
+`contentPos ≈ pre-seek-value`, then the snap `v.currentTime = contentPos` reverts the video to
+the old position.
+
+`seekDeck()` records the seek target in `pendingSeekTarget`. The RAF callback checks after computing
+`contentPos`: if `|contentPos − seekTarget| > 0.5 s`, the frame is skipped entirely (no snap, no
+`setDeckAudioTime`). Once GStreamer's position converges on the seek target, the filter clears.
+
+### `audioTimes.delete` on seek (not `.set(time)`)
+
+`seekDeck()` calls `audioTimes.delete(deckId)` rather than `audioTimes.set(deckId, time)`. If the
+GStreamer IPC later returns `null` (common during the EOS → seek → play transition), the callback
+exits early without calling `setDeckAudioTime` — leaving `audioTimes` populated with the seek target
+would block `getDeckTime`'s fallback, making the waveform return the stale seek-target value
+indefinitely. With `delete`, `getDeckTime` falls back to `els.get(deckId)?.currentTime`, which was
+already set synchronously by `el.currentTime = time` in `seekDeck()`.
+
+### One in-flight IPC per deck
+
+`pendingPos` map in `App.svelte` ensures only one `audioGetPosition` IPC is in flight per deck at
+a time. A stale slow-resolving IPC (e.g. from a mid-rate-change GStreamer hiccup) cannot overwrite
+a newer position already written by a subsequent IPC that resolved faster.
 
 ---
 

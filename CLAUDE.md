@@ -45,10 +45,23 @@ Tauri commands (`audio_load`, `audio_play`, `audio_pause`, `audio_seek`, `audio_
 pipeline to the frontend. The frontend wrapper lives in `src/lib/audio/pipeline.ts`.
 
 **Audio is the master clock.** The `<video>` element is muted and used only for frame decode. In the RAF loop,
-`audioGetPosition(deckId)` polls the GStreamer position (one in-flight IPC per deck via `pendingPos` map) and
-snaps the video element's `currentTime` to it if drift exceeds 80 ms. The resolved position is also written to
-`setDeckAudioTime(deckId, pos)` in `seekBus.ts`, where the waveform reads it. This keeps the waveform playhead
-tracking the audio clock rather than `video.currentTime` (which drifts and snaps at non-1× tempos).
+`audioGetPosition(deckId)` polls the GStreamer position (one in-flight IPC per deck via `pendingPos` map).
+**`query_position` always returns wall-clock stream time** — the soundtouch `tempo` property never issues a
+rate-seek, so the GStreamer segment rate stays 1.0 regardless of `deck.playbackRate`. To recover actual content
+position, `App.svelte` integrates per-frame deltas at `deck.playbackRate` via the `contentPosTracker` Map:
+`contentPos += Δaudio × playbackRate`. A jump > 500 ms between consecutive frames signals a seek, after which
+`audioPos` IS the correct content position. **`resolvedRate` is read at IPC resolution time** (not at IPC start
+time) — if the rate changed while the call was in flight (e.g. 2× → 1×), using the start rate would overshoot
+`contentPos` by `IPC-latency × rate-diff`. The computed `contentPos` is written to `setDeckAudioTime(deckId,
+contentPos)` in `seekBus.ts` where the waveform reads it, and snapped to `v.currentTime` if drift exceeds 80 ms.
+
+**`pendingSeekTarget` filter in `seekBus.ts`** — on a heavy video, GStreamer can take >1 s to process a seek
+while still returning the pre-seek position from `query_position`. `seekDeck()` records the seek target in
+`pendingSeekTarget`; the RAF callback drops any IPC result whose computed `contentPos` is > 0.5 s from that
+target. Once GStreamer's position converges on the seek target, the filter clears itself. `seekDeck()` also
+calls `audioTimes.delete(deckId)` rather than `.set(deckId, time)` — `getDeckTime()` then falls back to
+`v.currentTime` (set synchronously by `el.currentTime = time`), so the waveform shows the seek target
+immediately without waiting for GStreamer.
 
 **`v.playbackRate` must only be set when changed** — WebKitGTK rebuilds its internal GStreamer pipeline on
 each `v.playbackRate` write. At MIDI tempo rates (60/sec after rAF throttle) this causes CPU spikes that starve
@@ -56,6 +69,12 @@ the audio thread → PipeWire xruns → cascade failure. `syncVideoElements` tra
 skips the write if the value is unchanged. The rebuild also loses `v.muted`; fix: also set `v.volume = 0` (a JS
 property, not pipeline state — survives rebuilds). Both are applied unconditionally every pass and re-applied after
 each `v.playbackRate` write.
+
+**Rate-then-seek ordering**: when both `deck.playbackRate` and seek position change together, always apply the
+rate change first, wait ~200 ms for the WebKit pipeline rebuild to settle, then seek. If the seek fires while
+a rebuild is in progress, the new WebKit pipeline re-reads GStreamer's current position mid-seek (still the
+pre-seek value) and overwrites `v.currentTime` with it, silently undoing the seek. The `pendingSeekTarget`
+filter in the RAF loop catches this race for programmatic seeks, but the correct fix is ordering.
 
 **Device routing**: default output uses `autoaudiosink` (selects PipeWire/PulseAudio/ALSA automatically).
 A specific sink is targeted via `pipewiresink target-object=<node-name>`; falls back to `autoaudiosink` if
@@ -71,65 +90,23 @@ at end-of-stream. The bus thread is stopped via `bus.set_flushing(true)` before 
 This adjusts playback speed without changing pitch, with no seek or pipeline flush — the change is applied
 to the ongoing audio stream in-place. The `tempo` property accepts 0.1–4.0 (1.0 = normal speed).
 
-**PipeWire quantum**: the `capsfilter(rate=48000)` ensures pipewiresink always negotiates at 48000 Hz,
-matching PipeWire's native graph rate. Without it, 44100 Hz source files produce a non-power-of-two quantum
-(e.g. 3969) in PipeWire → scheduling irregularities → xruns. The `output_queue(100ms)` after `pitch` absorbs
-soundtouch's variable output chunk sizes (~82ms WSOLA window) so pipewiresink's pull callback always
-finds buffered data. **Keep this at 100ms or below**: 500ms was tried originally but caused audible
-tempo-change lag — when `set_property("tempo")` fires, up to `output_queue` worth of old-rate audio
-must drain before the new tempo is heard. 100ms gives ~5× the PipeWire quantum (21ms) of headroom
-with imperceptible latency.
-
-Earlier approaches using `FLUSH | ACCURATE` seeks, `INSTANT_RATE_CHANGE`, and `scaletempo` were all tried
-and abandoned — see `journal.md` for the full history. The core problem was that any seek-based approach
-requires a pipeline flush, which temporarily moves a live PipeWire sink to PAUSED for re-preroll. With
-MIDI firing at 200+ events/second this becomes unrecoverable. Property-based tempo change avoids the
-pipeline state machine entirely.
+**PipeWire quantum**: `capsfilter(rate=48000)` ensures pipewiresink always negotiates at 48000 Hz.
+`output_queue(100ms)` after `pitch` absorbs soundtouch's variable output chunks. **Keep `output_queue`
+at 100ms or below** — 500ms was tried originally but caused audible tempo-change lag (old-rate audio
+must drain before the new tempo is heard).
 
 **Preroll**: `load()` waits synchronously (up to 5 s) for the pipeline to reach `PAUSED` before returning,
 so callers can seek and play immediately without an extra wait.
 
-**`uridecodebin` must skip video decoder factories**: `uridecodebin` internally uses `decodebin3`,
-which attempts to decode *every* stream in a container — including video — even when only audio pads
-are connected. For video+audio containers, `decodebin3` instantiates the VA-API hardware video decoder
-(`vaav1dec` / `vaah264dec`), which can fail and emit a pipeline ERROR. That ERROR also corrupts the
-VA-API driver state for the entire process, breaking the `<video>` element and waveform analysis for
-the rest of the session. Fix in `pipeline.rs` `load()`, using the `autoplug-select` signal:
-```rust
-src.connect("autoplug-select", false, |values| {
-    let factory = values.get(3).and_then(|v| v.get::<gst::ElementFactory>().ok())?;
-    let klass = factory.metadata("klass").unwrap_or_default();
-    let is_video_decoder = klass.contains("Decoder") && klass.contains("Video");
-    let result_int = if is_video_decoder { 2i32 } else { 0i32 }; // SKIP=2, TRY=0
-    let enum_class = glib::Type::from_name("GstAutoplugSelectResult")
-        .and_then(glib::EnumClass::with_type)?;
-    enum_class.to_value(result_int)
-});
-```
-**Why factory klass, not caps**: stream caps like `video/quicktime` describe the *container* (MP4/MOV
-demuxer), not just the video track inside. A caps-based check accidentally skips the demuxer itself,
-preventing the file from opening. Checking `klass.contains("Decoder") && klass.contains("Video")`
-skips only actual video decoder elements.
-**Why `autoplug-select` not `autoplug-continue`**: returning `false` from `autoplug-continue` exposes
-the encoded video pad with nothing downstream to accept it → `not-linked` ERROR crashes the pipeline.
-`autoplug-select` returning SKIP (2) causes `decodebin` to try the next factory candidate, and when
-all are exhausted it emits an `unknown-type` WARNING (benign) — not an ERROR.
-**Return type pitfall**: the signal requires a `GstAutoplugSelectResult` enum value, not a plain `i32`.
-Use `glib::EnumClass::with_type` and `to_value()` — returning a raw integer fails at runtime with a
-type mismatch error.
-Symptom if missing: `[bus/<deck>] ERROR: No valid frames decoded … GstVaAV1Dec:vaav1dec0` followed by
-subsequent tracks showing waveform `—` and blank video previews for the rest of the session.
+**`uridecodebin` must skip video decoder factories** via the `autoplug-select` signal — checks factory
+klass (`klass.contains("Decoder") && klass.contains("Video")`) and returns SKIP(2). Without this,
+`decodebin3` instantiates VA-API hardware video decoders for audio+video containers, which can corrupt
+VA-API driver state for the entire session. See `audio-debugging` skill for the full code and pitfalls
+(why caps-based check fails; why `autoplug-continue` is wrong; return type gotcha).
 
-**Multiple sinks and `async=false`**: Every `GstBaseSink` with `async=true` (the default) must receive a
-preroll buffer before the pipeline can report PAUSED — it blocks the READY→PAUSED state transition until
-that buffer arrives. In a `tee` topology with N real sinks, GStreamer requires *all* of them to preroll
-simultaneously, but the tee pushes to each pad sequentially in one thread, so they can deadlock each other.
-**Rule: only one sink per pipeline should have `async=true`.** All additional sinks must be set to
-`async=false` before being linked. With `async=false`, a sink skips preroll and starts accepting buffers
-when the pipeline reaches PLAYING, synchronized to the clock provided by the `async=true` sink.
-This applies to every branch: the cue sink already uses `async=false`; secondary main output sinks do too.
-Symptom of getting this wrong: `[bus/<deck>] pipeline: Null → Ready (pending Paused)` followed by
-`[audio/<deck>] preroll still pending after 5s timeout` with no further state-change log lines.
+**Multiple sinks and `async=false`**: In a `tee` topology, only **one** sink per pipeline should have
+`async=true`. All additional sinks must be set to `async=false` before linking — they would otherwise
+deadlock each other during preroll. See `audio-debugging` skill for details.
 
 ### Rendering pipeline
 
@@ -142,62 +119,15 @@ Symptom of getting this wrong: `[bus/<deck>] pipeline: Null → Ready (pending P
 
 Each FBO renders at full output resolution. Compositor alpha-blends decks back-to-front by `opacity`.
 
-**`WEBKIT_DISABLE_DMABUF_RENDERER=1` is required**: When WebKit's `<video>` element decodes video via
-VA-API hardware (h264, AV1, VP9), the decoded frames are stored in DMA-BUF / VA-API surfaces. When
-`drawImage(video)` is called on a 2D canvas, these surfaces don't transfer to CPU-side pixel reads
-correctly — the canvas gets colorful random static instead of the video frame. Setting this env var
-forces WebKit to use a CPU-side compositing path for video frames, which handles color-space
-conversion correctly. Set before `cuemark_lib::run()` in `main.rs`:
-```rust
-std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-```
-Symptom if missing: video deck preview shows colorful noise (random RGB static) instead of the video.
-Note: this affects all WebKit rendering, not just video. There's a small GPU compositing performance
-cost but it's imperceptible at VJ workloads.
+**`WEBKIT_DISABLE_DMABUF_RENDERER=1` must be set in `main.rs`** before `cuemark_lib::run()` — prevents
+VA-API DMA-BUF canvas corruption (decoded frames render as random static without it). Also demote broken
+VA-API decoders via `GST_PLUGIN_FEATURE_RANK` in `main.rs` (currently
+`vaav1dec:0,vaapiav1dec:0,vah264dec:0,vaapih264dec:0`) — this GPU's DMA-BUF export is broken; software
+fallback works correctly with `WEBKIT_DISABLE_DMABUF_RENDERER=1` set. See `audio-debugging` skill for
+the full VA-API investigation, debugging tips, and env-var override pitfalls.
 
-**This GPU's VA-API DMA-BUF export is fundamentally broken — demote the hardware decoder, don't just
-hide the symptom**: confirmed via `GST_DEBUG=2`: `driver bug: fd size (3670016) is bigger than object
-descriptor size (3194880)` plus `Cannot map/copy External OES textures` from WebKit's GL compositor.
-This single underlying bug surfaces two different ways depending on `WEBKIT_DISABLE_DMABUF_RENDERER`:
-- **Unset**: hardware VA-API decode succeeds, but the corrupted DMA-BUF frame renders as a solid
-  garbage color (e.g. solid blue) in both the `<video>` element and any `drawImage()` canvas read.
-- **Set to `1`**: WebKit's decoder autoplugging for that codec fails outright with *no* software
-  fallback — `<video>` never fires `loadedmetadata`, `error.code === 4` (`MEDIA_ERR_SRC_NOT_SUPPORTED`),
-  preview stays solid black. This is what broke H.264 playback even though `avdec_h264` is installed
-  and works fine via plain `gst-launch-1.0` — WebKitGTK's own autoplugging logic, not a missing system
-  package.
-
-Fix: demote the VA-API decoder's GStreamer rank to 0 for every affected codec, forcing `decodebin` to
-fall through to the software decoder (`av1dec`/aom for AV1, `avdec_h264`/libav for H.264) — this avoids
-the broken DMA-BUF path entirely and works correctly with `WEBKIT_DISABLE_DMABUF_RENDERER=1` still set:
-```rust
-std::env::set_var(
-    "GST_PLUGIN_FEATURE_RANK",
-    "vaav1dec:0,vaapiav1dec:0,vah264dec:0,vaapih264dec:0",
-);
-```
-If VP9 or HEVC show the same black-screen (`FormatError`/code 4) or solid-garbage-color symptom, add
-their `va*dec`/`vaapi*dec` factory names here too — check with `gst-inspect-1.0 | grep -i <codec>`.
-
-**Debugging tip — `std::env::set_var` calls in `main.rs` cannot be overridden from the outside**: to
-test "what if this env var weren't set," editing/commenting the `main.rs` line and rebuilding is
-required — launching the binary with a different value of the same var in the shell has no effect,
-since the Rust call runs after the process starts and unconditionally overwrites it.
-
-**Debugging tip — WebKit's own GStreamer warnings don't reach the Tauri log file**: `tauri-plugin-log`
-only captures our own Rust `log::` call sites. WebKit's internal media pipeline (the separate
-`WebKitWebProcess`) logs straight to stderr via its own GStreamer instance. To see decoder-level errors
-(`FormatError`, `No decoder available for type ...`, DMA-BUF driver warnings), launch the binary
-directly from a terminal with `WEBKIT_DEBUG=Media GST_DEBUG=2 ./path/to/cuemark 2>&1 | tee /tmp/out.log`
-rather than relying on `~/.local/share/com.cuemark.app/logs/cuemark.log`.
-
-**Waveform analysis runs in Rust, not `decodeAudioData`**: WebKit's `OfflineAudioContext.decodeAudioData()`
-routes through a GStreamer pipeline in the WebKitWebProcess (a separate process). That internal pipeline
-also instantiates VA-API video decoders for video+audio containers — the same corruption path as the
-audio pipeline, but in a process we can't control. The fix: `analyzeFile()` in `waveform.ts` calls the
-`audio_analyze_file` Tauri command instead of `decodeAudioData`. The Rust implementation in
-`analysis.rs` (`compute_peaks()`) uses the same `autoplug-select` factory klass guard as
-`DeckAudioPipeline` and returns 30 peaks/sec via `appsink`. The `gstreamer-app` crate is required.
+**Waveform analysis uses `audio_analyze_file` Tauri command** (Rust/GStreamer, `analysis.rs`), not
+`decodeAudioData` — avoids VA-API corruption in the separate WebKitWebProcess.
 
 **WebGL Y-flip**: HTML canvas Y=0 is top; WebGL texture Y=0 is bottom. `UNPACK_FLIP_Y_WEBGL=true`
 corrects this on upload so video appears right-side up.
@@ -233,18 +163,29 @@ fire 200+ events/second. Calling `v.play()` or setting `v.playbackRate` that fre
 GStreamer's pipeline and causes playback to stall. Solution: use `requestAnimationFrame` as the
 throttle gate so `syncVideoElements` runs at most once per rendered frame (≤ 60/s).
 
-**Every per-frame RAF loop must gate its expensive work on an actual-change check, not just
-playback intent**: `App.svelte`'s `frame()`, `WaveformCanvas.svelte`, and `DeckCard.svelte`'s
-preview each ran full-resolution `drawImage`/`texImage2D`/`createImageBitmap` unconditionally
-every tick, regardless of whether the deck was playing. A paused video still re-uploads and
-re-composites an identical frame 60×/sec forever — confirmed in production: a real session with
-two paused decks loaded sat at 97-99% `WebKitWebProcess` CPU before this fix, ~2.4% after.
-The pattern used throughout: track the last-seen value that actually determines a different
-output (`video.currentTime` for frame uploads/canvas draws; a signature of
-id/source/opacity/visualization-opacity for the composite+`postFrame()` call) and skip the
-work when it's unchanged from the previous tick. `scripts/perf-idle-test.sh` is an automated
-regression test for this — re-run it after touching the render loop, `WaveformCanvas`, or the
-`DeckCard` preview.
+**14-bit fader LSB produces a slightly different rate than MSB alone — use a tolerance guard, not
+strict equality.** A 14-bit controller fires CC N (MSB) then CC N+32 (LSB) for each fader
+position. The Rust MIDI handler emits a `DeckPlaybackRate` action for *both* — correct behavior,
+since either byte changing should update the rate. But the MSB-only value (e.g. `0.8984375`) and
+the combined MSB+LSB value (e.g. `0.8950195`) differ by ~0.002–0.004. A strict `!==` guard lets
+both fire through: two `v.playbackRate` writes → two WebKit pipeline rebuilds per position, and
+two `audio_set_rate` IPC calls → two soundtouch `tempo` property sets per position. On a loaded
+CPU this reliably triggers a PipeWire xrun cascade (observed: 5,788 xruns → audio silence within
+~4 minutes). Fix: use `Math.abs(rate - last) < 0.005` in both the `lastPlaybackRate` check in
+`syncVideoElements` (`App.svelte`) and the `rateMap` check in `syncRate` (`audioSync.ts`). A 0.5%
+tolerance is imperceptible for video sync and completely absorbs the MSB/LSB oscillation while
+still responding immediately to any intentional fader movement.
+
+**Every per-frame RAF loop must gate its expensive work on an actual-change check**, not just
+playback intent. Track the last-seen value that determines a different output (`video.currentTime`
+for frame uploads/canvas draws; a signature of id/source/opacity/visualization-opacity for the
+composite+`postFrame()` call) and skip the work when it's unchanged from the previous tick.
+`scripts/perf-idle-test.sh` is an automated regression test for this — re-run it after touching
+the render loop (`App.svelte` `frame()`), `WaveformCanvas`, or the `DeckCard` preview.
+`scripts/latency-test.sh` covers the full deck workflow (load → waveform → playback → IPC latency
+→ MIDI-rate burst) and is the right script to run after touching the MIDI handler, `audioSync.ts`,
+or the GStreamer audio pipeline.
+
 **Audio IPC for rate/gain/volume must NOT live in `syncVideoElements`** — that function is
 rAF-gated (runs at most once per animation frame, up to 16ms delay). `v.playbackRate` stays
 there (WebKitGTK rebuilds its GStreamer pipeline on each write — must be rAF-throttled).
@@ -252,34 +193,17 @@ there (WebKitGTK rebuilds its GStreamer pipeline on each write — must be rAF-t
 **The `session` store is coarse-grained — bypass it for the audio path entirely.**
 `session` is a Svelte `writable<Session>`. Any call to `updateDeck()` (including every MIDI
 tempo/gain/volume event at 200+/sec) creates new Session + Deck objects and notifies ALL
-subscribers: every `$effect`, `compositor.syncDecks()`, and component re-renders. This
-saturates the JS thread, lagging both audio AND UI. Two symptoms confirmed:
-- 3,431 redundant `audio_set_cue` calls in 90 seconds from crossfader touching session state
-- Visible UI display lag for the tempo fader value even after moving audio IPC to a `$effect`
+subscribers: every `$effect`, `compositor.syncDecks()`, and component re-renders. Fix:
+`src/lib/audio/audioSync.ts` — idempotent `syncRate`/`syncGain`/`syncVolume` functions with
+shared Maps. The MIDI handler calls them directly (before any store update); the `App.svelte
+$effect` calls the same functions for UI-slider-triggered changes. For continuous controls
+(rate, gain, volume, crossfader), `queueDeckPatch()`/`queueCrossfader()` buffer the latest
+value and flush to the store once per rAF — capping Svelte re-renders at 60fps instead of 200/sec.
 
-**Fix: `src/lib/audio/audioSync.ts`** — module-level idempotent sync functions (`syncRate`,
-`syncGain`, `syncVolume`) with shared Maps. The MIDI handler calls them directly (before any
-store update); the App.svelte `$effect` calls the same functions for UI-slider-triggered
-changes. The module-level Maps prevent duplicate IPC calls regardless of which path fires first:
-```
-MIDI event → syncRate(id, value)          ← immediate, no Svelte involved
-           → queueDeckPatch(id, {rate})   ← rAF-throttled for display only (60fps)
-
-UI slider  → updateDeck() → $effect → syncRate(id, value)  ← fires, IPC sent
-                                                             (MIDI path didn't set it)
-```
-For continuous controls (rate, gain, volume, crossfader): the MIDI handler uses
-`queueDeckPatch()` / `queueCrossfader()` which buffer the latest value and flush to the store
-once per rAF — capping Svelte re-renders at 60fps instead of 200/sec.
-`v.playbackRate` stays in `syncVideoElements` (WebKitGTK rebuild risk). `audioSetMasterVolume`
-uses a scalar last-value guard (`_lastMasterVolume`) since it reads one field, not a per-deck Map.
-
-**`$effect` reading `$session.decks` fires at MIDI event rates**: any effect that reads
-`$session.decks` re-runs on every session mutation. For rare events (cue toggle, play/pause)
-a last-value Map guard is sufficient. For high-frequency continuous controls (rate/gain/volume)
-the guard is not enough — the JS thread still processes every store update. Those must go
-through `audioSync.ts` directly from the MIDI handler, not via the store at all.
-`audioSetCue` still uses the guard-only pattern (it fires infrequently, on button press).
+**`$effect` reading `$session.decks` fires at MIDI event rates**: for high-frequency continuous
+controls (rate/gain/volume), a last-value Map guard alone is not enough — those must go through
+`audioSync.ts` directly from the MIDI handler, not via the store at all. `audioSetCue` still
+uses the guard-only pattern (fires infrequently, on button press).
 
 ### Dual output
 
@@ -346,64 +270,6 @@ interface AudioAnalysis {
 ### MIDI architecture
 
 Rust backend (`midir`) receives raw MIDI → maps to structured actions → emits via Tauri `emit()` → frontend applies to session state → calls audio Tauri commands for gain/rate/play/pause changes. MIDI mappings reference `deckId` strings.
-
-## MIDI controller
-
-**Hercules DJControl Starlight** (USB)
-
-### Channel layout (verified)
-
-The Starlight uses separate MIDI channels per deck — do **not** mask the channel nibble in the map key:
-
-| MIDI bytes | Deck / purpose |
-|---|---|
-| `0x91` Note On, `0xB1` CC | Left deck (ch 2) |
-| `0x92` Note On, `0xB2` CC | Right deck (ch 3) |
-| `0x96` Note On | Left hot-cue pads (ch 7) |
-| `0x97` Note On | Right hot-cue pads (ch 8) |
-| `0xB0` CC | Global — crossfader, master volume (ch 1) |
-
-14-bit CC pairs: every continuous control sends a coarse MSB on CC N and a fine LSB on CC N+32.
-For volume/crossfader, mapping the MSB only (7-bit = 128 steps) is sufficient.
-For the **tempo fader**, map **both** MSB (CC 8) and LSB (CC 40): the MSB barely moves for small
-slider adjustments — the real fine data is in the LSB. Both are combined via `rate_from_14bit(msb, lsb)`:
-14-bit center = 8192 (MSB=64) → 1.0×; full range ±50% (0.5–1.5×).
-**Direction**: the Starlight sends *higher* values for negative pitch (pushing down = faster). The
-formula negates the delta so lower combined → rate > 1.0.
-
-### Control map
-
-| Physical control | MIDI key | Action |
-|---|---|---|
-| Play/Pause L | `(0x91, 7)` | DeckPlayToggle deck-0 |
-| Play/Pause R | `(0x92, 7)` | DeckPlayToggle deck-1 |
-| Cue L | `(0x91, 6)` | CueJump deck-0 |
-| Cue R | `(0x92, 6)` | CueJump deck-1 |
-| Loop L | `(0x91, 3)` | LoopToggle deck-0 |
-| Loop R | `(0x92, 3)` | LoopToggle deck-1 |
-| Vinyl/Scratch L | `(0x91, 5)` | SyncToggle deck-0 (apply master BPM / deck BPM rate) |
-| Vinyl/Scratch R | `(0x92, 5)` | SyncToggle deck-1 |
-| Volume fader L | `(0xB1, 0)` | DeckGain deck-0 (pre-fader trim; crossfader drives DeckVolume) |
-| Volume fader R | `(0xB2, 0)` | DeckGain deck-1 |
-| Tempo fader L | `(0xB1, 8)` MSB + `(0xB1, 40)` LSB | DeckPlaybackRate deck-0 (14-bit combined; center 8192→1.0×; higher=slower) |
-| Tempo fader R | `(0xB2, 8)` MSB + `(0xB2, 40)` LSB | DeckPlaybackRate deck-1 |
-| Jog wheel L | `(0xB1, 10)` | JogNudge deck-0 (relative ±1 step → ±2% rate; resets after 150ms idle) |
-| Jog wheel R | `(0xB2, 10)` | JogNudge deck-1 |
-| Crossfader | `(0xB0, 0)` | Crossfader (deck-0 ↔ deck-1 opacity) |
-| Master volume | `(0xB0, 3)` | MasterVolume |
-| Headphone volume | `(0xB0, 4)` MSB | CueGain |
-| Hot cues L (1–4) | `(0x96, 0–3)` | HotCue deck-0 index 0–3 |
-| Hot cues R (1–4) | `(0x97, 0–3)` | HotCue deck-1 index 0–3 |
-| Shift + Hot cues L (1–4) | `(0x96, 8–11)` | HotCueSet deck-0 index 0–3 (stamp current time) |
-| Shift + Hot cues R (1–4) | `(0x97, 8–11)` | HotCueSet deck-1 index 0–3 (stamp current time) |
-
-**Shift note**: The Starlight handles Shift entirely in firmware — it does not pass a modifier flag through
-MIDI. Instead, Shift+pad sends a different note number on the same channel (note += 8). No host-side
-shift-state tracking is needed; the shifted notes map directly to `HotCueSet` bindings.
-
-Intentionally unmapped: Bass/filter toggle `(0x90,1)`, mode-switch buttons `(0x91,15/16)`.
-
-Phase 2: MIDI learn mode (click control in UI, wiggle knob to map).
 
 ## Deck sources
 
@@ -575,100 +441,26 @@ behavior). Tail it live to see MIDI events, GStreamer bus messages, and pipeline
 tail -f ~/.local/share/com.cuemark.app/logs/cuemark.log
 ```
 
-## Desktop launcher (GNOME)
-
-Mirrors the Fieldnote pattern: build a release binary, symlink it onto `PATH`, and hand-write a
-`.desktop` entry pointing at the symlink — no `.deb` packaging needed.
-
-```bash
-npm run tauri build -- --no-bundle    # npm run build + cargo build --release, no installer packaging
-ln -sf "$(pwd)/src-tauri/target/release/cuemark" ~/.local/bin/cuemark
-mkdir -p ~/.local/share/icons/hicolor/{32x32,128x128}/apps
-cp src-tauri/icons/32x32.png ~/.local/share/icons/hicolor/32x32/apps/cuemark.png
-cp src-tauri/icons/128x128.png ~/.local/share/icons/hicolor/128x128/apps/cuemark.png
-update-desktop-database ~/.local/share/applications/
-```
-
-The `.desktop` file lives at `~/.local/share/applications/cuemark.desktop` (`Exec=cuemark`, relying on
-`~/.local/bin` being on `PATH`). After any Rust or frontend change meant for the launcher build, rerun
-`npm run tauri build -- --no-bundle` — the symlink means no reinstall step is needed, just relaunch from
-the app grid (or `gtk-launch cuemark`) to pick up the new binary.
-
-**Running launcher binary does not block the release build**: unlike `cargo tauri dev` (which owns the
-dev binary and must be killed before Rust changes take effect), a launcher instance running from
-`~/.local/bin/cuemark` can stay alive during `npm run tauri build -- --no-bundle`. The build overwrites
-the binary on disk; the running process keeps using its already-loaded image until the user relaunches.
-
-## Adding or re-calibrating a MIDI controller
-
-To map a new controller or verify an existing one:
-
-1. Add a one-line debug print inside the MIDI callback in `midi.rs` (before the map lookup):
-   ```rust
-   eprintln!("[midi] raw: msg[0]=0x{:02X} d1={} d2={}", msg[0], msg[1], msg[2]);
-   ```
-2. Run `cargo tauri dev` and wiggle each physical control. The terminal shows the raw bytes.
-3. `msg[0]` is the **full status byte** — high nibble = message type (`0x90`=Note On, `0xB0`=CC), low nibble = MIDI channel. Keep the full byte as the map key; do **not** mask off the channel nibble — DJ controllers use different channels for left/right decks.
-4. Identify 14-bit CC pairs: if two CC messages fire together where `d1_B = d1_A + 32`, the coarse (MSB) is `d1_A` and the fine (LSB) is `d1_B`. Map the MSB and ignore the LSB.
-5. Add entries to `hercules_starlight_map()` (or a new `foo_map()` function) using `(msg[0], d1)` as the key.
-6. Remove the debug print when done.
-
-## Integration: Digger
-
-Media library management lives in a **separate project** (`~/repos/digger`).
-Cuemark does not embed a media browser — Digger owns that concern.
-
-**What Digger provides** (FastAPI REST at `http://localhost:8200` by default):
-
-| Endpoint | Used for |
-|---|---|
-| `GET /queue/next` | Weighted-random track suggestion to push to the cuemark queue |
-| `GET /search?q=` | Quick track search from the cuemark toolbar |
-| `GET /tracks/{id}/cuemark` | Deck-ready payload: `filePath`, `cuePoint`, `hotCues[]` |
-| `POST /tracks/{id}/markers` | Write cue/hot-cue positions back after editing in cuemark |
-| `GET /queue/ws` | WebSocket — pushes `{"type": "queue_changed"}` after any queue mutation in Digger (add/remove/clear/consume/source-disable) |
-
-The `/cuemark` payload maps directly to cuemark's `Deck` source interface:
-```json
-{ "filePath": "/media/charles/music/artist/track.mp4", "cuePoint": 4.2, "hotCues": [32.0, 128.5] }
-```
-File preference in Digger: video > audio > any. Marker mapping: first `cue` → `cuePoint`, first 3 `hot_cue` → `hotCues[]`.
-
-**Queue panel live updates**: `DiggerQueue.svelte` opens once via `subscribeQueueChanges()`
-(`src/lib/digger/api.ts`) on mount and refetches the queue on every `queue_changed` event —
-no polling. Reconnects with a fixed 3s backoff if the socket drops (e.g. Digger restarts).
-Resubscribes if the user changes the Digger base URL in settings. In dev, the `/digger-api`
-Vite proxy needs `ws: true` (set in `vite.config.ts`) for the WebSocket upgrade to pass
-through alongside the existing REST proxying.
-
-**Queue panel is shown by default**: `showDiggerQueue` in `App.svelte` defaults to `true`
-(was `false`) — the queue is a primary workflow surface, not an opt-in panel. The main
-window width was bumped from 1280 to 1600 (`src-tauri/tauri.conf.json`) so decks aren't
-squeezed by the now-default-visible sidebar.
-
-**What cuemark owns:**
-- Current play queue — ordered list of upcoming loads; may be populated from Digger or manually
-- Session playback history — what has played this session (deck, title, artist, timestamp)
-- Runtime cue/hot-cue state; persisting them across sessions = push back to Digger markers API
-
-**Boundary rules:**
-- Cuemark calls Digger; Digger never calls cuemark
-- Graceful degradation: if Digger is unreachable, drag-and-drop and manual load still work
-- No embedded file browser in cuemark
-
 ## Skills
 
-Project-specific skills live in `skills/`. Load one with `/audio-debugging` (or via the Skill tool) when needed — don't load them on every session.
+Project-specific skills live in `skills/`. Load one with `/skill-name` (or via the Skill tool) when
+needed — don't load them on every session.
 
 | Skill | When to load |
 |---|---|
-| `audio-debugging` | GStreamer bus errors, rate-change issues, layered/detuned audio, pipeline recovery |
-| `run-app` | Launch and monitor the app; stop/restart for Rust changes; read log patterns |
-| `verify-ui` | Screenshot/click/inspect the real webview headlessly via tauri-driver + Xvfb, without touching the user's live desktop session |
+| `audio-debugging` | GStreamer bus errors, rate-change issues, layered/detuned audio, pipeline recovery, VA-API details |
+| `run-app` | Launch and monitor the app; stop/restart for Rust changes; log patterns; GNOME desktop launcher |
+| `verify-ui` | Screenshot/click/inspect the real webview headlessly via tauri-driver + Xvfb |
+| `midi` | Hercules Starlight channel layout, full control map, adding or re-calibrating a controller |
+| `digger-integration` | Digger API endpoints, WebSocket queue updates, cuemark/Digger boundary rules |
 
-`scripts/perf-idle-test.sh` automates a CPU regression check on top of `verify-ui`'s setup —
-samples `WebKitWebProcess` CPU% across empty/paused/playing scenarios. Run it after touching
-the render loop (`App.svelte` `frame()`), `WaveformCanvas`, or `DeckCard`'s preview canvas.
+Two automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb +
+`VITE_ENABLE_DEBUG_HOOK=1`):
+
+| Script | When to run |
+|---|---|
+| `scripts/perf-idle-test.sh [video]` | CPU regression — samples `WebKitWebProcess` CPU% across empty/paused/playing scenarios. Run after touching the render loop (`App.svelte` `frame()`), `WaveformCanvas`, or `DeckCard`'s preview canvas. |
+| `scripts/latency-test.sh <video>` | Full deck workflow — load track → waveform renders → video plays → `audio_set_rate` IPC latency stats → 200-event MIDI-rate burst with CPU check. Run after touching the MIDI handler, `audioSync.ts`, or the GStreamer audio pipeline. |
 
 ## Constraints
 

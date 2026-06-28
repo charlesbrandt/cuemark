@@ -15,7 +15,7 @@
   import { syncRate, syncGain, syncVolume, clearDeckAudioSync } from "./lib/audio/audioSync";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { listen } from "@tauri-apps/api/event";
-  import { registerVideoEl, unregisterVideoEl, setDeckAudioTime } from "./lib/renderer/seekBus";
+  import { registerVideoEl, unregisterVideoEl, setDeckAudioTime, getDeckTime, getVideoEl, seekDeck, getPendingSeekTarget, clearPendingSeekTarget } from "./lib/renderer/seekBus";
   import { postFrame } from "./lib/renderer/outputBus";
   import DeckCard from "./components/DeckCard.svelte";
   import Crossfader from "./components/Crossfader.svelte";
@@ -62,6 +62,15 @@
   // One in-flight audioGetPosition IPC per deck. Prevents stale out-of-order responses
   // from snapping video.currentTime backward when GStreamer is mid-rate-change.
   const pendingPos = new Map<string, boolean>();
+  // Per-deck state for content-position computation from GStreamer query_position.
+  // query_position returns stream time based on segment.rate=1.0 (the soundtouch tempo
+  // property doesn't issue a rate-seek, so the GStreamer segment rate never changes).
+  // That means audioPos advances at 1× wall-clock regardless of deck.playbackRate.
+  // We integrate per-frame deltas at deck.playbackRate to recover actual content position.
+  // A delta >500ms between consecutive frames (impossible at any real playback rate) signals
+  // a seek — after a seek, GStreamer immediately returns the seek target, which IS the correct
+  // content position, so we use it directly as the new reference.
+  const contentPosTracker = new Map<string, { audioPos: number; contentPos: number }>();
   // Last playbackRate applied to each video element. Setting v.playbackRate triggers
   // WebKitGTK to rebuild its internal GStreamer pipeline; only update on actual change.
   const lastPlaybackRate = new Map<string, number>();
@@ -158,6 +167,58 @@
         setVisualization,
         setVisualizationOpacity,
         getSession: () => get(session),
+
+        // Returns the video element's currentTime for a deck (null if no element yet).
+        // Used by latency-test.sh to verify video is actually advancing during playback.
+        getVideoTime: (deckId: string) => getVideoEl(deckId)?.currentTime ?? null,
+
+        // Returns the waveform's clock for a deck — the content-time position from the
+        // audioTimes registry (set each frame from GStreamer position, rate-corrected).
+        // Should match getVideoTime closely (both track content position, not wall-clock).
+        getAudioTime: (deckId: string) => getDeckTime(deckId),
+
+        // Seeks a deck to the given time (seconds). Clears audioTimes so getDeckTime
+        // falls back to v.currentTime while the GStreamer IPC settles post-seek.
+        seek: (deckId: string, time: number) => seekDeck(deckId, time),
+
+        // Times sequential audio_set_rate IPC round-trips.
+        // Returns {min, p50, p99, max, mean} in milliseconds.
+        measureAudioIpc: async (deckId: string, rate: number, reps = 20) => {
+          const timings: number[] = [];
+          for (let i = 0; i < reps; i++) {
+            const t0 = performance.now();
+            await invoke<void>('audio_set_rate', { deckId, rate });
+            timings.push(performance.now() - t0);
+          }
+          timings.sort((a, b) => a - b);
+          const fmt = (n: number) => +n.toFixed(2);
+          return {
+            min: fmt(timings[0]),
+            p50: fmt(timings[Math.floor(reps * 0.5)]),
+            p99: fmt(timings[Math.floor(reps * 0.99)]),
+            max: fmt(timings[reps - 1]),
+            mean: fmt(timings.reduce((a, b) => a + b, 0) / reps),
+          };
+        },
+
+        // Fires `count` audio_set_rate calls fire-and-forget at `intervalMs` spacing,
+        // matching the MIDI event rate a real tempo fader produces (~200 Hz at intervalMs=5).
+        // Returns {fired, durationMs} after the last event fires.
+        simulateMidiRateBurst: (deckId: string, count = 200, intervalMs = 5): Promise<{ fired: number; durationMs: number }> => {
+          return new Promise((resolve) => {
+            const rates = [0.9, 0.95, 1.0, 1.05, 1.1];
+            const t0 = performance.now();
+            let fired = 0;
+            const id = setInterval(() => {
+              invoke<void>('audio_set_rate', { deckId, rate: rates[fired % rates.length] }).catch(() => {});
+              fired++;
+              if (fired >= count) {
+                clearInterval(id);
+                resolve({ fired, durationMs: +(performance.now() - t0).toFixed(1) });
+              }
+            }, intervalMs);
+          });
+        },
       };
     }
     if (!import.meta.env.DEV) {
@@ -247,6 +308,7 @@
         lastPlaybackRate.delete(id);
         lastAudioPlaying.delete(id);
         clearDeckAudioSync(id);
+        contentPosTracker.delete(id);
       }
     }
 
@@ -318,6 +380,8 @@
         }).catch(console.error);
         // Reset audio state tracker so the next sync re-applies play/pause to the new pipeline.
         lastAudioPlaying.delete(deck.id);
+        // New track loads to position 0; reset content-position integrator.
+        contentPosTracker.delete(deck.id);
         // Report state after a short delay so we can see if the network request started
         setTimeout(() => {
           console.log(`[${deck.id}] state@500ms: readyState=${v!.readyState} networkState=${v!.networkState} error=${v!.error?.code ?? 'none'} src=${v!.src}`);
@@ -347,11 +411,14 @@
       // Both together ensure no audio bleed even during the brief rebuild window.
       v.volume = 0;
       v.muted = true;
-      // Only update playbackRate when it changes: setting v.playbackRate causes WebKitGTK
-      // to rebuild its internal GStreamer pipeline, causing CPU spikes and PipeWire xruns
-      // when called at rAF rate (60/sec) from rapid MIDI tempo events.
+      // Only update playbackRate when it changes meaningfully: setting v.playbackRate causes
+      // WebKitGTK to rebuild its internal GStreamer pipeline, causing CPU spikes and PipeWire
+      // xruns when called at rAF rate. Use a 0.5% tolerance to absorb the tiny oscillation
+      // between 14-bit fader MSB (CC 8) and LSB (CC 40) arriving in adjacent rAF frames —
+      // each pair would otherwise trigger two rebuilds per fader position.
       const targetRate = Math.max(0.0625, deck.playbackRate);
-      if (lastPlaybackRate.get(deck.id) !== targetRate) {
+      const lastRate = lastPlaybackRate.get(deck.id) ?? -1;
+      if (Math.abs(targetRate - lastRate) > 0.005) {
         lastPlaybackRate.set(deck.id, targetRate);
         v.playbackRate = targetRate;
         v.volume = 0;
@@ -414,14 +481,34 @@
           // out-of-order responses from snapping currentTime backward mid-rate-change.
           if (deck.playing && v && !pendingPos.get(deck.id)) {
             pendingPos.set(deck.id, true);
+            const capturedDeckId = deck.id;
             audioGetPosition(deck.id).then((audioPos) => {
-              pendingPos.delete(deck.id);
+              pendingPos.delete(capturedDeckId);
               if (audioPos === null || !v) return;
-              setDeckAudioTime(deck.id, audioPos); // feeds waveform playhead
-              if (Math.abs(v.currentTime - audioPos) > 0.08) {
-                v.currentTime = audioPos; // snap video to audio clock
+              // Use the rate at resolution time, not at IPC-start time. If the rate
+              // changed while the IPC was in flight (e.g. 2× → 1×), the at-start rate
+              // doubles the delta and overshoots contentPos by ~IPC-latency × rate-diff.
+              const resolvedRate = get(session).decks.find(d => d.id === capturedDeckId)?.playbackRate ?? 1.0;
+              // Recover content position from wall-clock audioPos (see contentPosTracker comment).
+              const prev = contentPosTracker.get(capturedDeckId);
+              const contentPos = prev && Math.abs(audioPos - prev.audioPos) < 0.5
+                ? prev.contentPos + (audioPos - prev.audioPos) * resolvedRate
+                : audioPos; // large jump = seek; audioPos IS correct content pos post-seek
+              // Filter out stale pre-seek IPC responses. On a heavy video, GStreamer
+              // can take >1s to complete a seek, returning the pre-seek position the
+              // whole time. If a seek is pending and contentPos is far from the seek
+              // target, this IPC was in flight before the seek took effect — skip it.
+              const seekTarget = getPendingSeekTarget(capturedDeckId);
+              if (seekTarget !== undefined) {
+                if (Math.abs(contentPos - seekTarget) > 0.5) return; // stale
+                clearPendingSeekTarget(capturedDeckId); // seek complete
               }
-            }).catch(() => { pendingPos.delete(deck.id); });
+              contentPosTracker.set(capturedDeckId, { audioPos, contentPos });
+              setDeckAudioTime(capturedDeckId, contentPos); // feeds waveform playhead
+              if (Math.abs(v.currentTime - contentPos) > 0.08) {
+                v.currentTime = contentPos; // snap video to audio clock
+              }
+            }).catch(() => { pendingPos.delete(capturedDeckId); });
           }
         }
       }
