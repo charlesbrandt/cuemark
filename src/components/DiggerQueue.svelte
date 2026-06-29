@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { openUrl } from '@tauri-apps/plugin-opener';
+  import { ask } from '@tauri-apps/plugin-dialog';
   import { session, updateDeck } from '../lib/state/session';
   import {
     search, randomTrack, getQueue, addToQueue, removeFromQueue, queueNext,
@@ -108,7 +109,7 @@
         const label = deck.source.type === 'video'
           ? deck.source.filePath.split('/').pop()
           : deck.id;
-        const ok = confirm(`${deckId.replace('deck-', 'D')} is playing "${label}". Load anyway?`);
+        const ok = await ask(`${deckId.replace('deck-', 'D')} is playing "${label}". Load anyway?`, { title: 'Deck is playing', kind: 'warning' });
         if (!ok) return;
       }
       const payload = await getCuemarkPayload(item.track_id);

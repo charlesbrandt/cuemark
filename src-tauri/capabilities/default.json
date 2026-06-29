@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Default capabilities for cuemark",
   "windows": ["main", "output"],
-  "permissions": ["core:default", "dialog:allow-open", "opener:default"]
+  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-ask", "opener:default"]
 }

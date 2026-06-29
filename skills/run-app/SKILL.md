@@ -207,6 +207,12 @@ RAF-loop functions before leaving them in place.
 
 - **Video canvas noise**: If deck preview shows random colored static instead of video, `WEBKIT_DISABLE_DMABUF_RENDERER=1` is missing from `main.rs`. This env var must be set before `cuemark_lib::run()` to prevent VA-API DMA-BUF surfaces from being misread by 2D canvas.
 - **Port conflict on restart**: If `cargo tauri dev` fails to bind port 1420, a Vite child process is still running. Fix: `fuser -k 1420/tcp`.
+- **`window.confirm()` / `window.alert()` / `window.prompt()` do NOT work** — wry (the WebView library under Tauri) never connects WebKit's `run-javascript-dialog` signal. In practice, `window.confirm()` either blocks the JS thread indefinitely with no visible dialog, or auto-accepts silently depending on WebKit version. Confirmed broken in WebKit2GTK 2.52.3. **Never use native JS dialogs for user-facing confirmation.** Use `@tauri-apps/plugin-dialog` instead:
+  - `ask(message, { title, kind })` → "Yes"/"No" native dialog, returns `Promise<boolean>` — use for "Are you sure?" prompts
+  - `confirm(message, { title, kind })` → "OK"/"Cancel" dialog
+  - `message(message, { title, kind })` → informational alert
+  - Requires the matching capability in `capabilities/default.json`: `dialog:allow-ask`, `dialog:allow-confirm`, or `dialog:allow-message`. Missing permission → IPC call silently fails.
+  - Both `tauri-plugin-dialog = "2"` (Cargo) and `@tauri-apps/plugin-dialog` (npm) are already installed in this project.
 
 ## Desktop launcher (GNOME — "Show Applications" / Super key)
 
