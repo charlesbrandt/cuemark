@@ -6,6 +6,8 @@ use midir::MidiInput;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
+use crate::midi_state;
+
 /// Actions emitted to the frontend via Tauri IPC.
 /// All deck references use string IDs, never indices, so N-deck sessions work.
 #[derive(Serialize, Clone, Debug)]
@@ -218,17 +220,35 @@ fn resolve_action(binding: &ControlBinding, data2: u8) -> Option<MidiAction> {
     }
 }
 
-pub fn spawn_listener(app: AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+/// Key for persisting a MidiAction's value. Returns None for discrete events (buttons)
+/// that have no position to restore (play/pause, hot-cues, loop, jog).
+fn persist_kv(action: &MidiAction) -> Option<(String, f32)> {
+    match action {
+        MidiAction::DeckGain         { deck_id, value } => Some((format!("{deck_id}.gain"),         *value)),
+        MidiAction::DeckVolume       { deck_id, value } => Some((format!("{deck_id}.volume"),       *value)),
+        MidiAction::DeckPlaybackRate { deck_id, value } => Some((format!("{deck_id}.playbackRate"), *value)),
+        MidiAction::Crossfader       { value }          => Some(("crossfader".into(),               *value)),
+        MidiAction::MasterVolume     { value }          => Some(("masterVolume".into(),             *value)),
+        MidiAction::CueGain          { value }          => Some(("cueGain".into(),                  *value)),
+        _ => None,
+    }
+}
+
+pub fn spawn_listener(app: AppHandle, persist: midi_state::MidiPersist) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::Manager;
+    let state_path = app.path().app_data_dir()?.join("midi_state.json");
+    midi_state::spawn_flusher(Arc::clone(&persist), state_path);
+
     let midi_map = Arc::new(hercules_starlight_map());
     std::thread::spawn(move || {
-        if let Err(e) = run_midi_loop(&app, &midi_map) {
+        if let Err(e) = run_midi_loop(&app, &midi_map, &persist) {
             log::error!("[midi] listener error: {e}");
         }
     });
     Ok(())
 }
 
-fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>, persist: &midi_state::MidiPersist) -> Result<(), Box<dyn std::error::Error>> {
     let midi_in = MidiInput::new("cuemark")?;
     let ports = midi_in.ports();
 
@@ -259,6 +279,7 @@ fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>) -> Result<(), Box<dyn
 
     let app = app.clone();
     let map = Arc::clone(midi_map);
+    let persist = Arc::clone(persist);
 
     // 14-bit CC pair state: keyed by (status_byte, msb_cc_num).
     // Both MSB and LSB handlers look up by the MSB key (LSB key = MSB key with cc+32).
@@ -331,6 +352,9 @@ fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>) -> Result<(), Box<dyn
 
             if let Some(action) = action {
                 if should_log { log::info!("[midi]   => {:?}", action); }
+                if let Some((key, val)) = persist_kv(&action) {
+                    midi_state::mark_dirty(&persist, &key, val);
+                }
                 let _ = app.emit("midi-action", action);
             } else if should_log {
                 log::info!("[midi]   (no action)");

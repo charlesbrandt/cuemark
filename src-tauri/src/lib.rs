@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod media_server;
 pub mod midi;
+pub mod midi_state;
 
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
@@ -92,6 +93,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_output_window,
             media_server_port,
+            midi_state::midi_get_saved_state,
+            midi_state::midi_benchmark_save,
             audio::list_audio_devices,
             audio::audio_load,
             audio::audio_unload,
@@ -113,7 +116,9 @@ pub fn run() {
             audio::audio_analyze_file,
         ])
         .setup(|app| {
-            midi::spawn_listener(app.handle().clone())?;
+            let persist = midi_state::new_persist();
+            app.manage(persist.clone());
+            midi::spawn_listener(app.handle().clone(), persist)?;
             Ok(())
         })
         .run(tauri::generate_context!())

@@ -289,6 +289,23 @@ WAVEFORM_OK=$(awk "BEGIN{print ($WAVEFORM_DIFF < 0.5) ? \"true\" : \"false\"}")
 check_eq "waveform time within 500ms of video time" "$WAVEFORM_OK" "true"
 
 echo
+echo "=== Step 9: MIDI state save I/O benchmark (100 atomic writes) ==="
+# Calls the Rust midi_benchmark_save command directly, bypassing the 100ms debounce.
+# This measures the worst-case per-write latency of the persist path so we can confirm
+# that file I/O on the MIDI-adjacent code path won't affect audio thread timing.
+# The MIDI callback itself never does I/O (it only sets an in-memory dirty flag);
+# the flusher thread does the actual write every 100ms. This benchmark quantifies that cost.
+SAVE_STATS=$(js_async "
+  const done = arguments[0];
+  window.__cuemarkDebug.benchmarkMidiSave(100).then(r => done(JSON.stringify(r))).catch(e => done(JSON.stringify({error: String(e)})));
+")
+echo "  $SAVE_STATS"
+SAVE_P99=$(echo "$SAVE_STATS" | jq -r '.p99_ms // 9999' 2>/dev/null || echo 9999)
+# Each write is ~200 bytes (6 keys). On a typical SSD fsync latency is 0.1–2ms;
+# threshold is 20ms to accommodate slow mechanical drives or tmpfs under load.
+check_lt "MIDI save p99 < 20 ms" "$SAVE_P99" 20
+
+echo
 echo "========================================"
 echo "  Results: $PASS passed, $FAIL failed"
 echo "========================================"

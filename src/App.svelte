@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { get } from "svelte/store";
-  import { session, addDeck, removeDeck, updateDeck, setMasterBpm, setVisualization, setVisualizationOpacity } from "./lib/state/session";
+  import { session, addDeck, removeDeck, updateDeck, setMasterBpm, setMasterVolume, setCrossfader, setVisualization, setVisualizationOpacity } from "./lib/state/session";
   import VisualizationPanel from "./components/VisualizationPanel.svelte";
   import { tapTempo } from "./lib/audio/bpm";
   import { startMidiListener } from "./lib/midi/handler";
@@ -201,6 +201,11 @@
           };
         },
 
+        // Runs `n` MIDI state file writes through the Rust path and returns timing stats.
+        // Used by latency-test.sh step 9 to measure Rust-side I/O latency.
+        benchmarkMidiSave: (n = 100): Promise<Record<string, number>> =>
+          invoke('midi_benchmark_save', { n }),
+
         // Fires `count` audio_set_rate calls fire-and-forget at `intervalMs` spacing,
         // matching the MIDI event rate a real tempo fader produces (~200 Hz at intervalMs=5).
         // Returns {fired, durationMs} after the last event fires.
@@ -225,6 +230,39 @@
       mediaServerPort = await invoke<number>('media_server_port');
     }
     midiUnlisten = await startMidiListener();
+
+    // Restore last-seen MIDI control positions from the persist file.
+    // This pre-populates faders/knobs so the software matches the controller on startup
+    // without requiring the user to touch every control. Applied before any track loads
+    // so the values are in the session when the first audioLoad pipeline is created.
+    try {
+      const saved = await invoke<Record<string, number>>('midi_get_saved_state');
+      const deckPatches = new Map<string, Record<string, number>>();
+      for (const [key, value] of Object.entries(saved)) {
+        if (key === 'crossfader') {
+          setCrossfader(value);
+        } else if (key === 'masterVolume') {
+          setMasterVolume(value);
+        } else if (key === 'cueGain') {
+          cueGain.set(value);
+        } else {
+          const dot = key.indexOf('.');
+          if (dot > 0) {
+            const deckId = key.slice(0, dot);
+            const field = key.slice(dot + 1);
+            const patch = deckPatches.get(deckId) ?? {};
+            (patch as Record<string, number>)[field] = value;
+            deckPatches.set(deckId, patch);
+          }
+        }
+      }
+      for (const [deckId, patch] of deckPatches) {
+        updateDeck(deckId, patch as Parameters<typeof updateDeck>[1]);
+      }
+    } catch (e) {
+      console.warn('[midi-state] failed to restore saved state:', e);
+    }
+
     compositor = new Compositor(canvas);
     let fftEventCount = 0;
     fftUnlisten = await listen<{ deckId: string; bass: number; mid: number; high: number }>(
@@ -373,6 +411,16 @@
         // waveform isn't stuck waiting on a duration that will never arrive from the video
         // element. Don't clobber a duration loadedmetadata already supplied.
         audioLoad(deck.id, filePath).then((duration) => {
+          // A new DeckAudioPipeline is created with default gain/rate/volume=1.0.
+          // Re-apply current session values so saved MIDI state (or UI slider changes
+          // made before this track was loaded) take effect on the fresh pipeline.
+          const d = get(session).decks.find((d) => d.id === deckId);
+          if (d) {
+            clearDeckAudioSync(deckId);
+            syncGain(deckId, d.gain);
+            syncRate(deckId, d.playbackRate);
+            syncVolume(deckId, d.volume);
+          }
           const s = get(session).decks.find((d) => d.id === deckId)?.source;
           if (duration && s?.type === "video" && s.filePath === filePath && (!s.duration || !Number.isFinite(s.duration))) {
             updateDeck(deckId, { source: { type: "video", filePath, duration } });
