@@ -53,14 +53,24 @@ What now exists (context for the remaining steps):
   `beginPath()` passes (normal, accented), no per-line style changes.
   Run `scripts/perf-idle-test.sh` after (WaveformCanvas is on its watch list).
 
-### Step 3 — Sync path correctness fixes
+### Step 3 — Sync path correctness fixes [done, 2026-07-05]
 
 1. **Rate-then-seek ordering** (violates the documented CLAUDE.md rule; can make
    Sync silently not take): `handler.ts` `sync_toggle` and DeckCard's Sync button
-   both set `playbackRate` and then seek immediately. Fix by doing the phase-align
-   seek FIRST, then the rate change — the phase delta is computed in content time,
-   so it's valid regardless of which order is applied, and seek-first avoids the
-   WebKit-rebuild race entirely.
+   both set `playbackRate` and then seek (near-)immediately. **Correction to an
+   earlier draft of this spec, which had the fix backwards**: CLAUDE.md's
+   "Rate-then-seek ordering" section is explicit — apply the rate change FIRST,
+   wait ~200ms for the WebKit pipeline rebuild to settle, THEN seek. Seek-first
+   does not avoid the race: `v.playbackRate` writes are rAF-throttled (deferred
+   to `syncVideoElements` on the next frame), so even if a seek's `el.currentTime`
+   write happens first in source order, the rate write's WebKit rebuild can still
+   land shortly after and clobber the seek before the video element's own internal
+   seek has settled — which is exactly today's bug. Fix: after setting
+   `playbackRate`, `setTimeout(..., 200)` before performing the phase-align seek
+   (both in `sync_toggle` and in the DeckCard Sync button's call into
+   `nudgePhaseToMaster`). No existing code has this exact pattern to mirror —
+   it's a new `setTimeout`, same idea as other debounce timers already in the
+   codebase (e.g. `DiggerQueue.svelte`'s search debounce).
 2. **`phaseNudge.ts` `applyRate()` must call `syncRate()`** (from `audioSync.ts`)
    instead of `audioSetRate()` directly — currently the rateMap goes stale and the
    `App.svelte` `$effect` fires a duplicate `audio_set_rate` IPC per nudge edge.
@@ -73,7 +83,7 @@ What now exists (context for the remaining steps):
    existing 80 ms audio-clock snap pull the video back after. Avoids two WebKit
    pipeline rebuilds per nudge. Run `scripts/latency-test.sh` after touching this.
 
-### Step 4 — Quantize / snap-to-beat
+### Step 4 — Quantize / snap-to-beat [done, 2026-07-05]
 
 - `Session.snapToBeat: boolean` (default false) + setter in `session.ts` + a
   "SNAP" toolbar toggle in `App.svelte`.
@@ -89,6 +99,22 @@ What now exists (context for the remaining steps):
   SET BEAT to the existing grid (that would make it unable to correct the grid).
 
 ### Step 5 — Grid persistence
+
+#### Step 5a — Local JSON sidecar [done, 2026-07-05]
+
+Implemented via `grid_store.rs` + `gridSource.ts` — see commit message for details.
+
+#### Step 5b — Digger round-trip [done, 2026-07-05]
+
+`GET /tracks/{id}/cuemark` now returns `bpm`/`downbeat` (downbeat via a new
+`"downbeat"` marker type — no schema migration). `Deck.diggerTrackId` tracks which
+Digger track is loaded; SET BEAT pushes corrections back (best-effort). See commit
+messages in both repos for details, including the `gridSource.ts` path-keying fix
+this required (a deck-id-only trust flag would misfire across track reloads).
+
+All of Step 5 (grid persistence) is now done — this closes out the full beat-grid /
+snap-to-beat feature (Steps 1-5).
+
 
 - Digger side (`~/repos/digger`, see `digger-integration` skill): add `bpm`
   (float) and `downbeat` (float seconds) to the `GET /tracks/{id}/cuemark`
