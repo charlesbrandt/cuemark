@@ -136,6 +136,28 @@ auto-populates `deck.bpm` and `deck.downbeat`; the integer `detectBpm()` remains
 work mod one beat. Algorithm details and tuning notes: `bpm.ts` comments + todo.md handoff spec;
 acceptance tests in `src/lib/audio/bpm.test.ts` (`npm test`).
 
+**Grid persistence and the trust-flag gotcha**: a saved `bpm`/`downbeat` pair (set via the
+DeckCard SET BEAT button) beats the auto-fit on load — persisted locally (`grid_store.rs` →
+`grids.json` in `app_data_dir()`, keyed by absolute file path) and, if the deck has a
+`diggerTrackId`, also pushed to Digger (`tracks.bpm` column + a `downbeat` marker). Precedence
+is tracked per-deck by `src/lib/audio/gridSource.ts`'s `(deckId → trusted filePath)` map:
+`hasSavedGrid`/`markGridSaved`/`clearSavedGrid`. **This map must be explicitly cleared whenever
+a deck loads a path that doesn't match its trusted one** — `App.svelte`'s new-source handler
+calls `clearSavedGrid(deck.id)` on any path mismatch before conditionally re-fetching. Omitting
+this (the original implementation did) causes a stale-trust bug: load track A (saved grid) →
+load track B (no saved grid, auto-fit runs) → reload A — the deck gets stuck showing B's
+leftover values forever, because the old `deck→A` trust entry survives B's load untouched and
+incorrectly reports "already trusted" when A comes back, skipping the re-fetch that would
+restore A's real grid. Found via live headless testing (`verify-ui` skill), not by
+code review or unit tests — the bug only manifests across a *sequence* of loads on one deck
+slot. Fixed in `060de16`; see `journal.md` 2026-07-06 entry for the full repro.
+
+**Snap-to-beat**: `Session.snapToBeat` (toggled by the SNAP toolbar button) routes every seek
+target — waveform clicks, hot-cue jump/set, loop in/out/bar-buttons — through
+`quantizeToGrid(deckId, t)` in `seekBus.ts`, which snaps to the nearest `downbeat + k·(60/bpm)`
+for any integer k (including negative, before the anchor). A no-op when `snapToBeat` is false
+or the deck has no `bpm`/`downbeat` yet.
+
 **WebGL Y-flip**: HTML canvas Y=0 is top; WebGL texture Y=0 is bottom. `UNPACK_FLIP_Y_WEBGL=true`
 corrects this on upload so video appears right-side up.
 The crossfader is a UI/MIDI convenience that drives two selected decks' opacities inversely — not a
@@ -338,6 +360,7 @@ cuemark/
         analyzer.ts             # AudioAnalyzer — Web Audio API FFT (waveform analysis only; not used for playback)
         waveform.ts             # analyzeFile() → calls audio_analyze_file Tauri command (Rust/GStreamer); computeWaveform() for AudioBuffer; amplitude color LUTs
         bpm.ts                  # detectBeatGrid(envelope, rate) — fractional BPM + grid phase (comb fit); detectBpm() integer fallback; tapTempo()
+        gridSource.ts           # Per-deck (deckId → trusted filePath) map gating saved-grid vs auto-fit precedence; see "Grid persistence" gotcha above
         audioSettings.ts        # Svelte stores: mainOutputDeviceIds, cueOutputDeviceId, cueGain
       midi/
         handler.ts              # Tauri IPC listener → session mutations
@@ -358,6 +381,7 @@ cuemark/
         devices.rs              # list_audio_devices() — PipeWire/PulseAudio sink enumeration
         analysis.rs             # Audio analysis (FFT, peak detection)
         record.rs               # RecordingSink — audio recording (Opus/FLAC)
+      grid_store.rs             # grid_get_saved/grid_save Tauri commands — local sidecar (grids.json) for saved bpm/downbeat
     capabilities/
       default.json              # Tauri 2 capability config
     icons/                      # App icons (placeholder PNGs)

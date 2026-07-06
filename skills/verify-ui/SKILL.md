@@ -24,6 +24,13 @@ dpkg -L webkit2gtk-driver | grep -E '/WebKitWebDriver$'
 ```
 If any of these are missing, stop and tell the user — don't try to work around it.
 
+**`which tauri-driver` can report missing when it's actually installed**: `cargo install`
+puts the binary at `~/.cargo/bin/tauri-driver`, which isn't always on this shell's `PATH`
+(confirmed empirically — a fresh bash session here had it absent). Before concluding it's
+not installed, check `ls ~/.cargo/bin/tauri-driver` and invoke it by full path
+(`/home/account/.cargo/bin/tauri-driver`) if found, rather than telling the user to
+reinstall something that's already there.
+
 ## 1. Build a real (non-dev-server) binary
 
 `tauri-driver` launches the compiled binary directly — it does not go through
