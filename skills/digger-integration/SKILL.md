@@ -22,10 +22,29 @@ FastAPI REST at `http://localhost:8200` by default:
 
 The `/cuemark` payload maps directly to cuemark's `Deck` source interface:
 ```json
-{ "filePath": "/media/charles/music/artist/track.mp4", "cuePoint": 4.2, "hotCues": [32.0, 128.5] }
+{ "filePath": "/media/charles/music/artist/track.mp4", "cuePoint": 4.2, "hotCues": [32.0, 128.5],
+  "bpm": 123.4, "downbeat": 0.812 }
 ```
 File preference in Digger: video > audio > any. Marker mapping: first `cue` → `cuePoint`, first 3
-`hot_cue` → `hotCues[]`.
+`hot_cue` → `hotCues[]`. `bpm`/`downbeat` round-trip the trusted beat grid (see cuemark's
+`gridSource.ts` gotcha in the top-level `CLAUDE.md`).
+
+**Gotcha — Digger omits unset `bpm`/`downbeat` instead of sending JSON `null`.** cuemark's
+`CuemarkPayload` TS interface declares `bpm: number | null`, but that's just a type annotation —
+if the FastAPI response body simply omits the key (e.g. a Pydantic model with
+`exclude_none=True`), `payload.bpm` deserializes as JS `undefined`, not `null`. Every consumer in
+cuemark (`DeckCard.svelte`, `gridSource.ts`, etc.) only ever guards `!== null` to match the `Deck`
+type's `number | null` invariant — `undefined !== null` is `true`, so it slips straight through
+every guard. Confirmed root cause of a live freeze (2026-07-06): `deck.bpm` ended up `undefined`,
+and `DeckCard.svelte`'s `{deck.bpm.toFixed(1)}` threw, which aborted that Svelte effect-flush tick
+before `App.svelte`'s `syncVideoElements` (and therefore `audioLoad`) or `WaveformCanvas`'s
+`analyzeFile` ever ran — the deck showed its filename (state updated fine) but never got a video
+frame, audio pipeline, or waveform, and the Rust log showed zero pipeline-construction lines
+because the backend was never actually invoked. Fixed in `DiggerQueue.svelte`'s `loadToDeck` by
+normalizing `payload.bpm ?? null` / `payload.downbeat ?? null` right at the API boundary, before
+the value touches any `!== null` guard. **Any new consumer of Digger JSON should normalize
+optional fields the same way at the point they enter cuemark** — don't trust the TS interface to
+guarantee the runtime shape.
 
 ## Queue panel live updates
 

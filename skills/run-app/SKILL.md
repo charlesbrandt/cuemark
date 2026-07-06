@@ -149,6 +149,39 @@ kill $(cat /tmp/cuemark-dev.pid) 2>/dev/null; rm -f /tmp/cuemark-dev.pid
 
 **If the freeze returns**: check `audio_load` in `mod.rs` — the mutex must be released (the `{}` block must close) before `pipeline.load(&file_path)` is called.
 
+### "Deck stuck on load" that isn't a GStreamer/backend freeze at all — check the console before chasing the pipeline
+
+**Symptom**: a deck shows its filename (so `deck.source` clearly updated) but never gets a video
+frame, waveform, or working transport — everything else in the app (other panels, other decks)
+stays fully responsive. This *looks* like the classic "freeze" but isn't the mutex-preroll bug
+above or a `WatchDogQueue` WebKitWebProcess crash (see "Known WebKitGTK quirks" below) — check
+process state before assuming either:
+
+1. `ps -T -p <cuemark-pid>` and `ps -T -p <WebKitWebProcess-pid>` — if every thread is idle
+   (`futex_do_wait`/`poll_schedule_timeout`, near-0% CPU across a couple of 1s samples), nothing
+   is deadlocked or spinning in native code. A real GStreamer preroll hang or postFrame backpressure
+   stall shows up as sustained CPU or a blocked syscall, not silence.
+2. `/tmp/cuemark-dev.log` — `audio_load`'s `load()` (`pipeline.rs`) logs unconditionally very early
+   (the `spectrum` element check, then `make_sink`) the moment it's reached. **Zero pipeline-related
+   log lines despite a deck supposedly loading means the Rust command was never actually invoked**
+   — this is backend-silent, not backend-stuck-with-a-5s-timeout (that case *does* log a `preroll
+   still pending` warning).
+3. Given (1) and (2), the bug is almost always a **frontend exception aborting a Svelte effect
+   flush**, not anything GStreamer-related. An uncaught error thrown while rendering one component
+   (e.g. a template expression like `deck.bpm.toFixed()` on an unexpectedly-`undefined` value) can
+   abort the whole batch of effects scheduled in that tick — including sibling effects with no
+   apparent connection to the crashing component, like `App.svelte`'s `syncVideoElements` (which
+   calls `audioLoad`) or `WaveformCanvas`'s `analyzeFile` `$effect`. This is why the symptom reads
+   as "the backend never got the command" — it didn't, but the actual bug is a frontend crash three
+   components away from the one that looks broken.
+4. **The fastest diagnostic is always the devtools console** (right-click → Inspect Element →
+   Console — enabled permanently in this project, see "Debugging the production/launcher build
+   specifically" below). Ask the user to check it before spending time on process/log forensics —
+   a live example (2026-07-06) found the actual cause (`TypeError: undefined is not an object
+   (evaluating '$$props.deck.bpm.toFixed')`) in seconds once the console was checked, after
+   significant time spent ruling out mutex/GStreamer/native-freeze theories first. See
+   `digger-integration` skill's gotcha on `bpm`/`downbeat` for that specific bug's root cause.
+
 ### HMR cascade hang — batch all App.svelte edits into one pass
 Each HMR reload of App.svelte (the root Svelte component) tears down and rebuilds every
 GStreamer audio pipeline and re-runs full waveform analysis for every loaded track. Three
