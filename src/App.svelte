@@ -605,7 +605,7 @@
       class:active={showVisualizationPanel}
       onclick={() => { showVisualizationPanel = !showVisualizationPanel; }}
     >Visualization</button>
-    <span class="bpm">{$session.bpm ? `${$session.bpm} BPM` : "—"}</span>
+    <span class="bpm">{$session.bpm !== null ? `${$session.bpm.toFixed(1)} BPM` : "—"}</span>
     <button class="tap-btn" onclick={handleTap}>TAP</button>
     {#if $session.bpm !== null}
       <button class="tap-reset" onclick={() => { setMasterBpm(null); tapTimestamps = []; }}>✕</button>
@@ -642,7 +642,10 @@
         {#each $session.decks as deck (deck.id)}
           <div class="waveform-row">
             <span class="waveform-label">{deck.id}</span>
-            <WaveformCanvas {deck} onBpmDetected={(bpm) => updateDeck(deck.id, { bpm })} />
+            <!-- downbeat is auto-set from the beat-grid fit on every track load (beat-level
+                 anchor; also clears a stale downbeat carried over from the previous track).
+                 SET BEAT in DeckCard remains the manual override. -->
+            <WaveformCanvas {deck} onAnalyzed={({ bpm, gridOffset }) => updateDeck(deck.id, { bpm, downbeat: gridOffset })} />
           </div>
         {/each}
       </div>

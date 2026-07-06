@@ -49,7 +49,15 @@ function findReferenceDeck(deckId: string) {
     (d) => d.id !== deckId && d.bpm !== null && d.downbeat !== null
   );
   if (candidates.length === 0) return null;
-  return candidates.find((d) => d.bpm === masterBpm) ?? candidates[0];
+  // Tolerance rather than exact equality: bpm is fractional now, and the master
+  // deck's bpm was float-copied into session.bpm — exact match works for that
+  // deck, but a tolerance also survives future re-analysis producing a value
+  // a hundredth of a BPM away.
+  return (
+    candidates.find(
+      (d) => masterBpm !== null && d.bpm !== null && Math.abs(d.bpm - masterBpm) < 0.05,
+    ) ?? candidates[0]
+  );
 }
 
 // Nudge deckId's phase toward the reference deck's phase.

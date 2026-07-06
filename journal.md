@@ -1144,3 +1144,73 @@ default even though it already proxies the REST calls on the same path.
 | `src/lib/digger/api.ts` | new `subscribeQueueChanges()` — WebSocket client with reconnect |
 | `src/components/DiggerQueue.svelte` | subscribes on mount; resubscribes on base-URL change |
 | `~/repos/digger/api.py` | new `GET /queue/ws` endpoint + `_broadcast_queue_changed()`, wired into all queue-mutation commit points |
+
+# 2026.07.05 — Fractional BPM + automatic beat-grid fit (step 1 of beat-grid/snap work)
+
+## Context
+
+Goal for the next feature arc: snap two songs to a shared beat grid so beat matching is
+easy and drift is handled by an occasional re-sync tap. A full review found the phase
+machinery (downbeat anchor, getPhase, nudgePhaseToMaster) already in place, and identified
+integer-quantized BPM as the dominant drift source: detectBpm returned whole numbers, so a
+true 127.6 BPM track stored as 128 drifts a full beat every ~2.5 minutes even after a
+perfect sync — no grid UI can fix that. This session implemented the algorithmic core
+(step 1); steps 2–5 (grid rendering, sync-path fixes, snap-to-beat, persistence) are
+specced in todo.md for handoff.
+
+## What changed
+
+**Rust (`analysis.rs`)**: `compute_peaks` → `compute_analysis`, returning
+`AnalysisData { peaks, envelope }` — the existing 30/s display peaks plus a new 210/s RMS
+envelope for onset timing, computed in the same decode pass. 210 was chosen because it
+divides 44100 exactly (hop = 210 samples), so envelope index → time has zero cumulative
+rounding drift — timing precision is the entire point of the array. Added a `cargo test`
+smoke test that synthesizes a WAV via audiotestsrc and checks both output rates.
+
+**`bpm.ts` — new `detectBeatGrid(envelope, envelopeRate)`** → `{ bpm, gridOffset,
+confidence } | null` with fractional bpm (0.01 resolution) and a beat-level grid anchor:
+
+1. **Onset detection** — log-domain half-wave-rectified envelope difference (loudness-
+   invariant), peak-picked at ≥2× local mean with 100 ms min separation, parabolic
+   sub-sample timing refinement.
+2. **Coarse tempo** — pairwise (not just consecutive) inter-onset-interval histogram,
+   integer bins 60–200, weighted by onset strength products and a log-normal tempo prior
+   centered at 120 BPM (σ 0.4 log). The prior replaces the old ×2-harmonic folding, which
+   systematically favored the slower octave once pairwise intervals were introduced.
+3. **Comb/Fourier refinement** — S(f) = Σ wⱼ·exp(2πi·f·tⱼ) scanned over ±3% around the
+   coarse candidate; |S|² parabolic interpolation localizes f far below the scan step;
+   arg S gives the grid phase for free; confidence = |S|/Σw gates bad fits (≥0.15).
+
+Two design decisions that came directly out of failing tests (this is why the tests were
+written first-class):
+
+- **Comb weights are linear envelope rises, detection is logarithmic.** Log-compressed
+  weights flattened the kick-vs-hat contrast (both jump ~5 log units off a quiet floor),
+  so 8th-note hats at half-beat phase nearly cancelled the beat-frequency comb → fit
+  rejected. Linear weights keep kicks dominant and make noise-floor onsets negligible.
+- **Octave candidates {b/2, b, 2b} are all refined; best confidence wins, slower
+  preferred on a ≤5% tie.** The histogram+prior picked 87 for a true 174 BPM track; the
+  comb correctly measured ~zero alignment at 87 (beat-spaced onsets alternate phase on a
+  double-period grid) and the octave sweep recovered 174. The tie-break matters because a
+  pure beat-spaced track aligns perfectly to its own 2× grid as well.
+
+**Wiring**: `audio_analyze_file` → `{ peaks, envelope }`; `analyzeFile()` (waveform.ts)
+runs the grid fit and falls back to integer `detectBpm` when it fails; WaveformCanvas's
+`onBpmDetected` became `onAnalyzed({ bpm, gridOffset })`; App.svelte now auto-sets BOTH
+`deck.bpm` and `deck.downbeat` on every track load (which also fixes downbeat staleness —
+nothing previously cleared it when a new track loaded). SET BEAT stays as manual override.
+BPM displays show one decimal. `findReferenceDeck` (phaseNudge.ts) now matches the master
+deck by 0.05 BPM tolerance instead of float equality.
+
+**Tests**: vitest added (`npm test`), `src/lib/audio/bpm.test.ts` — synthetic click-track
+envelopes with fractional ground truth (127.53 BPM clean; 93.87 with 20% dropped beats +
+amplitude jitter; 128 with 8th-note onsets must not halve to 64; 174.35 DnB range; noise
+and too-short → null; old detectBpm + tapTempo regressions). Tolerances deliberately
+tight: ±0.05 BPM clean / ±0.1 degraded, phase ±20 ms — "plausible but 0.2% off" is the
+exact failure mode this feature exists to eliminate.
+
+## Not done here (specced in todo.md "Beat grid + snap — handoff spec")
+
+Beat-line rendering in the zoom waveform, sync-path ordering fixes (rate-then-seek
+violations in sync_toggle and the Sync button; phaseNudge bypassing syncRate), the SNAP
+quantize toggle, and grid persistence via Digger + local sidecar.

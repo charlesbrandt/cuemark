@@ -29,11 +29,30 @@ pub struct AudioFftEvent {
 /// Peaks per second returned to the frontend. Must match `PEAKS_PER_SECOND` in waveform.ts.
 pub const PEAKS_PER_SECOND: usize = 30;
 
-/// Decode audio from `file_path` and return one peak amplitude value per 1/30s chunk.
+/// Envelope hops per second for beat-grid onset detection. Must match `ENVELOPE_RATE`
+/// in waveform.ts. 210 divides 44100 exactly (hop = 210 samples), so envelope index i
+/// maps to time i/210 with no cumulative rounding drift — timing precision is the whole
+/// point of this array (±2.4 ms per hop ≈ 0.5% of a beat at 128 BPM).
+pub const ENVELOPE_RATE: usize = 210;
+
+/// Result of `compute_analysis`: coarse peaks for the waveform display plus a
+/// high-rate RMS envelope for beat-grid fitting in the frontend.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisData {
+    /// Peak amplitude per 1/30 s chunk (waveform display).
+    pub peaks: Vec<f32>,
+    /// RMS amplitude per 1/210 s hop (onset detection for the beat grid).
+    pub envelope: Vec<f32>,
+}
+
+/// Decode audio from `file_path` and return waveform peaks (30/s) plus an RMS
+/// envelope (210/s) in a single decode pass.
 /// Runs synchronously; caller should run this off the main thread for long files.
-pub fn compute_peaks(file_path: &str) -> Result<Vec<f32>, String> {
+pub fn compute_analysis(file_path: &str) -> Result<AnalysisData, String> {
     const SAMPLE_RATE: i32 = 44_100;
     let chunk_samples = SAMPLE_RATE as usize / PEAKS_PER_SECOND; // 1470
+    let hop_samples = SAMPLE_RATE as usize / ENVELOPE_RATE; // 210
 
     let pipeline = gst::Pipeline::new();
 
@@ -99,6 +118,9 @@ pub fn compute_peaks(file_path: &str) -> Result<Vec<f32>, String> {
     let mut peaks = Vec::new();
     let mut chunk_max = 0.0f32;
     let mut chunk_pos = 0usize;
+    let mut envelope = Vec::new();
+    let mut hop_sum_sq = 0.0f32;
+    let mut hop_pos = 0usize;
 
     loop {
         match appsink.pull_sample() {
@@ -114,6 +136,13 @@ pub fn compute_peaks(file_path: &str) -> Result<Vec<f32>, String> {
                         chunk_max = 0.0;
                         chunk_pos = 0;
                     }
+                    hop_sum_sq += s * s;
+                    hop_pos += 1;
+                    if hop_pos >= hop_samples {
+                        envelope.push((hop_sum_sq / hop_samples as f32).sqrt());
+                        hop_sum_sq = 0.0;
+                        hop_pos = 0;
+                    }
                 }
             }
             Err(_) => break, // EOS or error
@@ -122,8 +151,60 @@ pub fn compute_peaks(file_path: &str) -> Result<Vec<f32>, String> {
     if chunk_pos > 0 {
         peaks.push(chunk_max);
     }
+    if hop_pos > 0 {
+        envelope.push((hop_sum_sq / hop_pos as f32).sqrt());
+    }
 
     let _ = pipeline.set_state(gst::State::Null);
-    log::info!("[analysis] peaks={} for {}", peaks.len(), file_path);
-    Ok(peaks)
+    log::info!("[analysis] peaks={} envelope={} for {}", peaks.len(), envelope.len(), file_path);
+    Ok(AnalysisData { peaks, envelope })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end smoke test: synthesize a 10 s WAV with GStreamer, run
+    /// compute_analysis on it, and check both output arrays have the expected
+    /// per-second rates. Verifies the decode pipeline, the autoplug guard, and
+    /// the peaks/envelope chunking stay in agreement with the declared constants.
+    #[test]
+    fn analysis_rates_match_constants() {
+        gst::init().expect("gstreamer init");
+        let wav_path = std::env::temp_dir().join("cuemark-analysis-test.wav");
+        let wav_str = wav_path.to_str().unwrap();
+
+        // 10 s of 440 Hz sine at 44.1 kHz mono.
+        let launch = format!(
+            "audiotestsrc num-buffers=431 samplesperbuffer=1024 wave=sine freq=440 \
+             ! audio/x-raw,rate=44100,channels=1 ! wavenc ! filesink location={wav_str}"
+        );
+        let pipeline = gst::parse::launch(&launch).expect("parse_launch");
+        pipeline.set_state(gst::State::Playing).expect("play");
+        let bus = pipeline.bus().unwrap();
+        bus.timed_pop_filtered(
+            gst::ClockTime::from_seconds(30),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        pipeline.set_state(gst::State::Null).expect("null");
+
+        let data = compute_analysis(wav_str).expect("compute_analysis");
+        let duration_secs = 431.0 * 1024.0 / 44_100.0; // ≈ 10.0
+
+        let expected_peaks = duration_secs * PEAKS_PER_SECOND as f64;
+        let expected_env = duration_secs * ENVELOPE_RATE as f64;
+        assert!(
+            (data.peaks.len() as f64 - expected_peaks).abs() <= 2.0,
+            "peaks len {} != expected ~{expected_peaks}", data.peaks.len()
+        );
+        assert!(
+            (data.envelope.len() as f64 - expected_env).abs() <= 5.0,
+            "envelope len {} != expected ~{expected_env}", data.envelope.len()
+        );
+        // A steady sine has RMS ≈ peak / √2; check the envelope is in a sane band.
+        let mid = data.envelope[data.envelope.len() / 2];
+        assert!(mid > 0.5 && mid < 0.8, "sine RMS out of range: {mid}");
+
+        let _ = std::fs::remove_file(&wav_path);
+    }
 }

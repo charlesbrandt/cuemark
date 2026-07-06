@@ -127,7 +127,14 @@ fallback works correctly with `WEBKIT_DISABLE_DMABUF_RENDERER=1` set. See `audio
 the full VA-API investigation, debugging tips, and env-var override pitfalls.
 
 **Waveform analysis uses `audio_analyze_file` Tauri command** (Rust/GStreamer, `analysis.rs`), not
-`decodeAudioData` — avoids VA-API corruption in the separate WebKitWebProcess.
+`decodeAudioData` — avoids VA-API corruption in the separate WebKitWebProcess. It returns
+`{ peaks, envelope }`: 30/s display peaks plus a 210/s RMS envelope used by `detectBeatGrid()`
+(`bpm.ts`) to fit a **fractional** BPM and beat-level grid anchor (`ENVELOPE_RATE = 210` is
+declared in both `analysis.rs` and `waveform.ts` and must stay in sync). On track load the fit
+auto-populates `deck.bpm` and `deck.downbeat`; the integer `detectBpm()` remains as fallback.
+`gridOffset`/`downbeat` marks *a* beat, not bar-beat-1 — all consumers (`getPhase`, phase nudge)
+work mod one beat. Algorithm details and tuning notes: `bpm.ts` comments + todo.md handoff spec;
+acceptance tests in `src/lib/audio/bpm.test.ts` (`npm test`).
 
 **WebGL Y-flip**: HTML canvas Y=0 is top; WebGL texture Y=0 is bottom. `UNPACK_FLIP_Y_WEBGL=true`
 corrects this on upload so video appears right-side up.
@@ -237,7 +244,8 @@ interface Deck {
   loop: boolean
   cuePoint: number        // seconds
   hotCues: number[]       // up to 4 time markers
-  bpm: number | null      // auto-detected or tapped BPM for this deck
+  bpm: number | null      // fractional (beat-grid fit) or tapped BPM for this deck
+  downbeat: number | null // beat-level grid anchor (seconds); auto-set from the grid fit on load
   loopIn: number | null   // custom loop region start (seconds); null = full track
   loopOut: number | null  // custom loop region end (seconds); null = full track
   // When loop=true and both loopIn/loopOut are set, ontimeupdate seeks back to loopIn
@@ -329,7 +337,7 @@ cuemark/
         pipeline.ts             # Typed TS wrappers around all Rust audio Tauri commands (audioLoad, audioPlay, …)
         analyzer.ts             # AudioAnalyzer — Web Audio API FFT (waveform analysis only; not used for playback)
         waveform.ts             # analyzeFile() → calls audio_analyze_file Tauri command (Rust/GStreamer); computeWaveform() for AudioBuffer; amplitude color LUTs
-        bpm.ts                  # detectBpm(peaks, peaksPerSecond) — energy-onset histogram; tapTempo(timestamps[])
+        bpm.ts                  # detectBeatGrid(envelope, rate) — fractional BPM + grid phase (comb fit); detectBpm() integer fallback; tapTempo()
         audioSettings.ts        # Svelte stores: mainOutputDeviceIds, cueOutputDeviceId, cueGain
       midi/
         handler.ts              # Tauri IPC listener → session mutations
@@ -406,7 +414,9 @@ Adding a third deck and reassigning the crossfader mapping is fully supported.
 ```
 cargo tauri dev        # starts Vite dev server + Tauri window
 npm run check          # TypeScript + Svelte type check
+npm test               # vitest — beat-grid / BPM algorithm tests (bpm.test.ts)
 cd src-tauri && cargo check   # Rust type check only
+cd src-tauri && cargo test    # includes analysis.rs decode smoke test (needs GStreamer)
 ```
 
 **Dev server lifecycle**: `cargo tauri dev` watches frontend files and hot-reloads them instantly.

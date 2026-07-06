@@ -211,7 +211,7 @@
   <div class="bpm-row">
     <span class="bpm-value">
       {#if deck.bpm !== null}
-        {deck.bpm} <span class="bpm-effective" title="Current BPM at {deck.playbackRate.toFixed(2)}× rate">→ {(deck.bpm * deck.playbackRate).toFixed(1)}</span> BPM
+        {deck.bpm.toFixed(1)} <span class="bpm-effective" title="Current BPM at {deck.playbackRate.toFixed(2)}× rate">→ {(deck.bpm * deck.playbackRate).toFixed(1)}</span> BPM
       {:else}
         — BPM
       {/if}

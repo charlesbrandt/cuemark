@@ -57,9 +57,13 @@ export function computeWaveform(buffer: AudioBuffer): Float32Array {
   return peaks;
 }
 
+/** Envelope samples per second from Rust. Must match ENVELOPE_RATE in analysis.rs. */
+export const ENVELOPE_RATE = 210;
+
 export interface AnalysisResult {
   peaks: Float32Array;
-  bpm: number | null;
+  bpm: number | null;        // fractional when the beat-grid fit succeeds, integer fallback otherwise
+  gridOffset: number | null; // seconds; a beat lies at gridOffset + k·(60/bpm). null = no grid fit
 }
 
 export async function analyzeFile(filePath: string): Promise<AnalysisResult> {
@@ -67,8 +71,11 @@ export async function analyzeFile(filePath: string): Promise<AnalysisResult> {
   // Rust decodes audio with video decoders disabled, avoiding the vaav1dec VA-API
   // corruption that decodeAudioData triggers on video+audio containers in WebKitGTK.
   const raw = await audioAnalyzeFile(filePath);
-  const peaks = new Float32Array(raw);
-  const { detectBpm } = await import('./bpm');
-  const bpm = detectBpm(peaks, PEAKS_PER_SECOND);
-  return { peaks, bpm };
+  const peaks = new Float32Array(raw.peaks);
+  const envelope = new Float32Array(raw.envelope);
+  const { detectBeatGrid, detectBpm } = await import('./bpm');
+  const grid = detectBeatGrid(envelope, ENVELOPE_RATE);
+  if (grid) return { peaks, bpm: grid.bpm, gridOffset: grid.gridOffset };
+  // Fallback: coarse integer BPM from the display peaks, no grid phase.
+  return { peaks, bpm: detectBpm(peaks, PEAKS_PER_SECOND), gridOffset: null };
 }

@@ -126,8 +126,17 @@ export function audioRecordStop(): Promise<void> {
 
 // ── Waveform analysis ─────────────────────────────────────────────────────────
 
-/** Decode audio in Rust and return peak amplitudes at 30/sec. Avoids decodeAudioData
- *  which triggers vaav1dec on video+audio containers in WebKitGTK. */
-export function audioAnalyzeFile(filePath: string): Promise<number[]> {
+/** Mirrors `AnalysisData` in analysis.rs. */
+export interface AudioAnalysisData {
+  /** Peak amplitude per 1/30 s chunk (waveform display). */
+  peaks: number[];
+  /** RMS amplitude per 1/210 s hop (beat-grid onset detection). */
+  envelope: number[];
+}
+
+/** Decode audio in Rust and return waveform peaks (30/s) plus a beat-grid RMS
+ *  envelope (210/s). Avoids decodeAudioData which triggers vaav1dec on
+ *  video+audio containers in WebKitGTK. */
+export function audioAnalyzeFile(filePath: string): Promise<AudioAnalysisData> {
   return invoke("audio_analyze_file", { filePath });
 }

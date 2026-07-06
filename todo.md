@@ -1,5 +1,117 @@
 # todo
 
+## Beat grid + snap-to-beat — handoff spec
+
+Goal: snap to a shared grid of beats between two songs so beat matching is easy and
+drift is handled by an occasional one-tap re-sync. Step 1 (the algorithmic core) is
+done; steps 2–5 below are specced for implementation and are deliberately mechanical.
+
+### Step 1 — Fractional BPM + automatic beat-grid fit [done, 2026-07-05]
+
+What now exists (context for the remaining steps):
+
+- `audio_analyze_file` returns `{ peaks: number[], envelope: number[] }`
+  (`AnalysisData` in `analysis.rs`): 30/s display peaks + 210/s RMS envelope,
+  computed in one decode pass. **`ENVELOPE_RATE = 210` is declared in both
+  `analysis.rs` and `waveform.ts` and must stay in sync** (210 divides 44100
+  exactly, so envelope index → time has no cumulative rounding drift).
+- `detectBeatGrid(envelope, envelopeRate)` in `bpm.ts` returns
+  `{ bpm, gridOffset, confidence } | null`:
+  - `bpm` is **fractional** (rounded to 0.01) — the old integer quantization was
+    the dominant drift source (128 vs true 127.6 = one beat of drift per ~2.5 min).
+  - `gridOffset` is a **beat-level** anchor in `[0, 60/bpm)`: a beat lies at
+    `gridOffset + k·(60/bpm)`. It is NOT bar-beat-1 — all current consumers
+    (`getPhase`, phase nudge) work mod one beat, so bar identity doesn't matter.
+  - Algorithm: log-domain onset detection with parabolic sub-sample timing →
+    pairwise-IOI histogram with a 120-BPM log-normal prior (coarse integer
+    candidate) → comb/Fourier scan `S(f) = Σ wⱼ·exp(2πi·f·tⱼ)` over ±3% around
+    the candidate *and its in-range octaves* (|S| collapses at the half tempo,
+    which both repairs octave mistakes and gates bad fits via
+    `confidence = |S|/Σw ≥ 0.15`). Comb weights are **linear** envelope rises
+    (kick ≫ hat) even though detection is logarithmic — see comments in `bpm.ts`.
+  - Old integer `detectBpm(peaks)` retained as the fallback when the fit fails.
+- On every track load, `App.svelte` auto-populates `deck.bpm` **and**
+  `deck.downbeat` from the fit (this also clears a stale downbeat carried over
+  from the previous track). SET BEAT remains a manual override.
+- Tests: `npm test` → `src/lib/audio/bpm.test.ts` (synthetic click envelopes with
+  fractional ground truth; tolerances ±0.05 BPM / ±20 ms phase — keep them tight,
+  "plausible but 0.2% off" is the exact failure mode this feature exists to kill).
+  Rust smoke test: `cd src-tauri && cargo test analysis_rates`.
+
+### Step 2 — Beat grid rendering in WaveformCanvas
+
+- In `drawZoom()`: when `deck.bpm !== null && deck.downbeat !== null`, draw beat
+  lines instead of the current 1-second ticks (keep the second-ticks fallback when
+  no grid). Beat times: `t = downbeat + k·(60/bpm)` for all k with t in
+  [timeStart, timeEnd]; x via the existing `timeToX`. Make every 4th beat
+  (`k % 4 === 0`) brighter/taller — e.g. `rgba(255,255,255,0.25)` vs `(0.10)`.
+- Overview mode: skip the grid (too dense); at most draw the downbeat anchor.
+- Both decks' zoom views already pin the playhead at the same 25% x-position
+  (`ZOOM_LEAD_RATIO`), so once beat lines exist, beat matching = visually lining
+  up verticals across the two waveforms. That's the payoff of this step.
+- Perf: this is inside the playing-deck RAF redraw — batch lines into two
+  `beginPath()` passes (normal, accented), no per-line style changes.
+  Run `scripts/perf-idle-test.sh` after (WaveformCanvas is on its watch list).
+
+### Step 3 — Sync path correctness fixes
+
+1. **Rate-then-seek ordering** (violates the documented CLAUDE.md rule; can make
+   Sync silently not take): `handler.ts` `sync_toggle` and DeckCard's Sync button
+   both set `playbackRate` and then seek immediately. Fix by doing the phase-align
+   seek FIRST, then the rate change — the phase delta is computed in content time,
+   so it's valid regardless of which order is applied, and seek-first avoids the
+   WebKit-rebuild race entirely.
+2. **`phaseNudge.ts` `applyRate()` must call `syncRate()`** (from `audioSync.ts`)
+   instead of `audioSetRate()` directly — currently the rateMap goes stale and the
+   `App.svelte` `$effect` fires a duplicate `audio_set_rate` IPC per nudge edge.
+3. **Unify `sync_toggle`'s inline phase-align block with `nudgePhaseToMaster`** —
+   `handler.ts` duplicates the shortest-arc logic and hard-seeks even while
+   playing (audible jump); the UI path rate-spikes. Call `nudgePhaseToMaster`
+   from the MIDI path (mind fix #1's ordering).
+4. Optional, verify live: make nudges **audio-only** — don't write
+   `deck.playbackRate` (and thus `v.playbackRate`) for the ±15% spike; let the
+   existing 80 ms audio-clock snap pull the video back after. Avoids two WebKit
+   pipeline rebuilds per nudge. Run `scripts/latency-test.sh` after touching this.
+
+### Step 4 — Quantize / snap-to-beat
+
+- `Session.snapToBeat: boolean` (default false) + setter in `session.ts` + a
+  "SNAP" toolbar toggle in `App.svelte`.
+- Helper (suggested: `seekBus.ts`): `quantizeToGrid(deckId, t): number` — returns
+  `max(0, downbeat + round((t − downbeat) / T) · T)` when snap is on and the deck
+  has bpm+downbeat; otherwise returns `t` unchanged.
+- Apply at the CALLERS, not inside `seekDeck()` (the nudge code needs raw seeks):
+  waveform click-to-seek, hot-cue jump + hot-cue set (both DeckCard and
+  `handler.ts`), loop IN/OUT stamping. Snapping loop points to beats is what makes
+  the bar-length loop buttons land exactly on musical boundaries.
+- Optional: snap SET BEAT to the nearest detected onset (needs keeping the onset
+  list from analysis around) — fixes ~50–100 ms human button latency. Do NOT snap
+  SET BEAT to the existing grid (that would make it unable to correct the grid).
+
+### Step 5 — Grid persistence
+
+- Digger side (`~/repos/digger`, see `digger-integration` skill): add `bpm`
+  (float) and `downbeat` (float seconds) to the `GET /tracks/{id}/cuemark`
+  response and the planned `POST /tracks/{id}/markers` write-back. Requires
+  cuemark to remember which Digger track id is on each deck (also needed by the
+  existing "Push markers to Digger" todo below).
+- Local fallback for non-Digger loads: JSON sidecar in the app data dir
+  (e.g. `~/.local/share/com.cuemark.app/grids.json`) keyed by absolute file path
+  → `{ bpm, downbeat }`. Load before analysis completes; save on SET BEAT /
+  manual bpm change.
+- Precedence on track load: saved grid > auto-fit > integer fallback.
+
+### Known limitations (by design — don't "fix" these)
+
+- Constant-tempo model: one bpm + one offset per track. Right for electronic /
+  dance material; live-drummer recordings will drift regardless — the NUDGE
+  workflow is the answer there, not a variable beat map.
+- Beat-level anchor, not bar-level. Phrase-aligned mixing would need bar
+  detection or a SET BEAT convention; nothing currently consumes bar identity.
+- Tempo prior centered at 120 BPM (σ 0.4 log) resolves octave ties toward
+  danceable tempo; genuinely ambiguous material (sparse 64 BPM downtempo) may
+  come back as 128 — harmless for sync if both decks get consistent treatment.
+
 ## Beat phase tracking + phase nudge
 
 ### Step 1 — Downbeat anchor in the data model [done]

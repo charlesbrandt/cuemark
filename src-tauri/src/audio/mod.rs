@@ -222,16 +222,16 @@ pub fn audio_record_stop(state: State<'_, AudioState>) -> Result<(), String> {
     state.lock().unwrap().record.stop()
 }
 
-/// Compute waveform peaks for a file entirely in Rust, bypassing WebKit's
-/// `decodeAudioData` path which triggers vaav1dec on video+audio containers
-/// and corrupts VA-API driver state.
+/// Compute waveform peaks (30/s) and beat-grid RMS envelope (210/s) for a file
+/// entirely in Rust, bypassing WebKit's `decodeAudioData` path which triggers
+/// vaav1dec on video+audio containers and corrupts VA-API driver state.
 ///
 /// Async so the Tauri IPC thread is not blocked during the full-file GStreamer decode.
-/// `spawn_blocking` runs compute_peaks on a dedicated OS thread so it doesn't starve
+/// `spawn_blocking` runs compute_analysis on a dedicated OS thread so it doesn't starve
 /// the async executor.
 #[tauri::command]
-pub async fn audio_analyze_file(file_path: String) -> Result<Vec<f32>, String> {
-    tauri::async_runtime::spawn_blocking(move || analysis::compute_peaks(&file_path))
+pub async fn audio_analyze_file(file_path: String) -> Result<analysis::AnalysisData, String> {
+    tauri::async_runtime::spawn_blocking(move || analysis::compute_analysis(&file_path))
         .await
         .map_err(|e| e.to_string())?
 }

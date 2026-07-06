@@ -5,10 +5,13 @@
 
   let {
     deck,
-    onBpmDetected,
+    onAnalyzed,
   }: {
     deck: Deck;
-    onBpmDetected?: (bpm: number | null) => void;
+    // Fired once per track load when analysis completes. gridOffset is a
+    // beat-level anchor (a beat lies at gridOffset + k·60/bpm), or null when
+    // the beat-grid fit failed and bpm is the integer fallback estimate.
+    onAnalyzed?: (result: { bpm: number | null; gridOffset: number | null }) => void;
   } = $props();
 
   let canvas = $state<HTMLCanvasElement | null>(null);
@@ -38,7 +41,7 @@
       if (analyzedPath === filePath) {
         peaks = result.peaks;
         loading = false;
-        onBpmDetected?.(result.bpm);
+        onAnalyzed?.({ bpm: result.bpm, gridOffset: result.gridOffset });
       }
     }).catch((err) => {
       console.warn('[waveform] analysis failed:', err);
