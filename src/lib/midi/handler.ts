@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { updateDeck, getDeck, setCrossfader, setMasterVolume, session } from "../state/session";
-import { seekDeck, getDeckTime, getPhase } from "../renderer/seekBus";
+import { seekDeck, getDeckTime } from "../renderer/seekBus";
 import { nudgePhaseToMaster } from "../audio/phaseNudge";
 import { syncRate, syncGain, syncVolume } from "../audio/audioSync";
 import { cueGain, tempoRange } from "../audio/audioSettings";
@@ -201,25 +201,9 @@ export async function startMidiListener(): Promise<() => void> {
         }
         updateDeck(d.id, { playbackRate: masterBpm / d.bpm });
 
-        if (d.downbeat !== null) {
-          const ref = s.decks.find(r => r.id !== d.id && r.bpm !== null && r.downbeat !== null);
-          if (ref) {
-            const deckPhase = getPhase(d.id);
-            const refPhase  = getPhase(ref.id);
-            if (deckPhase !== null && refPhase !== null) {
-              let delta = refPhase - deckPhase;
-              if (delta >  0.5) delta -= 1.0;
-              if (delta < -0.5) delta += 1.0;
-              if (Math.abs(delta) >= 0.02) {
-                const beatPeriod = 60 / d.bpm;
-                const currentTime = getDeckTime(d.id);
-                if (currentTime !== null) {
-                  seekDeck(d.id, Math.max(0, currentTime + delta * beatPeriod));
-                }
-              }
-            }
-          }
-        }
+        // Wait for WebKit's video-pipeline rebuild (triggered by the playbackRate write
+        // above) to settle before seeking — see CLAUDE.md "Rate-then-seek ordering".
+        setTimeout(() => nudgePhaseToMaster(d.id), 200);
         break;
       }
       case "headphone_cue": {

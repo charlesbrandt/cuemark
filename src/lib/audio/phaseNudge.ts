@@ -1,7 +1,7 @@
 import { get } from 'svelte/store';
-import { session, updateDeck, getDeck } from '../state/session';
+import { session, getDeck } from '../state/session';
 import { getPhase, getDeckTime, seekDeck } from '../renderer/seekBus';
-import { audioSetRate } from './pipeline';
+import { syncRate } from './audioSync';
 
 const NUDGE_MAGNITUDE = 0.15; // ±15% rate change while nudge is active
 
@@ -13,9 +13,10 @@ interface NudgeState {
 
 const activeNudges = new Map<string, NudgeState>();
 
+// Audio-only: skip the store write so the spike/revert doesn't trigger App.svelte's
+// $effect → v.playbackRate → WebKit pipeline rebuild (twice per nudge otherwise).
 function applyRate(deckId: string, rate: number) {
-  updateDeck(deckId, { playbackRate: rate });
-  audioSetRate(deckId, rate).catch(console.error);
+  syncRate(deckId, rate);
 }
 
 function scheduleRevert(deckId: string, restoreRate: number, durationMs: number) {

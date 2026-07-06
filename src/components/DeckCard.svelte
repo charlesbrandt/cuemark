@@ -230,7 +230,9 @@
       onclick={() => {
         if (deck.bpm !== null && masterBpm !== null) {
           updateDeck(deck.id, { playbackRate: masterBpm / deck.bpm });
-          nudgePhaseToMaster(deck.id);
+          // Wait for WebKit's video-pipeline rebuild (triggered by the playbackRate
+          // write above) to settle before seeking — see CLAUDE.md "Rate-then-seek ordering".
+          setTimeout(() => nudgePhaseToMaster(deck.id), 200);
         }
       }}
       disabled={deck.bpm === null || masterBpm === null}
