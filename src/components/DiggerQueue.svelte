@@ -115,16 +115,22 @@
       }
       const payload = await getCuemarkPayload(item.track_id);
       if (!payload.filePath) { error = 'No local file for this track'; return; }
+      // Digger's API omits bpm/downbeat entirely when unset rather than sending JSON
+      // `null`, which deserializes as `undefined` — normalize here so the rest of the
+      // app (which only ever checks `!== null`, matching the Deck type) never sees
+      // `undefined` and crashes on e.g. `deck.bpm.toFixed()`.
+      const bpm = payload.bpm ?? null;
+      const downbeat = payload.downbeat ?? null;
       // Only apply bpm/downbeat as a pair — a downbeat is only meaningful relative to
       // the bpm it was set against, so a partial grid would produce an inconsistent one.
-      const hasGrid = payload.bpm !== null && payload.downbeat !== null;
+      const hasGrid = bpm !== null && downbeat !== null;
       updateDeck(deckId, {
         source: { type: 'video', filePath: payload.filePath, duration: 0 },
         playing: false,
         cuePoint: payload.cuePoint ?? 0,
         hotCues: payload.hotCues ?? [],
         diggerTrackId: item.track_id,
-        ...(hasGrid ? { bpm: payload.bpm, downbeat: payload.downbeat } : {}),
+        ...(hasGrid ? { bpm, downbeat } : {}),
       });
       // Synchronous with updateDeck above, so this lands before App.svelte's rAF-deferred
       // syncVideoElements next inspects this deck — see gridSource.ts race-ordering note.
