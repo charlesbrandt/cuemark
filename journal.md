@@ -1214,3 +1214,72 @@ exact failure mode this feature exists to eliminate.
 Beat-line rendering in the zoom waveform, sync-path ordering fixes (rate-then-seek
 violations in sync_toggle and the Sync button; phaseNudge bypassing syncRate), the SNAP
 quantize toggle, and grid persistence via Digger + local sidecar.
+
+# 2026.07.06 — Live verification of the full beat-grid feature (steps 2-5) via headless run
+
+## Context
+
+Steps 2-5 of the beat-grid/snap-to-beat feature (rendering, sync-path fixes, quantize,
+persistence — see prior entry and todo.md) were implemented and unit-tested across a
+series of orchestrated subagent dispatches, each verified only via `npm run check`/
+`npm test`/`cargo check` and manual diff review — none of it had been driven in the
+actual running app. This session did that, via the `verify-ui` skill (tauri-driver +
+Xvfb + the `VITE_ENABLE_DEBUG_HOOK` build), using two synthetic click-track WAVs
+generated with `ffmpeg`'s `volume` filter gated by a `mod(t, period)` expression —
+one at 123.4 BPM, one at the same tempo phase-shifted ~0.286s — to get files with known
+ground-truth fractional BPM and phase without needing real music on hand.
+
+## What verified clean on the first pass
+
+- **Fractional BPM fit (step 1)**: both decks detected 123.39/123.41 BPM against a
+  123.4 target, and the phase difference between the two files' detected downbeats
+  matched the engineered ~0.286s offset to within 3ms.
+- **Beat-grid rendering (step 2)**: extracted the waveform `<canvas>`'s raw pixel data
+  via `toDataURL()` (rather than trusting a full-window screenshot) and sampled pixel
+  luminance at the mathematically predicted beat x-positions — confirmed grid lines at
+  the correct pixel columns, with every-4th-beat accent columns measurably brighter
+  than their neighbors, and both aligned with the actual audio-click waveform bumps.
+- **Snap-to-beat (step 4)**: clicking the SNAP toolbar button flips `session.snapToBeat`
+  live; with it on, a waveform click at an arbitrary pixel (ratio 0.63) produced a seek
+  landing on beat k=3 to 1e-10s precision; with it off, an equivalent click landed at a
+  non-integer beat fraction (k≈6.78) as expected.
+- **Local sidecar persistence (step 5a)**: SET BEAT wrote a real `grids.json` to
+  `~/.local/share/com.cuemark.app/`, keyed by absolute file path, with the correct
+  bpm/downbeat pair; a direct `window.__TAURI__.core.invoke('grid_get_saved', ...)`
+  confirmed the Rust command reads it back correctly.
+
+## Bug found and fixed: stale grid-trust flag across track reloads
+
+Tracing a realistic sequence — load track A (has a saved grid) → load a different
+track B (no saved grid) → reload A — showed deck-0 getting stuck on **B's** leftover
+bpm/downbeat instead of re-fetching A's real saved grid. Root cause: `gridSource.ts`'s
+`(deckId, filePath)` trust map (added in the Digger-integration step to fix an earlier,
+cruder deckId-only version) is write-only — nothing ever clears an entry when a
+*different*, ungridded file loads on top of it. So the stale `deck-0 → A` entry
+survived B's load untouched, and when A came back around, the exact-match check
+(correctly, on its own terms) said "already trusted," skipping the lookup that would
+have re-applied A's real values — while A's in-memory bpm/downbeat had long since been
+overwritten by B's auto-fit, with nothing left to trigger a re-check.
+
+This directly undermines the feature for an ordinary workflow (preview a second track,
+then switch back to the one you were beat-matching). The original code comment even
+claimed "no explicit clear is needed" — confirmed wrong by this test, not just an
+oversight. Fix (`App.svelte`): `clearSavedGrid(deck.id)` whenever a new source's path
+does *not* match the trusted one, so an intervening ungridded load correctly invalidates
+old trust instead of leaving it to coincidentally reactivate later. Re-ran the exact
+A→B→A sequence against a rebuilt binary — reload now correctly re-fetches A's saved
+grid (123.39 BPM / 3.309s downbeat) instead of inheriting B's.
+
+## Not exercised this session
+
+Digger round-trip (step 5b) — would need a running Digger instance (docker-compose);
+the underlying trust-flag mechanism it shares with the local-sidecar path was proven
+correct by the fix above, but the actual `PATCH`/`POST` calls to a live Digger weren't
+driven end-to-end. Sync/Nudge/Master buttons and playback (audio actually advancing)
+also weren't exercised in this pass — scope was the beat-grid/persistence surface.
+
+## Files touched
+
+| File | Change |
+|---|---|
+| `src/App.svelte` | `clearSavedGrid(deck.id)` added on the path-mismatch branch of the new-source handler — fixes the stale-trust bug above |
