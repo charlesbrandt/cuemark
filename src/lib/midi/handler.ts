@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { updateDeck, getDeck, setCrossfader, setMasterVolume, session } from "../state/session";
-import { seekDeck, getDeckTime } from "../renderer/seekBus";
+import { seekDeck, getDeckTime, quantizeToGrid } from "../renderer/seekBus";
 import { nudgePhaseToMaster } from "../audio/phaseNudge";
 import { syncRate, syncGain, syncVolume } from "../audio/audioSync";
 import { cueGain, tempoRange } from "../audio/audioSettings";
@@ -156,7 +156,7 @@ export async function startMidiListener(): Promise<() => void> {
         const d = getDeck(deckId);
         if (!d) break;
         const t = d.hotCues[a.index];
-        if (t !== undefined && !isNaN(t)) seekDeck(d.id, t);
+        if (t !== undefined && !isNaN(t)) seekDeck(d.id, quantizeToGrid(d.id, t));
         break;
       }
       case "hot_cue_set": {
@@ -166,7 +166,7 @@ export async function startMidiListener(): Promise<() => void> {
         const now = getDeckTime(deckId);
         if (now !== null) {
           const cues = [...d.hotCues];
-          cues[a.index] = now;
+          cues[a.index] = quantizeToGrid(d.id, now);
           updateDeck(d.id, { hotCues: cues });
         }
         break;

@@ -73,3 +73,14 @@ export function getPhase(deckId: string): number | null {
   const raw = (t - deck.downbeat) / beatPeriod;
   return ((raw % 1) + 1) % 1; // always [0, 1) even when t < downbeat
 }
+
+// Quantizes t to the nearest beat on deck's grid when snapToBeat is on and the
+// deck has a fitted grid (bpm + downbeat); otherwise returns t unchanged.
+export function quantizeToGrid(deckId: string, t: number): number {
+  if (!get(session).snapToBeat) return t;
+  const deck = get(session).decks.find((d) => d.id === deckId);
+  if (!deck || deck.bpm === null || deck.downbeat === null) return t;
+  const period = 60 / deck.bpm;
+  const k = Math.round((t - deck.downbeat) / period);
+  return Math.max(0, deck.downbeat + k * period);
+}

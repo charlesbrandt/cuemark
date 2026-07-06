@@ -1,7 +1,7 @@
 <script lang="ts">
   import { open } from "@tauri-apps/plugin-dialog";
   import { session, updateDeck, removeDeck, setMasterBpm } from "../lib/state/session";
-  import { seekDeck, getDeckTime, getPhase, getVideoEl } from "../lib/renderer/seekBus";
+  import { seekDeck, getDeckTime, getPhase, getVideoEl, quantizeToGrid } from "../lib/renderer/seekBus";
   import { nudgePhaseToMaster } from "../lib/audio/phaseNudge";
   import { tempoRange } from "../lib/audio/audioSettings";
   import type { Deck } from "../lib/state/types";
@@ -283,7 +283,7 @@
       onclick={() => {
         const t = getDeckTime(deck.id);
         if (t !== null) {
-          updateDeck(deck.id, { loopIn: t });
+          updateDeck(deck.id, { loopIn: quantizeToGrid(deck.id, t) });
         }
       }}
       title="Set loop-in point at current position"
@@ -296,7 +296,7 @@
       onclick={() => {
         const t = getDeckTime(deck.id);
         if (t !== null) {
-          updateDeck(deck.id, { loopOut: t });
+          updateDeck(deck.id, { loopOut: quantizeToGrid(deck.id, t) });
         }
       }}
       title="Set loop-out point at current position"
@@ -310,7 +310,7 @@
         class="bar-btn"
         onclick={() => {
           if (barSec === null) return;
-          const inTime = deck.loopIn ?? getDeckTime(deck.id) ?? 0;
+          const inTime = deck.loopIn ?? quantizeToGrid(deck.id, getDeckTime(deck.id) ?? 0);
           updateDeck(deck.id, { loopIn: inTime, loopOut: inTime + barSec, loop: true });
         }}
         disabled={barSec === null || !deck.source}
@@ -340,12 +340,12 @@
         class:set={isSet}
         onclick={(e) => {
           if (isSet && !e.shiftKey) {
-            seekDeck(deck.id, t);
+            seekDeck(deck.id, quantizeToGrid(deck.id, t));
           } else {
             const now = getDeckTime(deck.id);
             if (now !== null) {
               const cues = [...deck.hotCues];
-              cues[i] = now;
+              cues[i] = quantizeToGrid(deck.id, now);
               updateDeck(deck.id, { hotCues: cues });
             }
           }

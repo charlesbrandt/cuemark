@@ -1,6 +1,6 @@
 <script lang="ts">
   import { analyzeFile, COLOR_UPCOMING, COLOR_PLAYED } from '../lib/audio/waveform';
-  import { seekDeck, getDeckTime } from '../lib/renderer/seekBus';
+  import { seekDeck, getDeckTime, quantizeToGrid } from '../lib/renderer/seekBus';
   import type { Deck } from '../lib/state/types';
 
   let {
@@ -385,9 +385,9 @@
       const currentTime = getDeckTime(deck.id) ?? 0;
       const timeStart = currentTime - zoomSeconds * ZOOM_LEAD_RATIO;
       const t = timeStart + ratio * zoomSeconds;
-      seekDeck(deck.id, Math.max(0, Math.min(duration, t)));
+      seekDeck(deck.id, Math.max(0, Math.min(duration, quantizeToGrid(deck.id, t))));
     } else {
-      seekDeck(deck.id, ratio * duration);
+      seekDeck(deck.id, Math.max(0, Math.min(duration, quantizeToGrid(deck.id, ratio * duration))));
     }
   }
 

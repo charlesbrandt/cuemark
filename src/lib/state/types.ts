@@ -71,6 +71,7 @@ export interface Session {
   crossfaderTargets: CrossfaderTarget[]; // which deck properties the crossfader drives
   audioCurve: CrossfaderCurve;
   visualCurve: CrossfaderCurve;
+  snapToBeat: boolean;    // when true, seek/cue/loop actions quantize to the nearest beat
   effects: Effect[];      // global post-process chain
   visualization: Visualization | null; // global layer, composited above all decks
   visualizationOpacity: number;        // 0–1 — how it blends over the deck output

@@ -32,6 +32,7 @@ const initial: Session = {
   crossfaderTargets: ["opacity", "volume"],
   audioCurve: "equal-power",
   visualCurve: "linear",
+  snapToBeat: false,
   effects: [],
   visualization: null,
   visualizationOpacity: 0.5,
@@ -124,6 +125,10 @@ export function setCrossfaderVisualCurve(curve: CrossfaderCurve) {
 
 export function setMasterBpm(bpm: number | null) {
   session.update((s) => ({ ...s, bpm }));
+}
+
+export function setSnapToBeat(value: boolean) {
+  session.update((s) => ({ ...s, snapToBeat: value }));
 }
 
 export function setMidiMapping(left: string, right: string) {

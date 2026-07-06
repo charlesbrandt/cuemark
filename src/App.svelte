@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { get } from "svelte/store";
-  import { session, addDeck, removeDeck, updateDeck, setMasterBpm, setMasterVolume, setCrossfader, setVisualization, setVisualizationOpacity } from "./lib/state/session";
+  import { session, addDeck, removeDeck, updateDeck, setMasterBpm, setMasterVolume, setCrossfader, setVisualization, setVisualizationOpacity, setSnapToBeat } from "./lib/state/session";
   import VisualizationPanel from "./components/VisualizationPanel.svelte";
   import { tapTempo } from "./lib/audio/bpm";
   import { startMidiListener } from "./lib/midi/handler";
@@ -605,6 +605,12 @@
       class:active={showVisualizationPanel}
       onclick={() => { showVisualizationPanel = !showVisualizationPanel; }}
     >Visualization</button>
+    <button
+      class="output-btn"
+      class:active={$session.snapToBeat}
+      onclick={() => setSnapToBeat(!$session.snapToBeat)}
+      title="Snap seeks, hot cues, and loop points to the nearest beat"
+    >SNAP</button>
     <span class="bpm">{$session.bpm !== null ? `${$session.bpm.toFixed(1)} BPM` : "—"}</span>
     <button class="tap-btn" onclick={handleTap}>TAP</button>
     {#if $session.bpm !== null}
