@@ -12,7 +12,7 @@
     audioSeek, audioSetCue, audioSetMasterVolume, audioSetMainDevices,
     audioSetCueDevice, audioSetCueGain, gridGetSaved,
   } from "./lib/audio/pipeline";
-  import { markGridSaved, hasSavedGrid } from "./lib/audio/gridSource";
+  import { clearSavedGrid, markGridSaved, hasSavedGrid } from "./lib/audio/gridSource";
   import { syncRate, syncGain, syncVolume, clearDeckAudioSync } from "./lib/audio/audioSync";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { listen } from "@tauri-apps/api/event";
@@ -406,10 +406,14 @@
         console.log(`[${deck.id}] setting src:`, src);
         v.src = src;
         v.load();
-        // hasSavedGrid is now keyed by (deckId, filePath) — a flag left over from a
-        // previously loaded, different file on this deck simply won't match filePath,
-        // so no explicit clear is needed before checking it for the new file.
         if (!hasSavedGrid(deck.id, filePath)) {
+          // The trust map is write-only (markGridSaved never gets an automatic clear) —
+          // if we don't invalidate it here, loading track A (saved grid) then track B
+          // (no saved grid) then track A again would find the map still saying "deck-0
+          // is trusted for A" from the first load, skip this lookup, and leave A's
+          // bpm/downbeat frozen at whatever B's auto-fit last wrote. Confirmed live via
+          // /run: reloading A after visiting B silently inherited B's grid.
+          clearSavedGrid(deck.id);
           // Race-free vs. the auto-fit in the WaveformCanvas onAnalyzed callback below:
           // this lookup's updateDeck is UNCONDITIONAL (always wins, whenever it resolves,
           // even overwriting an auto-fit that already landed), while the auto-fit's
