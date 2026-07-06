@@ -256,18 +256,22 @@
       ctx.fillRect(Math.floor(x), mid - h, Math.max(1, Math.ceil(barW)), h * 2);
     }
 
-    // Tick marks every second (longer ticks every 4s)
-    ctx.lineWidth = 1;
-    const firstTick = Math.ceil(Math.max(0, timeStart));
-    const lastTick = Math.floor(Math.min(duration, timeEnd));
-    for (let t = firstTick; t <= lastTick; t++) {
-      const x = ((t - timeStart) / zoomSeconds) * W;
-      const tickH = t % 4 === 0 ? mid * 0.35 : mid * 0.15;
-      ctx.strokeStyle = t % 4 === 0 ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.08)';
-      ctx.beginPath();
-      ctx.moveTo(x, mid - tickH);
-      ctx.lineTo(x, mid + tickH);
-      ctx.stroke();
+    if (deck.bpm !== null && deck.downbeat !== null) {
+      drawBeatGrid(ctx, W, mid, timeStart, timeEnd, deck.bpm, deck.downbeat);
+    } else {
+      // Tick marks every second (longer ticks every 4s)
+      ctx.lineWidth = 1;
+      const firstTick = Math.ceil(Math.max(0, timeStart));
+      const lastTick = Math.floor(Math.min(duration, timeEnd));
+      for (let t = firstTick; t <= lastTick; t++) {
+        const x = ((t - timeStart) / zoomSeconds) * W;
+        const tickH = t % 4 === 0 ? mid * 0.35 : mid * 0.15;
+        ctx.strokeStyle = t % 4 === 0 ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.08)';
+        ctx.beginPath();
+        ctx.moveTo(x, mid - tickH);
+        ctx.lineTo(x, mid + tickH);
+        ctx.stroke();
+      }
     }
 
     drawMarkers(ctx, W, H, (t) => ((t - timeStart) / zoomSeconds) * W);
@@ -278,6 +282,48 @@
     ctx.beginPath();
     ctx.moveTo(playheadX, 0);
     ctx.lineTo(playheadX, H);
+    ctx.stroke();
+  }
+
+  function drawBeatGrid(
+    ctx: CanvasRenderingContext2D,
+    W: number, mid: number,
+    timeStart: number, timeEnd: number,
+    bpm: number, downbeat: number
+  ) {
+    const period = 60 / bpm;
+    const kStart = Math.ceil((timeStart - downbeat) / period);
+    const kEnd = Math.floor((timeEnd - downbeat) / period);
+
+    const normalH = mid * 0.15;
+    const accentH = mid * 0.4;
+    let normalPath: number[] = [];
+    let accentPath: number[] = [];
+
+    for (let k = kStart; k <= kEnd; k++) {
+      const t = downbeat + k * period;
+      const x = ((t - timeStart) / zoomSeconds) * W;
+      // k can be negative (downbeat is just one reference beat, not beat 0) —
+      // JS's % keeps the sign of the dividend, so -4 % 4 === -0, not 0.
+      const isAccent = ((k % 4) + 4) % 4 === 0;
+      (isAccent ? accentPath : normalPath).push(x);
+    }
+
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.beginPath();
+    for (const x of normalPath) {
+      ctx.moveTo(x, mid - normalH);
+      ctx.lineTo(x, mid + normalH);
+    }
+    ctx.stroke();
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx.beginPath();
+    for (const x of accentPath) {
+      ctx.moveTo(x, mid - accentH);
+      ctx.lineTo(x, mid + accentH);
+    }
     ctx.stroke();
   }
 
