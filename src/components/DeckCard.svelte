@@ -5,6 +5,8 @@
   import { nudgePhaseToMaster } from "../lib/audio/phaseNudge";
   import { tempoRange } from "../lib/audio/audioSettings";
   import { gridSave } from "../lib/audio/pipeline";
+  import { pushMarker, setTrackBpm } from "../lib/digger/api";
+  import { markGridSaved } from "../lib/audio/gridSource";
   import type { Deck } from "../lib/state/types";
 
   let { deck }: { deck: Deck } = $props();
@@ -251,6 +253,12 @@
           updateDeck(deck.id, { downbeat: t });
           if (deck.bpm !== null && deck.source?.type === 'video') {
             gridSave(deck.source.filePath, deck.bpm, t).catch(console.error);
+            markGridSaved(deck.id, deck.source.filePath);
+            if (deck.diggerTrackId !== null) {
+              // Best-effort — Digger being unreachable shouldn't block the local save.
+              pushMarker(deck.diggerTrackId, Math.round(t * 1000), 'downbeat').catch(console.error);
+              setTrackBpm(deck.diggerTrackId, deck.bpm).catch(console.error);
+            }
           }
         }
       }}

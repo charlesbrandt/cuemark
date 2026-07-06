@@ -26,6 +26,8 @@ export interface CuemarkPayload {
   filePath: string;
   cuePoint: number | null;
   hotCues: number[];
+  bpm: number | null;
+  downbeat: number | null;
 }
 
 const STORAGE_KEY = 'cuemark:diggerBaseUrl';
@@ -151,7 +153,7 @@ export function subscribeQueueChanges(onChange: () => void): () => void {
 export async function pushMarker(
   trackId: number,
   positionMs: number,
-  type: 'cue' | 'hot_cue' = 'cue',
+  type: 'cue' | 'hot_cue' | 'downbeat' = 'cue',
   label?: string,
 ): Promise<void> {
   const r = await fetch(`${_baseUrl}/tracks/${trackId}/markers`, {
@@ -160,4 +162,13 @@ export async function pushMarker(
     body: JSON.stringify({ position_ms: positionMs, type, label: label ?? null }),
   });
   if (!r.ok) throw new Error(`push marker ${r.status}`);
+}
+
+export async function setTrackBpm(trackId: number, bpm: number): Promise<void> {
+  const r = await fetch(`${_baseUrl}/tracks/${trackId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ bpm }),
+  });
+  if (!r.ok) throw new Error(`set bpm ${r.status}`);
 }

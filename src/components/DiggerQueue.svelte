@@ -9,6 +9,7 @@
     subscribeQueueChanges,
     type DiggerTrack, type DiggerQueueItem,
   } from '../lib/digger/api';
+  import { markGridSaved } from '../lib/audio/gridSource';
 
   let queue = $state<DiggerQueueItem[]>([]);
   let searchResults = $state<DiggerTrack[]>([]);
@@ -114,12 +115,20 @@
       }
       const payload = await getCuemarkPayload(item.track_id);
       if (!payload.filePath) { error = 'No local file for this track'; return; }
+      // Only apply bpm/downbeat as a pair — a downbeat is only meaningful relative to
+      // the bpm it was set against, so a partial grid would produce an inconsistent one.
+      const hasGrid = payload.bpm !== null && payload.downbeat !== null;
       updateDeck(deckId, {
         source: { type: 'video', filePath: payload.filePath, duration: 0 },
         playing: false,
         cuePoint: payload.cuePoint ?? 0,
         hotCues: payload.hotCues ?? [],
+        diggerTrackId: item.track_id,
+        ...(hasGrid ? { bpm: payload.bpm, downbeat: payload.downbeat } : {}),
       });
+      // Synchronous with updateDeck above, so this lands before App.svelte's rAF-deferred
+      // syncVideoElements next inspects this deck — see gridSource.ts race-ordering note.
+      if (hasGrid) markGridSaved(deckId, payload.filePath);
     } catch (e) {
       error = String(e);
     }
