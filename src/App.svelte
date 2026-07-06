@@ -10,8 +10,9 @@
   import {
     audioLoad, audioUnload, audioPlay, audioPause,
     audioSeek, audioSetCue, audioSetMasterVolume, audioSetMainDevices,
-    audioSetCueDevice, audioSetCueGain,
+    audioSetCueDevice, audioSetCueGain, gridGetSaved,
   } from "./lib/audio/pipeline";
+  import { clearSavedGrid, markGridSaved, hasSavedGrid } from "./lib/audio/gridSource";
   import { syncRate, syncGain, syncVolume, clearDeckAudioSync } from "./lib/audio/audioSync";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { listen } from "@tauri-apps/api/event";
@@ -405,6 +406,20 @@
         console.log(`[${deck.id}] setting src:`, src);
         v.src = src;
         v.load();
+        clearSavedGrid(deck.id);
+        // Race-free vs. the auto-fit in the WaveformCanvas onAnalyzed callback below:
+        // this lookup's updateDeck is UNCONDITIONAL (always wins, whenever it resolves,
+        // even overwriting an auto-fit that already landed), while the auto-fit's
+        // updateDeck is CONDITIONAL on hasSavedGrid(deckId) still being false. So the
+        // final state is always the saved grid when one exists, regardless of which
+        // async call resolves first.
+        gridGetSaved(filePath).then((saved) => {
+          const s = get(session).decks.find((d) => d.id === deckId)?.source;
+          if (saved && s?.type === 'video' && s.filePath === filePath) {
+            updateDeck(deckId, { bpm: saved.bpm, downbeat: saved.downbeat });
+            markGridSaved(deckId);
+          }
+        }).catch(console.error);
         // The <video> element's loadedmetadata never fires when WebKitGTK lacks a decoder
         // for the file's video codec (e.g. AV1/H264) — but the audio-only GStreamer pipeline
         // still decodes fine and knows the real duration. Use it as a fallback so the
@@ -651,7 +666,11 @@
             <!-- downbeat is auto-set from the beat-grid fit on every track load (beat-level
                  anchor; also clears a stale downbeat carried over from the previous track).
                  SET BEAT in DeckCard remains the manual override. -->
-            <WaveformCanvas {deck} onAnalyzed={({ bpm, gridOffset }) => updateDeck(deck.id, { bpm, downbeat: gridOffset })} />
+            <WaveformCanvas {deck} onAnalyzed={({ bpm, gridOffset }) => {
+              // A saved grid (sidecar or Digger) always wins over the auto-fit — see the
+              // race-ordering comment at the gridGetSaved() call site above.
+              if (!hasSavedGrid(deck.id)) updateDeck(deck.id, { bpm, downbeat: gridOffset });
+            }} />
           </div>
         {/each}
       </div>

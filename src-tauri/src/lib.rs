@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod grid_store;
 pub mod media_server;
 pub mod midi;
 pub mod midi_state;
@@ -95,6 +96,8 @@ pub fn run() {
             media_server_port,
             midi_state::midi_get_saved_state,
             midi_state::midi_benchmark_save,
+            grid_store::grid_get_saved,
+            grid_store::grid_save,
             audio::list_audio_devices,
             audio::audio_load,
             audio::audio_unload,

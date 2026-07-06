@@ -140,3 +140,20 @@ export interface AudioAnalysisData {
 export function audioAnalyzeFile(filePath: string): Promise<AudioAnalysisData> {
   return invoke("audio_analyze_file", { filePath });
 }
+
+// ── Grid persistence (local sidecar) ─────────────────────────────────────────
+
+export interface SavedGrid {
+  bpm: number;
+  downbeat: number;
+}
+
+/** Looks up a saved bpm/downbeat for this file path from the local JSON sidecar. */
+export function gridGetSaved(filePath: string): Promise<SavedGrid | null> {
+  return invoke("grid_get_saved", { filePath });
+}
+
+/** Persists a bpm/downbeat pair for this file path to the local JSON sidecar. */
+export function gridSave(filePath: string, bpm: number, downbeat: number): Promise<void> {
+  return invoke("grid_save", { filePath, bpm, downbeat });
+}

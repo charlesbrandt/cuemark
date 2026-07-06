@@ -4,6 +4,7 @@
   import { seekDeck, getDeckTime, getPhase, getVideoEl, quantizeToGrid } from "../lib/renderer/seekBus";
   import { nudgePhaseToMaster } from "../lib/audio/phaseNudge";
   import { tempoRange } from "../lib/audio/audioSettings";
+  import { gridSave } from "../lib/audio/pipeline";
   import type { Deck } from "../lib/state/types";
 
   let { deck }: { deck: Deck } = $props();
@@ -244,7 +245,15 @@
     </button>
     <button
       class="bpm-btn"
-      onclick={() => { const t = getDeckTime(deck.id); if (t !== null) updateDeck(deck.id, { downbeat: t }); }}
+      onclick={() => {
+        const t = getDeckTime(deck.id);
+        if (t !== null) {
+          updateDeck(deck.id, { downbeat: t });
+          if (deck.bpm !== null && deck.source?.type === 'video') {
+            gridSave(deck.source.filePath, deck.bpm, t).catch(console.error);
+          }
+        }
+      }}
       disabled={!deck.source}
       title="Stamp current position as beat 1 (downbeat anchor for phase tracking)"
     >
