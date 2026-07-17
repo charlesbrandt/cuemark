@@ -5,7 +5,7 @@
   import { session, updateDeck } from '../lib/state/session';
   import {
     search, randomTrack, getQueue, addToQueue, removeFromQueue, queueNext,
-    getCuemarkPayload, setDiggerBaseUrl, getDiggerBaseUrl, getDiggerWebUrl,
+    getCuemarkPayload, setDiggerBaseUrl, getDiggerBaseUrl, getDiggerBaseUrlHistory, getDiggerWebUrl,
     subscribeQueueChanges,
     type DiggerTrack, type DiggerQueueItem,
   } from '../lib/digger/api';
@@ -30,12 +30,22 @@
     Local: 'http://localhost:8200',
   } as const;
 
+  // Recently-used custom URLs (e.g. a Tailscale address) — excludes the two
+  // named presets above, which already have their own buttons.
+  let recentUrls = $state(
+    getDiggerBaseUrlHistory().filter((u) => u !== DIGGER_PRESETS.Home && u !== DIGGER_PRESETS.Local)
+  );
+
   const decks = $derived($session.decks);
   const activePreset = $derived(
     baseUrl === DIGGER_PRESETS.Home ? 'Home' :
     baseUrl === DIGGER_PRESETS.Local ? 'Local' :
     null
   );
+
+  function shortLabel(url: string): string {
+    return url.replace(/^https?:\/\//, '');
+  }
 
   let unsubscribeQueue: (() => void) | undefined;
 
@@ -162,6 +172,7 @@
   function applyBaseUrl(url?: string) {
     setDiggerBaseUrl((url ?? baseUrl) || '/digger-api');
     baseUrl = getDiggerBaseUrl();
+    recentUrls = getDiggerBaseUrlHistory().filter((u) => u !== DIGGER_PRESETS.Home && u !== DIGGER_PRESETS.Local);
     showUrlInput = false;
     refreshQueue();
     resubscribe();
@@ -203,6 +214,18 @@
       />
       <button class="small-btn" onclick={() => applyBaseUrl()}>Apply</button>
     </div>
+    {#if recentUrls.length > 0}
+      <div class="recent-row">
+        {#each recentUrls as url (url)}
+          <button
+            class="small-btn preset-btn recent-btn"
+            class:active={baseUrl === url}
+            onclick={() => applyBaseUrl(url)}
+            title={url}
+          >{shortLabel(url)}</button>
+        {/each}
+      </div>
+    {/if}
   {/if}
 
   {#if error}
@@ -363,6 +386,21 @@
     color: #cfc;
   }
   .preset-btn.active:hover { background: #446644; }
+
+  .recent-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 6px;
+    flex-shrink: 0;
+  }
+
+  .recent-btn {
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 
   .results-list,
   .queue-list {
