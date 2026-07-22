@@ -277,7 +277,7 @@ interface Deck {
 interface Session {
   decks: Deck[]           // ordered array; render back-to-front
   masterVolume: number
-  bpm: number | null      // master/reference BPM; set via tap tempo or "Master" button
+  bpm: number | null      // master/reference BPM; set via tap tempo or "Main Beat" button
   crossfaderMapping: {    // which two decks the hardware crossfader controls
     left: string          // deck id
     right: string         // deck id
@@ -365,7 +365,7 @@ cuemark/
       midi/
         handler.ts              # Tauri IPC listener → session mutations
     components/
-      DeckCard.svelte           # Per-deck controls: transport, hot cues, BPM/Master/Sync, loop in/out + bar presets, sliders
+      DeckCard.svelte           # Per-deck controls: transport, hot cues, BPM/Main Beat/Sync, loop in/out + bar presets, sliders
       Crossfader.svelte         # Hardware crossfader UI — deck selectors (left/right), slider, Visual/Audio toggles
       WaveformCanvas.svelte     # Per-deck waveform: overview + zoom (16s window); loop region highlight; fires onBpmDetected callback
       VisualizationPanel.svelte # Global visualization shader picker + opacity slider (toggled from toolbar)

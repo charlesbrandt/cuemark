@@ -120,6 +120,18 @@ pub fn audio_set_rate(state: State<'_, AudioState>, deck_id: String, rate: f64) 
     state.lock().unwrap().pipeline_mut(&deck_id)?.set_rate(rate)
 }
 
+/// Variable-rate scratch playback while paused (segment-rate seek, negative = reverse).
+/// See `DeckAudioPipeline::scratch` and docs/design/jog-scratch-audio.md.
+#[tauri::command]
+pub fn audio_scratch(state: State<'_, AudioState>, deck_id: String, rate: f64) -> Result<(), String> {
+    state.lock().unwrap().pipeline_mut(&deck_id)?.scratch(rate)
+}
+
+#[tauri::command]
+pub fn audio_stop_scratch(state: State<'_, AudioState>, deck_id: String) -> Result<(), String> {
+    state.lock().unwrap().pipeline_mut(&deck_id)?.stop_scratch()
+}
+
 #[tauri::command]
 pub fn audio_set_gain(state: State<'_, AudioState>, deck_id: String, gain: f32) -> Result<(), String> {
     state.lock().unwrap().pipeline_mut(&deck_id)?.set_gain(gain)

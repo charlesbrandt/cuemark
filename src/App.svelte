@@ -641,7 +641,7 @@
       <button class="tap-reset" onclick={() => { setMasterBpm(null); tapTimestamps = []; }}>✕</button>
     {/if}
     <label class="master-vol">
-      Master
+      Main Volume
       <input
         type="range"
         min="0"

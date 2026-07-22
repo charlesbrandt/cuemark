@@ -52,6 +52,21 @@ export function audioSetRate(deckId: string, rate: number): Promise<void> {
   return invoke("audio_set_rate", { deckId, rate });
 }
 
+/**
+ * Variable-rate scratch playback while paused: a segment-rate seek, so pitch bends with
+ * speed/direction (negative = reverse) like real vinyl — unlike audioSetRate, which is
+ * pitch-preserving (soundtouch `tempo`) and positive-only. Each call is a real GStreamer
+ * seek; throttle call frequency on the caller side (e.g. once per rAF).
+ */
+export function audioScratch(deckId: string, rate: number): Promise<void> {
+  return invoke("audio_scratch", { deckId, rate });
+}
+
+/** Stops scratch playback and returns to Paused, resetting the segment to forward rate=1.0. */
+export function audioStopScratch(deckId: string): Promise<void> {
+  return invoke("audio_stop_scratch", { deckId });
+}
+
 // ── Per-deck levels ───────────────────────────────────────────────────────────
 
 /** Pre-fader trim (0–1): normalise source level independently of the crossfader. */

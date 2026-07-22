@@ -105,6 +105,8 @@ pub fn run() {
             audio::audio_pause,
             audio::audio_seek,
             audio::audio_set_rate,
+            audio::audio_scratch,
+            audio::audio_stop_scratch,
             audio::audio_set_gain,
             audio::audio_set_volume,
             audio::audio_set_eq,

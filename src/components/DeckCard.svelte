@@ -224,9 +224,9 @@
       class:active={masterBpm !== null && deck.bpm !== null && masterBpm === deck.bpm}
       onclick={() => deck.bpm !== null && setMasterBpm(deck.bpm)}
       disabled={deck.bpm === null}
-      title="Set this deck as the master BPM reference"
+      title="Set this deck as the main beat reference"
     >
-      Master
+      Main Beat
     </button>
     <button
       class="bpm-btn"
@@ -240,8 +240,8 @@
       }}
       disabled={deck.bpm === null || masterBpm === null}
       title={masterBpm !== null && deck.bpm !== null
-        ? `Sync to master: set rate to ${(masterBpm / deck.bpm).toFixed(3)}× and align beat phase`
-        : 'Sync requires both deck BPM and master BPM'}
+        ? `Sync to main beat: set rate to ${(masterBpm / deck.bpm).toFixed(3)}× and align beat phase`
+        : 'Sync requires both deck BPM and a main beat reference'}
     >
       Sync
     </button>
@@ -333,7 +333,7 @@
         disabled={barSec === null || !deck.source}
         title={barSec !== null
           ? `Loop ${bars === 0.5 ? '½' : bars} bar${bars !== 1 ? 's' : ''} (${barSec.toFixed(2)}s)`
-          : 'Set master BPM first'}
+          : 'Set a main beat reference first'}
       >
         {bars === 0.5 ? '½' : bars}
       </button>

@@ -223,6 +223,26 @@ Use last-value guard Maps (in `$effect`) only for infrequent controls (cue toggl
 Symptom of getting this wrong: visible UI lag for the value display even when audio responds.
 Both audio lag and UI display lag together = JS thread saturated by store reactive cascades.
 
+**Confirmed miss (2026-07-21): the `jog_nudge` MIDI case was calling `updateDeck()` directly,
+synchronously, on every tick** — every other continuous control (`deck_playback_rate`,
+`deck_gain`, `deck_volume`, `crossfader`) already routes through `queueDeckPatch()`/
+`queueCrossfader()`, but jog_nudge predated that pattern and was never migrated. A sustained
+jog spin froze the whole UI (audio kept playing — GStreamer is a separate Rust thread/process,
+unaffected by the JS main thread stalling) while `audio_seek IPC` kept and processed calls
+fine. **When adding or reviewing any new `case` in the `handler.ts` MIDI switch that can fire
+at controller-tick rates, check it routes store writes through `queueDeckPatch`/
+`queueCrossfader`, not a bare `updateDeck()` call** — this is the single most common way to
+reintroduce this class of freeze.
+
+**Related but distinct bug in the same code (rate-runaway)**: `jog_nudge`'s "nudge and spring
+back after idle" logic computed the new rate as `d.playbackRate + delta` — the *live*,
+already-nudged value — instead of `jogBaseRate[deckId] + delta`, the saved base captured at
+the start of the gesture. Every tick compounded on the previous tick's result instead of
+producing a bounded offset, running the rate to its clamp within about a second of spinning.
+**Any "temporary offset that springs back after idle" control must compute the offset from
+the saved base value, never from the current live value** — the live value already includes
+previous ticks' effects, so adding to it integrates instead of bounding.
+
 ### `output_queue` buffer limits tempo-change response
 The GStreamer pipeline has an `output_queue` between the `pitch` element and `pipewiresink`.
 When `set_property("tempo")` is called, soundtouch immediately processes future audio at

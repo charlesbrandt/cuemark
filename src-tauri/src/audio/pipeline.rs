@@ -825,6 +825,70 @@ impl DeckAudioPipeline {
         Ok(())
     }
 
+    /// Variable-rate scratch playback while paused: seeks to the current position with a
+    /// signed rate (negative = reverse) and transitions to Playing. Unlike set_rate()
+    /// (soundtouch `tempo` property — pitch-preserving, no seek involved), this is a
+    /// segment-rate seek: pitch bends with speed/direction, matching real vinyl. GStreamer
+    /// has no way to change a running segment's rate other than seeking, so every call here
+    /// is a real FLUSH seek — callers must throttle call frequency (e.g. to once per rAF),
+    /// not invoke this once per raw MIDI tick. Reverse-playback support is codec/demuxer
+    /// dependent (untested against compressed formats as of this writing) and the `pitch`
+    /// element sits upstream in the signal path — behavior feeding it a reversed segment is
+    /// unverified; see docs/design/jog-scratch-audio.md.
+    pub fn scratch(&mut self, rate: f64) -> Result<(), String> {
+        let inner = self.inner.as_ref().ok_or_else(|| "no pipeline loaded".to_string())?;
+        inner.at_eos.store(false, Ordering::Relaxed);
+        let pos = inner
+            .pipeline
+            .query_position::<gst::ClockTime>()
+            .unwrap_or(gst::ClockTime::ZERO);
+        let flags = gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE;
+        let result = if rate >= 0.0 {
+            inner.pipeline.seek(
+                rate,
+                flags,
+                gst::SeekType::Set,
+                pos,
+                gst::SeekType::None,
+                gst::ClockTime::NONE,
+            )
+        } else {
+            inner.pipeline.seek(
+                rate,
+                flags,
+                gst::SeekType::None,
+                gst::ClockTime::NONE,
+                gst::SeekType::Set,
+                pos,
+            )
+        };
+        result.map_err(|e| e.to_string())?;
+        inner
+            .pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| format!("scratch play failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Stops scratch playback and returns to Paused. Resets the segment back to a forward
+    /// rate=1.0 first — scratch() leaves the pipeline's segment at whatever (possibly
+    /// negative or sped-up) rate the last tick set, and only a seek can change it, so a
+    /// plain pause() here would leave the segment armed to resume backward/fast on the next
+    /// play().
+    pub fn stop_scratch(&mut self) -> Result<(), String> {
+        if let Some(inner) = &self.inner {
+            let pos = inner
+                .pipeline
+                .query_position::<gst::ClockTime>()
+                .unwrap_or(gst::ClockTime::ZERO);
+            inner
+                .pipeline
+                .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, pos)
+                .map_err(|e| e.to_string())?;
+        }
+        self.pause()
+    }
+
     /// Current playback position in seconds. None if no pipeline is loaded.
     pub fn position(&self) -> Option<f64> {
         // A negative position is never meaningful to callers (the waveform's playhead

@@ -433,6 +433,18 @@ section, which now lists this as a separate "runtime plugins" install step from 
 High-frequency MIDI controls throttled to one log line per 500ms per `(status, d1)` key in `midi.rs`.
 To see every event, remove the key from `log_throttle` or set threshold to 0.
 
+**Debugging trap (confirmed 2026-07-21 jog-wheel session)**: the throttle only suppresses the
+*log line* — `MidiAction` dispatch to the frontend fires for every real message, unthrottled.
+Counting `=> JogNudge` (or any continuous-control) log lines and comparing against a downstream
+counter (e.g. real seeks/IPC calls) will show what looks like 5–13x "amplification" that isn't
+there — it's just many real events for each logged one. Don't chase a duplicate-listener or
+double-dispatch theory from this mismatch alone. To get a real 1:1 count for debugging, add a
+temporary counter/log at the effect site itself (e.g. inside the Tauri command being called),
+not by comparing against the throttled MIDI log line count. This cost real time in that session:
+a plausible-looking "5 HMR reloads ≈ 5x duplicate seeks" coincidence turned out to be a red
+herring once a Rust-side `audio_seek` call counter proved the real ratio (238 IPC calls for 92
+logged events) was fully explained by the log throttle, not by stacked event listeners.
+
 ---
 
 ## Files

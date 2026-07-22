@@ -54,8 +54,8 @@ to implement different ranges — the rescaling lives in `handler.ts` `deck_play
 | Volume fader R | `(0xB2, 0)` | DeckGain deck-1 |
 | Tempo fader L | `(0xB1, 8)` MSB + `(0xB1, 40)` LSB | DeckPlaybackRate deck-0 (14-bit combined; center 8192→1.0×; higher=slower) |
 | Tempo fader R | `(0xB2, 8)` MSB + `(0xB2, 40)` LSB | DeckPlaybackRate deck-1 |
-| Jog wheel L | `(0xB1, 10)` | JogNudge deck-0 (relative ±1 step → ±2% rate; resets after 150ms idle) |
-| Jog wheel R | `(0xB2, 10)` | JogNudge deck-1 |
+| Jog wheel L | `(0xB1, 10)` | JogNudge deck-0 — while playing: relative ±1 step → ±2% rate offset from a saved base (see gotcha below), resets after 150ms idle; while paused: scrubs track position (±0.015s/step, rAF-throttled seek) for finding a beat. Paused scrubbing is currently silent — see `docs/design/jog-scratch-audio.md` for the (not yet implemented) bidirectional scratch-audio design. |
+| Jog wheel R | `(0xB2, 10)` | JogNudge deck-1 (same dual behavior) |
 | Crossfader | `(0xB0, 0)` | Crossfader (deck-0 ↔ deck-1 opacity) |
 | Master volume | `(0xB0, 3)` | MasterVolume |
 | Headphone volume | `(0xB0, 4)` MSB | CueGain |
@@ -71,6 +71,25 @@ host-side shift-state tracking is needed; the shifted notes map directly to `Hot
 Intentionally unmapped: Bass/filter toggle `(0x90,1)`, mode-switch buttons `(0x91,15/16)`.
 
 Phase 2 goal: MIDI learn mode (click control in UI, wiggle knob to map).
+
+## Jog-wheel gotchas (fixed 2026-07-21 — see `skills/run-app/SKILL.md` "MIDI audio lag" for detail)
+
+Two real bugs were found in `jog_nudge`'s "while playing" branch (`handler.ts`), both worth
+checking for in any similar nudge-style continuous control:
+
+1. **Rate compounded instead of bounding**: the nudge offset was computed from the live
+   `d.playbackRate` (already includes previous ticks) instead of the saved `jogBaseRate[deckId]`
+   captured at gesture start. A sustained spin ran the rate to its 0.25–4.0 clamp in under a
+   second — audible pitch runaway plus soundtouch buffer stress.
+2. **Synchronous `updateDeck()` per tick**: unlike every sibling continuous control in the same
+   switch statement, jog_nudge wasn't routed through `queueDeckPatch()` — a sustained spin
+   saturated the JS thread with full Session/Deck rebuilds, freezing the UI while GStreamer
+   audio (separate Rust thread) kept playing.
+
+**Also learned while debugging this**: don't infer real MIDI event rate from log line counts —
+continuous controls are log-throttled to 1 line/500ms per key (`midi.rs`) but dispatch to the
+frontend unthrottled. See `skills/audio-debugging/SKILL.md` "MIDI log throttle" for the full trap
+and how to get a real count instead.
 
 ## Adding or re-calibrating a MIDI controller
 

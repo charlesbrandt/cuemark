@@ -3,6 +3,7 @@ import { updateDeck, getDeck, setCrossfader, setMasterVolume, session } from "..
 import { seekDeck, getDeckTime, quantizeToGrid } from "../renderer/seekBus";
 import { nudgePhaseToMaster } from "../audio/phaseNudge";
 import { syncRate, syncGain, syncVolume } from "../audio/audioSync";
+import { audioScratch, audioStopScratch } from "../audio/pipeline";
 import { cueGain, tempoRange } from "../audio/audioSettings";
 import { get } from "svelte/store";
 
@@ -86,6 +87,51 @@ function midiDeckId(hardcoded: string | undefined): string | undefined {
 const jogBaseRate: Record<string, number> = {};
 const jogTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 
+// Paused-deck jog scratch: true bidirectional audio scratch (segment-rate seek — pitch
+// bends with speed/direction, like real vinyl) rather than a silent position-only scrub.
+// See docs/design/jog-scratch-audio.md. Rate is derived from tick *velocity* (ticks per
+// second over a short rolling window), not just the raw ±1 per-tick value, so a fast spin
+// scratches faster than a slow one — a single tick's timing is too noisy to use directly.
+const SCRATCH_TICK_WINDOW_MS = 120;
+const SCRATCH_RATE_PER_TICK_PER_SEC = 0.35;
+// GStreamer can't play a segment at rate≈0 (divide-by-zero in the segment math), so the
+// magnitude floor keeps scratch audio always moving even when the wheel is barely turning.
+const SCRATCH_MIN_RATE = 0.15;
+// Fast-spin cap, comfortably inside soundtouch's own 0.1–4.0 range used elsewhere.
+const SCRATCH_MAX_RATE = 3.0;
+// Matches jogTimers' idle-reset window for the playing-branch nudge below.
+const SCRATCH_IDLE_MS = 150;
+
+const scratchTicks: Record<string, { t: number; value: number }[]> = {};
+const scratchIdleTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+const scratchActive = new Set<string>();
+
+// Coalesces rapid jog ticks into one audioScratch() call per rendered frame. Each call is
+// a real GStreamer FLUSH seek (there's no property to just "update the rate" for reverse
+// playback — only a seek can change a running segment's rate), so it needs the same
+// per-frame throttling as queueDeckPatch/queueCrossfader above, just applied to a rate
+// instead of a store patch.
+const _pendingScratchRate = new Map<string, number>();
+let _scratchFlushPending = false;
+
+function queueScratchRate(deckId: string, rate: number) {
+  _pendingScratchRate.set(deckId, rate);
+  if (!_scratchFlushPending) {
+    _scratchFlushPending = true;
+    requestAnimationFrame(() => {
+      _scratchFlushPending = false;
+      for (const [id, r] of _pendingScratchRate) audioScratch(id, r).catch(console.error);
+      _pendingScratchRate.clear();
+    });
+  }
+}
+
+function stopScratch(deckId: string) {
+  scratchActive.delete(deckId);
+  delete scratchTicks[deckId];
+  audioStopScratch(deckId).catch(console.error);
+}
+
 export async function startMidiListener(): Promise<() => void> {
   const unlisten = await listen<MidiAction>("midi-action", ({ payload: a }) => {
     const deckId = midiDeckId(a.deck_id);
@@ -93,7 +139,18 @@ export async function startMidiListener(): Promise<() => void> {
       case "deck_play_toggle": {
         if (!deckId) break;
         const d = getDeck(deckId);
-        if (d) updateDeck(d.id, { playing: !d.playing });
+        if (d) {
+          // Defensive: normal play() never re-seeks the segment rate, so if scratch is
+          // somehow still active (its own 150ms idle timer hasn't fired yet) when play is
+          // pressed, resuming would continue at the last scratch rate/direction instead of
+          // forward at 1.0. In practice the idle timer will have already fired by the time
+          // a discrete play-button press lands, but this closes the race unconditionally.
+          if (!d.playing && scratchActive.has(deckId)) {
+            clearTimeout(scratchIdleTimers[deckId]);
+            stopScratch(deckId);
+          }
+          updateDeck(d.id, { playing: !d.playing });
+        }
         break;
       }
       case "deck_gain":
@@ -175,17 +232,61 @@ export async function startMidiListener(): Promise<() => void> {
         if (!deckId || a.value === undefined) break;
         const d = getDeck(deckId);
         if (!d) break;
+        if (!d.playing) {
+          // Paused: true bidirectional scratch audio — turning the wheel forward/backward
+          // plays audio forward/backward at a speed matching the wheel, like a real
+          // turntable, so a beat/transient can be found by ear. Rate comes from tick
+          // velocity: track ticks in a short rolling window, sum their signed values, and
+          // divide by the window's elapsed time to get ticks/sec, which scales into a
+          // playback rate (sign = direction, magnitude = spin speed).
+          const now = performance.now();
+          const ticks = (scratchTicks[deckId] ??= []);
+          ticks.push({ t: now, value: a.value });
+          while (ticks.length > 1 && now - ticks[0].t > SCRATCH_TICK_WINDOW_MS) ticks.shift();
+
+          // Floor of 1ms avoids a divide-by-near-zero spike on the very first tick in a
+          // gesture (span would otherwise be 0ms) — the resulting rate gets clamped to
+          // SCRATCH_MAX_RATE below regardless, so this just bounds that first-tick spike.
+          const spanMs = Math.max(1, now - ticks[0].t);
+          const ticksPerSec = (ticks.reduce((sum, tick) => sum + tick.value, 0) / spanMs) * 1000;
+
+          const magnitude = Math.min(
+            SCRATCH_MAX_RATE,
+            Math.max(SCRATCH_MIN_RATE, Math.abs(ticksPerSec * SCRATCH_RATE_PER_TICK_PER_SEC)),
+          );
+          // Fall back to this tick's own direction when the window sums to ~0 (e.g. a
+          // direction reversal mid-window), so the deck doesn't stall silently instead of
+          // switching direction.
+          const rate = Math.sign(ticksPerSec || a.value) * magnitude;
+
+          scratchActive.add(deckId);
+          queueScratchRate(deckId, rate);
+
+          clearTimeout(scratchIdleTimers[deckId]);
+          scratchIdleTimers[deckId] = setTimeout(() => stopScratch(deckId), SCRATCH_IDLE_MS);
+          break;
+        }
         if (!(deckId in jogBaseRate)) jogBaseRate[deckId] = d.playbackRate;
-        const nudged = Math.max(0.25, Math.min(4.0, d.playbackRate + a.value * 0.02));
-        syncRate(d.id, nudged);
-        updateDeck(d.id, { playbackRate: nudged });
+        // Offset from the saved base, not from d.playbackRate — the latter is already the
+        // previous tick's nudged value, so adding to it compounds every event instead of
+        // producing a bounded ±2% bend. A spinning wheel fires many ticks well inside the
+        // 150ms idle-reset window, so compounding ran the rate to the 4.0 clamp in under a
+        // second (audible pitch runaway + soundtouch buffer stress). See journal.md.
+        const nudged = Math.max(0.25, Math.min(4.0, jogBaseRate[deckId] + a.value * 0.02));
+        syncRate(d.id, nudged);                    // audio: immediate, no Svelte overhead
+        queueDeckPatch(d.id, { playbackRate: nudged }); // UI: rAF-throttled — see deck_playback_rate
+        // above and CLAUDE.md "session store is coarse-grained": a direct updateDeck() here
+        // was firing a full Session/Deck rebuild + all-subscriber notify on every single MIDI
+        // tick. A sustained jog spin (many ticks/sec, same as the tempo fader) queued reactive
+        // work faster than the JS thread could drain it, freezing the UI while GStreamer audio
+        // (separate Rust thread) kept playing uninterrupted.
         clearTimeout(jogTimers[deckId]);
         jogTimers[deckId] = setTimeout(() => {
           const base = jogBaseRate[deckId];
           delete jogBaseRate[deckId];
           if (base !== undefined) {
             syncRate(deckId, base);
-            updateDeck(deckId, { playbackRate: base });
+            queueDeckPatch(deckId, { playbackRate: base });
           }
         }, 150);
         break;
