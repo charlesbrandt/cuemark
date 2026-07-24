@@ -1,10 +1,11 @@
 import { listen } from "@tauri-apps/api/event";
 import { updateDeck, getDeck, setCrossfader, setMasterVolume, session } from "../state/session";
-import { seekDeck, getDeckTime, quantizeToGrid } from "../renderer/seekBus";
+import { seekDeck, getDeckTime, quantizeToGrid, setScratching, isScratching } from "../renderer/seekBus";
 import { nudgePhaseToMaster } from "../audio/phaseNudge";
 import { syncRate, syncGain, syncVolume } from "../audio/audioSync";
 import { audioScratch, audioStopScratch } from "../audio/pipeline";
-import { cueGain, tempoRange } from "../audio/audioSettings";
+import { cueGain, tempoRange, scratchMode } from "../audio/audioSettings";
+import { debugLog } from "../debugLog";
 import { get } from "svelte/store";
 
 // Buffers the latest deck patch for continuous MIDI controls (rate, gain, volume)
@@ -87,49 +88,129 @@ function midiDeckId(hardcoded: string | undefined): string | undefined {
 const jogBaseRate: Record<string, number> = {};
 const jogTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 
-// Paused-deck jog scratch: true bidirectional audio scratch (segment-rate seek — pitch
-// bends with speed/direction, like real vinyl) rather than a silent position-only scrub.
-// See docs/design/jog-scratch-audio.md. Rate is derived from tick *velocity* (ticks per
-// second over a short rolling window), not just the raw ±1 per-tick value, so a fast spin
-// scratches faster than a slow one — a single tick's timing is too noisy to use directly.
-const SCRATCH_TICK_WINDOW_MS = 120;
-const SCRATCH_RATE_PER_TICK_PER_SEC = 0.35;
-// GStreamer can't play a segment at rate≈0 (divide-by-zero in the segment math), so the
-// magnitude floor keeps scratch audio always moving even when the wheel is barely turning.
-const SCRATCH_MIN_RATE = 0.15;
-// Fast-spin cap, comfortably inside soundtouch's own 0.1–4.0 range used elsewhere.
-const SCRATCH_MAX_RATE = 3.0;
-// Matches jogTimers' idle-reset window for the playing-branch nudge below.
-const SCRATCH_IDLE_MS = 150;
+// Paused-deck jog scratch: true bidirectional audio scratch (PCM-buffer feeder branch —
+// pitch bends with speed/direction, like real vinyl) rather than a silent position-only
+// scrub. See docs/design/pcm-buffer-playback.md. Rate is derived from tick *velocity*,
+// tracked as an exponential moving average (EMA) of instantaneous ticks/sec between
+// consecutive MIDI events — not a hard rolling window summed over a fixed span. A hard
+// window (sum of tick values over the last N ms, divided by the elapsed time since the
+// oldest one still in the window) was tried first and discarded on real hardware: USB
+// MIDI delivers ticks in bursts (several land in one JS macrotask, then a gap), so
+// whenever the window happened to contain only one recent tick — which happens
+// constantly during ordinary-speed scratching, not just at gesture start — the divisor
+// collapsed toward zero and blew the computed rate up to SCRATCH_MAX_RATE. Flooring
+// that divisor instead made *every* such tick register as SCRATCH_MIN_RATE, which is
+// just as common a case and made the response feel laggy/stuttery, occasionally letting
+// one stray tick's raw sign flip the perceived direction mid-gesture. An EMA blends each
+// new instantaneous reading into a running estimate by SCRATCH_EMA_ALPHA instead of
+// fully trusting (or fully discarding) any single inter-tick gap, so bursts and gaps
+// both get smoothed without the signal collapsing to a floor/ceiling constant.
+// Floors the inter-tick interval only enough to avoid a divide-by-near-zero when two
+// ticks land in the same millisecond (OS timer granularity) — not a "minimum meaningful
+// gap" like the old windowed approach needed, since the EMA below already absorbs burst
+// noise on its own.
+const SCRATCH_MIN_DT_MS = 4;
+// Weight given to each new instantaneous reading when blending into the EMA; lower =
+// smoother but slower to react to a genuine speed change.
+const SCRATCH_EMA_ALPHA = 0.4;
+// How long since the last tick before the whole scratch branch tears down and resyncs
+// to normal playback (stop_scratch_feeder() in pipeline.rs) — NOT how long before audio
+// goes quiet (that's hold_ms, handled entirely in the feeder thread, e.g. 40ms for
+// vinyl). Deliberately much longer than any per-mode hold_ms: stop_scratch_feeder()
+// runs a 130ms drain sleep plus two synchronous flush seeks (one ACCURATE, real decode
+// work) while holding the single global AudioManager mutex every audio IPC call for
+// every deck serializes behind. At the original 150ms, vinyl mode's natural usage —
+// short, precise nudges separated by brief pauses — fired that expensive teardown on
+// almost every pause between nudges, and overlapping ~200–500ms mutex-held windows
+// piled up faster than they drained, making the whole app's audio IPC (position polls,
+// rate syncs, everything) stall — observed as the app going unresponsive. Since hold_ms
+// already makes the audio itself go silent/frozen almost immediately on any pause,
+// there's no audible reason for the *pipeline teardown* to be nearly this eager; it
+// only needs to fire once the user has genuinely let go, not on every micro-gap between
+// precise nudges. Raised well above any hold_ms so this fires rarely instead of on
+// every pause. (Pressing play immediately still tears down synchronously first — see
+// the isScratching() check in deck_play_toggle below — so this doesn't add release lag
+// when the user is done and moves on.)
+const SCRATCH_IDLE_MS = 500;
 
-const scratchTicks: Record<string, { t: number; value: number }[]> = {};
+// Per-mode tuning — see scratchMode's doc comment in audioSettings.ts for the
+// shuttle-vs-vinyl distinction.
+const SCRATCH_MODE_PARAMS = {
+  shuttle: {
+    // Tunable sensitivity dial: still saturating to the cap on a fairly gentle spin
+    // at 0.35 (the Hercules encoder appears to report larger step values, not just
+    // ±1, as physical speed increases, so ticksPerSec grows faster than a plain
+    // "ticks counted per second" would suggest) — lowered to leave more usable range
+    // below the cap before it saturates. Retune here if it still saturates too
+    // early/late.
+    ratePerTickPerSec: 0.15,
+    // A rate of exactly 0 would freeze the feeder thread's buffer cursor entirely,
+    // so the magnitude floor keeps scratch audio always moving even when the wheel
+    // is barely turning — appropriate for shuttle's "always searching" character.
+    minRate: 0.15,
+    // Fast-spin cap, comfortably inside soundtouch's own 0.1–4.0 range used elsewhere.
+    maxRate: 3.0,
+    // Effectively "never decays within a real gesture" — the feeder keeps
+    // free-running at the last rate between ticks, which is the whole point of
+    // shuttle mode (fast cueing/searching, not direct position control).
+    holdMs: 100_000,
+  },
+  vinyl: {
+    // Much gentler scale than shuttle: vinyl mode is for slow, deliberate motion.
+    ratePerTickPerSec: 0.05,
+    // No "always moving" floor needed — holding the wheel still should mean silence,
+    // like a stationary hand on a real record, not a slow idle crawl.
+    minRate: 0.02,
+    // Capped well below shuttle's ceiling — this mode isn't for fast searching.
+    maxRate: 0.8,
+    // Decays to silence/hold almost immediately once ticks stop arriving, so motion
+    // tracks the wheel directly instead of free-running like shuttle mode does — see
+    // the ScratchFeeder hold_ms comment in pipeline.rs for how this is implemented.
+    holdMs: 40,
+  },
+} as const;
+
+const scratchVelocity: Record<string, { lastT: number; emaTicksPerSec: number }> = {};
 const scratchIdleTimers: Record<string, ReturnType<typeof setTimeout>> = {};
-const scratchActive = new Set<string>();
+// Timestamp the idle timer was (re)armed, so the callback can report how late it
+// actually fired vs. its SCRATCH_IDLE_MS deadline — a live "chokes up" diagnostic.
+// A setTimeout firing exactly on schedule but audioStopScratch() still taking
+// seconds to settle points at the IPC round-trip; a setTimeout firing itself
+// hundreds of ms to seconds late points at the JS main thread being blocked by
+// something else (e.g. a v.currentTime write storm) — see debugLog.ts.
+const scratchIdleArmedAt: Record<string, number> = {};
 
-// Coalesces rapid jog ticks into one audioScratch() call per rendered frame. Each call is
-// a real GStreamer FLUSH seek (there's no property to just "update the rate" for reverse
-// playback — only a seek can change a running segment's rate), so it needs the same
-// per-frame throttling as queueDeckPatch/queueCrossfader above, just applied to a rate
-// instead of a store patch.
-const _pendingScratchRate = new Map<string, number>();
+// Coalesces rapid jog ticks into one audioScratch() call per rendered frame. Every call
+// is still an IPC round-trip even though only the first one in a gesture does real setup
+// (see audioScratch's doc comment), so this needs the same per-frame throttling as
+// queueDeckPatch/queueCrossfader above, just applied to a rate instead of a store patch.
+const _pendingScratchRate = new Map<string, { rate: number; holdMs: number }>();
 let _scratchFlushPending = false;
 
-function queueScratchRate(deckId: string, rate: number) {
-  _pendingScratchRate.set(deckId, rate);
+function queueScratchRate(deckId: string, rate: number, holdMs: number) {
+  _pendingScratchRate.set(deckId, { rate, holdMs });
   if (!_scratchFlushPending) {
     _scratchFlushPending = true;
     requestAnimationFrame(() => {
       _scratchFlushPending = false;
-      for (const [id, r] of _pendingScratchRate) audioScratch(id, r).catch(console.error);
+      for (const [id, { rate, holdMs }] of _pendingScratchRate) audioScratch(id, rate, holdMs).catch(console.error);
       _pendingScratchRate.clear();
     });
   }
 }
 
 function stopScratch(deckId: string) {
-  scratchActive.delete(deckId);
-  delete scratchTicks[deckId];
-  audioStopScratch(deckId).catch(console.error);
+  const armedAt = scratchIdleArmedAt[deckId];
+  if (armedAt !== undefined) {
+    const lateBy = performance.now() - armedAt - SCRATCH_IDLE_MS;
+    debugLog(`[scratch/${deckId}] idle timer fired ${lateBy.toFixed(0)}ms late (main thread gate)`);
+  }
+  setScratching(deckId, false);
+  delete scratchVelocity[deckId];
+  const t0 = performance.now();
+  audioStopScratch(deckId)
+    .then(() => debugLog(`[scratch/${deckId}] audioStopScratch settled after ${(performance.now() - t0).toFixed(0)}ms (IPC round-trip)`))
+    .catch(console.error);
 }
 
 export async function startMidiListener(): Promise<() => void> {
@@ -140,12 +221,14 @@ export async function startMidiListener(): Promise<() => void> {
         if (!deckId) break;
         const d = getDeck(deckId);
         if (d) {
-          // Defensive: normal play() never re-seeks the segment rate, so if scratch is
-          // somehow still active (its own 150ms idle timer hasn't fired yet) when play is
-          // pressed, resuming would continue at the last scratch rate/direction instead of
-          // forward at 1.0. In practice the idle timer will have already fired by the time
-          // a discrete play-button press lands, but this closes the race unconditionally.
-          if (!d.playing && scratchActive.has(deckId)) {
+          // Defensive: the Rust side only tears down the scratch feeder branch on
+          // pause()/stop_scratch(), not play() — so if scratch is somehow still active
+          // (its own 150ms idle timer hasn't fired yet) when play is pressed, audio_play
+          // would leave the feeder thread still driving output instead of switching back
+          // to the normal branch. In practice the idle timer will have already fired by
+          // the time a discrete play-button press lands, but this closes the race
+          // unconditionally.
+          if (!d.playing && isScratching(deckId)) {
             clearTimeout(scratchIdleTimers[deckId]);
             stopScratch(deckId);
           }
@@ -236,33 +319,38 @@ export async function startMidiListener(): Promise<() => void> {
           // Paused: true bidirectional scratch audio — turning the wheel forward/backward
           // plays audio forward/backward at a speed matching the wheel, like a real
           // turntable, so a beat/transient can be found by ear. Rate comes from tick
-          // velocity: track ticks in a short rolling window, sum their signed values, and
-          // divide by the window's elapsed time to get ticks/sec, which scales into a
-          // playback rate (sign = direction, magnitude = spin speed).
+          // velocity, tracked as an EMA of instantaneous ticks/sec — see the SCRATCH_*
+          // constants above for why (a hard rolling window was tried and discarded).
+          // Scaling/floor/cap/hold-decay all come from SCRATCH_MODE_PARAMS, so shuttle
+          // and vinyl share this exact velocity-tracking logic and only differ in how
+          // it's turned into a rate and how long the feeder free-runs on it.
+          const params = SCRATCH_MODE_PARAMS[get(scratchMode)];
           const now = performance.now();
-          const ticks = (scratchTicks[deckId] ??= []);
-          ticks.push({ t: now, value: a.value });
-          while (ticks.length > 1 && now - ticks[0].t > SCRATCH_TICK_WINDOW_MS) ticks.shift();
-
-          // Floor of 1ms avoids a divide-by-near-zero spike on the very first tick in a
-          // gesture (span would otherwise be 0ms) — the resulting rate gets clamped to
-          // SCRATCH_MAX_RATE below regardless, so this just bounds that first-tick spike.
-          const spanMs = Math.max(1, now - ticks[0].t);
-          const ticksPerSec = (ticks.reduce((sum, tick) => sum + tick.value, 0) / spanMs) * 1000;
+          const prev = scratchVelocity[deckId];
+          // No prior tick to diff against (gesture just started): seed the EMA so the
+          // resulting magnitude comes out to the mode's floor rate rather than guessing
+          // at a velocity from nothing — real ticks/sec takes over from the next tick.
+          const instTicksPerSec = prev
+            ? (a.value / Math.max(SCRATCH_MIN_DT_MS, now - prev.lastT)) * 1000
+            : Math.sign(a.value) * (params.minRate / params.ratePerTickPerSec);
+          const emaTicksPerSec = prev
+            ? prev.emaTicksPerSec * (1 - SCRATCH_EMA_ALPHA) + instTicksPerSec * SCRATCH_EMA_ALPHA
+            : instTicksPerSec;
+          scratchVelocity[deckId] = { lastT: now, emaTicksPerSec };
 
           const magnitude = Math.min(
-            SCRATCH_MAX_RATE,
-            Math.max(SCRATCH_MIN_RATE, Math.abs(ticksPerSec * SCRATCH_RATE_PER_TICK_PER_SEC)),
+            params.maxRate,
+            Math.max(params.minRate, Math.abs(emaTicksPerSec * params.ratePerTickPerSec)),
           );
-          // Fall back to this tick's own direction when the window sums to ~0 (e.g. a
-          // direction reversal mid-window), so the deck doesn't stall silently instead of
-          // switching direction.
-          const rate = Math.sign(ticksPerSec || a.value) * magnitude;
+          // Fall back to this tick's own direction when the EMA sums to ~0 (e.g. a
+          // direction reversal), so the deck doesn't stall silently instead of switching.
+          const rate = Math.sign(emaTicksPerSec || a.value) * magnitude;
 
-          scratchActive.add(deckId);
-          queueScratchRate(deckId, rate);
+          setScratching(deckId, true);
+          queueScratchRate(deckId, rate, params.holdMs);
 
           clearTimeout(scratchIdleTimers[deckId]);
+          scratchIdleArmedAt[deckId] = performance.now();
           scratchIdleTimers[deckId] = setTimeout(() => stopScratch(deckId), SCRATCH_IDLE_MS);
           break;
         }

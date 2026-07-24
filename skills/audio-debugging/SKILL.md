@@ -447,6 +447,259 @@ logged events) was fully explained by the log throttle, not by stacked event lis
 
 ---
 
+## CPU profiling a live "chokes up" freeze — `pidstat` + `perf`
+
+For a freeze that JS-side timing (`frontend_log`/rAF heartbeat, see the pcm-buffer
+design doc) has already localized to "the WebKit main thread stopped responding,"
+the next question is *why* — busy doing something, or genuinely blocked. That
+distinction is invisible from `top`/a single CPU% snapshot and from reading code; it's
+immediate from a continuous per-thread trace spanning the repro. Two conflated
+freezes in the PCM-scratch feature (2026-07-23) turned out to be different mechanisms
+entirely — one CPU-bound (a runaway canvas redraw loop), one blocked-on-I/O (an SMB
+network stall) — and `pidstat` is what told them apart. See
+`docs/design/pcm-buffer-playback.md`'s "second"/"third freeze mechanism" sections for
+the full writeups.
+
+**Step 1 — `pidstat -t -p <cuemark PID>,<WebKitWebProcess PID> 1 -h`**, backgrounded
+for the whole test session (`nohup ... > pidstat.log 2>&1 &`). Find PIDs via
+`pgrep -af "target/debug/cuemark|WebKitWebProcess"`. Sustained ~100%+ CPU on one
+thread during the freeze window = compute-bound (profile it, step 2). Sustained
+near-0% CPU on both = blocked on a syscall (a GStreamer seek, a network mount, a lock)
+— check what Rust is waiting on instead of profiling JS.
+
+**Step 2 — if CPU-bound, `perf record -g -F 999 -p <WebKitWebProcess PID> -o out.data
+-- sleep <N>`.**
+
+- Needs `kernel.perf_event_paranoid` ≤ 1 for non-root profiling. Check with
+  `cat /proc/sys/kernel/perf_event_paranoid`; if it's higher, ask the user to run
+  `sudo sysctl -w kernel.perf_event_paranoid=1` (temporary, resets on reboot, no
+  config file touched — don't ask for anything more permanent than the session needs).
+- **A live-hardware repro needs a generous, explicit capture window** — the user is
+  looking at the controller, not the terminal. A 25s or 60s window reliably closes
+  before they get there (confirmed twice). Use 120s, say clearly that recording has
+  started and give a wide "any time in the next two minutes" instruction, then once
+  `pidstat` confirms the freeze already happened, stop early with `kill -INT <perf
+  pid>` (flushes the file cleanly) rather than waiting out the rest.
+
+**Step 3 — symbolizing the capture: `DEBUGINFOD_URLS="" perf report -i out.data
+--stdio -g none -n`.**
+
+- **The `DEBUGINFOD_URLS=""` prefix is not optional on this machine.**
+  `DEBUGINFOD_URLS=https://debuginfod.ubuntu.com` is set in the environment; any
+  `perf` command that resolves symbols (`perf report`, or `perf script` with a
+  `sym`/`dso` field) will try to fetch missing debug info from that URL and can hang
+  for many minutes with zero CPU usage and zero output — indistinguishable from perf
+  itself being stuck. Always disable it for these commands.
+- `-g none` (skip call-graph aggregation) resolves in seconds; `-g flat`/`-g graph`
+  (the default) can hang or take minutes on `libwebkit2gtk`'s huge symbol table even
+  with debuginfod disabled — start with `-g none` and only reach for a full call graph
+  if the flat profile doesn't already answer the question.
+- `perf script -F time,comm,tid` (no symbol fields at all) is unaffected by either
+  slowdown and resolves instantly — useful as a fast sanity check that the capture
+  actually spans the repro window before running the slower symbolized report.
+- Expect JS application code to show up as `[JIT] tid <pid>` with no further symbol —
+  perf can't resolve JIT-compiled JS without a `jitdump` integration this setup
+  doesn't have. High `[JIT]` percentage plus hot *named* leaf symbols in `libm`/`libc`
+  (e.g. `__round`, `__memmove`) is itself a useful signal: it means the app's own JS is
+  the hot path, not GStreamer/WebGL/video-decode C++ — go look at per-frame `$effect`s
+  and RAF loops in the frontend rather than the Rust pipeline.
+
+---
+
+## Catching an intermittent GStreamer-side stall live with `gdb` (not `perf`)
+
+`pidstat`/`perf` (above) answer "CPU-bound or blocked?" and, if CPU-bound, "which JS
+line?". For a **blocked** stall inside Rust/GStreamer/GLib — the audio pipeline just
+went quiet, `pidstat` shows near-0% CPU — the right tool is `gdb` attached live, to get
+an actual C-level thread backtrace at the moment of the block, rather than guessing
+from syscall timing. Found and used successfully in `docs/design/pcm-buffer-playback.md`'s
+"Seventh mechanism" section (root-caused the "reverse scratch is silent" bug this way).
+
+**`ptrace`/`gdb`/`strace` are not actually blocked in this environment** — a prior
+session's note to that effect was a self-inflicted testing mistake, not a real
+restriction. This system's default `yama.ptrace_scope=1` only allows a tracer to
+attach to its own **descendants**. Attaching `strace`/`gdb` to an independently
+backgrounded process makes them **siblings** (both children of the same shell), which
+`ptrace_scope=1` correctly rejects with `Operation not permitted` — easy to misread as
+"ptrace is disabled here." The fix: launch the target **under** the tracer from the
+start (`gdb --args <bin> ...` / `strace -f <bin> ...`), which makes the tracer the true
+parent — works with no `sudo`/`sysctl` changes. Attaching to an *already-running*
+arbitrary process (e.g. the live app via `gdb -p <pid>`) still needs `sudo sysctl
+kernel.yama.ptrace_scope=0` first.
+
+**The `DEBUGINFOD_URLS` gotcha applies to `gdb` too, not just `perf`.** On `run`, `gdb`
+prompts interactively "Enable debuginfod for this session? (y or [n])" the first time
+it needs symbols — this silently hangs any scripted/non-interactive `gdb` session
+(indistinguishable from the program itself hanging). Fix: launch with `-iex "set
+debuginfod enabled off"`.
+
+**Unfiltered `strace -f` measurably perturbs GStreamer/PipeWire scheduling races away
+(or into worse ones)** — confirmed again this session: one run under `strace -f` with a
+*filtered* syscall set hit a 60+ second stall on the very first `Paused→Playing`
+transition, far outside anything ever seen untraced. `gdb` launched normally (it only
+traps on breakpoints/signals, not every syscall) does **not** perturb timing-sensitive
+GStreamer races the way `strace` does — every `gdb`-launched repro run reproduced the
+target stall at the same rate/magnitude as untraced runs.
+
+**Pattern for catching an intermittent stall live** (see `scripts/gdb-stall-catcher.py`
+for a working implementation using Python's `pexpect`):
+1. Launch the target under `gdb --args` with debuginfod disabled, `run` it.
+2. Watch the **interleaved stdout** (gdb doesn't separate its own output from the
+   inferior's — the same pty carries both) for whatever signal indicates the stall is
+   *currently* happening — here, two consecutive identical counter values printed by
+   the test itself.
+3. The instant that fires, send `Ctrl-C` (`sendintr()` in `pexpect`) to stop the
+   inferior while the stall is still in progress, run `thread apply all bt` to see
+   every thread's C stack, then `continue`.
+4. To resolve a specific thread's `??` frames (common for stripped system `.so`s with
+   no debug info but still-present dynamic symbols) regardless of ASLR: switch to it
+   by name (`gdb`'s Python API: `for t in gdb.selected_inferior().threads(): if
+   t.name == "...": t.switch()`), then `frame N; info symbol $pc` per frame — resolves
+   to `<function> + <offset> in section .text of <library>` using the live process's
+   actual load addresses, no manual base-address arithmetic needed.
+
+This combination found the actual blocking call in one session: a thread stuck several
+frames inside `gst_pad_push()`, blocked on a condition variable inside
+`libgstcoreelements.so` — i.e. ordinary `GstQueue` backpressure, not a mysterious
+PipeWire scheduling bug. A vague "idle, waiting for work"-looking backtrace on an
+**earlier** catch of the *same* stall turned out to be a red herring from too small a
+sample (n=1) — re-run a few times (intermittent races need several catches) before
+trusting what the first one shows.
+
+## Verifying a fix for an intermittent GStreamer stall: always A/B the same binary
+
+Once a stall is root-caused (as above) and a fix is written, **measure it with a
+same-binary, same-environment before/after comparison — never just "run it a few
+times and eyeball it."** Pattern used successfully fixing the "reverse scratch is
+silent" bug (`docs/design/pcm-buffer-playback.md`, "Eighth mechanism"):
+1. Build the fixed test binary, run the repro test (e.g.
+   `scratch_second_gesture_reverse_repro`) untraced 10–25 times, tally stalls.
+2. Temporarily disable *only* the fix (e.g. set a widened constant back to its
+   original value) — not `git stash`, which on a branch with other uncommitted
+   work-in-progress can revert far more than intended (stashed an entire
+   feature's implementation once this session before the mistake was caught).
+   Rebuild, run the *same* test the *same* number of times as the "baseline."
+3. Compare hit rates and stall magnitudes side by side. A fix that isn't clearly
+   better on this comparison (not just "didn't stall on the 3 runs I tried") isn't
+   verified — intermittent races need double-digit sample sizes in both arms to
+   trust a delta.
+
+This caught a real mistake in the same session: an initial fix (widen
+`output_queue`'s cap at scratch-gesture start, narrow it back after a fixed
+grace-period timer) looked plausible and compiled clean, but the A/B comparison
+showed it made things *worse* — 8/8 runs stalled with the "fix" vs. ~75% (6/8)
+on the disabled-fix baseline. Without the baseline run, "it still stalls
+sometimes" could easily have been misread as "the underlying race is just still
+there, fix is a partial improvement" — the side-by-side made it obvious the fix
+had gone from making things *better* to *reliably worse*, which prompted
+looking for what the fix itself was causing (see next section) rather than
+concluding the earlier root-cause diagnosis was wrong.
+
+## GStreamer gotcha: narrowing a live `queue`'s `max-size-*` cap while it's over
+## the new limit re-applies backpressure immediately, not once it "catches up"
+
+Setting `max-size-time` (or `-buffers`/`-bytes`) on a `GstQueue` element while
+the pipeline is running takes effect immediately — the queue re-evaluates its
+current fill against the *new* limit on the next internal check, not just for
+future buffers. If the queue is currently holding more than the new (lower)
+limit, it blocks the pushing thread right then, exactly as if it had just now
+filled up to that point live. There is no grace period or graceful drain-down
+to the new cap.
+
+This matters for any "widen a queue's cap temporarily, then narrow it back"
+mitigation: **narrow it only in response to a real signal that the backlog is
+actually gone** (e.g. the event that ends the condition the wider cap was
+compensating for), never on a fixed timer independent of the pipeline's actual
+state. A timer that fires before the backlog has drained will self-inflict a
+new, *more* deterministic stall right at the timer's deadline — which is
+exactly what happened in the first attempt at the `output_queue` fix above (see
+docs/design/pcm-buffer-playback.md, "Eighth mechanism," and the A/B-testing
+section just above for how this was caught).
+
+---
+
+## Svelte reactive-storm freezes: when a "no-op guard" doesn't actually no-op
+
+Found 2026-07-23 (PCM-scratch feature): a redraw loop in `WaveformCanvas.svelte` had
+a correct pixel-movement gate on its `requestAnimationFrame` loop, yet the WebKit main
+thread still pegged at ~100% CPU for the whole scratch gesture. The gate wasn't
+broken — something else was tearing down and recreating the *entire effect* (which
+cancels and restarts the gated rAF loop) tens of times per second, and every
+recreation paid for one full ungated redraw before the gate was ever reached.
+
+**Root cause**: a `writable<Set<...>>` store (`scratchingDecks` in `seekBus.ts`) had a
+guard *inside* its `.update()` callback meant to skip notifying subscribers when
+membership didn't change:
+```js
+scratchingDecks.update((s) => {
+  if (active === s.has(deckId)) return s; // looks like a no-op guard — isn't one
+  ...
+});
+```
+This does not work. Svelte's `writable` store equality check (`safe_not_equal` from
+`svelte/store`) treats **any object or function value as always "changed,"**
+regardless of reference equality — `(a && typeof a === 'object')` short-circuits the
+whole comparison to `true` whenever the *old* value is a truthy object. A `Set`, `Map`,
+array, or plain object always satisfies this, so returning the *same* reference from
+inside `update()` still notifies every subscriber. The guard only skips constructing a
+*new* Set; it never skips the notification it was written to prevent.
+
+**Fix — move the check outside the `update()`/`set()` call entirely**, using `get()`:
+```js
+export function setScratching(deckId: string, active: boolean): void {
+  if (active === get(scratchingDecks).has(deckId)) return; // never touches the store
+  scratchingDecks.update((s) => { const next = new Set(s); ...; return next; });
+}
+```
+
+**Rule**: any `writable<Set<...>>` / `writable<Map<...>>` / `writable<Array<...>>` /
+`writable<object>` in this codebase needs its dedup/no-op guard placed *before* the
+`update()`/`set()` call, never inside the updater callback — a guard inside the
+callback that "returns the same reference to skip" is a silent no-op for any
+object-valued store. Grep for `writable<` and check every `.update()` callback for
+this pattern if a similar high-frequency freeze shows up elsewhere.
+
+**Diagnostic technique — isolated single-dependency probe effects.** When a manual
+snapshot comparison ("did any field I can think of change?") says nothing changed but
+an effect keeps re-running anyway, don't keep expanding the snapshot — the framework's
+own dependency tracking is more reliable than a hand-written comparison, which can
+have blind spots you haven't thought of. Add one throwaway probe effect per candidate
+reactive value, each depending on exactly one thing:
+```js
+$effect(() => { deck; deckOnlyRuns++; });
+$effect(() => { $someStore; someStoreOnlyRuns++; });
+```
+Flush the counters periodically via `debugLog`/`frontend_log` (see the pcm-buffer
+design doc's JS-timing pattern) and compare rates. This isolates the true trigger in
+one step instead of iterating on what a manual comparison might be missing — it's what
+found this bug after a manual `deck`-field snapshot had already (correctly) ruled out
+`deck` itself, leaving `$scratchingDecks` as the only remaining candidate.
+
+**Diagnostic technique — `/proc/<pid>/task/<tid>/wchan` sampling when `perf`/`sudo`
+isn't available.** `perf_event_paranoid` may be locked down with no way to lower it
+(e.g. a sandboxed session where `sudo` itself is blocked). Sampling every thread's
+`wchan` (the kernel function it's blocked in) and `comm` on a fixed interval needs no
+elevated permissions and gives the same CPU-bound-vs-blocked-on-I/O distinction
+`pidstat` gives at the process level, but additionally names *what* a blocked thread is
+waiting on:
+```bash
+CUEMARK_PID=$(pgrep -f "target/debug/cuemark" | head -1)
+nohup bash -c '
+while true; do
+  ts=$(date "+%H:%M:%S.%3N")
+  for t in /proc/'"$CUEMARK_PID"'/task/*/; do
+    echo "$ts $(basename "$t") $(cat "$t/comm" 2>/dev/null) $(cat "$t/wchan" 2>/dev/null)"
+  done
+  sleep 0.5
+done' > /tmp/cuemark-wchan.log 2>&1 &
+disown
+```
+Unfiltered on purpose (idle threads produce a lot of routine `futex_do_wait`/
+`poll_schedule_timeout` noise) — grep the log for the exact stall window after the
+fact rather than trying to pre-filter what's "interesting" live.
+
+---
+
 ## Files
 
 | File | Concern |

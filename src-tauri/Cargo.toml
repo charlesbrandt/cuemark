@@ -19,6 +19,9 @@ tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-log = "2"
 log = "0.4"
+# Already in the tree transitively (pulled by tauri-plugin-log); listed directly so our
+# own log formatter (lib.rs, millisecond-precision timestamps) can use it too.
+time = { version = "0.3", features = ["formatting", "macros"] }
 gstreamer = { version = "0.23", features = ["v1_18"] }
 gstreamer-audio = "0.23"
 gstreamer-app = "0.23"

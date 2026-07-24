@@ -1,6 +1,6 @@
 <script lang="ts">
   import { analyzeFile, COLOR_UPCOMING, COLOR_PLAYED } from '../lib/audio/waveform';
-  import { seekDeck, getDeckTime, quantizeToGrid } from '../lib/renderer/seekBus';
+  import { seekDeck, getDeckTime, quantizeToGrid, scratchingDecks } from '../lib/renderer/seekBus';
   import type { Deck } from '../lib/state/types';
 
   let {
@@ -110,13 +110,36 @@
   // advancing. Reading deck.playing here means this effect re-runs (and redraws once)
   // on every other reactive change too — zoom toggle, peaks arriving, cue edits, etc. —
   // without needing a 60fps loop to pick those up while paused/idle.
+  // Also redraws during scratch: scratch runs entirely with deck.playing=false (see
+  // handler.ts), so without $scratchingDecks the playhead would sit frozen even though
+  // getDeckTime() is moving (App.svelte's position poll now covers scratch too).
   $effect(() => {
     if (!canvas) return;
     const c = canvas;
     draw(c);
-    if (!deck.playing) return;
+    if (!deck.playing && !$scratchingDecks.has(deck.id)) return;
     let rafId: number;
-    function loop() { draw(c); rafId = requestAnimationFrame(loop); }
+    let lastDrawnTime = getDeckTime(deck.id) ?? 0;
+    // drawOverview() redraws every peak (thousands of bars) unconditionally; at 60fps
+    // that's ~500k fillRect+fillStyle calls/sec, easily pegging the WebKit main thread.
+    // A paused deck being scratched can move the playhead by a fraction of a pixel per
+    // frame (slow jog = rate ~0.02), so most of those redraws are wasted: skip whenever
+    // the playhead hasn't advanced by at least one device pixel since the last drawn
+    // frame. This effect itself was also re-running at MIDI-tick rate (not just 60fps)
+    // until 2026-07-23 — see setScratching()'s doc comment in seekBus.ts for the actual
+    // root cause (a Svelte store-equality gotcha), and docs/design/pcm-buffer-playback.md
+    // for the full investigation.
+    function loop() {
+      const t = getDeckTime(deck.id) ?? 0;
+      const w = c.width || 1;
+      const span = zoom ? zoomSeconds : (deck.source?.type === 'video' ? deck.source.duration : 1);
+      const pxPerSec = w / Math.max(span, 0.001);
+      if (Math.abs(t - lastDrawnTime) * pxPerSec >= 1) {
+        draw(c);
+        lastDrawnTime = t;
+      }
+      rafId = requestAnimationFrame(loop);
+    }
     rafId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafId);
   });

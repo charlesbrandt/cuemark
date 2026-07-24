@@ -1,6 +1,35 @@
-import { get } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import { audioSeek } from '../audio/pipeline';
 import { session } from '../state/session';
+
+// Which decks are mid-scratch-gesture right now. Scratch runs entirely while
+// deck.playing is false, so consumers that gate continuous work on deck.playing
+// (App.svelte's position poll, WaveformCanvas's redraw loop) need this to also cover
+// scratch — otherwise the audio scrubs correctly but the UI (timestamp, waveform
+// playhead) sits frozen at the pre-scratch position the whole gesture.
+export const scratchingDecks = writable<Set<string>>(new Set());
+
+export function setScratching(deckId: string, active: boolean): void {
+  // Guard BEFORE calling update()/set(), not inside it: Svelte's writable store equality
+  // check (safe_not_equal) treats any object/Set value as always "changed", even when the
+  // callback returns the exact same reference — so a guard inside update() never actually
+  // skips notification, it just skips the copy. Every setScratching() call (once per MIDI
+  // jog tick, ~2-30+/sec depending on controller/gesture) was therefore notifying all
+  // subscribers regardless of whether membership changed, re-running WaveformCanvas's
+  // $effect (and its unthrottled draw() at the top, before the redraw-rate gate) at MIDI
+  // tick rate — confirmed via isolated $effect probes during a live scratch gesture
+  // (2026-07-23): scratchingOnlyRuns reached 265 across a gesture with ~10 real ticks.
+  if (active === get(scratchingDecks).has(deckId)) return;
+  scratchingDecks.update((s) => {
+    const next = new Set(s);
+    if (active) next.add(deckId); else next.delete(deckId);
+    return next;
+  });
+}
+
+export function isScratching(deckId: string): boolean {
+  return get(scratchingDecks).has(deckId);
+}
 
 const els = new Map<string, HTMLVideoElement>();
 // Audio clock positions updated by the RAF loop from GStreamer IPC.

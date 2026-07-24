@@ -1,9 +1,11 @@
 pub mod audio;
 pub mod grid_store;
+pub mod media_cache;
 pub mod media_server;
 pub mod midi;
 pub mod midi_state;
 
+use std::sync::Arc;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 // Decode %XX sequences in a URL path component
@@ -57,6 +59,16 @@ fn media_server_port(state: tauri::State<MediaServerPort>) -> u16 {
     state.0
 }
 
+// Lets frontend-side timing land in the same millisecond-timestamped log file as the
+// Rust backend, so a live-hardware stall can be localized to a layer (JS main thread
+// frozen vs. IPC round-trip slow vs. Rust busy) by reading one timeline instead of
+// cross-referencing two clocks. Debug-instrumentation only — see App.svelte/handler.ts
+// call sites for what's being measured.
+#[tauri::command]
+fn frontend_log(msg: String) {
+    log::info!("[frontend] {msg}");
+}
+
 struct MediaServerPort(u16);
 
 #[tauri::command]
@@ -79,6 +91,24 @@ pub fn run() {
         .plugin(
             tauri_plugin_log::Builder::default()
                 .level(log::LevelFilter::Info)
+                // Millisecond-precision timestamps — the default format only has
+                // 1-second resolution, which isn't enough to diagnose the class of
+                // real-time-audio timing bug this app tends to hit (MIDI-tick-rate vs.
+                // GStreamer-pipeline stalls of tens to thousands of ms). See
+                // docs/design/pcm-buffer-playback.md, "choked up" investigation.
+                .format(|out, message, record| {
+                    let fmt = time::macros::format_description!(
+                        "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]"
+                    );
+                    let now = tauri_plugin_log::TimezoneStrategy::UseUtc.get_now();
+                    out.finish(format_args!(
+                        "[{}][{}][{}] {}",
+                        now.format(&fmt).unwrap_or_default(),
+                        record.target(),
+                        record.level(),
+                        message
+                    ))
+                })
                 .targets([
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
@@ -90,10 +120,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(audio::AudioState::new(audio::AudioManager::new()))
-        .manage(MediaServerPort(media_server::start()))
         .invoke_handler(tauri::generate_handler![
             open_output_window,
             media_server_port,
+            frontend_log,
             midi_state::midi_get_saved_state,
             midi_state::midi_benchmark_save,
             grid_store::grid_get_saved,
@@ -124,6 +154,14 @@ pub fn run() {
             let persist = midi_state::new_persist();
             app.manage(persist.clone());
             midi::spawn_listener(app.handle().clone(), persist)?;
+
+            // See media_cache.rs — resolved here (not at builder-config time, before
+            // media_server::start()) because it needs app.path(), which requires an
+            // AppHandle only available inside setup().
+            let cache_dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("media_cache");
+            let media_cache = Arc::new(media_cache::MediaCache::new(cache_dir));
+            app.manage(media_cache.clone());
+            app.manage(MediaServerPort(media_server::start(media_cache)));
             Ok(())
         })
         .run(tauri::generate_context!())

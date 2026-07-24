@@ -16,7 +16,7 @@
   import { syncRate, syncGain, syncVolume, clearDeckAudioSync } from "./lib/audio/audioSync";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { listen } from "@tauri-apps/api/event";
-  import { registerVideoEl, unregisterVideoEl, setDeckAudioTime, getDeckTime, getVideoEl, seekDeck, getPendingSeekTarget, clearPendingSeekTarget } from "./lib/renderer/seekBus";
+  import { registerVideoEl, unregisterVideoEl, setDeckAudioTime, getDeckTime, getVideoEl, seekDeck, getPendingSeekTarget, clearPendingSeekTarget, isScratching } from "./lib/renderer/seekBus";
   import { postFrame } from "./lib/renderer/outputBus";
   import DeckCard from "./components/DeckCard.svelte";
   import Crossfader from "./components/Crossfader.svelte";
@@ -26,6 +26,7 @@
   import { mainOutputDeviceIds, cueOutputDeviceId, cueGain } from "./lib/audio/audioSettings";
   import type { Deck } from "./lib/state/types";
   import { audioGetPosition } from "./lib/audio/pipeline";
+  import { debugLog } from "./lib/debugLog";
 
   function openOutputWindow() {
     invoke('open_output_window').catch(console.error);
@@ -72,6 +73,11 @@
   // a seek — after a seek, GStreamer immediately returns the seek target, which IS the correct
   // content position, so we use it directly as the new reference.
   const contentPosTracker = new Map<string, { audioPos: number; contentPos: number }>();
+  // Debug: rAF heartbeat, throttled to ~1/sec, so a live "chokes up" repro can be
+  // read against Rust-side timestamps to tell a fully-frozen main thread (no
+  // heartbeat lines during the stall) apart from an IPC round-trip that's merely
+  // slow (heartbeat keeps ticking fine) — see debugLog.ts.
+  let lastHeartbeatAt = 0;
   // Last playbackRate applied to each video element. Setting v.playbackRate triggers
   // WebKitGTK to rebuild its internal GStreamer pipeline; only update on actual change.
   const lastPlaybackRate = new Map<string, number>();
@@ -526,6 +532,11 @@
 
   // RAF render loop: upload video frames → composite; sync video to audio clock
   function frame() {
+    const nowMs = performance.now();
+    if (nowMs - lastHeartbeatAt > 1000) {
+      lastHeartbeatAt = nowMs;
+      debugLog(`[heartbeat] rAF alive`);
+    }
     if (compositor) {
       const { decks, visualization, visualizationOpacity } = get(session);
       const timeSecs = performance.now() / 1000;
@@ -551,33 +562,61 @@
           }
           // Audio is the master clock. One in-flight IPC per deck prevents stale
           // out-of-order responses from snapping currentTime backward mid-rate-change.
-          if (deck.playing && v && !pendingPos.get(deck.id)) {
+          // Also polls while scratching: scratch runs entirely with deck.playing=false
+          // (see jog_nudge in handler.ts), so without this branch the pipeline's audio
+          // position moves correctly but the UI (timestamp, waveform playhead) sits
+          // frozen at wherever it was when the gesture started.
+          const scratching = isScratching(deck.id);
+          if ((deck.playing || scratching) && v && !pendingPos.get(deck.id)) {
             pendingPos.set(deck.id, true);
             const capturedDeckId = deck.id;
             audioGetPosition(deck.id).then((audioPos) => {
               pendingPos.delete(capturedDeckId);
               if (audioPos === null || !v) return;
-              // Use the rate at resolution time, not at IPC-start time. If the rate
-              // changed while the IPC was in flight (e.g. 2× → 1×), the at-start rate
-              // doubles the delta and overshoots contentPos by ~IPC-latency × rate-diff.
-              const resolvedRate = get(session).decks.find(d => d.id === capturedDeckId)?.playbackRate ?? 1.0;
-              // Recover content position from wall-clock audioPos (see contentPosTracker comment).
-              const prev = contentPosTracker.get(capturedDeckId);
-              const contentPos = prev && Math.abs(audioPos - prev.audioPos) < 0.5
-                ? prev.contentPos + (audioPos - prev.audioPos) * resolvedRate
-                : audioPos; // large jump = seek; audioPos IS correct content pos post-seek
-              // Filter out stale pre-seek IPC responses. On a heavy video, GStreamer
-              // can take >1s to complete a seek, returning the pre-seek position the
-              // whole time. If a seek is pending and contentPos is far from the seek
-              // target, this IPC was in flight before the seek took effect — skip it.
-              const seekTarget = getPendingSeekTarget(capturedDeckId);
-              if (seekTarget !== undefined) {
-                if (Math.abs(contentPos - seekTarget) > 0.5) return; // stale
-                clearPendingSeekTarget(capturedDeckId); // seek complete
+              let contentPos: number;
+              if (scratching) {
+                // During scratch, position() (Rust side) returns the feeder's live
+                // PCM-buffer cursor directly — already true content position. Scratch
+                // bypasses the pitch/tempo element entirely (speed comes from how fast
+                // the feeder walks the buffer), so none of the wall-clock/rate
+                // integration below applies here.
+                contentPos = audioPos;
+              } else {
+                // Use the rate at resolution time, not at IPC-start time. If the rate
+                // changed while the IPC was in flight (e.g. 2× → 1×), the at-start rate
+                // doubles the delta and overshoots contentPos by ~IPC-latency × rate-diff.
+                const resolvedRate = get(session).decks.find(d => d.id === capturedDeckId)?.playbackRate ?? 1.0;
+                // Recover content position from wall-clock audioPos (see contentPosTracker comment).
+                const prev = contentPosTracker.get(capturedDeckId);
+                contentPos = prev && Math.abs(audioPos - prev.audioPos) < 0.5
+                  ? prev.contentPos + (audioPos - prev.audioPos) * resolvedRate
+                  : audioPos; // large jump = seek; audioPos IS correct content pos post-seek
+                // Filter out stale pre-seek IPC responses. On a heavy video, GStreamer
+                // can take >1s to complete a seek, returning the pre-seek position the
+                // whole time. If a seek is pending and contentPos is far from the seek
+                // target, this IPC was in flight before the seek took effect — skip it.
+                const seekTarget = getPendingSeekTarget(capturedDeckId);
+                if (seekTarget !== undefined) {
+                  if (Math.abs(contentPos - seekTarget) > 0.5) return; // stale
+                  clearPendingSeekTarget(capturedDeckId); // seek complete
+                }
               }
               contentPosTracker.set(capturedDeckId, { audioPos, contentPos });
-              setDeckAudioTime(capturedDeckId, contentPos); // feeds waveform playhead
-              if (Math.abs(v.currentTime - contentPos) > 0.08) {
+              setDeckAudioTime(capturedDeckId, contentPos); // feeds waveform playhead — cheap, no WebKit cost
+              // No v.currentTime writes at all during scratch — see the scratch-freeze
+              // investigation in docs/design/pcm-buffer-playback.md, 2026-07-23. A 150ms
+              // throttle (tried first) didn't help and measurably made a live-hardware
+              // freeze worse (4.4s -> 12.3s), and debug instrumentation (rAF heartbeat +
+              // idle-timer arm/fire timing) then proved the WebKit JS main thread itself
+              // was frozen solid for ~7s after a gesture ended, with Rust completely idle
+              // throughout and no single v.currentTime write ever measured >5ms — i.e. not
+              // a slow synchronous write, but WebKit's own internal (non-Rust) video decode
+              // pipeline blocking its main loop, apparently regardless of write frequency.
+              // Video doesn't need frame-accurate tracking during a fast jog — audio (the
+              // real cueing signal) is already exact via the independent PCM feeder — so
+              // don't touch the video element's clock at all until scratch ends; the
+              // non-scratch branch below then does one normal snap to resync it.
+              if (!scratching && Math.abs(v.currentTime - contentPos) > 0.08) {
                 v.currentTime = contentPos; // snap video to audio clock
               }
             }).catch(() => { pendingPos.delete(capturedDeckId); });
@@ -618,7 +657,7 @@
       class="output-btn"
       class:active={showAudioSettings}
       onclick={() => { showAudioSettings = !showAudioSettings; }}
-    >Audio</button>
+    >Settings</button>
     <button
       class="output-btn"
       class:active={showDiggerQueue}

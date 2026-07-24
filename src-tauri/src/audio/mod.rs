@@ -1,14 +1,16 @@
 pub mod analysis;
 pub mod devices;
 pub mod mixer;
+pub mod pcm_buffer;
 pub mod pipeline;
 pub mod record;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tauri::{Emitter, State};
 
+use crate::media_cache::MediaCache;
 use self::devices::AudioDevice;
 use self::mixer::MasterMix;
 use self::pipeline::DeckAudioPipeline;
@@ -51,6 +53,39 @@ impl AudioManager {
 
 pub type AudioState = Mutex<AudioManager>;
 
+/// Runs `f` against one deck's pipeline without holding `state`'s mutex for the
+/// duration of `f` itself — only for the HashMap remove/insert around it. Same pattern
+/// as `audio_load`'s preroll fix below, generalized: any deck command whose pipeline
+/// call can block for a while (GStreamer preroll, the scratch-teardown resync seek in
+/// `stop_scratch_feeder`) must not do so while every other deck's audio IPC (position
+/// polls, rate/gain syncs) is queued up behind the same global lock. A concurrent call
+/// for *this same* deck_id while it's detached fails fast with "no audio pipeline for
+/// deck" (already a handled, `.catch()`'d error path everywhere on the frontend) rather
+/// than racing on the pipeline's internal GStreamer state — see
+/// docs/design/pcm-buffer-playback.md and project memory project_pcm_scratch_status.md
+/// for the live-hardware stall this fixes (vinyl-mode jog decks became unresponsive).
+fn with_pipeline_detached<T>(
+    state: &Mutex<AudioManager>,
+    deck_id: &str,
+    f: impl FnOnce(&mut DeckAudioPipeline) -> T,
+) -> Result<T, String> {
+    // Logged with millisecond precision (see lib.rs's custom log formatter) so a stall
+    // report can be correlated against the last MIDI tick's own timestamp — narrows
+    // down "JS-side delay before the IPC call was even issued" vs. "Rust-side work
+    // itself took a long time" without guessing.
+    log::info!("[audio/{deck_id}] detached-pipeline IPC received");
+    let mut pipeline = {
+        let mut mgr = state.lock().unwrap();
+        mgr.pipelines
+            .remove(deck_id)
+            .ok_or_else(|| format!("no audio pipeline for deck '{deck_id}'"))?
+        // mutex released here
+    };
+    let result = f(&mut pipeline);
+    state.lock().unwrap().pipelines.insert(deck_id.to_string(), pipeline);
+    Ok(result)
+}
+
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -59,7 +94,21 @@ pub fn list_audio_devices(_state: State<'_, AudioState>) -> Vec<AudioDevice> {
 }
 
 #[tauri::command]
-pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, deck_id: String, file_path: String) -> Result<Option<f64>, String> {
+pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, cache: State<'_, Arc<MediaCache>>, deck_id: String, file_path: String) -> Result<Option<f64>, String> {
+    // Resolve to a local disk copy before touching GStreamer at all — see media_cache.rs.
+    // The library here is served over SMB/CIFS; scratch leaves the normal playback
+    // branch idle for a whole gesture, and resuming it against the network share after
+    // that idle period was measured blocking for ~10s on a live repro (SMB
+    // re-negotiation). PCM decode and uridecodebin preroll below both read this same
+    // local path, so the network is touched at most once per track, not repeatedly.
+    // Caching is an optimization, not a requirement: fall back to the original path on
+    // any failure (permissions, disk full, source not stat-able yet) rather than
+    // failing the load outright.
+    let load_path = cache.ensure_cached(&file_path).unwrap_or_else(|e| {
+        log::warn!("[audio/{deck_id}] media cache miss, loading directly from source: {e}");
+        file_path.clone()
+    });
+
     // Pull the pipeline out of the map before calling load() so the mutex is not held
     // during GStreamer preroll (which can block for up to 5 seconds). Without this,
     // every other audio command (audio_get_position, audio_play, …) waits on the mutex
@@ -85,7 +134,7 @@ pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, deck_id: 
     };
 
     pipeline.set_app(app.clone());
-    let result = pipeline.load(&file_path); // preroll runs without holding the mutex
+    let result = pipeline.load(&load_path); // preroll runs without holding the mutex
 
     // Re-insert the pipeline (even on error, to preserve the object for future loads).
     state.lock().unwrap().pipelines.insert(deck_id, pipeline);
@@ -107,7 +156,10 @@ pub fn audio_play(state: State<'_, AudioState>, deck_id: String) -> Result<(), S
 
 #[tauri::command]
 pub fn audio_pause(state: State<'_, AudioState>, deck_id: String) -> Result<(), String> {
-    state.lock().unwrap().pipeline_mut(&deck_id)?.pause()
+    // Detached: pause() may run stop_scratch_feeder()'s ~130-400ms teardown+resync
+    // (drain sleep + two flush seeks) if a scratch was active — see
+    // with_pipeline_detached's doc comment above.
+    with_pipeline_detached(&state, &deck_id, |p| p.pause())?
 }
 
 #[tauri::command]
@@ -120,16 +172,22 @@ pub fn audio_set_rate(state: State<'_, AudioState>, deck_id: String, rate: f64) 
     state.lock().unwrap().pipeline_mut(&deck_id)?.set_rate(rate)
 }
 
-/// Variable-rate scratch playback while paused (segment-rate seek, negative = reverse).
-/// See `DeckAudioPipeline::scratch` and docs/design/jog-scratch-audio.md.
+/// Variable-rate scratch playback while paused (PCM-buffer feeder branch, negative =
+/// reverse). `hold_ms` controls how long the feeder keeps free-running at the last
+/// `rate` after ticks stop arriving before decaying to silence/hold — large for
+/// shuttle-style scratch (effectively never decays within a gesture), small for
+/// vinyl-style direct manipulation (decays almost immediately, like a stationary
+/// hand on a real record). See `DeckAudioPipeline::scratch` and
+/// docs/design/pcm-buffer-playback.md.
 #[tauri::command]
-pub fn audio_scratch(state: State<'_, AudioState>, deck_id: String, rate: f64) -> Result<(), String> {
-    state.lock().unwrap().pipeline_mut(&deck_id)?.scratch(rate)
+pub fn audio_scratch(state: State<'_, AudioState>, deck_id: String, rate: f64, hold_ms: u64) -> Result<(), String> {
+    state.lock().unwrap().pipeline_mut(&deck_id)?.scratch(rate, hold_ms)
 }
 
 #[tauri::command]
 pub fn audio_stop_scratch(state: State<'_, AudioState>, deck_id: String) -> Result<(), String> {
-    state.lock().unwrap().pipeline_mut(&deck_id)?.stop_scratch()
+    // Detached — same reason as audio_pause above.
+    with_pipeline_detached(&state, &deck_id, |p| p.stop_scratch())?
 }
 
 #[tauri::command]
@@ -242,8 +300,94 @@ pub fn audio_record_stop(state: State<'_, AudioState>) -> Result<(), String> {
 /// `spawn_blocking` runs compute_analysis on a dedicated OS thread so it doesn't starve
 /// the async executor.
 #[tauri::command]
-pub async fn audio_analyze_file(file_path: String) -> Result<analysis::AnalysisData, String> {
-    tauri::async_runtime::spawn_blocking(move || analysis::compute_analysis(&file_path))
+pub async fn audio_analyze_file(cache: State<'_, Arc<MediaCache>>, file_path: String) -> Result<analysis::AnalysisData, String> {
+    // Best-effort only (lookup, not ensure_cached): read the cache audio_load already
+    // populated if it's there, but never trigger or block on a copy from here — this
+    // runs independently of/racing with audio_load, so a miss just falls back to the
+    // original (network) path exactly as before.
+    let path = cache.lookup(&file_path).unwrap_or(file_path);
+    tauri::async_runtime::spawn_blocking(move || analysis::compute_analysis(&path))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod concurrency_stress_test {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Regression guard for the vinyl-mode stall fixed by `with_pipeline_detached`:
+    /// before this fix, `audio_pause`/`audio_stop_scratch` held the single
+    /// `Mutex<AudioManager>` for the entire scratch-teardown resync (~130-400ms: a
+    /// drain sleep plus two flush seeks in `stop_scratch_feeder`), so every other
+    /// deck's audio IPC — including a plain position poll — queued up behind it.
+    /// Drives deck-a through repeated scratch → pause (teardown) cycles on one thread
+    /// while hammering deck-b's `position()` on another, and asserts deck-b's
+    /// worst-case call latency never approaches the teardown's blocking duration.
+    /// Manually run (`cargo test concurrency_stress -- --ignored --nocapture`) — like
+    /// the pipeline.rs smoke tests, it needs real GStreamer init and a real local file.
+    #[test]
+    #[ignore]
+    fn other_deck_ipc_stays_responsive_during_teardown() {
+        gstreamer::init().expect("gst init");
+        let path = "/home/account/Downloads/audio.wav";
+
+        let mgr = Mutex::new(AudioManager::new());
+        {
+            let mut m = mgr.lock().unwrap();
+            let mut a = DeckAudioPipeline::new("deck-a");
+            a.load(path).expect("load deck-a");
+            m.pipelines.insert("deck-a".to_string(), a);
+            let mut b = DeckAudioPipeline::new("deck-b");
+            b.load(path).expect("load deck-b");
+            m.pipelines.insert("deck-b".to_string(), b);
+        }
+        let mgr = Arc::new(mgr);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let max_latency_us = Arc::new(AtomicU64::new(0));
+
+        // Thread A: repeatedly start a scratch gesture on deck-a, then immediately
+        // pause it — pause() runs the full teardown+resync every time, same as a real
+        // vinyl-mode nudge-then-release cycle.
+        let mgr_a = mgr.clone();
+        let stop_a = stop.clone();
+        let deck_a = std::thread::spawn(move || {
+            while !stop_a.load(Ordering::Relaxed) {
+                let _ = with_pipeline_detached(&mgr_a, "deck-a", |p| {
+                    let _ = p.scratch(1.0, 100_000);
+                    std::thread::sleep(Duration::from_millis(10));
+                    let _ = p.pause();
+                });
+            }
+        });
+
+        // Thread B: hammer deck-b's position() and record worst-case call latency.
+        let mgr_b = mgr.clone();
+        let stop_b = stop.clone();
+        let max_b = max_latency_us.clone();
+        let deck_b = std::thread::spawn(move || {
+            while !stop_b.load(Ordering::Relaxed) {
+                let t0 = Instant::now();
+                let _ = with_pipeline_detached(&mgr_b, "deck-b", |p| p.position());
+                let us = t0.elapsed().as_micros() as u64;
+                max_b.fetch_max(us, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        std::thread::sleep(Duration::from_secs(3));
+        stop.store(true, Ordering::Relaxed);
+        deck_a.join().unwrap();
+        deck_b.join().unwrap();
+
+        let max_ms = max_latency_us.load(Ordering::Relaxed) as f64 / 1000.0;
+        println!("deck-b worst-case position() latency during deck-a teardown churn: {max_ms:.1}ms");
+        assert!(
+            max_ms < 50.0,
+            "deck-b's position() should never wait behind deck-a's teardown; worst case was {max_ms:.1}ms"
+        );
+    }
 }

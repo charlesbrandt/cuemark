@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listAudioDevices, type AudioDevice } from "../lib/audio/pipeline";
-  import { mainOutputDeviceIds, cueOutputDeviceId, cueGain, tempoRange } from "../lib/audio/audioSettings";
+  import { mainOutputDeviceIds, cueOutputDeviceId, cueGain, tempoRange, scratchMode } from "../lib/audio/audioSettings";
   import { session, setMidiMapping } from "../lib/state/session";
 
   let devices = $state<AudioDevice[]>([]);
@@ -27,7 +27,7 @@
 </script>
 
 <div class="audio-settings">
-  <span class="settings-title">Audio Output</span>
+  <span class="settings-title">Settings</span>
 
   {#if error}
     <span class="error">{error}</span>
@@ -87,6 +87,17 @@
       <option value={100}>±100%</option>
     </select>
     <span class="hint-inline">fader &amp; slider range</span>
+  </div>
+
+  <div class="settings-row">
+    <span class="row-label">Jog</span>
+    <select bind:value={$scratchMode}>
+      <option value="shuttle">Shuttle</option>
+      <option value="vinyl">Vinyl</option>
+    </select>
+    <span class="hint-inline">
+      {$scratchMode === "vinyl" ? "slow, precise — decays to a stop" : "fast ff/rev — free-runs at speed"}
+    </span>
   </div>
 
   <div class="settings-row">

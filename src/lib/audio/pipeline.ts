@@ -53,16 +53,25 @@ export function audioSetRate(deckId: string, rate: number): Promise<void> {
 }
 
 /**
- * Variable-rate scratch playback while paused: a segment-rate seek, so pitch bends with
- * speed/direction (negative = reverse) like real vinyl — unlike audioSetRate, which is
- * pitch-preserving (soundtouch `tempo`) and positive-only. Each call is a real GStreamer
- * seek; throttle call frequency on the caller side (e.g. once per rAF).
+ * Variable-rate scratch playback while paused: walks a pre-decoded PCM buffer forward
+ * or backward at `rate` (negative = reverse), so pitch bends with speed/direction like
+ * real vinyl — unlike audioSetRate, which is pitch-preserving (soundtouch `tempo`) and
+ * positive-only. See docs/design/pcm-buffer-playback.md. Cheap to call repeatedly: only
+ * the first call in a gesture does real setup (starts the feeder thread); later calls
+ * just update the rate it reads — still worth throttling call frequency on the caller
+ * side (e.g. once per rAF) since it's an IPC round-trip either way.
+ *
+ * `holdMs`: how long (from this call) the feeder keeps free-running at `rate` before
+ * decaying to silence/hold if no further audioScratch() call refreshes it. Large for
+ * shuttle-style scratch (never decays within a real gesture); small for vinyl-style
+ * direct manipulation (decays almost immediately once the wheel stops). See
+ * `SCRATCH_MODE_PARAMS` in handler.ts.
  */
-export function audioScratch(deckId: string, rate: number): Promise<void> {
-  return invoke("audio_scratch", { deckId, rate });
+export function audioScratch(deckId: string, rate: number, holdMs: number): Promise<void> {
+  return invoke("audio_scratch", { deckId, rate, holdMs });
 }
 
-/** Stops scratch playback and returns to Paused, resetting the segment to forward rate=1.0. */
+/** Stops scratch playback and returns to Paused. The next audioPlay() resyncs to the position the scratch cursor reached. */
 export function audioStopScratch(deckId: string): Promise<void> {
   return invoke("audio_stop_scratch", { deckId });
 }

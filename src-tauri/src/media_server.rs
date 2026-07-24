@@ -9,11 +9,17 @@
 // natively) instead of relying on the custom scheme.
 use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpListener;
+use std::sync::Arc;
 
+use crate::media_cache::MediaCache;
 use crate::{mime_from_path, parse_range, url_decode};
 
-fn handle(request: tiny_http::Request) {
-    let file_path = url_decode(request.url());
+fn handle(request: tiny_http::Request, cache: &MediaCache) {
+    let requested_path = url_decode(request.url());
+    // Best-effort only: lookup() never touches the network, so a cache miss (file not
+    // yet cached by audio_load, or caching still in progress) just serves the original
+    // network path exactly as before — no regression, no request-path blocking copy.
+    let file_path = cache.lookup(&requested_path).unwrap_or(requested_path);
     let range_hdr = request
         .headers()
         .iter()
@@ -77,7 +83,7 @@ fn header(field: &str, value: &str) -> tiny_http::Header {
 
 /// Starts the server on an ephemeral 127.0.0.1 port and returns that port.
 /// Spawns a thread per connection — local-only, low-concurrency (one app window).
-pub fn start() -> u16 {
+pub fn start(cache: Arc<MediaCache>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind media server port");
     let port = listener.local_addr().unwrap().port();
     let server = tiny_http::Server::from_listener(listener, None)
@@ -85,7 +91,8 @@ pub fn start() -> u16 {
 
     std::thread::spawn(move || {
         for request in server.incoming_requests() {
-            std::thread::spawn(move || handle(request));
+            let cache = cache.clone();
+            std::thread::spawn(move || handle(request, &cache));
         }
     });
 

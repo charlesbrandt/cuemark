@@ -1283,3 +1283,172 @@ also weren't exercised in this pass — scope was the beat-grid/persistence surf
 | File | Change |
 |---|---|
 | `src/App.svelte` | `clearSavedGrid(deck.id)` added on the path-mismatch branch of the new-source handler — fixes the stale-trust bug above |
+
+# 2026.07.23 — "Chokes up" investigation: three distinct freeze mechanisms, two fixed and confirmed
+
+Continuation of the PCM-buffer scratch feature's recurring choke-up bug (see prior
+entries and `docs/design/pcm-buffer-playback.md`). The `v.currentTime`-removal fix
+from the previous round didn't resolve it, so the investigation escalated from
+JS-only instrumentation to OS-level profiling — `pidstat -t` (per-thread CPU
+sampling) and `perf record -g` (stack profiling), the latter needing
+`kernel.perf_event_paranoid` temporarily lowered to 1.
+
+`pidstat` immediately separated two symptoms that all read the same from the user's
+side ("it froze, no sound") into two different mechanisms:
+
+1. **A blocking network stall.** `WebKitWebProcess`/`cuemark` both idle during the
+   freeze, but a GStreamer resync seek in Rust blocked for 9.9 seconds. The media
+   library (`/media/memory/t7` and siblings) turned out to be mounted over SMB/CIFS
+   from `10.20.2.222`, not local disk — scratch leaves that branch idle for the
+   whole gesture, and resuming it hit an apparent idle-reconnect stall. Fixed with a
+   new `media_cache.rs`: tracks are copied to local disk on `audio_load` and every
+   later read (PCM decode, seeks, video serving) resolves through the cache instead.
+   **Confirmed via log**: the same seek dropped to 25.6ms on the next repro.
+
+2. **A CPU-bound render loop.** With the network fix in place, the exact same
+   "locked up, no sound" symptom recurred immediately. This time `pidstat` showed
+   `WebKitWebProcess` pegged at ~100% CPU for a continuous 33 seconds. A `perf`
+   stack profile (see the audio-debugging skill's new profiling section for the
+   `DEBUGINFOD_URLS` gotcha that nearly derailed this capture) showed 92% of samples
+   inside JIT-compiled JS, with `Math.round`/`memmove`/string-compare as the hottest
+   named leaves — the signature of a tight per-item canvas loop, not video decode.
+   Root cause: `WaveformCanvas.svelte`'s per-frame draw effect redraws the *entire*
+   peaks array (~8000 bars) unconditionally on every animation frame whenever a deck
+   is playing or being scratched — a cost that used to only apply to playing decks,
+   but the scratch feature's `scratchingDecks` check extended it to paused decks too.
+   Fixed by skipping the redraw unless the playhead moved at least one device pixel
+   since the last drawn frame. **Not yet live-tested** — session was interrupted
+   (user needed to restart) right after this landed.
+
+Both fixes are frontend/backend-appropriate and already applied on
+`jog-scratch-reverse-pcm` (backend change needed a dev-server rebuild+restart, done;
+frontend change hot-reloaded, confirmed via Vite HMR log). Full technical writeup —
+including the exact `perf`/`pidstat` commands and gotchas worth reusing next time
+this class of bug shows up — lives in `docs/design/pcm-buffer-playback.md`'s "second"
+and "third freeze mechanism" sections and in `skills/audio-debugging`'s new CPU
+profiling section.
+
+## Not exercised this session
+
+The WaveformCanvas fix (mechanism 2) has not been retested against real hardware —
+next session should start there before doing anything else on this feature. Also
+still open from prior rounds: whether removing the earlier `v.currentTime` writes
+during scratch is still worth keeping now that the real causes are understood (almost
+certainly yes — it's cheap and still avoids unnecessary WebKit seeks — but it was
+never itself the fix).
+
+## Files touched
+
+| File | Change |
+|---|---|
+| `src-tauri/src/media_cache.rs` | New — local disk cache for network-mounted media, keyed by path hash + file size |
+| `src-tauri/src/audio/mod.rs` | `audio_load` resolves through `ensure_cached()`; `audio_analyze_file` does a best-effort `lookup()` |
+| `src-tauri/src/media_server.rs` | Video HTTP server resolves through `lookup()` before opening a file |
+| `src-tauri/src/lib.rs` | Wires up `MediaCache`, managed as `Arc<MediaCache>`, resolved inside `.setup()` (needs `AppHandle` for `app_data_dir()`) |
+| `src/components/WaveformCanvas.svelte` | Gate the per-frame redraw loop on ≥1 device-pixel playhead movement, instead of redrawing unconditionally every frame |
+| `docs/design/pcm-buffer-playback.md` | Documented both mechanisms, fixes, and the profiling toolchain used to find them |
+| `skills/audio-debugging/SKILL.md` | New section: `pidstat`+`perf` workflow for CPU-bound vs. blocked freezes, including the `DEBUGINFOD_URLS` hang gotcha |
+
+## Root-caused the "reverse scratch is silent" bug via live `gdb` — turned out `ptrace` was never actually blocked
+
+Picked back up the open item from earlier the same day: the intermittent scratch
+delivery stall, previously root-caused only as far as "some GStreamer/PipeWire
+scheduling race, tooling in this environment (`ptrace`, `perf` symbols) too limited to
+go further." That limitation turned out to be false — a self-inflicted testing mistake
+from the earlier session, not a real restriction. Verified from first principles: a
+process ptracing its own true `fork()` child succeeds instantly on this machine. The
+earlier "Operation not permitted" errors came from attaching `strace`/`gdb` to a
+**sibling** process (both backgrounded from the same shell) rather than a true child —
+this system's `yama.ptrace_scope=1` default correctly rejects that, and it's easy to
+misread as "ptrace is disabled here."
+
+Fix: launch the target **under** the tracer from the start (`gdb --args <bin> ...`),
+making the tracer the real parent — no `sudo`/`sysctl` needed. Built
+`scripts/gdb-stall-catcher.py` (`pexpect`-driven): runs the existing
+`scratch_second_gesture_reverse_repro` headless repro test under `gdb`, watches its
+interleaved stdout live, and the instant it detects a stall in progress (two
+consecutive identical delivery counts), interrupts and dumps every thread's C
+backtrace plus live symbol resolution (via `gdb`'s Python API, ASLR-safe). Two gotchas
+along the way: `gdb`'s debuginfod prompt hangs a scripted session exactly like `perf`
+does (fix: `-iex "set debuginfod enabled off"`), and unfiltered `strace -f` measurably
+perturbs the underlying GStreamer/PipeWire race (one run hit a 60+ second stall that
+never appears untraced) — `gdb` launched plainly does not have this problem.
+
+Caught the stall three times across a handful of runs (~50% hit rate, ~5s/attempt).
+The first catch looked like an idle thread-pool worker waiting for work — a red
+herring from n=1. The second and third catches (independent stalls, consistent with
+each other) showed the real picture: `appsrc`'s own streaming task thread, mid-call
+several frames inside `gst_pad_push()`, blocked on a condition variable inside
+`libgstcoreelements.so`. Cross-referencing the pipeline topology in `pipeline.rs`
+confirms this is `output_queue` — the `queue` element between `input_selector` and
+`tee`, capped at `max-size-time = 100ms` — applying its own ordinary backpressure
+because its downstream drain (ultimately `pipewiresink`'s PipeWire pull cadence) falls
+behind for hundreds of ms to a few seconds, specifically in the window right after a
+fresh scratch gesture starts following a teardown+restart. This also explains a loose
+end from the prior session's probe data (why two upstream probes always got stuck at
+an identical count together) for free: pad-buffer probes fire inline as part of one
+synchronous push call, so a block many frames downstream on a single thread explains
+both freezing together with no need for any separate input-selector or convert/resample
+routing bug (already ruled out earlier, now doubly confirmed).
+
+Not a fix yet — this was root-causing, not patching. Three concrete next directions
+(probe `output_queue`'s live fill level; check `pipewiresink`'s post-transition pull
+cadence; consider a larger transient allowance on `output_queue`'s 100ms cap) are
+queued up in the design doc for whoever picks this up next.
+
+## Files touched
+
+| File | Change |
+|---|---|
+| `docs/design/pcm-buffer-playback.md` | New "Seventh mechanism" section with the full root-cause writeup and next steps; `Status` section updated |
+| `skills/audio-debugging/SKILL.md` | New section: catching a live GStreamer-side stall with `gdb`, including the ptrace-sibling-vs-ancestor correction and the debuginfod-prompt gotcha |
+| `scripts/gdb-stall-catcher.py` | New — reusable live-stall catcher (`pexpect` + `gdb`), kept for future sessions to gather more evidence before attempting a fix |
+
+## Landed the fix for "reverse scratch is silent" — widen `output_queue` for a
+## gesture's duration, not on a timer (2026-07-24, same session continued)
+
+Picked up the root cause from the entry above and turned it into an actual fix.
+`scratch()` (`pipeline.rs`) now widens `output_queue`'s `max-size-time` from the
+steady 100ms to 2s when a fresh gesture starts (before the `Paused→Playing`
+transition), and `stop_scratch_feeder()` narrows it back to 100ms once the
+gesture ends and the normal branch is about to need tight tempo-change latency
+again.
+
+First attempt did this on a timer instead — widen at gesture start, narrow back
+after a fixed 1.5s grace period via a spawned thread (epoch-guarded against a
+newer gesture starting in the meantime). Building and running the headless
+`scratch_second_gesture_reverse_repro` test *untraced* (no `gdb` — matching real
+playback timing) exposed why that was wrong: narrowing a live `GstQueue`'s cap
+while it's still holding more buffered time than the new lower limit doesn't
+let the excess drain gracefully — the queue immediately re-applies
+backpressure at the moment of narrowing. Every one of 8 runs stalled for a
+suspiciously consistent ~1.2–1.4s landing almost exactly at the 1.5s timer —
+the timer had turned an intermittent bug into a deterministic self-inflicted
+one. A same-binary baseline with the cap fix disabled (8 runs) reproduced the
+original, expected shape: ~75% hit rate, 800ms–2.8s of variable stall length.
+
+Fix: drop the timer and epoch machinery entirely. Just hold the cap widened for
+the gesture's whole duration; narrow it back at the one place that actually
+needs to know the gesture ended (`stop_scratch_feeder()`). Verified clean: 25
+untraced runs (10 + 15, two batches) of the repro test, 0 stalls, vs. ~75% on
+the immediately-preceding disabled-cap baseline. Full `cargo test --lib` and
+`cargo test --lib -- --ignored` both pass with no regressions.
+
+Why this doesn't reintroduce the tempo-change-lag problem the 100ms cap
+originally guarded against: that concern only applies to soundtouch tempo
+changes on the normal branch, and the normal branch is always paused
+(valve closed, uridecodebin state-locked) for the entire time the cap is
+widened during scratch.
+
+Not resolved: *why* `output_queue`'s downstream drain lags after a fresh
+`Paused→Playing` transition in the first place — this fix absorbs the
+consequence, not the cause. Untested: live MIDI jog-wheel hardware (all
+verification this session was headless/automated via the repro test).
+
+## Files touched
+
+| File | Change |
+|---|---|
+| `docs/design/pcm-buffer-playback.md` | New "Eighth mechanism" section (the fix, the wrong-first-attempt/self-inflicted-stall finding, and verification data); `Status` section updated to "fixed" |
+| `journal.md` | This entry |
+| `src-tauri/src/audio/pipeline.rs` | `output_queue` cap now widens for a scratch gesture's duration (`scratch()`) and narrows back on gesture end (`stop_scratch_feeder()`); new `output_queue_el` field on `PipelineInner` |
