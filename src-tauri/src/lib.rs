@@ -4,6 +4,7 @@ pub mod media_cache;
 pub mod media_server;
 pub mod midi;
 pub mod midi_state;
+pub mod watchdog;
 
 use std::sync::Arc;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
@@ -126,6 +127,7 @@ pub fn run() {
             frontend_log,
             midi_state::midi_get_saved_state,
             midi_state::midi_benchmark_save,
+            watchdog::watchdog_heartbeat,
             grid_store::grid_get_saved,
             grid_store::grid_save,
             audio::list_audio_devices,
@@ -154,6 +156,10 @@ pub fn run() {
             let persist = midi_state::new_persist();
             app.manage(persist.clone());
             midi::spawn_listener(app.handle().clone(), persist)?;
+
+            let watchdog_persist = watchdog::new_persist();
+            app.manage(watchdog_persist.clone());
+            watchdog::spawn_watchdog(watchdog_persist);
 
             // See media_cache.rs — resolved here (not at builder-config time, before
             // media_server::start()) because it needs app.path(), which requires an

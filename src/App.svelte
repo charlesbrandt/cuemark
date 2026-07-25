@@ -81,6 +81,15 @@
   // heartbeat lines during the stall) apart from an IPC round-trip that's merely
   // slow (heartbeat keeps ticking fine) — see debugLog.ts.
   let lastHeartbeatAt = 0;
+  // Timestamp of the most recent frame() call, updated unconditionally every rAF tick
+  // (unlike lastHeartbeatAt above, which is throttled). Read by the watchdog heartbeat
+  // interval below to report rAF staleness to Rust — see docs/design/freeze-watchdog.md.
+  let lastRafTickAt = performance.now();
+  let watchdogIntervalId: ReturnType<typeof setInterval> | undefined;
+  // Set by the __cuemarkDebug.killRafLoop() simulation hook; checked at the tail of
+  // frame() where the loop reschedules itself (see docs/design/freeze-watchdog.md
+  // "Debug/simulation hooks").
+  let debugKillRafLoop = false;
   // Last playbackRate applied to each video element. Setting v.playbackRate triggers
   // WebKitGTK to rebuild its internal GStreamer pipeline; only update on actual change.
   const lastPlaybackRate = new Map<string, number>();
@@ -234,6 +243,26 @@
             }, intervalMs);
           });
         },
+
+        // Freeze-watchdog simulation hooks (docs/design/freeze-watchdog.md). Synchronous
+        // busy-loop blocking the whole JS main thread — timers, rAF, and the watchdog
+        // heartbeat interval itself all stop, simulating mechanism A. ms=0 blocks forever
+        // (the only variant that truly exercises tiers 2-3 once recovery is armed; a
+        // finite freeze lets a queued eval-based tier-1 recovery run as soon as it ends).
+        freezeMainThread: (ms = 0) => {
+          const start = performance.now();
+          const end = ms > 0 ? start + ms : Infinity;
+          debugLog(`[debug] freezeMainThread(${ms}) starting busy-loop`);
+          while (performance.now() < end) { /* intentional spin */ }
+          debugLog(`[debug] freezeMainThread(${ms}) finished busy-loop`);
+        },
+
+        // Kills the rAF loop (checked at the tail of frame()) while leaving setInterval
+        // timers — including the watchdog heartbeat — alive. Simulates mechanism B /
+        // "JS exception killed the loop" for exercising tier-1 recovery + lastRafMs.
+        killRafLoop: () => {
+          debugKillRafLoop = true;
+        },
       };
     }
     if (!import.meta.env.DEV) {
@@ -272,6 +301,22 @@
     } catch (e) {
       console.warn('[midi-state] failed to restore saved state:', e);
     }
+
+    // Freeze-watchdog heartbeat (docs/design/freeze-watchdog.md phase 1: observe + log
+    // only, no recovery yet). Deliberately a setInterval, not tied to the rAF loop —
+    // WebKitGTK throttles rAF for occluded/hidden windows, which would false-alarm the
+    // Rust-side silence trigger. lastRafMs lets Rust tell "rAF loop died, timers alive"
+    // apart from "whole main thread dead" (the heartbeat itself would stop in that case).
+    watchdogIntervalId = setInterval(() => {
+      const decks = get(session).decks.map((d) => {
+        const v = videoEls.get(d.id);
+        return { id: d.id, vct: v?.currentTime ?? null, ready: v?.readyState ?? null };
+      });
+      invoke('watchdog_heartbeat', {
+        window: 'main',
+        stats: { lastRafMs: Math.round(performance.now() - lastRafTickAt), decks },
+      }).catch(() => {});
+    }, 1000);
 
     compositor = new Compositor(canvas);
     let fftEventCount = 0;
@@ -312,6 +357,7 @@
     midiUnlisten?.();
     dragDropUnlisten?.();
     eosUnlisten?.();
+    clearInterval(watchdogIntervalId);
     cancelAnimationFrame(rafId);
     fftUnlisten?.();
     for (const [id, v] of videoEls) {
@@ -536,6 +582,7 @@
   // RAF render loop: upload video frames → composite; sync video to audio clock
   function frame() {
     const nowMs = performance.now();
+    lastRafTickAt = nowMs;
     if (nowMs - lastHeartbeatAt > 1000) {
       lastHeartbeatAt = nowMs;
       debugLog(`[heartbeat] rAF alive`);
@@ -680,6 +727,14 @@
       // 2026-07-24 investigation in docs/design/pcm-buffer-playback.md. Log and keep the
       // loop alive instead of vanishing silently.
       debugLog(`[frame-error] ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`);
+    }
+    // Deliberately outside the try/catch above (which exists precisely to keep the loop
+    // alive through errors) — killRafLoop() needs to actually kill it, simulating
+    // mechanism B for watchdog-test.sh: rAF dies, setInterval-based heartbeat keeps
+    // ticking, so lastRafMs in the heartbeat stats grows while `stats` itself keeps arriving.
+    if (debugKillRafLoop) {
+      debugLog('[debug] killRafLoop: rAF loop intentionally terminated');
+      throw new Error('killRafLoop debug hook: rAF loop intentionally terminated');
     }
     rafId = requestAnimationFrame(frame);
   }

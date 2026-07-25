@@ -1,3 +1,5 @@
+import { invoke } from '@tauri-apps/api/core';
+
 const channel = new BroadcastChannel('cuemark-output');
 const canvas = document.getElementById('output') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
@@ -13,11 +15,25 @@ function resize() {
 resize();
 window.addEventListener('resize', resize);
 
+let lastFrameAt = performance.now();
 channel.onmessage = (e: MessageEvent<{ frame: ImageBitmap }>) => {
   const { frame } = e.data;
+  lastFrameAt = performance.now();
   ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
   frame.close();
 };
+
+// Freeze-watchdog heartbeat (docs/design/freeze-watchdog.md phase 1: observe + log only,
+// no recovery yet). This window has no rAF loop of its own — frames arrive via the
+// BroadcastChannel from the main window's compositor — so "lastRafMs" here is reused to
+// mean "time since the last composited frame arrived", the closest analog of main's
+// rAF-staleness signal for detecting this window's own JS main thread going silent.
+setInterval(() => {
+  invoke('watchdog_heartbeat', {
+    window: 'output',
+    stats: { lastRafMs: Math.round(performance.now() - lastFrameAt), decks: [] },
+  }).catch(() => {});
+}, 1000);
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'f' || e.key === 'F') {

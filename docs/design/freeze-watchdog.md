@@ -1,7 +1,16 @@
 # Freeze watchdog and session recovery (design)
 
-Status: **approved direction, not yet implemented.** Ships before (and independently
-of) `webcodecs-video-path.md`. Rationale discussion: 2026-07-25 session; background:
+Status: **Phase 1 (observe-only) implemented and live-verified 2026-07-25.** Heartbeat
+(`App.svelte`/`output.ts` → `watchdog_heartbeat`), the Rust watchdog thread
+(`src-tauri/src/watchdog.rs`), and diagnostics logging are in; recovery is still
+disabled. Verified live: `kill -STOP` on the real `WebKitWebProcess` produced a
+trigger log (with the process's `T` state and zero utime/stime delta flagged as the
+known deadlock signature) ~5.5s after the last heartbeat, and `kill -CONT` produced a
+"heartbeat resumed after Ns silence" log — no false triggers across ~35s of otherwise
+idle operation. Also added the `freezeMainThread`/`killRafLoop` debug hooks from the
+"Debug/simulation hooks" section below. Phases 2–4 (session-of-record, armed recovery,
+mechanism-B self-heal) not started. Ships before (and independently of)
+`webcodecs-video-path.md`. Rationale discussion: 2026-07-25 session; background:
 `pcm-buffer-playback.md` mechanisms Nine/Ten/Eleven and the
 `project_webkit_freeze_mechanisms` memory.
 
@@ -179,9 +188,10 @@ never hiccups and by eye that the UI returns with decks intact.
 
 ## Phases
 
-1. **Observe only**: heartbeat + watchdog + diagnostics logging, recovery disabled.
-   Run normal sessions (incl. heavy load) to measure the false-positive rate. Gate:
-   zero false triggers across a week of normal use.
+1. **Observe only** (implemented 2026-07-25): heartbeat + watchdog + diagnostics
+   logging, recovery disabled. Run normal sessions (incl. heavy load) to measure the
+   false-positive rate. Gate: zero false triggers across a week of normal use — not
+   yet run; only spot-verified so far (see Status above).
 2. **Session-of-record**: `session_sync`/`session_restore` + rehydration, exercised
    via a debug-hook forced reload (recovery still not automatic). Gate:
    forced-reload rehydration is seamless (audio uninterrupted, decks/positions/grids
