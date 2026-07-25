@@ -5,7 +5,23 @@ Status: **Phase 1 (observe-only) implemented and live-verified 2026-07-25. Phase
 runs, `scripts/rehydration-test.sh`, 14/14 checks each run — deck source/bpm/downbeat
 intact, audio position continuous within ~0.1s of expected across the reload, `<video>`
 adoption landed within 20-150ms of live audio position, no `audioLoad` call on the
-surviving pipeline) and real-desktop (user confirmed by ear, after one fix — see below).**
+surviving pipeline) and real-desktop (user confirmed by ear, after one fix — see below).
+Phase 3 (armed recovery tiers) implemented 2026-07-25; headless gate PASSED — 3/3 clean
+runs of `scripts/watchdog-test.sh` (23/23 checks each run) across `kill -STOP`,
+`freezeMainThread(0)`, and `kill -KILL`, plus a short false-positive smoke check. The
+full 10-minute false-positive soak (design doc's step-5 gate, distinct from the 15s
+smoke check) also PASSED 2026-07-25 via new `scripts/watchdog-soak-test.sh` — 600s of
+looped playback + a 200-event MIDI-rate burst every 60s (9 bursts total), zero
+`[watchdog] TRIGGER` lines, deck still playing at the end. **Real-desktop pass also
+PASSED 2026-07-25**: user ran `freezeMainThread(0)` mid-playback on a real track via
+devtools console; confirmed by ear that audio never glitched and by eye that the deck
+came back playing at the right spot. Rust log for that run: `TRIGGER` at 21:00:15 →
+tier1 (eval, no-op — queued behind the infinite busy-loop) → tier2 (native reload,
+no-op) → tier3 SIGKILL'd 4 WebKitWebProcess/WebKitNetworkProcess descendants, first
+`reload_all_windows()` raced process teardown as documented above, the built-in retry
+landed → frontend adopted deck-0 at 74.22s still `playing=true` → heartbeat resumed
+after 21.2s silence → recovery sequence succeeded. **Phase 3 is fully closed** — both
+headless and real-desktop gates green.
 
 **Bug found and fixed during the real-desktop pass**: the first live attempt had an
 audible stutter on reload ("went back just a subtle amount"). Root cause: `App.svelte`'s
@@ -51,9 +67,51 @@ same risk). Only exercised so far via `cargo check`/`npm run check`; the design 
 own gate for this phase — forced-reload rehydration seamless 5/5 runs, headless + real
 desktop — has not been run yet.
 
-Phases 3–4 (armed recovery, mechanism-B self-heal) not started. Ships before (and
-independently of) `webcodecs-video-path.md`. Rationale discussion: 2026-07-25 session;
-background: `pcm-buffer-playback.md` mechanisms Nine/Ten/Eleven and the
+Phase 3 adds: the tiered recovery sequence in `src-tauri/src/watchdog.rs`
+(`spawn_recovery_sequence`) — tier1 `window.eval("location.reload()")`, tier2 native
+`window.reload()`, tier3 `kill -KILL` every `WebKitWebProcess`/`WebKitNetworkProcess`
+descendant (shells out to `kill`, no libc/nix dependency) followed by reloading every
+open window (attribution of the killed process to one specific window isn't reliable,
+per the design doc's original risk note). Backoff (15s between sequences) and a
+give-up threshold (3 consecutive full-sequence failures, reset on the next real
+heartbeat) are tracked per window in the existing `WindowBeat` struct. `spawn_watchdog`
+now takes an `AppHandle` (threaded through from `lib.rs` `setup()`) so the watchdog
+thread can call `eval`/`reload` on the actual `WebviewWindow` and enumerate/reload
+`app.webview_windows()`.
+
+Two things changed from the design doc's original estimates, found empirically via
+`scripts/watchdog-test.sh` (see that script's own comments for the full story):
+
+- **`TIER3_WAIT` raised from the doc's estimated 5s to 15s.** Tiers 1-2 act on an
+  existing process (fast if it's cooperative); tier 3 forks a brand-new
+  `WebKitWebProcess` and waits for it to load the page, run `onMount`, and rehydrate the
+  session — empirically ~11-20s in headless testing, not ~5s.
+- **Tier 3 retries its `reload_all_windows()` call once, partway through its wait
+  budget.** A `reload()` dispatched in the same instant as the `SIGKILL` was observed to
+  sometimes get silently dropped — most likely a race with WebKitGTK's own
+  SIGCHLD-driven bookkeeping for the just-killed process not having caught up yet on the
+  GTK main loop. Without the retry, the first full sequence would reliably "fail" and a
+  second sequence's tier 1/2 would end up doing the real work ~15-20s later — harmless
+  (audio never touched) but slower and noisier in the log than necessary.
+
+Also discovered: a real, externally-triggered navigation on a window under an active
+tauri-driver/WebKitWebDriver session (eval/reload/SIGKILL+reload dispatched from Rust,
+as opposed to a `location.reload()` called *from inside* a WebDriver `execute/async`
+script, which is what `rehydration-test.sh` does) leaves that WebDriver session unable
+to reliably answer further `execute/sync` calls, even though the page itself reloaded
+and rehydrated correctly (confirmed via the Rust log). `watchdog-test.sh` works around
+this by verifying recovery through the Rust log (`TRIGGER`, `recovery sequence ...
+succeeded`, the frontend's `[recovery] adopted deck-0 at Xs playing=Y` line) instead of
+polling the debug hook through the same session post-reload, and by giving each freeze
+scenario its own fresh app launch + session rather than chaining three scenarios through
+one session. Real-desktop verification (`kill -STOP`/`kill -CONT` plus
+`freezeMainThread(0)` mid-playback, confirming by ear per
+`feedback_audio_midi_live_testing`) has not been done yet for phase 3 — only phase 1's
+observe-only behavior was live-verified on the real desktop so far.
+
+Phase 4 (mechanism-B self-heal) not started. Ships before (and independently of)
+`webcodecs-video-path.md`. Rationale discussion: 2026-07-25 session; background:
+`pcm-buffer-playback.md` mechanisms Nine/Ten/Eleven and the
 `project_webkit_freeze_mechanisms` memory.
 
 ## Goal
@@ -220,7 +278,11 @@ New `scripts/watchdog-test.sh` (verify-ui harness pattern):
 4. Repeat with `freezeMainThread(0)` (tier coverage) and `kill -KILL` (crash path).
 5. Negative test: 10 min of ordinary playback + MIDI burst (`latency-test.sh` load
    profile) with recovery armed — assert **zero** watchdog triggers (false-positive
-   gate).
+   gate). `watchdog-test.sh` runs a ~15s smoke version of this (playback + one
+   200-event MIDI burst) as a quick sanity check on every run; `scripts/watchdog-soak-test.sh`
+   is the real 10-minute version (loops a track via `deck.loop`, fires a 200-event
+   burst every 60s) — run that separately before relying on recovery in prod. **PASSED
+   2026-07-25** — see Status above.
 
 Gates: `perf-idle-test.sh` and `latency-test.sh` unchanged-or-better (heartbeat and
 1 s debounced `session_sync` are negligible next to existing per-frame IPC).
@@ -241,7 +303,16 @@ never hiccups and by eye that the UI returns with decks intact.
    (`scripts/rehydration-test.sh`, 5/5 runs, 14/14 checks each) and real desktop
    (user-confirmed by ear, after fixing the `set_devices`/`set_cue_device` rebuild bug
    — see Status above). Phase 2 is done.
-3. **Arm recovery tiers** + `watchdog-test.sh` green.
+3. **Arm recovery tiers** + `watchdog-test.sh` green. **PASSED 2026-07-25 — phase fully
+   closed.** Headless (`scripts/watchdog-test.sh`, 3/3 clean runs, 23/23 checks each,
+   covering `kill -STOP`/`freezeMainThread(0)`/`kill -KILL` plus a false-positive smoke
+   check). `TIER3_WAIT` and a tier-3 retry were tuned based on what this testing found
+   — see Status above. The full 10-minute false-positive soak
+   (`scripts/watchdog-soak-test.sh`) also PASSED — zero triggers across 600s of
+   playback + 9 MIDI-rate bursts. Real-desktop pass (per
+   `feedback_audio_midi_live_testing`) also PASSED — user-confirmed by ear/eye with
+   `freezeMainThread(0)` mid-playback, full tier1→tier2→tier3 escalation, deck adopted
+   back at the correct live position. See Status above for the log detail.
 4. **Mechanism-B self-heal** (smallest piece, riskiest history — the Eleventh
    mechanism was four failed iterations of a *cousin* of this; the difference here is
    it acts only on an already-stalled element, never on healthy playback. Live-test

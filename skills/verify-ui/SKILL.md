@@ -224,6 +224,35 @@ External process-level simulation of the documented freeze mechanisms, useful on
 - Rust-side audio can be verified alive during a frozen webview by watching the log
   (`audio_get_position` keeps being served) — the webview is not required for audio.
 
+**A real navigation triggered from OUTSIDE a WebDriver command breaks the WebDriver
+session** — found implementing `docs/design/freeze-watchdog.md` phase 3
+(`scripts/watchdog-test.sh`). If Rust code calls `WebviewWindow::eval("location.reload()")`,
+`.reload()`, or forces one via `kill -KILL` + `.reload()` on a window that has an active
+tauri-driver session attached, that session stops answering `/execute/sync` reliably (or
+returns `invalid session id`) afterward — **even though the page itself reloaded and
+rehydrated correctly** (verify via the Rust log, not another `js_sync` call). This is
+different from `rehydration-test.sh`'s own `location.reload()`, which works fine because
+it's called *from inside* an `/execute/async` script — i.e. the reload itself is a
+WebDriver-issued command in that case, not an external navigation the session has to
+notice and recover from.
+
+Practical fallout for any test that forces a recovery/reload and then wants to check
+post-reload state:
+- **Verify recovery via the Rust log**, not by polling the debug hook through the same
+  session afterward (`grep` for your own log lines, e.g. a `recovery sequence ...
+  succeeded` or an `adopted deck-X at Ys` line the frontend already logs via
+  `frontend_log`/`debugLog`) — the log is unaffected by the session's fate and is
+  already the authoritative source (a `[recovery] adopted ...` line only fires from the
+  exact code path that also updates the live DOM/session state).
+- If you need multiple freeze scenarios in one script, give each its own fresh
+  `start_app`/session rather than chaining them through one — trying to reuse a session
+  across a scenario that already forced a reload just compounds into "invalid session
+  id" for everything after the first.
+- Don't use webdriver-only fixed sleeps to time "how long did recovery take" — the Rust
+  log's own line timestamps (`[YYYY-MM-DD HH:MM:SS.mmm]` prefix, `date -u -d "<ts>"
+  +%s.%N` to convert) give the true moment an event happened, vs. whatever moment your
+  polling loop happened to notice it.
+
 ## Gotchas
 
 - **`dpkg -L webkit2gtk-driver | grep WebKitWebDriver` matches two lines**, not one — the
@@ -251,6 +280,16 @@ External process-level simulation of the documented freeze mechanisms, useful on
   `apt-get upgrade webkit2gtk-driver` if cuemark's WebKit dependency is bumped.
 - **One session at a time**: `tauri-driver` does not multiplex; creating a second
   session before deleting the first will hang or error.
+- **A test script's `cleanup()` must kill the launched app binary itself, not just
+  Xvfb/tauri-driver** — none of the existing gate scripts (`rehydration-test.sh`,
+  `perf-idle-test.sh`) do this, and it doesn't bite them because they never signal
+  processes by pid. But a script that does (e.g. `kill -STOP`/`kill -KILL` on the
+  WebKitWebProcess, as `watchdog-test.sh` does) needs it: a stray `cuemark` instance
+  left running from an aborted run makes `pgrep -f "^$BINARY\$" | head -1` in the *next*
+  run pick an arbitrary (often the wrong, stale) process, silently invalidating every pid
+  derived from it. Capture the app's pid once right after creating the session (only
+  safe if you first confirmed nothing else matched `$BINARY`), and `kill -KILL` it
+  (plus `pkill -KILL -P` its children) in cleanup.
 - **GStreamer/audio still runs for real** inside Xvfb — if the verification task
   doesn't need audio, prefer leaving decks empty (no source loaded) or using only the
   global visualization layer (`Session.visualization` — no deck/audio involvement) rather

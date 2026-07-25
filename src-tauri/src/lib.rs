@@ -164,7 +164,7 @@ pub fn run() {
 
             let watchdog_persist = watchdog::new_persist();
             app.manage(watchdog_persist.clone());
-            watchdog::spawn_watchdog(watchdog_persist);
+            watchdog::spawn_watchdog(watchdog_persist, app.handle().clone());
 
             // See media_cache.rs — resolved here (not at builder-config time, before
             // media_server::start()) because it needs app.path(), which requires an

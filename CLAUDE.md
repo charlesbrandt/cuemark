@@ -512,13 +512,16 @@ needed — don't load them on every session.
 | `midi` | Hercules Starlight channel layout, full control map, adding or re-calibrating a controller |
 | `digger-integration` | Digger API endpoints, WebSocket queue updates, cuemark/Digger boundary rules |
 
-Two automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb +
+Several automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb +
 `VITE_ENABLE_DEBUG_HOOK=1`):
 
 | Script | When to run |
 |---|---|
 | `scripts/perf-idle-test.sh [video]` | CPU regression — samples `WebKitWebProcess` CPU% across empty/paused/playing scenarios. Run after touching the render loop (`App.svelte` `frame()`), `WaveformCanvas`, or `DeckCard`'s preview canvas. |
 | `scripts/latency-test.sh <video>` | Full deck workflow — load track → waveform renders → video plays → `audio_set_rate` IPC latency stats → 200-event MIDI-rate burst with CPU check. Run after touching the MIDI handler, `audioSync.ts`, or the GStreamer audio pipeline. |
+| `scripts/rehydration-test.sh <video>` | `docs/design/freeze-watchdog.md` phase 2 gate — forced-reload session rehydration (deck/bpm/downbeat intact, audio position continuous, no stray `audioLoad`). Run after touching `session_store.rs`, `sessionRecovery.ts`, or `App.svelte`'s onMount rehydration path. |
+| `scripts/watchdog-test.sh <video>` | `docs/design/freeze-watchdog.md` phase 3 gate — tiered recovery (`kill -STOP`/`freezeMainThread(0)`/`kill -KILL`) plus a 15s false-positive smoke check. Run after touching `watchdog.rs` or the recovery/adoption path. |
+| `scripts/watchdog-soak-test.sh <video> [seconds]` | The design doc's full 10-minute false-positive soak (default 600s) — looped playback + a MIDI-rate burst every 60s, asserts zero watchdog triggers. Run before relying on recovery in prod, not on every change. |
 
 ## Constraints
 
