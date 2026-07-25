@@ -1,7 +1,29 @@
 # Freeze watchdog and session recovery (design)
 
 Status: **Phase 1 (observe-only) implemented and live-verified 2026-07-25. Phase 2
-(session-of-record) implemented 2026-07-25, not yet live-tested.** Heartbeat
+(session-of-record) implemented 2026-07-25; full gate PASSED 2026-07-25 — headless (5/5
+runs, `scripts/rehydration-test.sh`, 14/14 checks each run — deck source/bpm/downbeat
+intact, audio position continuous within ~0.1s of expected across the reload, `<video>`
+adoption landed within 20-150ms of live audio position, no `audioLoad` call on the
+surviving pipeline) and real-desktop (user confirmed by ear, after one fix — see below).**
+
+**Bug found and fixed during the real-desktop pass**: the first live attempt had an
+audible stutter on reload ("went back just a subtle amount"). Root cause: `App.svelte`'s
+`$effect`s syncing `mainOutputDeviceIds`/`cueOutputDeviceId` (persisted stores) to Rust
+call `audio_set_main_devices`/`audio_set_cue_device` unconditionally on every mount —
+and both Rust commands unconditionally call `DeckAudioPipeline::set_devices`/
+`set_cue_device` on every live pipeline, which **always tears the GStreamer pipeline
+down and rebuilds it** (PipeWire's `pipewiresink` can't retarget at runtime) even when
+the device list is unchanged. Pre-existing bug, invisible before phase 2 because there
+was never a scenario where a live, playing pipeline existed when a fresh webview mounted
+and ran this effect. Fixed with a no-op guard in both Rust commands
+(`src-tauri/src/audio/mod.rs`: skip the rebuild loop entirely when the new device
+list/id matches the stored one) — confirmed via log inspection that a post-fix reload
+shows `[recovery] adopted` with **no** `Null → Ready` pipeline-rebuild sequence, and
+confirmed by ear on the real desktop. **The headless test suite does not catch this
+class of bug** — it runs with a fresh WebKitGTK profile, so `mainOutputDeviceIds`
+defaults to empty, which trivially equals the stored empty default even pre-fix. Only a
+real desktop with a configured output device exposes it. Heartbeat
 (`App.svelte`/`output.ts` → `watchdog_heartbeat`), the Rust watchdog thread
 (`src-tauri/src/watchdog.rs`), and diagnostics logging are in; recovery is still
 disabled. Verified live: `kill -STOP` on the real `WebKitWebProcess` produced a
@@ -215,11 +237,10 @@ never hiccups and by eye that the UI returns with decks intact.
 2. **Session-of-record**: `session_sync`/`session_restore` + rehydration, exercised
    via a debug-hook forced reload (recovery still not automatic). Gate:
    forced-reload rehydration is seamless (audio uninterrupted, decks/positions/grids
-   correct) 5/5 runs, headless + real desktop. **Implemented 2026-07-25** — gate not
-   yet run; next step is a `verify-ui`-driven forced-reload test (load a track, let it
-   play a few seconds, trigger a webview reload via WebDriver, assert the deck comes
-   back with source/bpm/downbeat intact and audio position continuous) plus a live
-   desktop pass.
+   correct) 5/5 runs, headless + real desktop. **PASSED 2026-07-25** — headless
+   (`scripts/rehydration-test.sh`, 5/5 runs, 14/14 checks each) and real desktop
+   (user-confirmed by ear, after fixing the `set_devices`/`set_cue_device` rebuild bug
+   — see Status above). Phase 2 is done.
 3. **Arm recovery tiers** + `watchdog-test.sh` green.
 4. **Mechanism-B self-heal** (smallest piece, riskiest history — the Eleventh
    mechanism was four failed iterations of a *cousin* of this; the difference here is

@@ -281,6 +281,19 @@ pub fn audio_set_master_volume(state: State<'_, AudioState>, volume: f32) -> Res
 #[tauri::command]
 pub fn audio_set_main_devices(state: State<'_, AudioState>, device_ids: Vec<String>) -> Result<(), String> {
     let mut mgr = state.lock().unwrap();
+    // No-op guard: the frontend calls this unconditionally on every mount (App.svelte's
+    // `$effect` syncing the persisted `mainOutputDeviceIds` store has no change check),
+    // and `DeckAudioPipeline::set_devices` unconditionally tears down and rebuilds the
+    // GStreamer pipeline (PipeWire's pipewiresink can't retarget at runtime). On a normal
+    // cold boot `pipelines` is still empty so the rebuild is free — but on a freeze-watchdog
+    // recovery-boot reload (docs/design/freeze-watchdog.md phase 2), the pipeline the
+    // frontend just finished carefully *adopting* without an audioLoad call gets torn down
+    // and rebuilt seconds later by this unrelated call, producing an audible glitch (brief
+    // stutter, position rewound slightly) — confirmed live 2026-07-25. Same fix pattern as
+    // `audio_set_cue_device` below.
+    if mgr.main_devices == device_ids {
+        return Ok(());
+    }
     mgr.main_devices = device_ids.clone();
     // MasterMix uses the first device as its primary target (or empty = default).
     let primary = device_ids.first().map(|s| s.as_str()).unwrap_or("");
@@ -296,6 +309,11 @@ pub fn audio_set_main_devices(state: State<'_, AudioState>, device_ids: Vec<Stri
 #[tauri::command]
 pub fn audio_set_cue_device(state: State<'_, AudioState>, device_id: String) -> Result<(), String> {
     let mut mgr = state.lock().unwrap();
+    // No-op guard — see the matching comment in audio_set_main_devices above; same bug,
+    // same fix, for the headphone cue output's `$effect` in App.svelte.
+    if mgr.cue_device == device_id {
+        return Ok(());
+    }
     mgr.cue_device = device_id.clone();
     mgr.mixer.set_cue_device(&device_id)?;
     for pipeline in mgr.pipelines.values_mut() {
