@@ -13,7 +13,7 @@
     audioSetCueDevice, audioSetCueGain, gridGetSaved,
   } from "./lib/audio/pipeline";
   import { clearSavedGrid, markGridSaved, hasSavedGrid } from "./lib/audio/gridSource";
-  import { syncRate, syncGain, syncVolume, clearDeckAudioSync } from "./lib/audio/audioSync";
+  import { syncRate, syncGain, syncVolume, clearDeckAudioSync, averageRateOverWindow } from "./lib/audio/audioSync";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { listen } from "@tauri-apps/api/event";
   import { registerVideoEl, unregisterVideoEl, setDeckAudioTime, getDeckTime, getVideoEl, seekDeck, getPendingSeekTarget, clearPendingSeekTarget, isScratching } from "./lib/renderer/seekBus";
@@ -72,7 +72,10 @@
   // A delta >500ms between consecutive frames (impossible at any real playback rate) signals
   // a seek — after a seek, GStreamer immediately returns the seek target, which IS the correct
   // content position, so we use it directly as the new reference.
-  const contentPosTracker = new Map<string, { audioPos: number; contentPos: number }>();
+  // `tsMs` (performance.now() at the moment this entry was computed) lets the next resolution
+  // ask audioSync.ts's rate-history log for the time-weighted average rate actually in effect
+  // across the gap, instead of a single instantaneous snapshot (see averageRateOverWindow).
+  const contentPosTracker = new Map<string, { audioPos: number; contentPos: number; tsMs: number }>();
   // Debug: rAF heartbeat, throttled to ~1/sec, so a live "chokes up" repro can be
   // read against Rust-side timestamps to tell a fully-frozen main thread (no
   // heartbeat lines during the stall) apart from an IPC round-trip that's merely
@@ -577,6 +580,7 @@
               const pollMs = performance.now() - pollStartMs;
               if (pollMs > 300) debugLog(`[position-poll] ${capturedDeckId} took ${pollMs.toFixed(0)}ms, audioPos=${audioPos}`);
               if (audioPos === null || !v) return;
+              const nowMs = performance.now();
               let contentPos: number;
               if (scratching) {
                 // During scratch, position() (Rust side) returns the feeder's live
@@ -586,15 +590,23 @@
                 // integration below applies here.
                 contentPos = audioPos;
               } else {
-                // Use the rate at resolution time, not at IPC-start time. If the rate
-                // changed while the IPC was in flight (e.g. 2× → 1×), the at-start rate
-                // doubles the delta and overshoots contentPos by ~IPC-latency × rate-diff.
-                const resolvedRate = get(session).decks.find(d => d.id === capturedDeckId)?.playbackRate ?? 1.0;
                 // Recover content position from wall-clock audioPos (see contentPosTracker comment).
                 const prev = contentPosTracker.get(capturedDeckId);
-                contentPos = prev && Math.abs(audioPos - prev.audioPos) < 0.5
-                  ? prev.contentPos + (audioPos - prev.audioPos) * resolvedRate
-                  : audioPos; // large jump = seek; audioPos IS correct content pos post-seek
+                if (prev && Math.abs(audioPos - prev.audioPos) < 0.5) {
+                  // Use the time-weighted average rate actually in effect across
+                  // [prev.tsMs, nowMs], not just the rate at resolution time. During
+                  // active tempo/pitch adjustment the rate can change several times within
+                  // one poll's round trip (~140-190ms, see IPC latency baseline); applying
+                  // only the latest snapshot to the whole span systematically overshoots
+                  // contentPos while the rate is climbing (and undershoots while falling) —
+                  // this is what made the waveform/video position drift ahead of the audio
+                  // whenever tempo/pitch was actively being adjusted.
+                  const currentRate = get(session).decks.find(d => d.id === capturedDeckId)?.playbackRate ?? 1.0;
+                  const rate = averageRateOverWindow(capturedDeckId, prev.tsMs, nowMs, currentRate);
+                  contentPos = prev.contentPos + (audioPos - prev.audioPos) * rate;
+                } else {
+                  contentPos = audioPos; // large jump = seek; audioPos IS correct content pos post-seek
+                }
                 // Filter out stale pre-seek IPC responses. On a heavy video, GStreamer
                 // can take >1s to complete a seek, returning the pre-seek position the
                 // whole time. If a seek is pending and contentPos is far from the seek
@@ -605,7 +617,7 @@
                   clearPendingSeekTarget(capturedDeckId); // seek complete
                 }
               }
-              contentPosTracker.set(capturedDeckId, { audioPos, contentPos });
+              contentPosTracker.set(capturedDeckId, { audioPos, contentPos, tsMs: nowMs });
               setDeckAudioTime(capturedDeckId, contentPos); // feeds waveform playhead — cheap, no WebKit cost
               // No v.currentTime writes at all during scratch — see the scratch-freeze
               // investigation in docs/design/pcm-buffer-playback.md, 2026-07-23. A 150ms

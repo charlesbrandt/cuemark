@@ -22,6 +22,64 @@ export function syncRate(deckId: string, rate: number): void {
   if (Math.abs(rate - last) < 0.005) return;
   rateMap.set(deckId, rate);
   audioSetRate(deckId, rate).catch(console.error);
+  recordRateChange(deckId, rate);
+}
+
+// Timestamped rate-change log, used by App.svelte's content-position integration
+// (see contentPosTracker) to recover the actual content position from GStreamer's
+// wall-clock query_position. That integration needs the rate that was ACTUALLY in
+// effect across a wall-clock span, not just the rate at the instant the span ends —
+// during active tempo/pitch adjustment (MIDI can fire 200+ rate events/sec) the rate
+// often changes several times within a single position-poll's round trip (~140-190ms
+// per the IPC latency baseline), so "latest known rate applied to the whole span"
+// systematically over/undershoots the true content position while the fader is moving.
+interface RateChange { ts: number; rate: number }
+const rateHistory = new Map<string, RateChange[]>();
+const RATE_HISTORY_MAX_AGE_MS = 2000;
+
+function recordRateChange(deckId: string, rate: number): void {
+  const now = performance.now();
+  let history = rateHistory.get(deckId);
+  if (!history) {
+    history = [];
+    rateHistory.set(deckId, history);
+  }
+  history.push({ ts: now, rate });
+  // Trim stale entries, but always leave at least one at/before the cutoff so the
+  // rate in effect at any timestamp within the retention window stays resolvable.
+  const cutoff = now - RATE_HISTORY_MAX_AGE_MS;
+  let i = 0;
+  while (i < history.length - 1 && history[i + 1].ts <= cutoff) i++;
+  if (i > 0) history.splice(0, i);
+}
+
+/**
+ * Time-weighted average rate applied to `deckId` over [fromMs, toMs] (both
+ * `performance.now()`-space timestamps), accounting for any rate changes recorded
+ * inside that window. Falls back to `currentRate` when there's no window or no
+ * history (e.g. before the deck's first rate sync).
+ */
+export function averageRateOverWindow(deckId: string, fromMs: number, toMs: number, currentRate: number): number {
+  if (toMs <= fromMs) return currentRate;
+  const history = rateHistory.get(deckId);
+  if (!history || history.length === 0) return currentRate;
+
+  let segStart = fromMs;
+  let segRate = currentRate;
+  for (const change of history) {
+    if (change.ts <= fromMs) segRate = change.rate;
+    else break;
+  }
+
+  let weighted = 0;
+  for (const change of history) {
+    if (change.ts <= fromMs || change.ts >= toMs) continue;
+    weighted += (change.ts - segStart) * segRate;
+    segStart = change.ts;
+    segRate = change.rate;
+  }
+  weighted += (toMs - segStart) * segRate;
+  return weighted / (toMs - fromMs);
 }
 
 export function syncGain(deckId: string, gain: number): void {
@@ -40,4 +98,5 @@ export function clearDeckAudioSync(deckId: string): void {
   rateMap.delete(deckId);
   gainMap.delete(deckId);
   volumeMap.delete(deckId);
+  rateHistory.delete(deckId);
 }
