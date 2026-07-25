@@ -243,6 +243,28 @@ kill $(cat /tmp/xvfb.pid) 2>/dev/null; rm -f /tmp/xvfb.pid
   silently undoing the seek — `getVideoTime()` then returns the pre-seek position even after a full second
   of sleep. The `pendingSeekTarget` filter in the RAF loop is a safety net for programmatic seeks, but the
   correct fix for test scripts is ordering: rate change → settle → seek.
+- **A shell helper's `bash -c "$(declare -f fn); fn ..."` subshell does NOT inherit the
+  outer script's variables** — `declare -f` exports the function *body* only, not the
+  `$SESSION`/`$DRIVER_PORT` etc. it closes over. A monitoring loop built this way (to get
+  a hard per-call `timeout`) silently called the WebDriver endpoint with an empty session
+  ID on every iteration, producing a fast, wrong "empty result" that looked exactly like a
+  timeout — nearly reported as a live freeze repro before noticing the elapsed time (0.05s)
+  was far too fast for the `timeout 12`/`--max-time 10` that supposedly fired (2026-07-25).
+  Either inline the variable values directly into the script string (via `jq -n --arg`, not
+  string interpolation — see the gotcha above) or use `curl --max-time` for the timeout
+  instead of wrapping in `timeout bash -c`.
+- **A polled value that stops changing is not proof of a freeze** — confirmed the hard way
+  chasing a suspected second freeze mechanism (2026-07-25, see `audio-debugging` skill's
+  "UI frozen solid" entry): a track reaching its natural end also makes a polled
+  `getVideoTime()` go flat (WebKitGTK resets `currentTime` to 0 after `ended` fires, with
+  `paused=true`), which looks identical to a genuine stall from the polled number alone. A
+  monitor that treats "N consecutive identical readings" as a stall signal will false-alarm
+  on every clean end-of-track. Before concluding a repro, check the video element's
+  `paused`/`ended`/`readyState`/`networkState`/`buffered` (`readyState < 3` mid-playback,
+  not `paused`, not `ended` = genuine stall; `paused=true` with `readyState=4` and the full
+  range buffered = the track just ended normally) and cross-check against the real Rust-side
+  position (`window.__TAURI__.core.invoke('audio_get_position', {deckId})` directly, not the
+  frontend's cached `getAudioTime()`, which can itself be stuck from an unrelated cause).
 - **`latency-test.sh` step 6 burst timeout on heavy videos.** JS `setInterval` is throttled by the browser
   under CPU load; a heavy H.264 music video can slow 5 ms ticks to ~150 ms, making a 200-event burst take
   ~30 s. The script sets the WebDriver script timeout to 60 s before the burst call and restores it

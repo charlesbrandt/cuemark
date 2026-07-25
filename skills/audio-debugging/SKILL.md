@@ -385,6 +385,96 @@ If a file fails to load and the path contains special characters, check `file_to
 `load()` preroll failure path calls `bus.set_flushing(true)` + `set_state(Null)` before early return.
 `Drop` impl does the same. If you see CRITICAL warnings on teardown, check these paths.
 
+### UI frozen solid, audio keeps playing, rAF heartbeat log stops forever — check which of two distinct causes
+
+**Shared symptom**: `[heartbeat] rAF alive` (`App.svelte`'s `frame()`, logged once/sec via
+`debugLog`) ticks cleanly then stops permanently — no further log output of any kind —
+while GStreamer's independent Rust audio pipeline keeps playing. Found live, root-caused
+via `gdb`, 2026-07-24/25 — full writeup in `docs/design/pcm-buffer-playback.md`, "Ninth
+mechanism". Two different mechanisms produce this identical externally-observable
+symptom; don't assume it's the first one just because the shape matches:
+
+1. **A real deadlock inside WebKitGTK's own `MediaPlayerPrivateGStreamer`** — the GTK/JS
+   main thread stuck inside a synchronous `gst_element_send_event()` (a `<video>` seek),
+   holding a GStreamer element mutex, while one of WebKit's own internal GStreamer
+   streaming threads is parked on a `WTF::ParkingLot` condition variable waiting for that
+   same main thread's run loop to service a "new sample ready" signal. Classic AB-BA
+   deadlock, confirmed via a live `gdb -p <pid> thread apply all bt` on the actual
+   still-hung `WebKitWebProcess`. Not a cuemark/Rust bug — a real WebKitGTK bug. Trigger:
+   `App.svelte`'s drift-correction resync (`v.currentTime = contentPos` when audio/video
+   drift exceeds a threshold) fires this exact seek call on essentially every
+   position-poll for as long as any deck plays at a non-1.0 rate, not just during scratch.
+   Mitigation (not a fix — can't fix a bug in WebKitGTK itself): widen the drift threshold
+   (`App.svelte`, currently 250ms) so the seek — and thus this deadlock's trigger window —
+   fires far less often. **Diagnostic tell**: if you can still get a `gdb`/WebDriver JS
+   execution response from the frozen process, it's NOT this one — see #2.
+2. **A near-end-of-track decode stall at non-1.0 rate, unrelated to seeks or
+   networking** — WebKit's `<video>` element itself genuinely stops advancing
+   (`readyState` stuck at 2 `HAVE_CURRENT_DATA`, `networkState` stuck at 2
+   `LOADING`, every internal GStreamer streaming thread parked in
+   `futex_do_wait`) while the **JS main thread stays fully responsive**
+   (WebDriver JS execution and the rAF loop itself keep working). **First
+   hypothesis (media_server.rs cache-lookup race) turned out to be wrong** —
+   disproven live when the exact same stall recurred with `buffered` already
+   reporting the *entire file* downloaded (`[0, duration]`), which rules out
+   any network race by definition (nothing left to fetch). `media_cache.rs`'s
+   `lookup_wait()` is still a real, worthwhile fix for the race it *does* fix
+   (kept), just not the cause of this stall. **Actual root cause, confirmed via
+   a control test**: WebKitGTK's internal video-only GStreamer pipeline runs at
+   `segment.rate = deck.playbackRate` once `v.playbackRate` ≠ 1.0, and its own
+   EOS/segment-boundary bookkeeping doesn't land cleanly at a non-1.0 rate — a
+   downstream element waits forever for one more buffer that a rate-scaled
+   calculation thinks should exist but doesn't. Confirmed by seeking near the
+   end and playing to true EOS at `playbackRate=1.0`: clean every time, vs. 2
+   stalls in 3 attempts at 0.87×. A bug inside WebKitGTK itself, same family as
+   #1 above (both triggered by non-1.0 `v.playbackRate`) but a different
+   manifestation — a decode-thread stall with the main thread free, not a
+   main-thread deadlock. **A mitigation (reset `<video>` to `playbackRate=1.0`
+   near track end) was built, live-tested, and fully reverted the same day
+   (2026-07-25)** after three compounding regressions — see "Eleventh
+   mechanism" in the design doc for the full sequence (a store-effect-gated
+   guard that never fired; a switch to `v.currentTime` for reliability; a real
+   audio-truncation regression from letting `onended` stop the still-playing
+   real audio early; a worse attempt to fix that by waiting on `deck-eos`,
+   which doesn't reliably arrive and left audio playing forever). **Currently
+   unmitigated by deliberate choice** — every attempted fix cost more than the
+   rare freeze it avoided. Root-cause research (same session): `libwebkit2gtk
+   -4.1` is already at the latest Ubuntu 24.04 apt version (2.52.3, no upgrade
+   path); WebKit's own `setRate()` issues a standard `FLUSH|ACCURATE` seek with
+   `stop=GST_CLOCK_TIME_NONE`, not obviously wrong in isolation — the actual
+   bug likely lives in `multiqueue`'s rate-scaled buffering-level accounting
+   never resolving to real EOS once `segment.rate != 1.0`. No matching public
+   WebKit bug report found. A real structural fix would mean either never
+   setting `v.playbackRate` away from 1.0 at all (raises mechanism-#1
+   exposure instead) or a custom Rust/GStreamer video-decode pipeline
+   bypassing WebKit's `<video>` element entirely (mirrors the PCM-buffer
+   approach already built for audio scratch) — neither attempted; both are
+   substantial projects, not quick patches.
+   **Diagnostic tell**: check the video element's
+   `paused`/`ended`/`readyState`/`networkState`/`buffered` via the debug hook
+   or devtools. `readyState < 3` mid-playback (not `paused`, not `ended`) means
+   a genuine stall; `buffered` already covering the full duration at the time
+   of the stall rules out a network cause and points at internal
+   decode/segment bookkeeping instead. Don't assume a stuck position value is a
+   freeze at all until you've checked these — reaching a legitimate
+   end-of-track also freezes the polled position (WebKitGTK resets
+   `currentTime` to 0 after `ended` fires, with `paused=true`), which looks
+   identical to a stall from a single polled number alone. A control run at
+   `playbackRate=1.0` (the setting a rate-related hypothesis predicts should
+   *not* fail) is a cheap, decisive way to confirm or rule out this whole
+   class before trusting any fix.
+
+**Catching either one live, cheaper than a fresh repro**: if a process from a *real*
+incident is still alive and hung (check `ps -o etimes,stat -p <pid>` — an old, sleeping
+`cuemark`/`WebKitWebProcess` pair is worth investigating before anything else), attaching
+`gdb` to it directly (`gdb -p <pid> -batch -iex "set debuginfod enabled off" -ex "thread
+apply all bt"`) hands you the actual incident's state instead of needing to reproduce
+from scratch. This still needs root — `ptrace_scope=1` blocks attaching to a
+non-descendant process even with the harness's sandbox override disabled (confirmed: that
+override only lifts the harness's own restrictions, not the kernel's). If you don't have
+passwordless `sudo`, ask the user to run the `gdb -p` command themselves via `!` so the
+password prompt reaches them directly, and paste the backtrace back.
+
 ### Fresh machine: tracks load (filename shows) but never play, no waveform, black video preview
 
 Confirmed root cause on a clean Ubuntu install (2026-06-19): `gstreamer1.0-plugins-bad` was never
@@ -420,7 +510,7 @@ section, which now lists this as a separate "runtime plugins" install step from 
 
 | Message | What it tells you |
 |---|---|
-| `EOS` | Track ended. `at_eos` flag triggers seek-to-zero on next `play()`. |
+| `EOS` | Track ended. `at_eos` flag triggers seek-to-zero on next `play()`. **The bus thread also calls `pipeline.set_state(Paused)` directly right here** (added 2026-07-25) — GStreamer does not stop a pipeline's clock on EOS by itself; `PLAYING` state keeps ticking with nothing left to render, so `query_position` climbs forever (real-time, unbounded, well past the track's actual duration) until something explicitly pauses it. This used to rely entirely on the frontend's `deck-eos` Tauri-event handler calling `audio_pause()` in response — live-tested and found that round-trip doesn't reliably land in every scenario, leaving audio playing forever with an ever-growing, silently-wrong position. Self-pausing here makes the pipeline correct regardless of frontend timing/behavior. Safe to call `set_state` from this thread: it's a dedicated bus-consumer thread via `bus.iter_timed()`, not a GStreamer streaming thread or the GLib main loop (the documented-unsafe case for synchronous state changes). |
 | `ERROR` | Fatal pipeline error. Log names the element and GStreamer flow return. Sets `at_error`. |
 | `WARNING` | Non-fatal. Usually codec quirks. |
 | `StateChanged` (pipeline-level) | Shows NULL→READY→PAUSED→PLAYING lifecycle. An unexpected drop to PAUSED mid-playback is a sign of a seek interaction problem. |

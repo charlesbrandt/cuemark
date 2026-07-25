@@ -10,16 +10,22 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpListener;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::media_cache::MediaCache;
 use crate::{mime_from_path, parse_range, url_decode};
 
 fn handle(request: tiny_http::Request, cache: &MediaCache) {
     let requested_path = url_decode(request.url());
-    // Best-effort only: lookup() never touches the network, so a cache miss (file not
-    // yet cached by audio_load, or caching still in progress) just serves the original
-    // network path exactly as before — no regression, no request-path blocking copy.
-    let file_path = cache.lookup(&requested_path).unwrap_or(requested_path);
+    // Wait out an in-progress ensure_cached() copy instead of falling straight back to
+    // the network — a video's first HTTP request can otherwise race ahead of audio_load's
+    // cache copy and end up streaming (and, on this codebase's known SMB share, sometimes
+    // stalling) straight off the original network path for the rest of the connection. A
+    // path that was never requested to be cached at all still falls back immediately, same
+    // as before. See media_cache.rs's lookup_wait() doc comment for the full incident.
+    let file_path = cache
+        .lookup_wait(&requested_path, Duration::from_secs(10))
+        .unwrap_or(requested_path);
     let range_hdr = request
         .headers()
         .iter()

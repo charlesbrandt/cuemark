@@ -666,6 +666,7 @@ impl DeckAudioPipeline {
         let deck_id_log = self.deck_id.clone();
         let eos_cb = self.eos_callback.clone();
         let app_handle = self.app.clone();
+        let pipeline_eos = pipeline.clone();
 
         std::thread::spawn(move || {
             for msg in bus_thread.iter_timed(None) {
@@ -673,6 +674,21 @@ impl DeckAudioPipeline {
                     gst::MessageView::Eos(_) => {
                         log::info!("[bus/{}] EOS", deck_id_log);
                         at_eos_thread.store(true, Ordering::Relaxed);
+                        // Pause the pipeline ourselves right here instead of relying on the
+                        // frontend to react to the eos_callback below and call audio_pause().
+                        // GStreamer does NOT stop a pipeline's clock on EOS — PLAYING state
+                        // keeps running with nothing left to render, so query_position keeps
+                        // climbing indefinitely at wall-clock speed forever if nothing pauses
+                        // it. Previously this depended entirely on the frontend's 'deck-eos'
+                        // Tauri-event handler calling audio_pause() — live-tested (2026-07-25)
+                        // and found that round trip does not reliably land in time (or at all)
+                        // in every scenario, leaving audio playing forever with a waveform
+                        // position that never stops growing (silently unbounded past the
+                        // track's real duration). Pausing directly here makes the pipeline
+                        // self-correct regardless of frontend timing/behavior.
+                        if let Err(e) = pipeline_eos.set_state(gst::State::Paused) {
+                            log::warn!("[bus/{}] EOS: failed to pause pipeline: {}", deck_id_log, e);
+                        }
                         if let Some(cb) = &eos_cb { cb(); }
                     }
                     gst::MessageView::Error(e) => {

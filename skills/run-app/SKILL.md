@@ -114,6 +114,14 @@ kill $(cat /tmp/cuemark-dev.pid) 2>/dev/null; rm -f /tmp/cuemark-dev.pid
 
 **Always stop before making Rust changes** (`src-tauri/`). After editing Rust code: stop, make the edit, restart. `cargo tauri dev` auto-detects frontend changes and hot-reloads them without a restart.
 
+**`pkill -f "target/debug/cuemark"` matches every instance, not just the one you mean** —
+confirmed the hard way (2026-07-25): a `verify-ui`-style headless debug-hook build and the
+visible `cargo tauri dev` window both run a binary at the same relative path
+(`target/debug/cuemark`), so a substring `pkill -f` pattern kills both, including the
+window the user is actively looking at. Use the **full absolute path**
+(`pkill -f "src-tauri/target/debug/cuemark$"`, note the trailing `$`) or the specific PID
+(`kill $(cat /tmp/cuemark-dev.pid)`) when you only want one of them gone.
+
 ## Lifecycle rules (from CLAUDE.md)
 
 - Frontend changes (`.svelte`, `.ts`) → Vite hot-reloads instantly, no restart needed.

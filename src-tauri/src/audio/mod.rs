@@ -301,12 +301,18 @@ pub fn audio_record_stop(state: State<'_, AudioState>) -> Result<(), String> {
 /// the async executor.
 #[tauri::command]
 pub async fn audio_analyze_file(cache: State<'_, Arc<MediaCache>>, file_path: String) -> Result<analysis::AnalysisData, String> {
-    // Best-effort only (lookup, not ensure_cached): read the cache audio_load already
-    // populated if it's there, but never trigger or block on a copy from here — this
-    // runs independently of/racing with audio_load, so a miss just falls back to the
-    // original (network) path exactly as before.
-    let path = cache.lookup(&file_path).unwrap_or(file_path);
-    tauri::async_runtime::spawn_blocking(move || analysis::compute_analysis(&path))
+    // Waits out an in-progress ensure_cached() copy (see media_cache.rs's lookup_wait())
+    // instead of a bare best-effort lookup — this runs independently of/racing with
+    // audio_load, so without waiting it could resolve to the original (network) path for
+    // the whole analysis pass. A path never requested to be cached still falls back
+    // immediately. Done inside spawn_blocking since lookup_wait() can block synchronously.
+    let cache = cache.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = cache
+            .lookup_wait(&file_path, std::time::Duration::from_secs(10))
+            .unwrap_or(file_path);
+        analysis::compute_analysis(&path)
+    })
         .await
         .map_err(|e| e.to_string())?
 }

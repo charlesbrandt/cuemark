@@ -537,6 +537,7 @@
       lastHeartbeatAt = nowMs;
       debugLog(`[heartbeat] rAF alive`);
     }
+    try {
     if (compositor) {
       const { decks, visualization, visualizationOpacity } = get(session);
       const timeSecs = performance.now() / 1000;
@@ -570,8 +571,11 @@
           if ((deck.playing || scratching) && v && !pendingPos.get(deck.id)) {
             pendingPos.set(deck.id, true);
             const capturedDeckId = deck.id;
+            const pollStartMs = performance.now();
             audioGetPosition(deck.id).then((audioPos) => {
               pendingPos.delete(capturedDeckId);
+              const pollMs = performance.now() - pollStartMs;
+              if (pollMs > 300) debugLog(`[position-poll] ${capturedDeckId} took ${pollMs.toFixed(0)}ms, audioPos=${audioPos}`);
               if (audioPos === null || !v) return;
               let contentPos: number;
               if (scratching) {
@@ -616,7 +620,19 @@
               // real cueing signal) is already exact via the independent PCM feeder — so
               // don't touch the video element's clock at all until scratch ends; the
               // non-scratch branch below then does one normal snap to resync it.
-              if (!scratching && Math.abs(v.currentTime - contentPos) > 0.08) {
+              //
+              // Threshold widened 80ms -> 250ms (2026-07-24): this write is a <video> seek,
+              // i.e. exactly the gst_element_send_event() call a live gdb backtrace caught
+              // WebKitGTK's own main thread deadlocked inside (see "Ninth mechanism",
+              // docs/design/pcm-buffer-playback.md) — a real bug in WebKitGTK's
+              // MediaPlayerPrivateGStreamer, not something fixable on the cuemark/Rust side.
+              // This resync fires on every position-poll resolution for as long as any deck
+              // plays at a non-1.0 rate (not just during scratch), so it's the most frequent
+              // source of these seeks. Widening the tolerance is a mitigation, not a fix —
+              // it cuts how often the deadlock's trigger condition (a seek landing while the
+              // video pipeline is mid-flight) can occur. 250ms of AV drift is imperceptible
+              // for VJ visuals synced by eye to a beat, unlike e.g. lip-synced dialogue.
+              if (!scratching && Math.abs(v.currentTime - contentPos) > 0.25) {
                 v.currentTime = contentPos; // snap video to audio clock
               }
             }).catch(() => { pendingPos.delete(capturedDeckId); });
@@ -643,6 +659,15 @@
         compositor.composite(decks, visualization ? visualizationOpacity : 0);
         postFrame(canvas);
       }
+    }
+    } catch (e) {
+      // An uncaught throw here previously killed the rAF loop forever (this line never
+      // reschedules) while GStreamer's independent audio pipeline kept playing — total,
+      // permanent UI freeze with music still going and zero trace in the log (only
+      // debugLog() reaches the Rust-side log file; console.error doesn't). See the
+      // 2026-07-24 investigation in docs/design/pcm-buffer-playback.md. Log and keep the
+      // loop alive instead of vanishing silently.
+      debugLog(`[frame-error] ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`);
     }
     rafId = requestAnimationFrame(frame);
   }

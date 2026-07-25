@@ -1275,3 +1275,298 @@ disabled. Not yet done: live-hardware confirmation with real MIDI jog-wheel
 input (this session's verification was all headless/automated); understanding
 *why* the drain lags in the first place, which remains open per the Seventh
 mechanism section's queued directions.
+
+## Ninth mechanism: non-scratch playback freeze is a real WebKitGTK deadlock,
+## caught live via `gdb` on the still-hung process — found 2026-07-24
+
+A live report came in describing a *different* trigger than anything above:
+no scratch/jog involved at all. Deck-0's tempo fader was dragged from 1.0 down
+to ~0.87–0.94× (a 120.1→112.8 BPM drop) over about 4 seconds, then playback
+continued normally. **2:44 into playback — roughly 2.5 minutes after the fader
+move ended** — the UI froze solid: `[heartbeat] rAF alive` (logged once/sec
+from the top of `frame()`, `App.svelte`) ticked cleanly the whole time, then
+stopped forever with zero further log output of any kind, while GStreamer's
+independent Rust audio pipeline kept playing uninterrupted.
+
+**Gap found and fixed first**: there was no `window.onerror`/
+`unhandledrejection` handler anywhere in the frontend, and `frame()` had no
+try/catch — so an uncaught JS exception there would produce this exact
+"silence forever" signature with literally no trace, since `console.error`
+never reaches the Rust-side log file (only explicit `debugLog()` calls do).
+Fixed in `main.ts` (global handlers → `debugLog`) and `App.svelte` (`frame()`
+body wrapped in try/catch, logs via `debugLog`, still reschedules the loop
+instead of dying). This closes the blind spot regardless of what caused this
+particular freeze, and will produce a stack trace immediately if a genuine JS
+exception is ever the cause of a future freeze.
+
+**Then a rare opportunity**: the frozen `cuemark`/`WebKitWebProcess` pair from
+the actual incident was still running, untouched, hours later — every thread
+parked (`futex_do_wait`/`poll_schedule_timeout`, near-0% CPU), the genuinely-
+blocked signature, not a busy-spin. Direct `gdb -p <pid>` attach needs root
+(`yama.ptrace_scope=1` blocks attaching to a non-descendant process even with
+the sandbox override that unblocked plain `ptrace` for a true `fork()` child
+in the Seventh-mechanism investigation above); the user ran it manually via
+`sudo gdb -p <WebKitWebProcess-pid> -batch -iex "set debuginfod enabled off"
+-ex "thread apply all bt"` and pasted back all 39 thread backtraces.
+
+**Root cause, read directly off the backtrace — a real deadlock inside
+WebKitGTK's own `MediaPlayerPrivateGStreamer`, not a cuemark/Rust bug**:
+
+- **Thread 1** (the GTK/JS main thread) is inside `gst_element_send_event()`
+  — ~240 frames deep through `gst_pad_push_event` → `gst_pad_forward` →
+  `gst_pad_event_default`, fanning an event (the call shape matches a
+  **seek**) synchronously through the whole demux→decode→videoconvertscale
+  graph. It holds a GStreamer element mutex (`0x58c4e9653100`) for the
+  duration.
+- **A streaming thread** (`vqueue:src`, WebKit's own internal GStreamer
+  thread) is mid-way through the *identical* `gst_pad_push_event` chain shape,
+  but hits a `g_signal_emit` that calls into WebKit's C++ layer, which parks
+  it on a `WTF::ParkingLot` condition variable — waiting for the main thread's
+  run loop to service WebKit's "new video sample ready → schedule repaint"
+  handoff.
+- **Four `pool-WebKitWebP` threads** are piled up behind the same element
+  mutex Thread 1 holds, trying to run `gst_bin_recalculate_latency`.
+
+Classic AB-BA deadlock: the main thread can't finish sending the event until
+the streaming thread acknowledges it; the streaming thread can't proceed until
+the main thread's run loop is free to service its signal — and the main
+thread is stuck inside the very call that's blocking it from reaching that run
+loop. Nothing on the Rust/cuemark side participates in this at all, which is
+exactly why audio kept playing throughout.
+
+**Why this fits the timing**: `App.svelte`'s drift-correction resync
+(`if (!scratching && Math.abs(v.currentTime - contentPos) > 0.08) { v.currentTime
+= contentPos }`) issues a `<video>` seek — i.e. exactly the `gst_element_send_event`
+call this deadlock is stuck inside — on essentially every position-poll
+resolution for the *entire* time any deck plays at a non-1.0 rate, not just
+during scratch. The earlier "WebKit's own internal video decode pipeline
+blocking its main loop" finding (see "Localized" section above) characterized
+the same underlying fragility but only for scratch's much denser seek stream,
+where the freeze happened to self-resolve in 7–12s. Ordinary rate-adjusted
+playback exposes the same seek path far less densely (so the freeze is rare
+and, this time, arrived ~2.5 minutes in) but with no scratch-end trigger to
+help WebKit ever un-wedge itself once it does hit the deadlock — hence
+permanent instead of transient.
+
+**Mitigation (not a real fix — this is a WebKitGTK bug, we can only avoid
+triggering it as often)**: widen the drift-correction threshold well past
+80ms so the corrective seek fires far less frequently during sustained
+off-1.0-rate playback, trading a bit of AV-sync precision for a large cut in
+how often this deadlock's trigger condition (a seek landing while the video
+pipeline is mid-flight) can occur. Landed as `App.svelte`'s threshold going
+from 80ms to 250ms.
+
+## Tenth mechanism: a second, distinct near-EOS stall — WebKitGTK's own
+## segment/EOS bookkeeping breaks at non-1.0 `playbackRate`, not a network
+## race — found and corrected 2026-07-25, same session continued
+
+Live-testing the Ninth mechanism's mitigation (sustained 0.87× playback, same
+file) surfaced a *second*, distinct freeze: the video froze at ~90-95% through
+the track — not during a seek, and with the **JS main thread staying fully
+responsive** the whole time (WebDriver JS execution and the rAF loop kept
+working) — ruling out a repeat of the Ninth mechanism's deadlock. The video
+element's own state told a clear story: `readyState` stuck at 2
+(`HAVE_CURRENT_DATA`), `networkState` stuck at 2 (`LOADING`), every one of
+WebKit's internal GStreamer streaming threads (`vqueue:src`, `multiqueue0:src`,
+etc.) parked in `futex_do_wait` — a genuine internal stall, not a busy spin.
+
+**First (wrong) hypothesis and the fix built around it**: given this
+codebase's `media_server.rs` serves video over local HTTP with a best-effort,
+non-blocking cache lookup — a video's first HTTP request can race ahead of
+`audio_load`'s `ensure_cached()` finishing its local copy and fall back to the
+SMB-mounted original, the exact same "idle-reconnect stall" class already
+root-caused and fixed for the audio path and scratch's `resync_seek` (see
+"Second freeze mechanism" above) — that looked like the obvious culprit here
+too. Built `MediaCache::lookup_wait()` (blocks on an in-progress
+`ensure_cached()` copy via a `Condvar` instead of reporting an immediate miss)
+and wired it into `media_server.rs` and `audio_analyze_file`.
+
+**Live-tested and disproven**: re-running the same sustained-playback repro
+with the fix in place hit the *identical* stall again (video stuck at
+275.6/288.485s, `readyState=2`, `networkState=2`) — but this time with
+`buffered` reporting `[0, 288.485]`, i.e. **the entire file was already fully
+downloaded** when it stalled. That's decisive: with nothing left to fetch,
+there is no network request left to race or wait on, so the cache-lookup race
+cannot be what's causing this specific stall. `lookup_wait()` is still a
+correct, low-risk improvement for the race it *does* fix (kept), but it isn't
+the fix for this mechanism.
+
+**Real cause, per a direct user hypothesis, confirmed with a control test**:
+the user asked whether this could be a rate-scaling issue — WebKit's own
+internal (video-only, since the `<video>` element is muted) GStreamer pipeline
+runs at `segment.rate = deck.playbackRate` once `v.playbackRate` is set to
+anything other than 1.0 (already documented elsewhere in this codebase as
+triggering a full internal pipeline rebuild on every write). If that
+rate-scaled pipeline's EOS/segment-boundary bookkeeping doesn't land cleanly
+at a non-1.0 rate, a downstream element (most likely `multiqueue`, which
+tracks buffering level in rate-scaled time) could end up waiting forever for
+one more buffer that was never coming — exactly "one end condition fires
+(Rust audio, untouched by `v.playbackRate`, reaches real EOS fine), another
+doesn't (WebKit's own rate-scaled video pipeline never triggers its own
+EOS)," as the user put it. **Confirmed via a direct control test**: seeked the
+same deck to 258s and played to the true end at `playbackRate=1.0` (no rate
+change at all) — completed cleanly every time, reaching the same normal
+end-of-track state (`paused=true`, `readyState=4`, fully buffered,
+`currentTime` reset to 0) that a lucky 0.87× run had also reached once.
+Tally across all attempts: 3 runs at 0.87× (2 stalled, 1 clean) vs. 1 run at
+1.0× (clean) — a small sample, but the qualitative signature (full file
+already buffered, decode-side thread parked, only ever seen at non-1.0 rate)
+plus the clean control run together make a strong case.
+
+**Status**: root-caused to "WebKitGTK's internal video pipeline mishandles
+EOS detection at a non-1.0 `segment.rate`," which is a bug inside WebKitGTK
+itself — same category as the Ninth mechanism, different manifestation (a
+decode-thread stall with the main thread free, vs. a full main-thread AB-BA
+deadlock). **Not mitigated in cuemark's own code — a mitigation was built,
+live-tested, and reverted the same session; see "Eleventh mechanism" below for
+why.** VJs typically mix out before a track's natural end anyway, which is why
+this remains accepted as a known, rare, unmitigated WebKitGTK bug for now.
+
+**Lesson for next time**: don't trust a fix for a plausible-sounding mechanism
+without a live re-test that can actually falsify it — the cache-race theory
+was reasonable and matched the symptom shape, but the very next live rerun
+disproved it outright once `buffered` was checked. A control run at the
+"normal" setting (here, rate 1.0) that a bug hypothesis predicts *shouldn't*
+fail is one of the cheapest, most decisive tests available once a plausible
+trigger variable has been identified — worth reaching for before assuming a
+fix worked or writing off a report as a one-off. **This lesson repeated at
+least three more times in the Eleventh mechanism session below** — each
+"fix" for the Tenth mechanism looked right after one live check and broke
+under the next.
+
+## Eleventh mechanism: the Tenth mechanism's own mitigation was built, and
+## reverted, in the same session — three compounding lessons in over-trusting
+## a single live-test pass — 2026-07-25, later session
+
+The Tenth mechanism's proposed mitigation ("reset `<video>` to `playbackRate
+=1.0` once a deck nears its track's end while playing off-tempo") was
+implemented, live-tested via `verify-ui` (tauri-driver + Xvfb, debug hook,
+the exact 288.485s file from the Tenth mechanism's control test replayed at
+0.87×), found broken, fixed, found broken differently, fixed again, and then
+**reverted entirely** once live desktop testing (the user's own visible
+window, not the isolated Xvfb session) surfaced a real regression the
+automated test never would have caught cleanly. Full sequence, because each
+step is a reusable lesson on its own:
+
+**Attempt 1 — guard lived only in `syncVideoElements`.** `syncVideoElements`
+is an `$effect` gated on `$session.decks` reference changes — it does **not**
+re-run every rAF frame, only when something mutates the store (MIDI, UI,
+`deck-eos`). During steady off-tempo playback with no other store activity,
+it never re-ran, so the near-end check never got evaluated at all. Confirmed
+by WebDriver sample logging: `playbackRate` stayed at 0.87 through a clean
+natural end across a live run. **Lesson**: any per-frame *decision* (not just
+per-frame *rendering*) must live in the rAF loop (`frame()`) itself, never in
+a store-reactive `$effect`, however tempting the shared code path looks.
+
+**Attempt 2 — moved the check into `frame()`, but read position from
+`getDeckTime()`** (the audio-clock-derived, IPC-fed `contentPos`). Still only
+fired on 1 of 5 live runs. Ground-truth `debugLog` timestamps (see below)
+eventually proved the guard *was* firing correctly every time — the 1-of-5
+appearance was an artifact of the *test script's* 1-second external polling
+interval missing a ~2s-wide window by phase luck, not a real bug. But while
+chasing this false lead, a second, real issue surfaced: `getDeckTime()`
+returned a stale value in some runs because `audioGetPosition()`'s IPC poll
+can itself go quiet for stretches near end-of-track. **Lesson**: when a
+per-frame guard depends on a value fed by an async IPC round-trip, prefer a
+synchronous, always-fresh native property over the IPC-derived value if one
+exists for the same purpose — `v.currentTime` is literally what WebKit's own
+pipeline uses to decide its own EOS, so it's strictly the more correct signal
+here regardless of the IPC-staleness question. Switched to it.
+
+**Attempt 3 — the real regression, only visible from the live desktop
+window.** With the guard correctly forcing `v.playbackRate=1.0` for the last
+~2s, the video now deliberately finishes *before* the real (still-0.87×) Rust
+audio pipeline does — that's the entire point, letting WebKit's EOS
+bookkeeping run its well-tested 1.0 code path. But `v.onended` unconditionally
+called `updateDeck(deckId, {playing:false})`, which triggers `audioPause()`
+on the **still-playing real audio pipeline** — cutting it off ~0.2-0.5s
+early. The Xvfb/WebDriver automated test never surfaces this: it doesn't
+listen to actual audio output, and the position samples it captures (video
+time, `paused`, `ended`) all looked exactly like a correct clean end. **This
+was only caught because the user was watching (and listening to) the real,
+visible desktop window in parallel and reported "the waveform got stuck /
+there was more of the song to play."** Lesson: an automated headless
+correctness check and a human watching the real window are not redundant —
+they catch different classes of bug, and for anything touching perceived
+A/V behavior, live human observation is not optional.
+
+**Attempt 4 — tried to fix Attempt 3 by suppressing `onended` and waiting for
+the real `deck-eos` event instead** (Rust audio's own real EOS). This was the
+worst of the four: `deck-eos` turned out not to reliably arrive in this
+scenario at all — `audio_get_position` kept climbing indefinitely, wall-clock
+rate, no `[bus/*] EOS` line ever logged, for as long as the test watched (45s+,
+well past the ~35s the track needed to actually finish). Root cause, found
+by re-reading `pipeline.rs`: **the Rust bus thread never paused the pipeline
+on EOS itself** — it only set an `AtomicBool` and emitted an event, assuming
+the frontend would call `audio_pause()` in response. GStreamer does not stop
+a pipeline's clock on EOS; `PLAYING` state just keeps ticking with nothing
+left to render, so `query_position` climbs forever until something explicitly
+pauses it. Attempt 4 removed the one thing (`onended`) that reliably did that
+pausing, and its replacement (`deck-eos`) didn't reliably do it either — net
+result, worse than Attempt 3: audio never stopped at all, confirmed live by
+the user ("I see the waveform display position get frozen during playback").
+
+**What shipped from this investigation, after reverting the video-side
+mitigation entirely:**
+1. **`pipeline.rs`'s EOS bus handler now calls `pipeline.set_state(Paused)`
+   directly**, in the bus thread, the moment `GST_MESSAGE_EOS` arrives —
+   instead of only setting a flag and hoping the frontend's `deck-eos`
+   round-trip reacts. This is a genuine, unconditional correctness fix,
+   independent of the video-freeze question: the Rust audio pipeline now
+   always stops itself at real EOS regardless of whether any frontend event
+   ever arrives or is ever handled. (Safe to call `set_state` from this
+   thread — it's a dedicated bus-consumer thread via `bus.iter_timed()`, not
+   a GStreamer streaming thread or the GLib main loop, which is the
+   documented-unsafe case.)
+2. **The `App.svelte` near-end `playbackRate` guard was reverted in full** —
+   `nearTrackEnd()`/`applyVideoRate()`, the `deck-eos` handler's rate-reset
+   backstop, and the `v.onended` suppression are all gone. The Tenth
+   mechanism's freeze is unmitigated again, exactly as it was before this
+   session. Given VJs mix out before natural track end in practice, and every
+   attempted fix introduced a worse, more surprising bug than the freeze it
+   was avoiding, the user's call was to look for an actual root cause instead
+   of stacking further mitigations.
+3. **Root-cause research, not conclusive**: `libwebkit2gtk-4.1` is already at
+   `2.52.3`, the latest available via Ubuntu 24.04's apt repos — no version
+   bump available that way. WebKit's actual `setRate()` source
+   (`MediaPlayerPrivateGStreamer.cpp`) issues a `GST_SEEK_FLAG_FLUSH |
+   GST_SEEK_FLAG_ACCURATE` seek with `stop=GST_CLOCK_TIME_NONE` for forward
+   rate changes on every `v.playbackRate` write — not an obviously wrong call
+   in isolation (this is the standard way GStreamer apps do a rate change),
+   which points the actual bug deeper, most likely in a downstream element's
+   (`multiqueue`'s) rate-scaled buffering-level accounting never resolving to
+   a real EOS once `segment.rate != 1.0`. No matching public WebKit bug
+   report was found. This is inside WebKitGTK's own GStreamer integration —
+   not something patchable from cuemark's side without either (a) never
+   setting `v.playbackRate` away from 1.0 at all (shifts more sync burden
+   onto drift-correction seeks, which raises exposure to the Ninth
+   mechanism's separate WebKitGTK deadlock instead), or (b) a genuinely large
+   project: a custom Rust/GStreamer video-decode pipeline that bypasses
+   WebKit's `<video>` element for frame delivery entirely, mirroring the
+   PCM-buffer approach already built for audio scratch in this same doc.
+   Neither was attempted this session.
+
+**Reusable lessons, distilled:**
+- A per-frame *decision* belongs in the rAF loop itself, never in a
+  store-reactive `$effect`, even when the effect's code path looks shared and
+  convenient.
+- Prefer a synchronous native property over an async-IPC-fed value for any
+  check that needs to be reliably fresh every frame, if an equivalent native
+  property exists.
+- An automated headless test (WebDriver/Xvfb) and a human watching the real,
+  visible window are not redundant checks — they catch different bug classes.
+  Neither replaces the other for anything touching perceived A/V behavior.
+- Before making an event you don't control (`deck-eos`, or any
+  cross-process/cross-thread event) load-bearing for correctness, verify it
+  actually arrives reliably under the specific conditions you're relying on
+  it for — "the plumbing already exists" is not the same as "the plumbing is
+  dependable here."
+- A component should make itself correct rather than depending on a
+  notification round-trip to another component to do it for it, whenever
+  that's feasible — `pipeline.rs` pausing itself on EOS, instead of waiting
+  for the frontend to notice and ask it to pause, is strictly more robust and
+  was a small, self-contained change once identified.
+- When a mitigation for bug A turns out to reliably cause bug B, and every
+  attempted fix for B introduces bug C, that's a signal to stop patching and
+  either accept bug A as documented-and-unmitigated or scope the real
+  structural fix — not to keep iterating on the same shape of patch.

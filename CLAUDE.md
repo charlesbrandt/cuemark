@@ -81,10 +81,15 @@ A specific sink is targeted via `pipewiresink target-object=<node-name>`; falls 
 the `gstreamer1.0-pipewire` plugin is absent.
 
 **EOS handling**: Each `DeckAudioPipeline` spawns a background thread that watches the GStreamer bus.
-When an `EOS` message arrives the thread sets an `Arc<AtomicBool>` (`at_eos`). The next call to `play()`
-checks this flag and seeks back to zero before resuming, so the track replays cleanly instead of stalling
-at end-of-stream. The bus thread is stopped via `bus.set_flushing(true)` before pipeline teardown and in
-`Drop`.
+When an `EOS` message arrives the thread sets an `Arc<AtomicBool>` (`at_eos`) and **pauses the pipeline
+itself** (`set_state(Paused)`, called directly from this bus thread — safe, since it's a dedicated
+`bus.iter_timed()` consumer thread, not a GStreamer streaming thread or the GLib main loop). This matters
+because GStreamer does not stop a pipeline's clock on EOS by itself — left in `PLAYING`, `query_position`
+keeps climbing at wall-clock rate forever with nothing left to render. The thread also notifies the
+frontend (`deck-eos` Tauri event) so it can update `Session` state, but playback correctness no longer
+depends on that round-trip arriving. The next call to `play()` checks the `at_eos` flag and seeks back to
+zero before resuming, so the track replays cleanly instead of stalling at end-of-stream. The bus thread is
+stopped via `bus.set_flushing(true)` before pipeline teardown and in `Drop`.
 
 **Rate changes**: `set_rate()` sets the `tempo` property on the `pitch` element (soundtouch, `gst-plugins-bad`).
 This adjusts playback speed without changing pitch, with no seek or pipeline flush — the change is applied

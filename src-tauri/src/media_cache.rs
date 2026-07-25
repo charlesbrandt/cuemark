@@ -18,27 +18,71 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+enum CacheEntry {
+    InProgress,
+    Ready(String),
+}
 
 pub struct MediaCache {
     dir: PathBuf,
-    /// original path -> local cached path, so the HTTP media server (media_server.rs)
+    /// original path -> cache state, so the HTTP media server (media_server.rs)
     /// and audio_analyze_file can find an already-cached copy without touching the
     /// network themselves — only ensure_cached() (called once from audio_load) does
-    /// the actual network read.
-    resolved: Mutex<HashMap<String, String>>,
+    /// the actual network read. `cond` wakes lookup_wait() callers when an entry
+    /// transitions out of InProgress.
+    resolved: Mutex<HashMap<String, CacheEntry>>,
+    cond: Condvar,
 }
 
 impl MediaCache {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir, resolved: Mutex::new(HashMap::new()) }
+        Self { dir, resolved: Mutex::new(HashMap::new()), cond: Condvar::new() }
     }
 
     /// Best-effort, non-blocking lookup of an already-cached local path. Never touches
-    /// the network — callers fall back to the original path on a miss.
+    /// the network and never waits — a path still InProgress reads as a miss.
     pub fn lookup(&self, original_path: &str) -> Option<String> {
-        let hit = self.resolved.lock().unwrap().get(original_path).cloned()?;
-        Path::new(&hit).is_file().then_some(hit)
+        match self.resolved.lock().unwrap().get(original_path) {
+            Some(CacheEntry::Ready(p)) => Path::new(p).is_file().then(|| p.clone()),
+            _ => None,
+        }
+    }
+
+    /// Like lookup(), but if ensure_cached() is currently copying this exact path, waits
+    /// (up to `timeout`) for it to finish instead of reporting an immediate miss. Fixes a
+    /// race where a video's first HTTP request (media_server.rs) can arrive before
+    /// audio_load's ensure_cached() finishes copying the file locally — previously that
+    /// request (and any using the same still-open connection) would silently fall back to
+    /// streaming straight off the SMB-mounted original, exposing video playback to the same
+    /// "SMB idle-reconnect stall" class of bug already root-caused and fixed for the audio
+    /// path and scratch's resync_seek (docs/design/pcm-buffer-playback.md, "Second freeze
+    /// mechanism") but never patched for this path. Confirmed live: a sustained non-1.0-rate
+    /// playback session stalled WebKit's <video> element at ~90% through a track — readyState
+    /// stuck at HAVE_CURRENT_DATA, every GStreamer streaming thread parked waiting for data
+    /// that never arrived — while the Rust audio pipeline (already on the local cache) kept
+    /// playing fine (see "Ninth mechanism", same doc, 2026-07-25). A path that was never
+    /// requested to be cached at all (no matching entry) still returns None immediately —
+    /// this only waits out a copy that's actually in flight.
+    pub fn lookup_wait(&self, original_path: &str, timeout: Duration) -> Option<String> {
+        let mut guard = self.resolved.lock().unwrap();
+        let deadline = Instant::now() + timeout;
+        loop {
+            match guard.get(original_path) {
+                Some(CacheEntry::Ready(p)) => return Path::new(p).is_file().then(|| p.clone()),
+                Some(CacheEntry::InProgress) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return None;
+                    }
+                    let (g, _) = self.cond.wait_timeout(guard, remaining).unwrap();
+                    guard = g;
+                }
+                None => return None,
+            }
+        }
     }
 
     /// Copies `original_path` into the cache dir if not already there, and records the
@@ -46,31 +90,60 @@ impl MediaCache {
     /// call off the IPC thread for large files. Idempotent: a second call for the same
     /// path that hasn't changed size is a cheap stat, not a re-copy.
     pub fn ensure_cached(&self, original_path: &str) -> Result<String, String> {
-        if let Some(hit) = self.lookup(original_path) {
-            return Ok(hit);
+        {
+            let mut guard = self.resolved.lock().unwrap();
+            match guard.get(original_path) {
+                Some(CacheEntry::Ready(p)) => return Ok(p.clone()),
+                Some(CacheEntry::InProgress) => {
+                    // Another caller is already copying this exact path (shouldn't normally
+                    // happen — audio_load is the only ensure_cached() caller — but wait
+                    // rather than racing a duplicate copy if it ever does).
+                    drop(guard);
+                    return self
+                        .lookup_wait(original_path, Duration::from_secs(60))
+                        .ok_or_else(|| format!("timed out waiting for concurrent cache of {original_path}"));
+                }
+                None => {
+                    guard.insert(original_path.to_string(), CacheEntry::InProgress);
+                }
+            }
         }
 
-        let src = Path::new(original_path);
-        let meta = fs::metadata(src).map_err(|e| format!("stat {original_path}: {e}"))?;
-        let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("bin");
-        // Cache key includes size so a replaced/changed source file re-copies instead of
-        // silently serving stale cached bytes forever.
-        let cached_path = self.dir.join(format!("{:016x}-{}.{ext}", path_hash(original_path), meta.len()));
+        let result = (|| -> Result<String, String> {
+            let src = Path::new(original_path);
+            let meta = fs::metadata(src).map_err(|e| format!("stat {original_path}: {e}"))?;
+            let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("bin");
+            // Cache key includes size so a replaced/changed source file re-copies instead of
+            // silently serving stale cached bytes forever.
+            let cached_path = self.dir.join(format!("{:016x}-{}.{ext}", path_hash(original_path), meta.len()));
 
-        if !cached_path.is_file() {
-            fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
-            // Copy to a temp name first and rename into place — an interrupted copy
-            // (app killed mid-load) must never leave a truncated file at the final path
-            // that a later lookup() would trust as complete.
-            let tmp_path = self.dir.join(format!("{:016x}-{}.{ext}.part", path_hash(original_path), meta.len()));
-            fs::copy(src, &tmp_path).map_err(|e| format!("cache copy {original_path}: {e}"))?;
-            fs::rename(&tmp_path, &cached_path).map_err(|e| e.to_string())?;
-            log::info!("[media_cache] cached {original_path} ({} bytes) -> {}", meta.len(), cached_path.display());
+            if !cached_path.is_file() {
+                fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
+                // Copy to a temp name first and rename into place — an interrupted copy
+                // (app killed mid-load) must never leave a truncated file at the final path
+                // that a later lookup() would trust as complete.
+                let tmp_path = self.dir.join(format!("{:016x}-{}.{ext}.part", path_hash(original_path), meta.len()));
+                fs::copy(src, &tmp_path).map_err(|e| format!("cache copy {original_path}: {e}"))?;
+                fs::rename(&tmp_path, &cached_path).map_err(|e| e.to_string())?;
+                log::info!("[media_cache] cached {original_path} ({} bytes) -> {}", meta.len(), cached_path.display());
+            }
+
+            Ok(cached_path.to_string_lossy().into_owned())
+        })();
+
+        let mut guard = self.resolved.lock().unwrap();
+        match &result {
+            Ok(local) => {
+                guard.insert(original_path.to_string(), CacheEntry::Ready(local.clone()));
+            }
+            Err(_) => {
+                // Allow a later retry instead of permanently reporting InProgress/miss.
+                guard.remove(original_path);
+            }
         }
-
-        let local = cached_path.to_string_lossy().into_owned();
-        self.resolved.lock().unwrap().insert(original_path.to_string(), local.clone());
-        Ok(local)
+        drop(guard);
+        self.cond.notify_all();
+        result
     }
 }
 

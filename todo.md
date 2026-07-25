@@ -1,5 +1,55 @@
 # todo
 
+## Known issues
+
+### Frontend had no uncaught-exception/rejection logging [fixed, 2026-07-24]
+
+Found while investigating a live UI freeze (2:44 into playback, dropped BPM 120.1 ->
+112.8): the JS main thread stopped dead — rAF heartbeat log went silent forever —
+while GStreamer's independent Rust audio pipeline kept playing, but `cuemark.log`
+had zero trace of why. Root cause of the *silence*: no `window.onerror`/
+`unhandledrejection` handler existed anywhere, and the rAF loop (`frame()` in
+`App.svelte`) had no try/catch, so any uncaught throw there would kill the loop
+forever with nothing logged (`console.error` doesn't reach the Rust-side log file;
+only explicit `debugLog()` calls do).
+
+Fixed: `main.ts` now installs global `window.onerror`/`unhandledrejection` handlers
+that forward to `debugLog`; `frame()`'s body is wrapped in try/catch that logs via
+`debugLog` and still reschedules the loop instead of dying silently.
+
+**Root-caused, 2026-07-24**: caught live via `gdb -p <pid> thread apply all bt`
+on the still-hung WebKitWebProcess from the actual incident (see "Ninth
+mechanism" in `docs/design/pcm-buffer-playback.md`). It's a genuine **deadlock
+inside WebKitGTK's own `MediaPlayerPrivateGStreamer`** — the main thread stuck
+inside a synchronous `gst_element_send_event()` (a video seek) holding a
+GStreamer element mutex, while one of WebKit's own GStreamer streaming threads
+is parked on a `WTF::ParkingLot` condition variable waiting for that same main
+thread's run loop to service a "new sample ready" signal. Not a cuemark/Rust
+bug — nothing on the backend participates, which is why audio kept playing.
+Trigger: `App.svelte`'s drift-correction `v.currentTime = contentPos` seek
+(fires whenever audio/video drift exceeds 80ms) issued while the video
+pipeline is mid-flight — this fires repeatedly for the whole time any deck
+plays at a non-1.0 rate, not just during scratch. **Mitigated**: widened the
+threshold to 250ms (`App.svelte`) to cut how often the seek fires.
+
+**Second, distinct freeze found live-testing the mitigation, 2026-07-25** ("Tenth
+mechanism" in the design doc): a near-end-of-track stall, not during a seek —
+video's `readyState` sticks at 2 (`HAVE_CURRENT_DATA`) with the JS main thread
+staying fully responsive (unlike the deadlock above). First hypothesis (a
+`media_server.rs` cache-lookup race falling back to a stall-prone SMB path) was
+built into a fix (`MediaCache::lookup_wait()`) but **live-disproven** — the
+stall recurred with `buffered` already showing the entire file downloaded,
+ruling out any network cause. `lookup_wait()` is kept as a real but unrelated
+improvement. **Actual root cause** (per a user hypothesis, confirmed via a
+1.0×-rate control test that played through cleanly every time vs. 2/3 stalls
+at 0.87×): WebKitGTK's own internal video-only GStreamer pipeline runs at
+`segment.rate = deck.playbackRate`, and its EOS/segment bookkeeping doesn't
+land cleanly at non-1.0 rates — a bug inside WebKitGTK itself, same family as
+the deadlock above, different manifestation. **Not yet mitigated.** Proposed
+direction: reset the `<video>` element (not Rust audio) to `playbackRate=1.0`
+as a deck nears its track's end while playing off-tempo. Open question: worth
+the complexity given VJs typically mix out before natural track end anyway.
+
 ## Beat grid + snap-to-beat — handoff spec
 
 Goal: snap to a shared grid of beats between two songs so beat matching is easy and
