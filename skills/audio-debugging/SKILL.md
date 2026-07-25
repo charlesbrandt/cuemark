@@ -215,6 +215,36 @@ the old position.
 `contentPos`: if `|contentPos − seekTarget| > 0.5 s`, the frame is skipped entirely (no snap, no
 `setDeckAudioTime`). Once GStreamer's position converges on the seek target, the filter clears.
 
+**Bug found and fixed 2026-07-25: this filter had no time bound, so "seek while playing" could
+freeze the waveform position permanently.** The distance check above assumes a stale reading is
+always *behind* the target — true for "seek then stay paused," false for "seek while playing"
+(the normal case): real playback carries the position *past* the target the instant the seek
+actually lands. If the first post-seek reading happens to arrive late enough (slow seek, or
+several seeks/rate-changes fired back-to-back) that the position is already `>0.5s` past the
+target, it's wrongly discarded as stale — and since the filter never clears, *every* reading
+after that is discarded too, freezing `getDeckTime()`/the waveform position clock forever while
+GStreamer and the `<video>` element both keep advancing normally underneath. User-reported
+symptom: "video keeps playing but the waveform position stopped moving," especially at
+non-1.0 rate. Confirmed live both headlessly (via this skill's technique below) and
+independently on the real desktop at the same time. **Fix**: `pendingSeekTarget` now stores
+`{time, setAtMs}`; `getPendingSeekTarget()` auto-expires and clears the entry after
+`SEEK_STALE_TIMEOUT_MS` (1500ms) regardless of distance, so a reading that old is trusted
+outright — a wrong one-frame reading self-corrects on the very next poll, unlike the permanent
+freeze it replaces. See `project_seek_staleness_freeze_fix` memory for the full writeup and
+regression-test repro recipe.
+
+**Diagnostic technique for "cached/derived value frozen but is the underlying thing actually
+stuck?"**: call the real Tauri command directly from a WebDriver script, bypassing whatever
+frontend caching/derivation is under suspicion, and compare side-by-side:
+```js
+window.__TAURI__.core.invoke("audio_get_position", {deckId}).then(raw => /* compare raw vs cached */)
+```
+This is what distinguished "the Rust pipeline is genuinely stuck" (raw position frozen too) from
+"only the frontend's cached/derived clock is stuck" (raw keeps climbing, `v.currentTime` keeps
+climbing, only `getDeckTime()`'s cached value is frozen) — the latter is what this bug turned out
+to be. Reusable any time a value read through app-level state is suspected of lying about the
+underlying system's real state.
+
 ### `audioTimes.delete` on seek (not `.set(time)`)
 
 `seekDeck()` calls `audioTimes.delete(deckId)` rather than `audioTimes.set(deckId, time)`. If the

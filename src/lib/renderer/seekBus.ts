@@ -36,10 +36,27 @@ const els = new Map<string, HTMLVideoElement>();
 // The waveform reads these rather than video.currentTime, which drifts between
 // IPC-driven snaps when tempo ≠ 1.0.
 const audioTimes = new Map<string, number>();
-// When a seek is in flight, holds the target position so the RAF loop can
-// filter out stale pre-seek GStreamer position responses. Heavy videos can take
-// >1s to complete a seek; during that time audioGetPosition returns the old position.
-const pendingSeekTarget = new Map<string, number>();
+// When a seek is in flight, holds the target position (plus when it was issued) so the
+// RAF loop can filter out stale pre-seek GStreamer position responses. Heavy videos can
+// take >1s to complete a seek; during that time audioGetPosition returns the old position.
+//
+// Bug found live 2026-07-25 (matches the user's own "waveform position stopped tracking
+// while audio/video kept playing" report, reproduced headlessly via seek-while-playing at
+// non-1.0 rate): the distance check below (`> 0.5s away = stale, discard`) assumes a stale
+// reading is BEHIND the target and a real post-seek reading will land close to it. That
+// only holds for "seek then stay still." For "seek while playing" — the normal case — real
+// playback keeps advancing the position past the target the moment the seek actually
+// lands. If the very first post-seek reading arrives after the position has already moved
+// more than 0.5s past the target (slow seek, or several seeks fired in quick succession),
+// it gets wrongly discarded as "stale" — and since the target is never cleared, EVERY
+// subsequent reading forever after does too, permanently freezing the waveform's cached
+// position while GStreamer and the <video> element keep advancing underneath. Fix: give up
+// on the distance check after SEEK_STALE_TIMEOUT_MS and accept whatever comes back next —
+// a reading that old is far more likely to be a legitimate advanced position than a
+// genuinely stale pre-seek one, and a wrong one-frame reading self-corrects on the next
+// poll, unlike the permanent freeze this replaces.
+const SEEK_STALE_TIMEOUT_MS = 1500;
+const pendingSeekTarget = new Map<string, { time: number; setAtMs: number }>();
 
 export function registerVideoEl(deckId: string, el: HTMLVideoElement) {
   els.set(deckId, el);
@@ -60,7 +77,7 @@ export function seekDeck(deckId: string, time: number) {
   // the EOS→seek→play transition.
   audioTimes.delete(deckId);
   // Record seek target so the RAF loop can ignore stale pre-seek IPC responses.
-  pendingSeekTarget.set(deckId, time);
+  pendingSeekTarget.set(deckId, { time, setAtMs: performance.now() });
   audioSeek(deckId, time).catch(console.error);
 }
 
@@ -80,9 +97,18 @@ export function getVideoEl(deckId: string): HTMLVideoElement | undefined {
   return els.get(deckId);
 }
 
-// Returns the pending seek target if a seek is in progress, undefined otherwise.
+// Returns the pending seek target if a seek is in progress AND still within
+// SEEK_STALE_TIMEOUT_MS of being issued; undefined otherwise (no pending seek, or one
+// old enough that the RAF loop should stop distance-filtering and trust the next
+// reading — see the comment on pendingSeekTarget above).
 export function getPendingSeekTarget(deckId: string): number | undefined {
-  return pendingSeekTarget.get(deckId);
+  const pending = pendingSeekTarget.get(deckId);
+  if (pending === undefined) return undefined;
+  if (performance.now() - pending.setAtMs > SEEK_STALE_TIMEOUT_MS) {
+    pendingSeekTarget.delete(deckId);
+    return undefined;
+  }
+  return pending.time;
 }
 
 // Clears the pending seek flag once the first valid post-seek IPC arrives.

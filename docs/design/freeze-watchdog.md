@@ -109,10 +109,33 @@ one session. Real-desktop verification (`kill -STOP`/`kill -CONT` plus
 `feedback_audio_midi_live_testing`) has not been done yet for phase 3 — only phase 1's
 observe-only behavior was live-verified on the real desktop so far.
 
-Phase 4 (mechanism-B self-heal) not started. Ships before (and independently of)
+Phase 4 (mechanism-B self-heal) implemented 2026-07-25 in `App.svelte`'s `frame()` loop
+(per-frame detection, per the design below — not a store `$effect`, learned the hard way
+from the reverted `nearTrackEnd`/`applyVideoRate` attempt, see
+`project_webkit_freeze_mechanisms` memory). `npm run check` clean; `scripts/perf-idle-test.sh`
+and `scripts/latency-test.sh` both re-run against a rebuilt binary and show no regression
+(CPU deltas within normal run-to-run noise, all 10 latency-test checks pass) — confirms the
+new per-frame Map bookkeeping is cheap and the normal load/play/rate-change path is
+undisturbed. **A live-test attempt was made 2026-07-25 (same day) via `verify-ui`, using
+the confirmed historical mechanism-B repro recipe (`pcm-buffer-playback.md`'s "Tenth
+mechanism": load the same 288.485s track, set `playbackRate=0.87`, seek to ~90% through,
+play to the real end) — it did NOT reproduce.** Two attempts, both completed cleanly to a
+real EOS (Rust pipeline self-paused correctly, video reached `ended=true` at the true
+duration). Mechanism-B is documented as intermittent (historically ~2/3 stall rate on a
+small sample), so two clean runs don't rule it out, but the self-heal recovery path
+specifically has still never been exercised against a genuine stall — **the phase 4 gate
+remains open**; do not rely on it in a live show until it clears a real repro, per the
+reverted-attempt history above. **A different, real bug surfaced as a byproduct of this
+testing attempt** (not mechanism-B, not WebKitGTK's fault): a permanent waveform-position
+freeze during seek-while-playing, independently corroborated by the user live on their own
+desktop at the same time. Root-caused and fixed the same session — see
+`project_seek_staleness_freeze_fix` memory and `audio-debugging` skill's `pendingSeekTarget`
+section for the full writeup; unrelated to this design doc's own scope but worth knowing
+about if a future mechanism-B repro attempt also produces a stuck-looking waveform, since
+that symptom can now have two different causes. Ships before (and independently of)
 `webcodecs-video-path.md`. Rationale discussion: 2026-07-25 session; background:
-`pcm-buffer-playback.md` mechanisms Nine/Ten/Eleven and the
-`project_webkit_freeze_mechanisms` memory.
+`pcm-buffer-playback.md` mechanisms Nine/Ten/Eleven and the `project_webkit_freeze_mechanisms`
+memory.
 
 ## Goal
 
@@ -317,7 +340,22 @@ never hiccups and by eye that the UI returns with decks intact.
    mechanism was four failed iterations of a *cousin* of this; the difference here is
    it acts only on an already-stalled element, never on healthy playback. Live-test
    accordingly, and be willing to drop this phase if it misbehaves — phases 1–3 stand
-   alone).
+   alone). **Implemented 2026-07-25** (`frame()` in `App.svelte`): per-frame stall
+   detection (`deck.playing && !v.paused && !v.ended && v.readyState < 3`, native
+   `v.currentTime` unchanged > 2s, audio content position — via `getDeckTime()` —
+   advanced > 0.05s over that same span); recovery is `v.load()`, then on `canplay`
+   restore `currentTime`/`volume`/`muted`/`playbackRate`, wait 200ms, `play()`; bounded
+   to one attempt per deck per 10s; guarded through the existing `playPromises` map
+   (with a 5s safety-valve release) so `syncVideoElements`'s own play/pause branch can't
+   race the recovery sequence. `npm run check` clean; `perf-idle-test.sh`/`latency-test.sh`
+   re-run with no regression. **Live-test attempt made 2026-07-25 — did not reproduce.** Two
+   headless `verify-ui` attempts at the historical repro recipe (0.87× rate, seek to ~90%
+   through the confirmed 288.485s repro track, play to real end) both completed cleanly with
+   no stall. **Gate remains open**: mechanism-B is documented as intermittent (~2/3 stall
+   rate historically on a small sample), so this doesn't clear it — needs more attempts,
+   ideally also on the real desktop, before the recovery logic can be trusted live. See
+   Status above for what this attempt *did* find (an unrelated waveform-position-freeze bug,
+   fixed the same session).
 
 ## Risks
 

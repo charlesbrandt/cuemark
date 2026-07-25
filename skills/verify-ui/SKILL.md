@@ -346,6 +346,38 @@ post-reload state:
   range buffered = the track just ended normally) and cross-check against the real Rust-side
   position (`window.__TAURI__.core.invoke('audio_get_position', {deckId})` directly, not the
   frontend's cached `getAudioTime()`, which can itself be stuck from an unrelated cause).
+  Concrete example of that "unrelated cause" found 2026-07-25 via exactly this technique:
+  `seekBus.ts`'s `pendingSeekTarget` staleness filter could freeze `getAudioTime()` forever
+  after a seek-while-playing while `v.currentTime` and the raw Rust position both kept
+  advancing fine — see `audio-debugging` skill's `pendingSeekTarget` section. Fixed; the
+  side-by-side raw-vs-cached comparison is what proved it was a frontend bug, not a
+  WebKitGTK/GStreamer stall.
+- **Don't load a very long video (tens of minutes) in a headless test.** Loading a ~49-minute
+  file caused the WebDriver session itself to die (`"session deleted because of page crash or
+  hang"`) even though the underlying app process and its `WebKitWebProcess` were both still
+  alive per `pgrep` — the WebDriver health-check gave up waiting, not a real crash. Stick to
+  short/modest clips (tens of seconds to a few minutes) for headless repros; use `ffprobe -v
+  error -show_entries format=duration -of csv=p=0 <file>` to check before loading.
+- **Reuse a locally-cached copy for a reliable, network-independent repro file** rather than
+  pointing at a path on the SMB media library (`project_media_library_smb_mount` memory) or one
+  associated with a live Digger queue item. `media_cache.rs` caches every loaded file locally at
+  `~/.local/share/com.cuemark.app/media_cache/<hash>-<size>.<ext>` — `ffprobe`'s `duration`/
+  `TAG:title` on files there will identify a specific previously-used track (e.g. a known
+  mechanism-B repro file) without depending on the original SMB path being reachable or
+  triggering any Digger-side side effects. Loading that cache path directly as the deck's
+  `filePath` works identically to the original (Rust's `ensure_cached()` just no-ops on an
+  already-local path).
+- **A "fresh" headless launch is not airtight isolation from other cuemark activity** — observed
+  2026-07-25: a deck loaded via the debug hook on a just-launched headless instance was later
+  found to have a *different* track loaded (one the user says they loaded elsewhere, on a
+  separate real desktop session, around the same time). The mechanism was not fully diagnosed —
+  ruled out: session-recovery boot logic (requires a *live* pipeline in this process's own,
+  freshly-empty `AudioManager`, which a truly fresh launch can't have yet) and a Tauri
+  single-instance plugin (not present in `Cargo.toml`). Whatever the cause, treat any headless
+  session as potentially not perfectly isolated from concurrent real-desktop cuemark/Digger
+  activity: call `getSession()` right after launch and again right before an action that
+  depends on a specific deck being in a specific state, rather than assuming a fresh launch
+  guarantees a clean slate.
 - **`latency-test.sh` step 6 burst timeout on heavy videos.** JS `setInterval` is throttled by the browser
   under CPU load; a heavy H.264 music video can slow 5 ms ticks to ~150 ms, making a 200-event burst take
   ~30 s. The script sets the WebDriver script timeout to 60 s before the burst call and restores it

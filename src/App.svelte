@@ -115,6 +115,21 @@
   // to avoid burning CPU/GPU every RAF tick while idle. Still catches seeks made while paused
   // since currentTime changes even with playing=false.
   const lastUploadedTime = new Map<string, number>();
+  // Mechanism-B self-heal (freeze-watchdog.md phase 4): WebKitGTK's <video> element can
+  // silently stop advancing (readyState stuck < HAVE_FUTURE_DATA) while the separate
+  // Rust/GStreamer audio pipeline keeps playing fine — see project_webkit_freeze_mechanisms
+  // memory, "Mechanism B". Detected here, per-frame, inside frame() itself — never a store
+  // $effect (an $effect only re-runs on store mutation, so it silently never fires during a
+  // stall with no other UI activity; this is the same lesson the Eleventh-mechanism/
+  // nearTrackEnd attempt paid for four times before being reverted, see that memory).
+  // lastVideoCt/lastChangeMs track native v.currentTime (never the IPC-fed audio clock,
+  // for the same "must be reliably fresh" reason documented elsewhere in this file);
+  // refAudioPos snapshots the audio content position at the moment video last moved, so a
+  // later stall check can ask "did audio advance since video stopped?" over exactly the
+  // stalled span. lastAttemptMs bounds recovery to at most once per deck per 10s (design
+  // doc: "if it recurs, it recurs" — no permanent give-up, unlike the watchdog's 3-strike rule).
+  type StallWatch = { lastVideoCt: number; lastChangeMs: number; refAudioPos: number; lastAttemptMs: number };
+  const stallWatch = new Map<string, StallWatch>();
   // Signature of the last composited frame's static inputs (deck id/source/opacity).
   // Used to skip the composite()+postFrame() GPU readback entirely when nothing visual
   // changed and nothing is animating — otherwise that full-resolution capture + cross-window
@@ -458,6 +473,7 @@
         lastAudioPlaying.delete(id);
         clearDeckAudioSync(id);
         contentPosTracker.delete(id);
+        stallWatch.delete(id);
       }
     }
 
@@ -585,6 +601,11 @@
         // position handled above); either way reset the content-position integrator so
         // it reinitializes cleanly from the first position poll.
         contentPosTracker.delete(deck.id);
+        // Same reason: a new track's fresh <video> element hasn't stalled yet — carrying
+        // over the old track's stall-tracking state could either false-trigger (stale
+        // refAudioPos far behind the new track's position) or block a real detection
+        // for up to 10s (stale lastAttemptMs cooldown).
+        stallWatch.delete(deck.id);
         // Report state after a short delay so we can see if the network request started
         setTimeout(() => {
           console.log(`[${deck.id}] state@500ms: readyState=${v!.readyState} networkState=${v!.networkState} error=${v!.error?.code ?? 'none'} src=${v!.src}`);
@@ -686,6 +707,64 @@
             lastUploadedTime.set(deck.id, v.currentTime);
             fbo.uploadVideoFrame(v);
             dirty = true;
+          }
+          // Mechanism-B self-heal (freeze-watchdog.md phase 4) — see stallWatch comment above.
+          if (v) {
+            const deckId = deck.id;
+            let st = stallWatch.get(deckId);
+            if (!st) {
+              st = { lastVideoCt: v.currentTime, lastChangeMs: nowMs, refAudioPos: getDeckTime(deckId) ?? 0, lastAttemptMs: 0 };
+              stallWatch.set(deckId, st);
+            }
+            if (v.currentTime !== st.lastVideoCt) {
+              st.lastVideoCt = v.currentTime;
+              st.lastChangeMs = nowMs;
+              st.refAudioPos = getDeckTime(deckId) ?? st.refAudioPos;
+            }
+            const stalledMs = nowMs - st.lastChangeMs;
+            if (
+              deck.playing && !v.paused && !v.ended && v.readyState < 3 &&
+              stalledMs > 2000 && nowMs - st.lastAttemptMs > 10000
+            ) {
+              const curAudioPos = getDeckTime(deckId);
+              // "Audio kept advancing while video didn't" over the exact stalled span —
+              // the design doc's condition that distinguishes a real WebKit stall from a
+              // legitimate pause/paused-deck/end-of-track state (already excluded above).
+              if (curAudioPos !== null && curAudioPos - st.refAudioPos > 0.05) {
+                st.lastAttemptMs = nowMs;
+                st.lastChangeMs = nowMs; // restart the clock; don't re-trigger before canplay lands
+                const target = curAudioPos;
+                const rate = lastPlaybackRate.get(deckId) ?? 1.0;
+                debugLog(`[self-heal] ${deckId} <video> stalled ${(stalledMs / 1000).toFixed(1)}s ` +
+                  `while audio advanced ${(curAudioPos - st.refAudioPos).toFixed(2)}s — resetting element to ${target.toFixed(2)}s`);
+                // Guard via playPromises (same map syncVideoElements checks before calling
+                // v.play() itself) so its play/pause branch doesn't race a v.play() call
+                // against the recovery sequence below while v.load() is still settling.
+                // Safety-valve timeout: if canplay never fires (decoder wedged even after
+                // load()), release the guard anyway rather than permanently blocking normal
+                // play/pause sync for this deck.
+                const releaseGuard = () => playPromises.delete(deckId);
+                const guardTimeout = setTimeout(releaseGuard, 5000);
+                playPromises.set(deckId, new Promise<void>((resolve) => {
+                  v.addEventListener('canplay', () => {
+                    clearTimeout(guardTimeout);
+                    v.currentTime = target;
+                    v.volume = 0;
+                    v.muted = true;
+                    v.playbackRate = rate;
+                    lastPlaybackRate.set(deckId, rate);
+                    // Rate-then-seek ordering doesn't apply here (load() built a fresh
+                    // pipeline, no in-flight rebuild) but keep the 200ms settle delay
+                    // anyway — cheap insurance per the design doc.
+                    setTimeout(() => {
+                      v.play().catch((e) => { if (e.name !== 'AbortError') console.error(e); })
+                        .finally(() => { releaseGuard(); resolve(); });
+                    }, 200);
+                  }, { once: true });
+                  v.load(); // full element reset — discards WebKit's wedged internal pipeline
+                }));
+              }
+            }
           }
           // Audio is the master clock. One in-flight IPC per deck prevents stale
           // out-of-order responses from snapping currentTime backward mid-rate-change.
