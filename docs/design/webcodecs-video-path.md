@@ -1,14 +1,16 @@
 # WebCodecs video path: replacing the `<video>` element for deck playback (design)
 
-Status: **phase 2 done (2026-07-25)** — full playback path (`codecPlayer.ts`/
-`codecWorker.ts`), feature flag + live per-deck A/B toggle, `App.svelte` integration, and
-in-app verification (real Tauri webview, real library files). See "Phase 2 results" below
-the phased-rollout list. Phase 1: demux service + in-app WebCodecs verification — one real
-finding that changed the phase 2 plan: hardware H.264 decode needs `description`/avc
-format, not the spike's annexb-only assumption. Feasibility spike completed 2026-07-25
-(results below — all gates passed *for software decode*; see phase 1 results for the
-correction). Companion doc: `freeze-watchdog.md` (ships first; independent of this work
-but makes any remaining webview failure recoverable).
+Status: **phase 3 done (2026-07-25)** — audited and live-tested the legacy/codec-path
+isolation Phase 2 already built; zero code gaps found, one live-test proof instrumentation
+added (kept permanently). See "Phase 3 results" below. Phase 2: full playback path
+(`codecPlayer.ts`/`codecWorker.ts`), feature flag + live per-deck A/B toggle, `App.svelte`
+integration, and in-app verification (real Tauri webview, real library files) — see "Phase 2
+results". Phase 1: demux service + in-app WebCodecs verification — one real finding that
+changed the phase 2 plan: hardware H.264 decode needs `description`/avc format, not the
+spike's annexb-only assumption. Feasibility spike completed 2026-07-25 (results below — all
+gates passed *for software decode*; see phase 1 results for the correction). Companion doc:
+`freeze-watchdog.md` (ships first; independent of this work but makes any remaining webview
+failure recoverable).
 
 ## Why this exists
 
@@ -185,10 +187,24 @@ every phase; new soak test added in Phase 4. One phase per PR/branch; do not com
 2. **DONE (2026-07-25). `codecPlayer.ts` behind a feature flag.** Deck video renders via
    WebCodecs when flagged; `<video>` element not created for those decks. Live
    per-deck A/B toggle shipped (`DeckCard`'s LEGACY/CODEC badge). Results below.
-3. **Retire sync machinery for codec-path decks**: loop wraparound via worker (no
-   seek), hot cues/snap seeks via worker seek, remove drift-resync +
-   `pendingSeekTarget` + `contentPosTracker` involvement for these decks. Keep all
-   of it for legacy-path decks.
+3. **DONE (2026-07-25). Audit + harden legacy/codec-path isolation.** Corrected
+   framing (was: "retire sync machinery for codec-path decks... remove drift-resync +
+   `pendingSeekTarget` + `contentPosTracker` involvement for these decks"). That
+   description conflated two different things. `contentPosTracker`'s wall-clock→
+   content-position integration and `pendingSeekTarget`'s stale-IPC filter are **not**
+   `<video>`-element-specific — they exist because the *Rust audio pipeline's*
+   `query_position` always returns wall-clock stream time regardless of video
+   backend (soundtouch's `tempo` property never issues a rate-seek), so both backends
+   need this shared clock math; Phase 2 already fed it into `codecPlayer.setClock()`
+   for codec-path decks rather than bypassing it. What actually *is* legacy-only —
+   and was already gated correctly in Phase 2 — is the small set of literal `<video>`
+   DOM writes: `v.currentTime =`, `v.playbackRate =`, `v.play()`/`v.pause()`, and the
+   mechanism-B self-heal block. All of these are reached only through a `v` obtained
+   from `videoEls`/`seekBus.ts`'s `els` map, which by construction never holds an
+   entry for a webcodecs-backend deck. Phase 3's actual work was auditing every one
+   of those call sites for a missing guard, and proving the isolation live rather than
+   trusting the code review. See "Phase 3 results" below — zero gaps found; one
+   permanent proof-instrumentation hook added (`__cuemarkDebug.getLegacyVideoOpCounts`).
 4. **Soak + live testing** (`feedback_audio_midi_live_testing` applies in full):
    headless soak — off-tempo (0.87×) full-track playback to natural end, repeated
    ×10 (mechanism B's repro conditions: was 2-of-3 stall); sustained off-tempo
@@ -391,6 +407,90 @@ Two decks loaded with the same 8s H.264 file, deck-0 forced `legacy`, deck-1 for
   exercise the doc's specific color-space/rotation call-out — only gross
   orientation/color-sanity was verified. Revisit if a rotated or unusual-colorimetry
   clip surfaces in the library.
+
+## Phase 3 results (2026-07-25)
+
+**Audit method**: grepped every reference to `videoEls`, `lastPlaybackRate`,
+`stallWatch`, `v.currentTime`, `v.playbackRate`, `v.play(`, `v.pause(`,
+`pendingSeekTarget`, `contentPosTracker` across `App.svelte`, `seekBus.ts`,
+`audioSync.ts`, `DeckCard.svelte`, `WaveformCanvas.svelte`, and `Crossfader.svelte`.
+
+**Finding: no gaps.** Every literal `<video>` DOM mutation (all `v.currentTime =`,
+`v.playbackRate =`, `v.play()`, `v.pause()` call sites — createLegacyVideoEl's
+adopted-position seek, the custom loop-wraparound `ontimeupdate`, the rate-tolerance
+write, play/pause sync, the mechanism-B self-heal reset, and the drift-resync snap in
+`frame()`) is reached only via a `v` obtained from `videoEls`/`seekBus.ts`'s `els`
+map, and `syncVideoElements`'s state machine only ever populates that map for a deck
+resolved to `legacy`/`legacy-fallback` — a `webcodecs`-resolved deck is torn out of
+both maps in the same rAF pass that switches it over (`teardownCodecPlayerOnly`/the
+toggle branches). `DeckCard.svelte`'s preview canvas reads `video.currentTime` but
+never writes it, and falls through to `codec.getFrameForTime()` when no `v` exists.
+`WaveformCanvas.svelte` and `Crossfader.svelte` never touch a video element at all —
+they go through `getDeckTime`/`getPhase`/`seekDeck` exclusively. `audioSync.ts` is
+pure Rust-IPC (rate/gain/volume), not video-backend-aware, confirming it's genuinely
+shared infrastructure rather than something that needed scoping. **No code changes
+were needed** — Phase 2 built the isolation preemptively and correctly, exactly as
+its own inline comments already claimed (e.g. the `frame()` self-heal block's "codec-
+path decks have no `v`... this block naturally never runs for them").
+
+**Live-test proof** (`verify-ui`: tauri-driver + Xvfb, `VITE_ENABLE_DEBUG_HOOK=1
+cargo tauri build --debug --no-bundle`, two decks on the 265s/1080p H.264 cached
+file `a3f47c64298e7849-36194713.mp4`, deck-0 forced `legacy`, deck-1 forced
+`webcodecs`):
+
+- Added `window.__cuemarkDebug.getLegacyVideoOpCounts(deckId)` — per-deck counters
+  (`currentTime`, `playbackRate`, `playPause`) bumped at every one of the write
+  sites above, plus `hasVideoEl` (`videoEls.has(deckId)`). Kept permanently (cheap
+  Map bump, same style as the rest of the debug hook) as a standing live sanity
+  check for this isolation, not a one-off test hook — removed nothing else, no
+  `console.log` added to the RAF loop.
+- Ran two cumulative `simulateMidiRateBurst('deck-1', …)` calls that each exceeded
+  the WebDriver async script timeout (90s) while still executing server-side
+  (fire-and-forget `setInterval`, confirmed still advancing after the timeout), plus
+  one clean bounded run — **1000 events fired over 22.5s** (rates cycling
+  0.9/0.95/1.0/1.05/1.1×) with a clean result. Combined sustained non-1.0-rate
+  exposure on deck-1: **~230+ seconds**, well over the "a minute or more" bar.
+- One `seek('deck-1', 50.0)` mid-burst: `getCodecFramePts` landed at 50.33s,
+  `getAudioTime` at 50.35s — within one frame interval, no black-flash stall.
+- One loop (`loopIn=50.0, loopOut=52.0`) driven for 6 polls across ~12s: audio clock
+  oscillated 47.3 → 51.4 → 48.9 → 50.9 → 48.1, confirming repeated wraparound (not a
+  run to real EOS).
+- **`getLegacyVideoOpCounts('deck-1')` throughout all of the above:
+  `{currentTime: 0, playbackRate: 0, playPause: 0, hasVideoEl: false}` — never
+  changed from zero, at any single poll, across the whole workout.**
+  `document.querySelectorAll('video').length` was `1` the entire time (deck-0's
+  element only).
+- **Side-by-side legacy sanity check**: deck-0 (`legacy`, same file) showed its
+  normal machinery firing throughout — `currentTime` counter climbed from 278→314
+  over ~10s of playback (the drift-resync snap firing repeatedly, as expected for a
+  playing legacy deck), `playbackRate`/`playPause` incremented on each session-
+  lifecycle event (fresh load, toggle). Confirms this phase's audit/instrumentation
+  didn't accidentally disable or no-op the legacy path.
+- App log (`~/.local/share/com.cuemark.app/logs/cuemark.log`) showed zero
+  `[self-heal]` lines for either deck across the session — no mechanism-B stall
+  triggered on either backend during the test.
+
+**Gate scripts**: `scripts/perf-idle-test.sh` — no regression (`video-deck-playing`
+46.00%, new `webcodecs-deck-playing` scenario 50.62%, both comparable to Phase 2's
+recorded baseline). `scripts/latency-test.sh` — 10/10 passed on the 8s light clip;
+run a second time against the 265s/1080p heavy clip and failed only step 6's CPU
+threshold (106% vs. an 80% bar) — this reproduces the skill's own documented gotcha
+("The CPU > 80% failure for heavy content is expected... use a light DJ clip to
+verify the 80% threshold") rather than a regression; the light-clip run confirms the
+actual gate passes cleanly. `npm run check` — clean, 230 files, 0 errors/warnings.
+No Rust changed this phase, so `cargo check` wasn't re-run.
+
+**New gotcha confirmed, nothing new needed**: this phase found no new isolation bug
+and needed no code fix beyond the doc correction above — worth recording plainly as
+a "the design held" result, per this project's memory culture, rather than
+inventing a gotcha to report. The one genuinely new procedural note (added to
+`skills/verify-ui/SKILL.md`): `simulateMidiRateBurst`'s `setInterval` can be
+throttled far enough under this environment's CPU load (two decks playing + a
+sustained burst) that its wrapping WebDriver `/execute/async` call hits the default
+90s script timeout well before the requested event count fires — the burst keeps
+running fire-and-forget in the page regardless (confirmed: audio position kept
+advancing, and a smaller bounded re-run completed and reported real numbers), so a
+timed-out response is not itself a failure signal for this particular hook.
 
 ## Risks and open items
 

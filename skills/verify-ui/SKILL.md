@@ -255,6 +255,20 @@ post-reload state:
 
 ## Gotchas
 
+- **`simulateMidiRateBurst`'s fire-and-forget `setInterval` can outlive the WebDriver
+  `/execute/async` call that started it** — found live 2026-07-25 verifying
+  `docs/design/webcodecs-video-path.md` phase 3: under enough CPU load (two decks
+  playing simultaneously, one on each video backend), a burst nominally 20-60s long
+  (`count * intervalMs`) took long enough that the wrapping `/execute/async` request
+  hit the default 90s WebDriver script timeout and returned `{"error":"script
+  timeout",...}` — but the in-page `setInterval` kept firing regardless (it's not
+  cancelled by the WebDriver call returning/erroring), confirmed by polling
+  `getAudioTime()`/rate-history state afterward and seeing it keep changing. A timed-
+  out response from this specific hook is therefore not itself proof the burst failed
+  or stopped — re-run with a smaller `count` for a clean, promptly-returning
+  measurement if you need the actual `{fired, durationMs}` numbers, and don't confuse
+  "the WebDriver call timed out" with "the burst didn't happen" when checking for
+  sustained-load side effects.
 - **WebDriver's full-window `GET /session/$SESSION/screenshot` can hang indefinitely in
   this environment** — confirmed 2026-07-25 while verifying `docs/design/
   webcodecs-video-path.md` phase 2: repeated 20-45s timeouts with zero response, even

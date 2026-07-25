@@ -112,6 +112,20 @@
   const lastAudioPlaying = new Map<string, boolean>();
   // Per-deck audio rate/gain/volume are synced via audioSync.ts (module-level Maps shared
   // with handler.ts). No per-component Maps needed here.
+  // Phase 3 proof instrumentation (docs/design/webcodecs-video-path.md "Phase 3 results"):
+  // counts every actual <video>-element mutation (currentTime write, playbackRate write,
+  // play()/pause() call) per deck. Every call site that touches `v` is only reachable
+  // through videoEls.get(deckId), which by construction (syncVideoElements) only ever
+  // holds legacy/legacy-fallback-backend decks — a webcodecs-backend deckId should show
+  // zero counts here for its entire lifetime. Kept permanently (cheap Map bump, same style
+  // as the rest of __cuemarkDebug) as a live sanity check for the codec-path isolation this
+  // design doc claims, not just a one-off test hook.
+  const legacyVideoOpCounts = new Map<string, { currentTime: number; playbackRate: number; playPause: number }>();
+  function recordLegacyOp(deckId: string, kind: 'currentTime' | 'playbackRate' | 'playPause') {
+    const c = legacyVideoOpCounts.get(deckId) ?? { currentTime: 0, playbackRate: 0, playPause: 0 };
+    c[kind]++;
+    legacyVideoOpCounts.set(deckId, c);
+  }
   // Last video.currentTime uploaded to each deck's FBO texture. uploadVideoFrame() does a
   // full-resolution drawImage + texImage2D — skip it when the frame hasn't advanced (paused)
   // to avoid burning CPU/GPU every RAF tick while idle. Still catches seeks made while paused
@@ -235,6 +249,16 @@
         // Returns the video element's currentTime for a deck (null if no element yet).
         // Used by latency-test.sh to verify video is actually advancing during playback.
         getVideoTime: (deckId: string) => getVideoEl(deckId)?.currentTime ?? null,
+
+        // Phase 3 verification (docs/design/webcodecs-video-path.md): per-deck counts of
+        // every <video>-element currentTime/playbackRate write and play()/pause() call
+        // this session, plus whether a <video> element is currently registered for the
+        // deck at all. A webcodecs-backend deck should show all-zero counts and
+        // hasVideoEl=false for its entire lifetime — see recordLegacyOp above.
+        getLegacyVideoOpCounts: (deckId: string) => ({
+          ...(legacyVideoOpCounts.get(deckId) ?? { currentTime: 0, playbackRate: 0, playPause: 0 }),
+          hasVideoEl: videoEls.has(deckId),
+        }),
 
         // Phase 2 verification: live per-deck A/B override, same call the DeckCard toggle
         // button makes — lets a headless test force legacy/webcodecs without clicking.
@@ -747,7 +771,7 @@
     v.src = src;
     v.load();
     if (adopted) {
-      v.addEventListener('loadedmetadata', () => { v.currentTime = adopted.positionSecs; }, { once: true });
+      v.addEventListener('loadedmetadata', () => { v.currentTime = adopted.positionSecs; recordLegacyOp(deckId, 'currentTime'); }, { once: true });
     }
     setTimeout(() => {
       console.log(`[${deckId}] state@500ms: readyState=${v.readyState} networkState=${v.networkState} error=${v.error?.code ?? 'none'} src=${v.src}`);
@@ -934,6 +958,7 @@
         v.ontimeupdate = () => {
           if (v!.currentTime >= loopOut) {
             v!.currentTime = loopIn;
+            recordLegacyOp(deckId, 'currentTime');
             audioSeek(deckId, loopIn).catch(console.error);
           }
         };
@@ -957,17 +982,20 @@
       if (Math.abs(targetRate - lastRate) > 0.005) {
         lastPlaybackRate.set(deckId, targetRate);
         v.playbackRate = targetRate;
+        recordLegacyOp(deckId, 'playbackRate');
         v.volume = 0;
         v.muted = true;
       }
       // Video element: sync play/pause based on element state.
       if (deck.playing && v.paused && !playPromises.has(deckId)) {
+        recordLegacyOp(deckId, 'playPause');
         const p = v.play().catch((e) => {
           if (e.name !== 'AbortError') console.error(e);
         }).finally(() => playPromises.delete(deckId)) as Promise<void>;
         playPromises.set(deckId, p);
       } else if (!deck.playing && !v.paused) {
         playPromises.delete(deckId); // pending play() will abort; that's intentional
+        recordLegacyOp(deckId, 'playPause');
         v.pause();
       }
 
@@ -1079,14 +1107,17 @@
                   v.addEventListener('canplay', () => {
                     clearTimeout(guardTimeout);
                     v.currentTime = target;
+                    recordLegacyOp(deckId, 'currentTime');
                     v.volume = 0;
                     v.muted = true;
                     v.playbackRate = rate;
+                    recordLegacyOp(deckId, 'playbackRate');
                     lastPlaybackRate.set(deckId, rate);
                     // Rate-then-seek ordering doesn't apply here (load() built a fresh
                     // pipeline, no in-flight rebuild) but keep the 200ms settle delay
                     // anyway — cheap insurance per the design doc.
                     setTimeout(() => {
+                      recordLegacyOp(deckId, 'playPause');
                       v.play().catch((e) => { if (e.name !== 'AbortError') console.error(e); })
                         .finally(() => { releaseGuard(); resolve(); });
                     }, 200);
@@ -1181,6 +1212,7 @@
               // for VJ visuals synced by eye to a beat, unlike e.g. lip-synced dialogue.
               if (!scratching && v && Math.abs(v.currentTime - contentPos) > 0.25) {
                 v.currentTime = contentPos; // snap video to audio clock
+                recordLegacyOp(capturedDeckId, 'currentTime');
               }
               if (codecPlayer) {
                 // Codec-path decks have no <video> ontimeupdate, so this poll is where
