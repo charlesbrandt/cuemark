@@ -475,6 +475,23 @@ override only lifts the harness's own restrictions, not the kernel's). If you do
 passwordless `sudo`, ask the user to run the `gdb -p` command themselves via `!` so the
 password prompt reaches them directly, and paste the backtrace back.
 
+**Systemic plan (2026-07-25 architecture review) — read before adding any new
+`<video>`-element mitigation**: both mechanisms above are bugs inside WebKitGTK's
+`MediaPlayerPrivateGStreamer`, and the mitigation-stacking approach was explicitly
+retired after the Eleventh mechanism. The agreed direction is in `docs/design/`:
+`freeze-watchdog.md` (Rust-side heartbeat watchdog + session-of-record + webview
+reload recovery — makes ANY webview freeze a few-second blink instead of a
+show-ender), `webcodecs-video-path.md` (replace the `<video>` element with
+`VideoDecoder` slaved to the Rust audio clock — removes both mechanisms'
+trigger operations entirely; feasibility spike passed same day, see its results
+table), and `native-output-pipeline.md` (shelved escalation path). Upstream bug
+drafts with evidence: `docs/upstream/`. Key empirical facts to not re-discover:
+WebCodecs decode is mature/default-on and works correctly here (1080p software
+decode 153–165 fps), but **any use of `VideoEncoder` (`isConfigSupported` or
+`configure`) SIGABRTs the web process** — recording must stay in Rust. Probe
+harnesses: `scripts/probes/` (see `verify-ui` skill's "Lightweight webview
+probes" section for the technique).
+
 ### Fresh machine: tracks load (filename shows) but never play, no waveform, black video preview
 
 Confirmed root cause on a clean Ubuntu install (2026-06-19): `gstreamer1.0-plugins-bad` was never

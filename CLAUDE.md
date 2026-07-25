@@ -400,7 +400,26 @@ cuemark/
   svelte.config.js
   todo.md
   journal.md
+  docs/
+    design/                     # Feature/architecture design docs (see below)
+    upstream/                   # Draft WebKitGTK bug reports (with evidence + reproducers)
+  scripts/
+    probes/                     # Headless WebKitGTK feature probes (python3-gi; see verify-ui skill)
 ```
+
+## Active architecture plan (2026-07-25)
+
+The WebKitGTK freeze mechanisms (see `skills/audio-debugging` "UI frozen solid" entry)
+are being fixed structurally, not mitigated further. Read these before touching video
+playback, the drift-resync path, or anything freeze-related:
+
+- `docs/design/freeze-watchdog.md` — **build first**: Rust heartbeat watchdog +
+  session-of-record + webview reload recovery.
+- `docs/design/webcodecs-video-path.md` — **build second**: replace the `<video>`
+  element with WebCodecs `VideoDecoder` slaved to the Rust audio clock. Feasibility
+  spike passed (results table in the doc).
+- `docs/design/native-output-pipeline.md` — shelved escalation path; do not start
+  without an explicit decision.
 
 ## Development phases
 
@@ -507,3 +526,7 @@ Two automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb +
 - Cross-platform: avoid platform-specific code outside Tauri's abstraction layer
 - Wayland primary target; X11 fallback via GTK
 - Open source goal — keep dependencies permissively licensed
+- **Never use WebCodecs `VideoEncoder`** — `isConfigSupported()` or `configure()`
+  SIGABRTs WebKitWebProcess on WebKitGTK 2.52.3 (100% reproducible; see
+  `docs/upstream/videoencoder-crash.md`). Recording stays in Rust (`record.rs`).
+  `VideoDecoder` is fine and is the basis of `docs/design/webcodecs-video-path.md`.

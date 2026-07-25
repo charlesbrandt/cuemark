@@ -182,6 +182,48 @@ kill $(cat /tmp/tauri-driver.pid) 2>/dev/null; rm -f /tmp/tauri-driver.pid
 kill $(cat /tmp/xvfb.pid) 2>/dev/null; rm -f /tmp/xvfb.pid
 ```
 
+## Lightweight webview probes without the app (python3-gi)
+
+For "does this machine's WebKitGTK support/do X?" questions — feature detection,
+API behavior, crash isolation, perf measurement of a web API — you don't need the
+app, a build, or tauri-driver at all. A bare `WebKit2 4.1` GI webview loads the
+**same `libwebkit2gtk-4.1` library** Tauri/wry links, so results transfer (verify
+in-app before shipping anything that depends on them). This is how the WebCodecs
+feasibility spike was run in minutes per question (2026-07-25 — see
+`scripts/probes/README.md` and `docs/design/webcodecs-video-path.md`).
+
+Pattern (full working examples in `scripts/probes/`):
+- Python: `gi.require_version('WebKit2', '4.1')`, create `Gtk.Window` + `WebKit2.WebView`,
+  `view.load_html(PAGE, "http://localhost/")`, run a `GLib.MainLoop`.
+- Result channel: the page sets `document.title = "RESULT:" + JSON.stringify(out)`;
+  Python polls `view.get_title()` on a `GLib.timeout_add`. No server, no WebDriver.
+- Host-side GStreamer (`gi.require_version('Gst', '1.0')`) can prepare real test
+  data in the same script (e.g. encode H.264 AUs to feed a decoder under test).
+- Crash detection: connect `view.connect('web-process-terminated', ...)` — a probe
+  that times out with no title is usually a dead web process.
+- Run under `xvfb-run -a`, with the app's env (`WEBKIT_DISABLE_DMABUF_RENDERER=1`,
+  the `GST_PLUGIN_FEATURE_RANK` demotions from `main.rs`) so behavior matches.
+- **Always set `APPORT_DISABLE=1`** — a WebKitWebProcess crash inside the probe
+  otherwise pops Ubuntu's "application stopped unexpectedly" dialog on the user's
+  real desktop session (learned live 2026-07-25, twice).
+- Feature-flag enumeration: `WebKit2.Settings.get_all_features()` lists every
+  WebKit feature with default/status (`webcodecs_probe.py` does this) — the fast
+  way to check whether an API needs a settings toggle before blaming its absence.
+- **Never touch `VideoEncoder` in probe pages** (`isConfigSupported` or `configure`
+  — instant web process SIGABRT on 2.52.3; `docs/upstream/videoencoder-crash.md`).
+
+## Simulating freezes and crashes (for watchdog/recovery testing)
+
+External process-level simulation of the documented freeze mechanisms, useful once
+`docs/design/freeze-watchdog.md` lands (and for ad-hoc triage today):
+- `kill -STOP <WebKitWebProcess pid>` — closest cheap analog of the mechanism-A
+  main-thread freeze (heartbeat/rAF/JS all stop; process alive). `kill -CONT` releases.
+- `kill -KILL <pid>` — web process crash path.
+- Find the pid: `pgrep -f WebKitWebProcess` and match the one whose ancestor is the
+  cuemark binary under test (there may be a `bwrap` sandbox layer in between).
+- Rust-side audio can be verified alive during a frozen webview by watching the log
+  (`audio_get_position` keeps being served) — the webview is not required for audio.
+
 ## Gotchas
 
 - **`dpkg -L webkit2gtk-driver | grep WebKitWebDriver` matches two lines**, not one — the
