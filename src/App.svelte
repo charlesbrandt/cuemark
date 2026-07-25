@@ -287,6 +287,164 @@
         killRafLoop: () => {
           debugKillRafLoop = true;
         },
+
+        // docs/design/webcodecs-video-path.md phase 1 in-app verification: demuxes
+        // filePath via the Rust video_demux service, fetches the resulting AUs over
+        // HTTP from the media server, and decodes them with WebCodecs VideoDecoder —
+        // exercising the exact real-file codec-string derivation + real-AU decode path
+        // the feasibility spike (scripts/probes/) only approximated with host-encoded
+        // synthetic data. Debug/verification only — not used by the real playback path
+        // (that's phase 2's codecPlayer.ts). Bounded to 60 frames so a long file's
+        // whole demux isn't decoded here (video_demux_load itself demuxes the whole
+        // file into memory regardless — this just limits the HTTP fetch + decode).
+        //
+        // Tries annexb (no `description`, raw byte-stream chunks) first — the mode the
+        // spike documented as working — then falls back to avc (`description` built from
+        // the SPS/PPS, chunks re-muxed to length-prefixed NALs with parameter sets
+        // stripped). Found live 2026-07-25, re-verifying this phase: WebKitGTK 2.52.3's
+        // *hardware* (`vah264dec`/VA-API) WebCodecs H.264 decode path unconditionally
+        // requires avc+description — its internal harness always signals
+        // `stream-format=avc` downstream regardless of how `configure()` was called, so
+        // annexb-without-description decodes 0 frames (`h264parse`: "H.264 AVC caps, but
+        // no codec_data" → "refused caps") and `flush()` rejects with "EncodingError:
+        // Decode error". Confirmed the spike's own probe script reproduces the identical
+        // failure today, and only matches its documented "60/60 decoded" result once
+        // `vah264dec`/`vaapih264dec` are demoted to force software `avdec_h264` — so the
+        // spike's recorded pass was (unknowingly) exercising software decode only, not
+        // the hardware path this app's real env (main.rs) leaves enabled for H.264. See
+        // the design doc's phase 1 results note and `skills/audio-debugging` for the
+        // full writeup.
+        probeWebCodecs: async (deckId: string, filePath: string) => {
+          try {
+            const demux = await invoke<{
+              codec: string;
+              codedWidth: number;
+              codedHeight: number;
+              fpsHint: number;
+              auCount: number;
+              keyframes: { auIndex: number; ptsUs: number }[];
+              duration: number;
+            }>('video_demux_load', { deckId, filePath });
+
+            const port = await invoke<number>('media_server_port');
+            const auLimit = Math.min(demux.auCount, 60);
+            const res = await fetch(
+              `http://127.0.0.1:${port}/demux/${encodeURIComponent(deckId)}/aus?from=0&count=${auLimit}`,
+            );
+            if (!res.ok) throw new Error(`AU fetch failed: ${res.status}`);
+            const bytes = new Uint8Array(await res.arrayBuffer());
+            const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+            // Per-AU framing (media_server.rs's /demux/<deck>/aus route):
+            // [u32 le length][u8 flags(bit0=key)][i64 le pts_us][i64 le dur_us][data…]
+            const chunks: { key: boolean; ptsUs: number; data: Uint8Array }[] = [];
+            let off = 0;
+            while (off + 21 <= bytes.length) {
+              const len = view.getUint32(off, true); off += 4;
+              const flags = view.getUint8(off); off += 1;
+              const ptsUs = Number(view.getBigInt64(off, true)); off += 8;
+              off += 8; // dur_us — not needed for this probe
+              const data = bytes.slice(off, off + len); off += len;
+              chunks.push({ key: (flags & 1) !== 0, ptsUs, data });
+            }
+
+            // --- Annex-B NAL splitting, used by both the annexb attempt (to check for
+            // an SPS/PPS at all) and the avc fallback (to build description + rewrite
+            // each chunk to length-prefixed form). Trims the zero_byte padding Annex-B
+            // allows before a start code — spec-mandated, not a heuristic.
+            const splitNals = (data: Uint8Array): { type: number; bytes: Uint8Array }[] => {
+              const starts: number[] = [];
+              for (let i = 0; i + 2 < data.length; i++) {
+                if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1) starts.push(i + 3);
+              }
+              const nals: { type: number; bytes: Uint8Array }[] = [];
+              for (let k = 0; k < starts.length; k++) {
+                const start = starts[k];
+                let end = k + 1 < starts.length ? starts[k + 1] - 3 : data.length;
+                while (end > start && data[end - 1] === 0) end--;
+                if (end > start) nals.push({ type: data[start] & 0x1f, bytes: data.slice(start, end) });
+              }
+              return nals;
+            };
+
+            const runDecode = async (
+              config: VideoDecoderConfig,
+              toChunkData: (data: Uint8Array) => Uint8Array,
+            ) => {
+              const errors: string[] = [];
+              let frameCount = 0;
+              const decoder = new VideoDecoder({
+                output: (frame) => { frameCount++; frame.close(); },
+                error: (e) => errors.push(String(e)),
+              });
+              decoder.configure(config);
+              const t0 = performance.now();
+              for (const c of chunks) {
+                decoder.decode(new EncodedVideoChunk({
+                  type: c.key ? 'key' : 'delta',
+                  timestamp: c.ptsUs,
+                  data: toChunkData(c.data),
+                }));
+              }
+              await decoder.flush(); // rejects if any decode() call errored
+              const decodeMs = +(performance.now() - t0).toFixed(1);
+              decoder.close();
+              return { frameCount, errors, decodeMs };
+            };
+
+            let mode: 'annexb' | 'avc';
+            let result: { frameCount: number; errors: string[]; decodeMs: number };
+            try {
+              result = await runDecode({ codec: demux.codec }, (d) => d);
+              mode = 'annexb';
+            } catch {
+              const firstNals = splitNals(chunks[0].data);
+              const sps = firstNals.find((n) => n.type === 7);
+              const pps = firstNals.find((n) => n.type === 8);
+              if (!sps || !pps) throw new Error('avc fallback: no SPS/PPS in first AU to build description');
+              const description = new Uint8Array(11 + sps.bytes.length + pps.bytes.length);
+              let o = 0;
+              description[o++] = 1; // configurationVersion
+              description[o++] = sps.bytes[1]; // AVCProfileIndication
+              description[o++] = sps.bytes[2]; // profile_compatibility
+              description[o++] = sps.bytes[3]; // AVCLevelIndication
+              description[o++] = 0xff; // reserved(6)=111111 | lengthSizeMinusOne=3 (4-byte length prefix)
+              description[o++] = 0xe1; // reserved(3)=111 | numOfSequenceParameterSets=1
+              description[o++] = (sps.bytes.length >> 8) & 0xff; description[o++] = sps.bytes.length & 0xff;
+              description.set(sps.bytes, o); o += sps.bytes.length;
+              description[o++] = 1; // numOfPictureParameterSets
+              description[o++] = (pps.bytes.length >> 8) & 0xff; description[o++] = pps.bytes.length & 0xff;
+              description.set(pps.bytes, o);
+
+              const toAvc = (data: Uint8Array) => {
+                const slices = splitNals(data).filter((n) => n.type === 1 || n.type === 5);
+                const out = new Uint8Array(slices.reduce((n, s) => n + 4 + s.bytes.length, 0));
+                let p = 0;
+                for (const s of slices) {
+                  const len = s.bytes.length;
+                  out[p++] = (len >>> 24) & 0xff; out[p++] = (len >>> 16) & 0xff;
+                  out[p++] = (len >>> 8) & 0xff; out[p++] = len & 0xff;
+                  out.set(s.bytes, p); p += len;
+                }
+                return out;
+              };
+              result = await runDecode({ codec: demux.codec, description }, toAvc);
+              mode = 'avc';
+            }
+
+            return {
+              codec: demux.codec,
+              mode,
+              frameCount: result.frameCount,
+              errors: result.errors,
+              decodeMs: result.decodeMs,
+              codedWidth: demux.codedWidth,
+              codedHeight: demux.codedHeight,
+            };
+          } catch (e) {
+            return { error: String(e instanceof Error ? (e.stack ?? e.message) : e) };
+          }
+        },
       };
     }
     if (!import.meta.env.DEV) {

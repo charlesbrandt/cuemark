@@ -5,6 +5,7 @@ pub mod media_server;
 pub mod midi;
 pub mod midi_state;
 pub mod session_store;
+pub mod video_demux;
 pub mod watchdog;
 
 use std::sync::Arc;
@@ -124,6 +125,7 @@ pub fn run() {
         .manage(audio::AudioState::new(audio::AudioManager::new()))
         .manage(Arc::new(audio::analysis::AnalysisCache::new()))
         .manage(session_store::SessionStoreState::new())
+        .manage(Arc::new(video_demux::VideoDemuxRegistry::new()))
         .invoke_handler(tauri::generate_handler![
             open_output_window,
             media_server_port,
@@ -156,6 +158,8 @@ pub fn run() {
             audio::audio_record_start,
             audio::audio_record_stop,
             audio::audio_analyze_file,
+            video_demux::video_demux_load,
+            video_demux::video_demux_unload,
         ])
         .setup(|app| {
             let persist = midi_state::new_persist();
@@ -172,7 +176,8 @@ pub fn run() {
             let cache_dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("media_cache");
             let media_cache = Arc::new(media_cache::MediaCache::new(cache_dir));
             app.manage(media_cache.clone());
-            app.manage(MediaServerPort(media_server::start(media_cache)));
+            let video_demux_registry = app.state::<Arc<video_demux::VideoDemuxRegistry>>().inner().clone();
+            app.manage(MediaServerPort(media_server::start(media_cache, video_demux_registry)));
             Ok(())
         })
         .run(tauri::generate_context!())

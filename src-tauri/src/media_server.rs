@@ -13,9 +13,60 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::media_cache::MediaCache;
+use crate::video_demux::VideoDemuxRegistry;
 use crate::{mime_from_path, parse_range, url_decode};
 
-fn handle(request: tiny_http::Request, cache: &MediaCache) {
+/// Serves `GET /demux/<deck_id>/aus?from=<idx>&count=<n>` — the binary AU-chunk
+/// transport for the WebCodecs debug probe (docs/design/webcodecs-video-path.md phase
+/// 1). Deliberately a flat byte stream, not Tauri JSON IPC — encoded AUs run ~1 MB/s
+/// per deck at typical bitrates, and this HTTP server is already the established local
+/// transport for video bytes (see the module doc comment above).
+fn handle_demux_aus(request: tiny_http::Request, deck_id: &str, query: &str, demux: &VideoDemuxRegistry) {
+    let mut from = 0usize;
+    let mut count = usize::MAX;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            match k {
+                "from" => from = v.parse().unwrap_or(0),
+                "count" => count = v.parse().unwrap_or(usize::MAX),
+                _ => {}
+            }
+        }
+    }
+    match demux.encode_aus_range(deck_id, from, count) {
+        Some(body) => {
+            let response = tiny_http::Response::from_data(body)
+                .with_status_code(200)
+                .with_header(header("Content-Type", "application/octet-stream"))
+                .with_header(header("Access-Control-Allow-Origin", "*"));
+            let _ = request.respond(response);
+        }
+        None => {
+            // Every branch — including this error one — must carry CORS, same reason
+            // as the file-not-found branch in handle() below: a response missing this
+            // header permanently CORS-taints the resource for any later JS read of it.
+            let response = tiny_http::Response::from_string(format!("no demuxed video for deck '{deck_id}'"))
+                .with_status_code(404)
+                .with_header(header("Access-Control-Allow-Origin", "*"));
+            let _ = request.respond(response);
+        }
+    }
+}
+
+fn handle(request: tiny_http::Request, cache: &MediaCache, demux: &VideoDemuxRegistry) {
+    // `/demux/<deck_id>/aus?...` is routed separately from the file-serving path below —
+    // it serves in-memory AU data, not a file on disk, so it never touches media_cache.
+    // Parsed into owned Strings up front: `request.url()` borrows from `request`, which
+    // `handle_demux_aus` below needs to take by value (to call `.respond()` on it).
+    let demux_route = request.url().strip_prefix("/demux/").and_then(|rest| {
+        let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+        path.strip_suffix("/aus").map(|deck_id| (url_decode(deck_id), query.to_string()))
+    });
+    if let Some((deck_id, query)) = demux_route {
+        handle_demux_aus(request, &deck_id, &query, demux);
+        return;
+    }
+
     let requested_path = url_decode(request.url());
     // Wait out an in-progress ensure_cached() copy instead of falling straight back to
     // the network — a video's first HTTP request can otherwise race ahead of audio_load's
@@ -89,7 +140,7 @@ fn header(field: &str, value: &str) -> tiny_http::Header {
 
 /// Starts the server on an ephemeral 127.0.0.1 port and returns that port.
 /// Spawns a thread per connection — local-only, low-concurrency (one app window).
-pub fn start(cache: Arc<MediaCache>) -> u16 {
+pub fn start(cache: Arc<MediaCache>, demux: Arc<VideoDemuxRegistry>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind media server port");
     let port = listener.local_addr().unwrap().port();
     let server = tiny_http::Server::from_listener(listener, None)
@@ -98,7 +149,8 @@ pub fn start(cache: Arc<MediaCache>) -> u16 {
     std::thread::spawn(move || {
         for request in server.incoming_requests() {
             let cache = cache.clone();
-            std::thread::spawn(move || handle(request, &cache));
+            let demux = demux.clone();
+            std::thread::spawn(move || handle(request, &cache, &demux));
         }
     });
 

@@ -860,6 +860,40 @@ symptom returns for H.264, or shows up freshly for AV1/VP9/HEVC, re-add the code
 `vaapi*dec` factory name to the rank string in `main.rs` — see the comment there and the
 2026-06-19/2026-06-20 journal entries for the full history before assuming it's fixed for good.
 
+## WebCodecs H.264 hardware decode requires `description` (avc), not annexb (2026-07-25)
+
+**Symptom**: `VideoDecoder.configure({codec: 'avc1.PPCCLL'})` (no `description`) + `decode()` on
+real Annex-B chunks (start-code-delimited NALs, in-band SPS/PPS) — the WebCodecs-documented
+"annexb" mode — decodes **zero frames** and `flush()` rejects with `EncodingError: Decode error`.
+Confirmed both for real demuxed file data (`video_demux.rs`) and for
+`scripts/probes/webcodecs_decode_only_probe.py`'s own **host-encoded synthetic** AUs — re-running
+that exact spike script today reproduces the failure it originally reported as a 60/60-frame pass.
+
+**Root cause**: with `GST_DEBUG=h264*:6,webkitvideodecoder:6`, WebKitGTK 2.52.3's internal
+`webkitvideodecoder` harness selects `vah264dec` (hardware, VA-API) for `avc1.*` codecs — H.264
+hardware decode is enabled in this app's env (see "VA-API hardware decode status" above, only AV1
+is demoted) — and **unconditionally signals `stream-format=avc` downstream**, regardless of
+whether `configure()` was called with or without `description`. Its internal `h264parse0` then logs
+`H.264 AVC caps, but no codec_data` → `refused caps`, and no frames ever reach the decoder. Forcing
+software decode instead (`GST_PLUGIN_FEATURE_RANK=vah264dec:0,vaapih264dec:0`) makes the exact same
+annexb-without-description call succeed (60/60 frames, pixel-exact) — `avdec_h264` (software) tolerates
+annexb-without-description; `vah264dec` (hardware) does not. The spike's originally-recorded pass
+was unknowingly exercising the software path only; it does not hold for this app's actual env, which
+leaves H.264 hardware decode on.
+
+**Fix**: always build an **avc**-format `description` (AVCDecoderConfigurationRecord: version,
+profile_idc/compat/level_idc from the SPS, `lengthSizeMinusOne`, then length-prefixed SPS/PPS) from
+the stream's first keyframe, and re-mux each chunk from Annex-B (start-code-delimited, includes
+AUD/SPS/PPS/SEI) to avc format (4-byte-length-prefixed slice NALs only, parameter sets stripped —
+they live in `description` instead) before calling `decode()`. `App.svelte`'s `probeWebCodecs` debug
+hook tries annexb first, falls back to avc+description on failure, and reports which `mode` actually
+decoded — use that fallback (or just go straight to avc+description, skipping the doomed-on-hardware
+annexb attempt) in `codecPlayer.ts` (phase 2), not annexb-only as the design doc's spike table implied.
+**Don't trust a probe result recorded before this app's real env was re-verified against it live** —
+same lesson as "GStreamer/audio still runs for real inside Xvfb" in `verify-ui`'s gotcha list, one
+level up: even a *result*, not just a mechanism, needs re-confirming once the surrounding env
+(feature ranks, driver versions) can plausibly have shifted since it was recorded.
+
 ## Clipping / muddy output — gain chain and master volume
 
 **Symptom**: output sounds clipped or distorted even when per-deck volume and gain sliders are
