@@ -1,12 +1,14 @@
 # WebCodecs video path: replacing the `<video>` element for deck playback (design)
 
-Status: **phase 1 done (2026-07-25)** — demux service + in-app WebCodecs verification, real
-Tauri webview, real library files. See "Phase 1 results" below the phased-rollout list for
-what actually happened (one real finding that changes the phase 2 plan: hardware H.264
-decode needs `description`/avc format, not the spike's annexb-only assumption). Feasibility
-spike completed 2026-07-25 (results below — all gates passed *for software decode*; see
-phase 1 results for the correction). Companion doc: `freeze-watchdog.md` (ships first;
-independent of this work but makes any remaining webview failure recoverable).
+Status: **phase 2 done (2026-07-25)** — full playback path (`codecPlayer.ts`/
+`codecWorker.ts`), feature flag + live per-deck A/B toggle, `App.svelte` integration, and
+in-app verification (real Tauri webview, real library files). See "Phase 2 results" below
+the phased-rollout list. Phase 1: demux service + in-app WebCodecs verification — one real
+finding that changed the phase 2 plan: hardware H.264 decode needs `description`/avc
+format, not the spike's annexb-only assumption. Feasibility spike completed 2026-07-25
+(results below — all gates passed *for software decode*; see phase 1 results for the
+correction). Companion doc: `freeze-watchdog.md` (ships first; independent of this work
+but makes any remaining webview failure recoverable).
 
 ## Why this exists
 
@@ -180,13 +182,9 @@ every phase; new soak test added in Phase 4. One phase per PR/branch; do not com
    the real Tauri webview. Verified on real library files, including one AV1 file (see
    `project_av1_vaapi_bug` history — AV1 is the likeliest codec-support gap; WebCodecsAV1
    is *preview* status). Results below.
-2. **`codecPlayer.ts` behind a feature flag** (`VITE_VIDEO_PATH=webcodecs` or a
-   settings toggle persisted via the `cuemark:` localStorage pattern). Deck video
-   renders via WebCodecs when flagged; `<video>` element not created for those decks.
-   A/B toggle must be live-switchable per deck for side-by-side comparison (visual
-   correctness: color range/space vs. the `<video>` rendering — check BT.601 vs 709
-   on real content; rotation metadata; variable-frame-rate files must present by pts,
-   never by assumed cfr).
+2. **DONE (2026-07-25). `codecPlayer.ts` behind a feature flag.** Deck video renders via
+   WebCodecs when flagged; `<video>` element not created for those decks. Live
+   per-deck A/B toggle shipped (`DeckCard`'s LEGACY/CODEC badge). Results below.
 3. **Retire sync machinery for codec-path decks**: loop wraparound via worker (no
    seek), hot cues/snap seeks via worker seek, remove drift-resync +
    `pendingSeekTarget` + `contentPosTracker` involvement for these decks. Keep all
@@ -247,6 +245,152 @@ decode, but phase 3's loop-without-seek and hot-cue-without-seek plans should ke
 some real library content may have very sparse keyframes, making an arbitrary seek target's
 "nearest keyframe ≤ target" catch-up window much larger than the spike's `key-int-max=30` test
 data implied.
+
+## Phase 2 results (2026-07-25)
+
+Built the full playback path:
+
+- **`src/lib/video/h264.ts`** — Annex-B/avc helpers (NAL split, `AVCDecoderConfigurationRecord`
+  builder, avc re-mux, AU-framing parser) factored out of phase 1's `probeWebCodecs` debug
+  hook so `codecWorker.ts` reuses the exact proven logic rather than re-deriving it.
+- **`src/lib/video/codecWorker.ts`** — one `VideoDecoder` per deck in a Worker. Always
+  avc+description (per phase 1's finding — annexb-without-description not attempted).
+  Decode-ahead gated on `pts/1e6 - clockPos > ~5/fpsHint` (N≈5 frames) plus
+  `decoder.decodeQueueSize` backpressure. Seek: `reset()`+`configure()`, feed from
+  `keyframeAuIndexAtOrBefore(target)`, drop output pts < target. Loop: a second
+  `VideoDecoder` pre-decodes from `loopIn`'s keyframe once the clock is within 1.5s of
+  `loopOut` (buffers up to 6 frames), then a `loopWrap` message swaps it in as primary
+  with zero seek for the common case — the same physical `VideoDecoder` instance is
+  reused post-swap (its output callback checks a `loopIsNowPrimary` flag rather than
+  needing a new decoder, since a `VideoDecoder`'s callback is fixed at construction).
+  Falls back to a normal seek if the wrap arrives before prefetch finished. EOS: stops
+  feeding, no synthesized `ended` event, per the doc's "one source of truth" rule.
+- **`src/lib/video/codecPlayer.ts`** — main thread, holds ≤2 `VideoFrame`s, `getFrameForTime`
+  picks largest pts ≤ t (no CFR assumption). `setClock()` detects a backward jump (>0.5s,
+  mirroring `contentPosTracker`'s own seek heuristic) and treats it as an implicit seek —
+  this is what makes the Rust EOS-then-replay-from-zero path work correctly on the codec
+  path with no extra code (confirmed live: an EOS-restarted deck resumed cleanly).
+- **`fbo.ts`**: `uploadVideoFrameFromCodec()` tries `texImage2D(gl, VideoFrame)` directly,
+  falls back to the scratch-canvas `drawImage` detour on the first throw, caching the
+  choice in a module-level static (not per-instance — the capability is a GPU/driver
+  property, not a per-deck one). **Finding**: on this real GPU (not just the spike's
+  Xvfb/llvmpipe), `texImage2D(gl, VideoFrame)` direct upload works — confirmed by the
+  compositor output screenshot below rendering correctly with no fallback exception
+  logged. **No Y-flip is applied** for this path (unlike `uploadVideoFrame`'s
+  `UNPACK_FLIP_Y_WEBGL`) — verified by screenshot: codec-path frames render right-side-up
+  and color-correct with the flip *omitted*, confirming WebCodecs' pixel format is already
+  in the orientation WebGL expects.
+- **`seekBus.ts`** extended with a `CodecPlayerHandle` registry (`registerCodecPlayer`/
+  `getCodecPlayer`/`codecPlayerDeckIds`) alongside the existing `els` video-element map.
+  `seekDeck()` routes to both, so every existing call site (hot cues, loop in/out, cue
+  point in `DeckCard.svelte`) needed **zero changes** — they already went through
+  `seekDeck`/`getDeckTime` generically.
+- **Feature flag**: `src/lib/video/videoPathSettings.ts` — `cuemark:videoPathDefault`
+  (global, seeded from `VITE_VIDEO_PATH=webcodecs` on first run only, same
+  first-run-only precedent as other `persistentWritable` settings) and
+  `cuemark:videoPathOverride` (per-deck `Record<deckId, 'legacy'|'webcodecs'>`).
+  **UI**: a small LEGACY/CODEC badge button in `DeckCard`'s header (next to the deck id)
+  — click to flip that deck's override live, no reload needed.
+- **`App.svelte`**: `syncVideoElements` now resolves a per-deck backend (`legacy` |
+  `pending` | `webcodecs` | `legacy-fallback`) via `resolveVideoPath()`, tearing down/
+  spinning up the right backend on file changes and on live A/B toggles — a toggle on an
+  already-loaded file does **not** call `audio_load` again (verified: toggling
+  legacy→webcodecs→legacy on a playing deck never glitched the audio). `frame()`'s
+  position-poll (audio clock) is no longer gated on a `<video>` element existing — it now
+  drives both `v.currentTime` snapping (legacy) and `codecPlayer.setClock()` (webcodecs)
+  from the same poll. The deck's custom loop (`loopIn`/`loopOut`) wraps via
+  `codecPlayer.notifyLoopWrap()` + `audioSeek()` in that same poll for codec-path decks,
+  the poll-driven equivalent of legacy's `v.ontimeupdate` loop-back.
+
+### Verification (real Tauri webview, tauri-driver + Xvfb, real cached library files)
+
+Two decks loaded with the same 8s H.264 file, deck-0 forced `legacy`, deck-1 forced
+`webcodecs` (`__cuemarkDebug.setVideoPathOverride`, added as a phase 2 verification hook):
+
+- **Backend resolution**: `getVideoBackend('deck-0')` → `legacy`, `getVideoBackend('deck-1')`
+  → `webcodecs`. `document.querySelectorAll('video').length` → **1** (only deck-0's) while
+  deck-1's `DeckCard` preview canvas and the main compositor output both showed moving,
+  correctly-oriented, color-correct content — confirmed by `canvas.toDataURL()` screenshot
+  comparison (see gotcha below on why `toDataURL()` was used instead of the WebDriver
+  screenshot endpoint).
+- **Sync**: both decks' `getAudioTime()` (same audio-driven clock) tracked within ~20ms of
+  each other while playing; deck-1's `getCodecFramePts()` stayed within one frame interval
+  (~40ms at 24fps) of `getAudioTime()`.
+- **Visual correctness**: screenshots of both decks' composited output at matching audio
+  positions — codec-path frame is right-side-up, correct color (matches the legacy
+  frame's palette/content), not garbled/static. No rotation-metadata or BT.601/709 test
+  clip was available locally; only the orientation/gross-color-correctness checks the doc
+  asks for were run.
+- **Seek**: `seek('deck-1', 1.0)` landed the audio clock at the target within ~1s
+  (GStreamer seek latency, same as legacy); the codec frame briefly returned `null` from
+  `getFrameForTime` until the worker decoded past the seek target, then tracked correctly
+  — no black flash held for seconds (confirmed via screenshot at the target position).
+- **Loop**: `loopIn=0.5`/`loopOut=2.0`/`loop=true` on the webcodecs deck — `getAudioTime`
+  oscillated repeatedly between ~0.5s and ~2.0s (confirming wraparound, not a run to real
+  EOS) with the codec frame staying in the loop window and no black frame at the wrap
+  (screenshot taken mid-loop shows valid content). A few individual polls showed the
+  codec frame briefly lagging the audio clock by ~0.3–0.4s right after a wrap on this
+  single-keyframe test file (see gotcha below) — self-corrected within the next poll.
+- **`scripts/perf-idle-test.sh`**: added a `webcodecs-deck-playing` scenario (mirrors the
+  existing `video-deck-playing` one). Results: `video-deck-playing` 46.75% avg CPU vs.
+  `webcodecs-deck-playing` 49.69% — comparable, no regression, on this Xvfb/software-GL
+  test box.
+- **`scripts/latency-test.sh`**: left unmodified — deck-0 stays on the (unaffected)
+  legacy path by default, and the script's actual subject (WebKit pipeline rebuild
+  timing on `v.playbackRate` writes) structurally doesn't apply to codec-path decks
+  (no `v`, no rate writes at all — see the doc's "Rate changes" bullet). All 10 checks
+  passed against a 25s file (an 8s file made step 7's 2× rate check hit real EOS
+  mid-test — a test-fixture artifact of file length, not a regression, confirmed by
+  re-running with a longer file).
+- **`npm run check`**: clean (0 errors/warnings, 230 files). No Rust changes this phase,
+  so `cargo check` wasn't re-run.
+
+### New gotchas found
+
+- **WebDriver's full-window `/screenshot` endpoint hangs indefinitely in this
+  environment** (confirmed: 45s timeout, no response, even with an empty session/no
+  decks loaded) — a pre-existing issue unrelated to this phase's code, matching the
+  precedent already noted in `journal.md`'s 2026-07-06 entry ("extracted the waveform
+  canvas's raw pixel data via `toDataURL()` rather than trusting a full-window
+  screenshot"). Use `canvas.toDataURL('image/png')` via `execute/sync` instead — reads
+  back the actual composited WebGL output (or any other canvas) and is fast/reliable.
+  Added to `verify-ui` skill.
+- **A leftover `WebKitWebDriver` process from an earlier session in the same Xvfb
+  display can silently steal tauri-driver's native-driver port** (`4445`, i.e.
+  `webdriver-port+1`) — the *new* tauri-driver still accepts a session and answers
+  `execute/sync` (confusing: it looks alive), but its log shows
+  `FATAL: Unable to listen for HTTP server at host 127.0.0.1 and port 4445` and some
+  operations (screenshot) hang. Check `ps -o pid,lstart,cmd -p $(pgrep -f
+  WebKitWebDriver)` and compare start times/`DISPLAY` before trusting a session is
+  clean; kill anything stale on your own `:99`-style display (never touch a process
+  whose `DISPLAY=:0` — that's the user's real desktop).
+- **Single-keyframe test files make every seek/loop-fallback a full re-decode from AU
+  0** — the 8s test file has exactly one keyframe (per phase 1's own note). Loop
+  wraparound still worked correctly in testing because the loop-prefetch path doesn't
+  need a keyframe seek for the common case, but any *fallback* path (prefetch not
+  ready in time, or a hot-cue seek deep into a sparse-keyframe file) pays the full
+  from-AU-0 decode cost. Not a phase 2 regression — flagged as a real limitation for
+  phase 3/4 soak testing on content with realistic GOP structure.
+- **Reloading the identical file path on a deck is a no-op** for both backends (matches
+  the pre-existing legacy behavior of comparing `v.getAttribute('src')`) — `backendState`
+  tracks `(deckId, filePath)`, so calling `updateDeck(deckId, {source: {...same
+  filePath...}})` doesn't retrigger `audio_load`, `video_demux_load`, or grid lookup.
+  Confirmed via testing but worth remembering when scripting repeated-load test
+  sequences — force a `source: null` clear first if a fresh reload is actually needed.
+
+### Known limitations carried into phase 3
+
+- Codec support is still H.264-only (unchanged from phase 1) — any other codec on a
+  deck flagged `webcodecs` falls back to `legacy` automatically (`legacy-fallback`
+  state), logged via `debugLog`.
+- Loop-prefetch and seek-fallback both use `keyframeAuIndexAtOrBefore`, which can be
+  arbitrarily far from the target on sparse-keyframe content (see gotcha above) —
+  fine for phase 2's "common case" bar, worth re-measuring in phase 4's soak on real
+  multi-minute library content with normal GOP sizes.
+- No rotation-metadata or BT.601-vs-709 real test clip was available locally to
+  exercise the doc's specific color-space/rotation call-out — only gross
+  orientation/color-sanity was verified. Revisit if a rotated or unusual-colorimetry
+  clip surfaces in the library.
 
 ## Risks and open items
 

@@ -31,6 +31,37 @@ export function isScratching(deckId: string): boolean {
   return get(scratchingDecks).has(deckId);
 }
 
+// Minimal shape codecPlayer.ts's CodecPlayer satisfies — kept structural here (rather than
+// importing the class) so seekBus.ts, used by every deck-control call site (DeckCard hot
+// cues/loop/cue-point), doesn't need to know about the WebCodecs path's implementation,
+// only that a codec-path deck has a per-deck "backend" registered here instead of a
+// <video> element. See docs/design/webcodecs-video-path.md phase 2.
+export interface CodecPlayerHandle {
+  seek(t: number): void;
+  getFrameForTime(t: number): VideoFrame | null;
+  setClock(contentPos: number, playing: boolean): void;
+  setLoop(bounds: { inPos: number; outPos: number } | null): void;
+  notifyLoopWrap(loopInPos: number): void;
+  destroy(): void;
+}
+const codecPlayers = new Map<string, CodecPlayerHandle>();
+
+export function registerCodecPlayer(deckId: string, player: CodecPlayerHandle): void {
+  codecPlayers.set(deckId, player);
+}
+
+export function unregisterCodecPlayer(deckId: string): void {
+  codecPlayers.delete(deckId);
+}
+
+export function getCodecPlayer(deckId: string): CodecPlayerHandle | undefined {
+  return codecPlayers.get(deckId);
+}
+
+export function codecPlayerDeckIds(): string[] {
+  return [...codecPlayers.keys()];
+}
+
 const els = new Map<string, HTMLVideoElement>();
 // Audio clock positions updated by the RAF loop from GStreamer IPC.
 // The waveform reads these rather than video.currentTime, which drifts between
@@ -71,6 +102,9 @@ export function unregisterVideoEl(deckId: string) {
 export function seekDeck(deckId: string, time: number) {
   const el = els.get(deckId);
   if (el) el.currentTime = time;
+  // Codec-path decks (no <video> element) route the same seek to their worker instead —
+  // reset()+configure(), feed from the nearest keyframe <= target (see codecWorker.ts).
+  codecPlayers.get(deckId)?.seek(time);
   // Delete rather than set: getDeckTime falls back to v.currentTime (which equals `time`
   // immediately after the seek above). Setting to `time` would block the fallback and
   // leave the waveform stuck at the seek position if the GStreamer IPC gets stuck in

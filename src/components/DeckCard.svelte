@@ -1,16 +1,18 @@
 <script lang="ts">
   import { open } from "@tauri-apps/plugin-dialog";
   import { session, updateDeck, removeDeck, setMasterBpm } from "../lib/state/session";
-  import { seekDeck, getDeckTime, getPhase, getVideoEl, quantizeToGrid } from "../lib/renderer/seekBus";
+  import { seekDeck, getDeckTime, getPhase, getVideoEl, getCodecPlayer, quantizeToGrid } from "../lib/renderer/seekBus";
   import { nudgePhaseToMaster } from "../lib/audio/phaseNudge";
   import { tempoRange } from "../lib/audio/audioSettings";
   import { gridSave } from "../lib/audio/pipeline";
   import { pushMarker, setTrackBpm } from "../lib/digger/api";
   import { markGridSaved } from "../lib/audio/gridSource";
+  import { videoPathOverrides, videoPathDefault, setVideoPathOverride, resolveVideoPath } from "../lib/video/videoPathSettings";
   import type { Deck } from "../lib/state/types";
 
   let { deck }: { deck: Deck } = $props();
   let masterBpm = $derived($session.bpm);
+  let resolvedVideoPath = $derived(resolveVideoPath(deck.id, $videoPathOverrides, $videoPathDefault));
   let isDragOver = $state(false);
   let previewCanvas = $state<HTMLCanvasElement | null>(null);
   let currentTime = $state(0);
@@ -50,9 +52,11 @@
     // texture upload — skip it while paused and the frame hasn't moved (idle CPU sink
     // otherwise). lastDrawnTime still catches a seek made while paused.
     let lastDrawnTime = -1;
+    let lastDrawnPts = -1;
     let rafId: number;
     function draw() {
       const video = getVideoEl(deck.id);
+      const codec = getCodecPlayer(deck.id);
       if (video && video.readyState >= 2) {
         if (video.currentTime !== lastDrawnTime) {
           lastDrawnTime = video.currentTime;
@@ -70,6 +74,24 @@
         }
         currentTime = video.currentTime;
         if (video.duration && isFinite(video.duration)) videoDuration = video.duration;
+      } else if (codec) {
+        // Codec-path deck: no <video> element to read from — pick the current frame from
+        // the same audio clock the compositor's FBO upload uses, and drawImage() it (2D
+        // canvas accepts a VideoFrame directly, no scratch-canvas detour needed here).
+        const t = getDeckTime(deck.id);
+        if (t !== null) {
+          currentTime = t;
+          const frame = codec.getFrameForTime(t);
+          if (frame && frame.timestamp !== lastDrawnPts) {
+            lastDrawnPts = frame.timestamp;
+            try {
+              ctx!.drawImage(frame, 0, 0, canvas.width, canvas.height);
+            } catch (e) {
+              console.error(`[${deck.id}] preview drawImage (codec) failed:`, e);
+            }
+          }
+        }
+        if (deck.source?.type === "video" && deck.source.duration) videoDuration = deck.source.duration;
       }
       phase = getPhase(deck.id);
       rafId = requestAnimationFrame(draw);
@@ -128,7 +150,19 @@
   ondrop={handleDrop}
 >
   <div class="deck-header">
-    <span class="deck-id">{deck.id}</span>
+    <span class="deck-header-left">
+      <span class="deck-id">{deck.id}</span>
+      {#if deck.source?.type === "video"}
+        <button
+          class="video-path-btn"
+          class:webcodecs={resolvedVideoPath === "webcodecs"}
+          onclick={() => setVideoPathOverride(deck.id, resolvedVideoPath === "webcodecs" ? "legacy" : "webcodecs")}
+          title="Video decode path for this deck — click to switch. Falls back to legacy automatically if the file isn't H.264 (docs/design/webcodecs-video-path.md)."
+        >
+          {resolvedVideoPath === "webcodecs" ? "CODEC" : "LEGACY"}
+        </button>
+      {/if}
+    </span>
     <button class="remove-btn" onclick={() => removeDeck(deck.id)} aria-label="Remove deck">
       ×
     </button>

@@ -139,6 +139,25 @@ body {
 }
 .remove-btn:hover { color: #e04040; }
 
+.deck-header-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.video-path-btn {
+  padding: 1px 5px;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  background: #1a1a1a;
+  border: 1px solid #444;
+  border-radius: 3px;
+  color: #777;
+  cursor: pointer;
+}
+.video-path-btn:hover { border-color: #888; color: #ccc; }
+.video-path-btn.webcodecs { border-color: #7ec8e3; color: #7ec8e3; }
+
 /* ── Stacked waveform area ────────────────────────────── */
 .waveform-stack {
   display: flex;

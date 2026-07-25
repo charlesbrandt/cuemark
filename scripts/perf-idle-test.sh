@@ -155,6 +155,17 @@ if [ -n "$VIDEO_FILE" ]; then
   sleep 2
   run_scenario "video-deck-playing"
   js "window.__cuemarkDebug.updateDeck('deck-0', {source: null, playing: false});" >/dev/null
+
+  echo "=== Scenario: one webcodecs-path video deck playing (docs/design/webcodecs-video-path.md phase 2) ==="
+  # No <video> element for this deck at all — decode runs in codecWorker.ts's Worker, off
+  # the WebKitWebProcess main thread, so a regression here would show up as elevated CPU
+  # from FBO-upload/compositor work, not video-element decode.
+  js "window.__cuemarkDebug.setVideoPathOverride('deck-0', 'webcodecs'); window.__cuemarkDebug.updateDeck('deck-0', {source: {type:'video', filePath: '$VIDEO_FILE', duration: 0}, playing: false});" >/dev/null
+  sleep 2 # let video_demux_load + CodecPlayer init settle
+  js "window.__cuemarkDebug.updateDeck('deck-0', {playing: true});" >/dev/null
+  sleep 2
+  run_scenario "webcodecs-deck-playing"
+  js "window.__cuemarkDebug.updateDeck('deck-0', {source: null, playing: false}); window.__cuemarkDebug.setVideoPathOverride('deck-0', null);" >/dev/null
 else
   echo "(no video file given — skipping video-deck scenarios; pass one as \$1 to include them)"
 fi

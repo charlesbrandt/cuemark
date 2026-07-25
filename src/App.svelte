@@ -17,7 +17,7 @@
   import { startSessionSync } from "./lib/state/sessionRecovery";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { listen } from "@tauri-apps/api/event";
-  import { registerVideoEl, unregisterVideoEl, setDeckAudioTime, getDeckTime, getVideoEl, seekDeck, getPendingSeekTarget, clearPendingSeekTarget, isScratching } from "./lib/renderer/seekBus";
+  import { registerVideoEl, unregisterVideoEl, setDeckAudioTime, getDeckTime, getVideoEl, seekDeck, getPendingSeekTarget, clearPendingSeekTarget, isScratching, registerCodecPlayer, unregisterCodecPlayer, getCodecPlayer, codecPlayerDeckIds } from "./lib/renderer/seekBus";
   import { postFrame } from "./lib/renderer/outputBus";
   import DeckCard from "./components/DeckCard.svelte";
   import Crossfader from "./components/Crossfader.svelte";
@@ -25,6 +25,8 @@
   import AudioSettings from "./components/AudioSettings.svelte";
   import DiggerQueue from "./components/DiggerQueue.svelte";
   import { mainOutputDeviceIds, cueOutputDeviceId, cueGain } from "./lib/audio/audioSettings";
+  import { CodecPlayer, type DemuxInfo } from "./lib/video/codecPlayer";
+  import { videoPathOverrides, videoPathDefault, resolveVideoPath, setVideoPathOverride } from "./lib/video/videoPathSettings";
   import type { Deck, Session } from "./lib/state/types";
   import { audioGetPosition, sessionRestore } from "./lib/audio/pipeline";
   import { debugLog } from "./lib/debugLog";
@@ -141,6 +143,25 @@
   // uses via the Vite middleware. Fetched once at startup; null until then.
   let mediaServerPort: number | null = null;
 
+  // WebCodecs video path (docs/design/webcodecs-video-path.md phase 2). Codec-path decks
+  // have no <video> element at all — CodecPlayer instances live in seekBus.ts's registry
+  // (shared with DeckCard's preview canvas + seekDeck/getFrameForTime callers); this map
+  // just tracks per-deck backend-resolution state so syncVideoElements doesn't re-attempt
+  // a demux probe every rAF pass or double-call audio_load on a live A/B toggle.
+  interface VideoBackendState {
+    filePath: string;
+    kind: 'legacy' | 'pending' | 'webcodecs' | 'legacy-fallback';
+    adoptedPos?: number; // recovery-boot position, carried through an in-flight demux probe
+  }
+  const backendState = new Map<string, VideoBackendState>();
+  // deckId -> filePath already passed to audio_load, so switching a deck's *video*
+  // backend (legacy <-> webcodecs) on an already-loaded file never reloads the audio
+  // pipeline — only the presentation path changes.
+  const audioLoadedFor = new Map<string, string>();
+  // Same purpose as lastUploadedTime above, but for codec-path decks (compares decoded
+  // VideoFrame pts instead of v.currentTime).
+  const lastUploadedCodecPts = new Map<string, number>();
+
   // Sync master volume to Rust audio pipeline. Guard: $session is coarse-grained — ANY
   // mutation (MIDI rate/gain/volume events) re-runs this effect, so only call IPC on change.
   let _lastMasterVolume: number | undefined;
@@ -214,6 +235,26 @@
         // Returns the video element's currentTime for a deck (null if no element yet).
         // Used by latency-test.sh to verify video is actually advancing during playback.
         getVideoTime: (deckId: string) => getVideoEl(deckId)?.currentTime ?? null,
+
+        // Phase 2 verification: live per-deck A/B override, same call the DeckCard toggle
+        // button makes — lets a headless test force legacy/webcodecs without clicking.
+        setVideoPathOverride,
+
+        // Phase 2 verification: which video backend a deck actually resolved to
+        // ('legacy' | 'pending' | 'webcodecs' | 'legacy-fallback' | null if no source).
+        getVideoBackend: (deckId: string) => backendState.get(deckId)?.kind ?? null,
+
+        // Phase 2 verification: the pts (seconds) of the codec player's currently-selected
+        // frame for a deck, or null if the deck isn't on the codec path / has no frame yet.
+        // Used to confirm a codec-path deck stays in sync with a legacy-path deck playing
+        // the same file (compare against getAudioTime, which both paths share).
+        getCodecFramePts: (deckId: string) => {
+          const player = getCodecPlayer(deckId);
+          const t = getDeckTime(deckId);
+          if (!player || t === null) return null;
+          const frame = player.getFrameForTime(t);
+          return frame ? frame.timestamp / 1_000_000 : null;
+        },
 
         // Returns the waveform's clock for a deck — the content-time position from the
         // audioTimes registry (set each frame from GStreamer position, rate-corrected).
@@ -447,9 +488,11 @@
         },
       };
     }
-    if (!import.meta.env.DEV) {
-      mediaServerPort = await invoke<number>('media_server_port');
-    }
+    // Always fetched (not just in prod): the legacy <video> element's src only needs this
+    // in prod (dev uses the Vite media middleware instead), but the WebCodecs AU-fetch
+    // route (/demux/<deck>/aus) is served by this same Rust media_server in both dev and
+    // prod — codec-path decks need the port either way.
+    mediaServerPort = await invoke<number>('media_server_port');
     midiUnlisten = await startMidiListener();
 
     // Session-of-record rehydration (docs/design/freeze-watchdog.md phase 2), before any
@@ -595,6 +638,10 @@
       audioUnload(id).catch(console.error);
     }
     videoEls.clear();
+    for (const id of codecPlayerDeckIds()) {
+      teardownCodecPlayerOnly(id);
+      audioUnload(id).catch(console.error);
+    }
   });
 
   // Keep compositor FBOs and video elements in sync with the deck list.
@@ -616,60 +663,252 @@
     }
   });
 
+  // Loads the Rust audio pipeline for a (deckId, filePath) pair exactly once, regardless
+  // of which video backend renders it — factored out of the old single "src changed"
+  // branch so a live legacy<->webcodecs toggle never re-triggers audioLoad. Also runs the
+  // saved-grid lookup and consumes a pending recovery adoption. Returns the adopted
+  // recovery record (if any) so the caller can seek its video backend to the live position.
+  function ensureAudioLoaded(deck: Deck, filePath: string): { positionSecs: number; playing: boolean } | undefined {
+    const deckId = deck.id;
+    if (!hasSavedGrid(deckId, filePath)) {
+      // See the (removed) inline comment this used to carry: the trust map is write-only,
+      // so it must be explicitly cleared on every new-file transition — confirmed live via
+      // /run (loading A after visiting B silently inherited B's grid otherwise).
+      clearSavedGrid(deckId);
+      gridGetSaved(filePath).then((saved) => {
+        const s = get(session).decks.find((d) => d.id === deckId)?.source;
+        if (saved && s?.type === 'video' && s.filePath === filePath) {
+          updateDeck(deckId, { bpm: saved.bpm, downbeat: saved.downbeat });
+          markGridSaved(deckId, filePath);
+        }
+      }).catch(console.error);
+    }
+    const adopted = pendingAdoption.get(deckId);
+    if (adopted) {
+      pendingAdoption.delete(deckId);
+      // Recovery adoption (freeze-watchdog.md phase 2): this deck's Rust/GStreamer
+      // pipeline survived the freeze/reload — calling audioLoad() here would tear it down
+      // and reload from scratch, audibly glitching the one thing this feature must never
+      // do. The caller seeks its video backend to adopted.positionSecs once ready instead.
+      lastAudioPlaying.set(deckId, adopted.playing);
+      debugLog(`[recovery] adopted ${deckId} at ${adopted.positionSecs.toFixed(2)}s playing=${adopted.playing}`);
+    } else {
+      // audio_load's loadedmetadata-equivalent: the <video> element's own loadedmetadata
+      // never fires when WebKitGTK lacks a decoder for the file's codec, and codec-path
+      // decks have no <video> element at all — audio_load's returned duration is the one
+      // fallback both backends can rely on.
+      audioLoad(deckId, filePath).then((duration) => {
+        // A new DeckAudioPipeline is created with default gain/rate/volume=1.0. Re-apply
+        // current session values so saved MIDI state (or UI slider changes made before
+        // this track was loaded) take effect on the fresh pipeline.
+        const d = get(session).decks.find((d) => d.id === deckId);
+        if (d) {
+          clearDeckAudioSync(deckId);
+          syncGain(deckId, d.gain);
+          syncRate(deckId, d.playbackRate);
+          syncVolume(deckId, d.volume);
+        }
+        const s = get(session).decks.find((d) => d.id === deckId)?.source;
+        if (duration && s?.type === "video" && s.filePath === filePath && (!s.duration || !Number.isFinite(s.duration))) {
+          updateDeck(deckId, { source: { type: "video", filePath, duration } });
+        }
+      }).catch(console.error);
+      lastAudioPlaying.delete(deckId);
+    }
+    contentPosTracker.delete(deckId);
+    stallWatch.delete(deckId);
+    audioLoadedFor.set(deckId, filePath);
+    return adopted;
+  }
+
+  // Creates the legacy <video> element for a deck and points it at filePath. Everything
+  // per-pass (event handlers, loop bookkeeping, rate throttle, play/pause) still runs
+  // unconditionally in syncVideoElements below, same as before this refactor — this only
+  // covers what used to be the one-time "src changed" branch.
+  function createLegacyVideoEl(deck: Deck, filePath: string, adopted?: { positionSecs: number; playing: boolean }): HTMLVideoElement {
+    const deckId = deck.id;
+    // Dev: serve via Vite's HTTP middleware (localhost:1420/media/<abs-path>).
+    // Prod: serve via our own local HTTP server (see media_server.rs) — the custom
+    // media:// scheme doesn't work reliably with WebKitGTK's GStreamer media backend.
+    const encodedPath = filePath.split('/').map(encodeURIComponent).join('/');
+    const src = import.meta.env.DEV ? '/media' + encodedPath : `http://127.0.0.1:${mediaServerPort}${encodedPath}`;
+    console.log(`[${deckId}] creating video element`);
+    const v = document.createElement("video");
+    v.style.cssText = "position:fixed;top:-9999px;width:1px;height:1px;pointer-events:none";
+    v.muted = true; // audio is handled by Rust/GStreamer; video element is for decode only
+    // Video is served cross-origin (http://127.0.0.1:<port> vs. tauri://localhost in prod).
+    // Without this, drawImage/texImage2D reads in fbo.ts taint the canvas with a
+    // SecurityError, silently killing the compositor's render loop after one frame.
+    v.crossOrigin = "anonymous";
+    document.body.appendChild(v);
+    registerVideoEl(deckId, v);
+    videoEls.set(deckId, v);
+    console.log(`[${deckId}] setting src:`, src);
+    v.src = src;
+    v.load();
+    if (adopted) {
+      v.addEventListener('loadedmetadata', () => { v.currentTime = adopted.positionSecs; }, { once: true });
+    }
+    setTimeout(() => {
+      console.log(`[${deckId}] state@500ms: readyState=${v.readyState} networkState=${v.networkState} error=${v.error?.code ?? 'none'} src=${v.src}`);
+    }, 500);
+    return v;
+  }
+
+  // Fully removes a deck's video presentation backend AND its audio pipeline — used when
+  // the deck itself disappears or its source changes to a different file. NOT used for a
+  // live legacy<->webcodecs toggle on the same file (see the *Only variants below), which
+  // must leave the audio pipeline running untouched.
+  function teardownVideoBackendFull(deckId: string) {
+    const v = videoEls.get(deckId);
+    if (v) {
+      v.pause(); v.remove(); unregisterVideoEl(deckId); videoEls.delete(deckId);
+      lastPlaybackRate.delete(deckId); lastUploadedTime.delete(deckId);
+    }
+    teardownCodecPlayerOnly(deckId);
+    audioUnload(deckId).catch(console.error);
+    playPromises.delete(deckId); lastAudioPlaying.delete(deckId);
+    clearDeckAudioSync(deckId); contentPosTracker.delete(deckId); stallWatch.delete(deckId);
+    audioLoadedFor.delete(deckId); backendState.delete(deckId);
+  }
+
+  // Tears down just the codec-path presentation backend (worker + Rust demux registry
+  // entry) without touching the audio pipeline — safe to call for a live A/B toggle away
+  // from webcodecs, or as part of teardownVideoBackendFull above.
+  function teardownCodecPlayerOnly(deckId: string) {
+    const player = getCodecPlayer(deckId);
+    if (player) { player.destroy(); unregisterCodecPlayer(deckId); }
+    invoke('video_demux_unload', { deckId }).catch(() => {});
+    lastUploadedCodecPts.delete(deckId);
+  }
+
+  // Demuxes filePath via the Rust video_demux service and, on success, spawns a
+  // CodecPlayer for deckId (docs/design/webcodecs-video-path.md phase 2). On failure
+  // (non-H.264, parse error) falls back to 'legacy-fallback' — the bottom of
+  // syncVideoElements then creates a normal <video> element for this deck, same as if
+  // 'legacy' had been requested. adoptedPos, if given, is a recovery-boot or live-toggle
+  // position to seek the fresh player to once constructed.
+  async function startCodecPath(deckId: string, filePath: string, adoptedPos?: number) {
+    try {
+      const demux = await invoke<DemuxInfo>('video_demux_load', { deckId, filePath });
+      // Guard: the deck's source may have changed again while this awaited.
+      const cur = get(session).decks.find((d) => d.id === deckId)?.source;
+      if (!cur || cur.type !== 'video' || cur.filePath !== filePath) {
+        invoke('video_demux_unload', { deckId }).catch(() => {});
+        return;
+      }
+      const port = mediaServerPort ?? await invoke<number>('media_server_port');
+      const player = new CodecPlayer(deckId, port, demux);
+      registerCodecPlayer(deckId, player);
+      backendState.set(deckId, { filePath, kind: 'webcodecs' });
+      if (adoptedPos !== undefined) player.seek(adoptedPos);
+      const s = get(session).decks.find((d) => d.id === deckId)?.source;
+      if (s?.type === 'video' && s.filePath === filePath && (!s.duration || !Number.isFinite(s.duration)) && demux.duration) {
+        updateDeck(deckId, { source: { type: 'video', filePath, duration: demux.duration } });
+      }
+    } catch (e) {
+      debugLog(`[video-path] ${deckId} demux failed, falling back to legacy <video>: ${e}`);
+      const prev = backendState.get(deckId);
+      backendState.set(deckId, { filePath, kind: 'legacy-fallback', adoptedPos: prev?.adoptedPos });
+    }
+  }
+
   function syncVideoElements(decks: Deck[]) {
-    // Remove elements for decks that are gone or no longer have a video source
+    // Remove elements/players for decks that are gone or no longer have a video source.
     for (const [id, v] of videoEls) {
       const deck = decks.find((d) => d.id === id);
       if (!deck || deck.source?.type !== "video") {
-        v.pause();
-        v.remove();
-        unregisterVideoEl(id);
-        videoEls.delete(id);
+        v.pause(); v.remove(); unregisterVideoEl(id); videoEls.delete(id);
+        lastPlaybackRate.delete(id); lastUploadedTime.delete(id);
         audioUnload(id).catch(console.error);
-        playPromises.delete(id);
-        lastPlaybackRate.delete(id);
-        lastAudioPlaying.delete(id);
-        clearDeckAudioSync(id);
-        contentPosTracker.delete(id);
-        stallWatch.delete(id);
+        playPromises.delete(id); lastAudioPlaying.delete(id);
+        clearDeckAudioSync(id); contentPosTracker.delete(id); stallWatch.delete(id);
+        audioLoadedFor.delete(id); backendState.delete(id);
       }
+    }
+    for (const id of codecPlayerDeckIds()) {
+      const deck = decks.find((d) => d.id === id);
+      if (!deck || deck.source?.type !== "video") teardownVideoBackendFull(id);
     }
 
     for (const deck of decks) {
       if (deck.source?.type !== "video") continue;
+      const deckId = deck.id;
       const filePath = deck.source.filePath;
-      // Dev: serve via Vite's HTTP middleware (localhost:1420/media/<abs-path>).
-      // Prod: serve via our own local HTTP server (see media_server.rs) — the custom
-      // media:// scheme doesn't work reliably with WebKitGTK's GStreamer media backend.
-      const encodedPath = filePath.split('/').map(encodeURIComponent).join('/');
-      const src = import.meta.env.DEV
-        ? '/media' + encodedPath
-        : `http://127.0.0.1:${mediaServerPort}${encodedPath}`;
+      const desired = resolveVideoPath(deckId, get(videoPathOverrides), get(videoPathDefault));
+      const state = backendState.get(deckId);
 
-      let v = videoEls.get(deck.id);
+      if (!state || state.filePath !== filePath) {
+        // Brand-new file for this deck (fresh load or track swap) — tear down whatever
+        // backend was active for the OLD file (including its audio pipeline) first.
+        teardownVideoBackendFull(deckId);
+        const adopted = ensureAudioLoaded(deck, filePath);
+        if (desired === 'webcodecs') {
+          backendState.set(deckId, { filePath, kind: 'pending', adoptedPos: adopted?.positionSecs });
+          startCodecPath(deckId, filePath, adopted?.positionSecs);
+        } else {
+          backendState.set(deckId, { filePath, kind: 'legacy', adoptedPos: adopted?.positionSecs });
+          createLegacyVideoEl(deck, filePath, adopted);
+        }
+        continue; // rest of this deck's sync resumes next rAF pass once state settles
+      }
+
+      if (state.kind === 'pending') continue; // demux probe in flight
+
+      if (desired === 'webcodecs' && state.kind === 'legacy') {
+        // Live per-deck A/B toggle to codec path — audio pipeline (and its already-applied
+        // gain/rate/volume) survives untouched; only the presentation backend changes.
+        const resumeAt = getDeckTime(deckId) ?? undefined;
+        const v = videoEls.get(deckId);
+        if (v) { v.pause(); v.remove(); unregisterVideoEl(deckId); videoEls.delete(deckId); lastUploadedTime.delete(deckId); }
+        backendState.set(deckId, { filePath, kind: 'pending' });
+        startCodecPath(deckId, filePath, resumeAt);
+        continue;
+      }
+      if (desired === 'legacy' && state.kind === 'webcodecs') {
+        const resumeAt = getDeckTime(deckId) ?? undefined;
+        teardownCodecPlayerOnly(deckId);
+        backendState.set(deckId, { filePath, kind: 'legacy' });
+        createLegacyVideoEl(deck, filePath, resumeAt !== undefined ? { positionSecs: resumeAt, playing: deck.playing } : undefined);
+        continue;
+      }
+
+      if (state.kind === 'webcodecs') {
+        // Codec-path deck: no <video> element. frame() handles per-tick clock/frame work;
+        // here we just keep the worker's loop bounds in sync (CodecPlayer.setLoop no-ops
+        // when unchanged) and mirror deck.playing to the audio pipeline exactly like the
+        // legacy branch below does.
+        const player = getCodecPlayer(deckId);
+        if (player) {
+          if (deck.loop && deck.loopIn !== null && deck.loopOut !== null) {
+            player.setLoop({ inPos: deck.loopIn, outPos: deck.loopOut });
+          } else {
+            player.setLoop(null);
+          }
+        }
+        const wasAudioPlaying = lastAudioPlaying.get(deckId);
+        if (deck.playing !== wasAudioPlaying) {
+          lastAudioPlaying.set(deckId, deck.playing);
+          if (deck.playing) audioPlay(deckId).catch(console.error);
+          else audioPause(deckId).catch(console.error);
+        }
+        continue;
+      }
+
+      // state.kind is 'legacy' or 'legacy-fallback': normal <video>-element sync path.
+      let v = videoEls.get(deckId);
       if (!v) {
-        console.log(`[${deck.id}] creating video element`);
-        v = document.createElement("video");
-        v.style.cssText = "position:fixed;top:-9999px;width:1px;height:1px;pointer-events:none";
-        v.muted = true; // audio is handled by Rust/GStreamer; video element is for decode only
-        // Video is served cross-origin (http://127.0.0.1:<port> vs. tauri://localhost in prod).
-        // Without this, drawImage/texImage2D reads in fbo.ts taint the canvas with a
-        // SecurityError, silently killing the compositor's render loop after one frame.
-        v.crossOrigin = "anonymous";
-        document.body.appendChild(v);
-        registerVideoEl(deck.id, v);
-        videoEls.set(deck.id, v);
-        // audioLoad is called in the src-change block below (always runs for a new element)
+        const adopted = state.adoptedPos !== undefined ? { positionSecs: state.adoptedPos, playing: deck.playing } : undefined;
+        v = createLegacyVideoEl(deck, filePath, adopted);
       }
 
       // Update event handlers each sync so they capture the current filePath / deckId
-      const deckId = deck.id;
       v.onloadedmetadata = () => {
         console.log(`[${deckId}] loadedmetadata fired, duration:`, v!.duration);
         const s = get(session).decks.find((d) => d.id === deckId)?.source;
         // v.duration is Infinity for non-fast-start MP4s (moov atom at the end of the
         // file) until enough of the file has streamed — Infinity is truthy in JS, so
-        // storing it here would permanently block the audioLoad duration fallback below
+        // storing it here would permanently block the audioLoad duration fallback
         // (`!s.duration` never matches Infinity) and pins the waveform playhead at x=0
         // forever (currentTime / Infinity = 0). Only accept a real, finite duration.
         if (s?.type === "video" && s.filePath === filePath && Number.isFinite(v!.duration)) {
@@ -686,96 +925,11 @@
       v.onstalled = () => console.warn(`[${deckId}] stalled (networkState=${v!.networkState})`);
       v.onended = () => updateDeck(deckId, { playing: false });
 
-      if (v.getAttribute('src') !== src) {
-        console.log(`[${deck.id}] setting src:`, src);
-        v.src = src;
-        v.load();
-        if (!hasSavedGrid(deck.id, filePath)) {
-          // The trust map is write-only (markGridSaved never gets an automatic clear) —
-          // if we don't invalidate it here, loading track A (saved grid) then track B
-          // (no saved grid) then track A again would find the map still saying "deck-0
-          // is trusted for A" from the first load, skip this lookup, and leave A's
-          // bpm/downbeat frozen at whatever B's auto-fit last wrote. Confirmed live via
-          // /run: reloading A after visiting B silently inherited B's grid.
-          clearSavedGrid(deck.id);
-          // Race-free vs. the auto-fit in the WaveformCanvas onAnalyzed callback below:
-          // this lookup's updateDeck is UNCONDITIONAL (always wins, whenever it resolves,
-          // even overwriting an auto-fit that already landed), while the auto-fit's
-          // updateDeck is CONDITIONAL on hasSavedGrid(deckId, filePath) still being false.
-          // So the final state is always the saved grid when one exists, regardless of
-          // which async call resolves first. Skipped entirely when Digger already supplied
-          // a trusted grid for this exact file (see DiggerQueue.svelte's loadToDeck).
-          gridGetSaved(filePath).then((saved) => {
-            const s = get(session).decks.find((d) => d.id === deckId)?.source;
-            if (saved && s?.type === 'video' && s.filePath === filePath) {
-              updateDeck(deckId, { bpm: saved.bpm, downbeat: saved.downbeat });
-              markGridSaved(deckId, filePath);
-            }
-          }).catch(console.error);
-        }
-        const adopted = pendingAdoption.get(deck.id);
-        if (adopted) {
-          pendingAdoption.delete(deck.id);
-          // Recovery adoption (freeze-watchdog.md phase 2): this deck's Rust/GStreamer
-          // pipeline survived the freeze/reload and may already be playing — calling
-          // audioLoad() here would tear it down and reload from scratch, audibly
-          // glitching the one thing this feature must never do (see the "Adoption bugs"
-          // risk in the design doc, and the matching assertion log in audio_load).
-          // The fresh <video> element still needs its own normal decode-only load
-          // (v.src / v.load() above already did that); just point its clock at the live
-          // audio position once metadata is available, and let the play/pause branch
-          // below start it if the pipeline was playing.
-          v.addEventListener('loadedmetadata', () => {
-            v!.currentTime = adopted.positionSecs;
-          }, { once: true });
-          lastAudioPlaying.set(deck.id, adopted.playing);
-          debugLog(`[recovery] adopted ${deck.id} at ${adopted.positionSecs.toFixed(2)}s playing=${adopted.playing}`);
-        } else {
-          // The <video> element's loadedmetadata never fires when WebKitGTK lacks a decoder
-          // for the file's video codec (e.g. AV1/H264) — but the audio-only GStreamer pipeline
-          // still decodes fine and knows the real duration. Use it as a fallback so the
-          // waveform isn't stuck waiting on a duration that will never arrive from the video
-          // element. Don't clobber a duration loadedmetadata already supplied.
-          audioLoad(deck.id, filePath).then((duration) => {
-            // A new DeckAudioPipeline is created with default gain/rate/volume=1.0.
-            // Re-apply current session values so saved MIDI state (or UI slider changes
-            // made before this track was loaded) take effect on the fresh pipeline.
-            const d = get(session).decks.find((d) => d.id === deckId);
-            if (d) {
-              clearDeckAudioSync(deckId);
-              syncGain(deckId, d.gain);
-              syncRate(deckId, d.playbackRate);
-              syncVolume(deckId, d.volume);
-            }
-            const s = get(session).decks.find((d) => d.id === deckId)?.source;
-            if (duration && s?.type === "video" && s.filePath === filePath && (!s.duration || !Number.isFinite(s.duration))) {
-              updateDeck(deckId, { source: { type: "video", filePath, duration } });
-            }
-          }).catch(console.error);
-          // Reset audio state tracker so the next sync re-applies play/pause to the new pipeline.
-          lastAudioPlaying.delete(deck.id);
-        }
-        // New track loads to position 0 (or, on recovery adoption, the live audio
-        // position handled above); either way reset the content-position integrator so
-        // it reinitializes cleanly from the first position poll.
-        contentPosTracker.delete(deck.id);
-        // Same reason: a new track's fresh <video> element hasn't stalled yet — carrying
-        // over the old track's stall-tracking state could either false-trigger (stale
-        // refAudioPos far behind the new track's position) or block a real detection
-        // for up to 10s (stale lastAttemptMs cooldown).
-        stallWatch.delete(deck.id);
-        // Report state after a short delay so we can see if the network request started
-        setTimeout(() => {
-          console.log(`[${deck.id}] state@500ms: readyState=${v!.readyState} networkState=${v!.networkState} error=${v!.error?.code ?? 'none'} src=${v!.src}`);
-        }, 500);
-      }
-
       // Custom loop: when loopIn/loopOut are set and loop is on, seek back manually
       // rather than relying on native video loop (which loops the whole file).
       if (deck.loop && deck.loopIn !== null && deck.loopOut !== null) {
         const loopIn = deck.loopIn;
         const loopOut = deck.loopOut;
-        const deckId = deck.id;
         v.loop = false;
         v.ontimeupdate = () => {
           if (v!.currentTime >= loopOut) {
@@ -799,21 +953,21 @@
       // between 14-bit fader MSB (CC 8) and LSB (CC 40) arriving in adjacent rAF frames —
       // each pair would otherwise trigger two rebuilds per fader position.
       const targetRate = Math.max(0.0625, deck.playbackRate);
-      const lastRate = lastPlaybackRate.get(deck.id) ?? -1;
+      const lastRate = lastPlaybackRate.get(deckId) ?? -1;
       if (Math.abs(targetRate - lastRate) > 0.005) {
-        lastPlaybackRate.set(deck.id, targetRate);
+        lastPlaybackRate.set(deckId, targetRate);
         v.playbackRate = targetRate;
         v.volume = 0;
         v.muted = true;
       }
       // Video element: sync play/pause based on element state.
-      if (deck.playing && v.paused && !playPromises.has(deck.id)) {
+      if (deck.playing && v.paused && !playPromises.has(deckId)) {
         const p = v.play().catch((e) => {
           if (e.name !== 'AbortError') console.error(e);
-        }).finally(() => playPromises.delete(deck.id)) as Promise<void>;
-        playPromises.set(deck.id, p);
+        }).finally(() => playPromises.delete(deckId)) as Promise<void>;
+        playPromises.set(deckId, p);
       } else if (!deck.playing && !v.paused) {
-        playPromises.delete(deck.id); // pending play() will abort; that's intentional
+        playPromises.delete(deckId); // pending play() will abort; that's intentional
         v.pause();
       }
 
@@ -822,13 +976,13 @@
       // its internal pipeline). A play→pause toggle arriving in that window finds v.paused=true,
       // making both branches above no-ops. Tracking audio state separately ensures audioPause
       // always fires when deck.playing flips to false, regardless of the video element state.
-      const wasAudioPlaying = lastAudioPlaying.get(deck.id);
+      const wasAudioPlaying = lastAudioPlaying.get(deckId);
       if (deck.playing !== wasAudioPlaying) {
-        lastAudioPlaying.set(deck.id, deck.playing);
+        lastAudioPlaying.set(deckId, deck.playing);
         if (deck.playing) {
-          audioPlay(deck.id).catch(console.error);
+          audioPlay(deckId).catch(console.error);
         } else {
-          audioPause(deck.id).catch(console.error);
+          audioPause(deckId).catch(console.error);
         }
       }
     }
@@ -860,13 +1014,31 @@
       for (const deck of decks) {
         if (deck.source?.type === 'video') {
           const v = videoEls.get(deck.id);
+          const codecPlayer = getCodecPlayer(deck.id);
           const fbo = compositor.getFBO(deck.id);
           if (v && fbo && v.currentTime !== lastUploadedTime.get(deck.id)) {
             lastUploadedTime.set(deck.id, v.currentTime);
             fbo.uploadVideoFrame(v);
             dirty = true;
+          } else if (codecPlayer && fbo) {
+            // Codec-path deck: no <video> element to read a currentTime from — pick the
+            // frame whose pts matches the audio clock (same value the waveform consumes),
+            // gated on actual pts change per CLAUDE.md's per-frame RAF rule.
+            const t = getDeckTime(deck.id);
+            if (t !== null) {
+              const frame = codecPlayer.getFrameForTime(t);
+              if (frame && frame.timestamp !== lastUploadedCodecPts.get(deck.id)) {
+                lastUploadedCodecPts.set(deck.id, frame.timestamp);
+                fbo.uploadVideoFrameFromCodec(frame);
+                dirty = true;
+              }
+            }
           }
-          // Mechanism-B self-heal (freeze-watchdog.md phase 4) — see stallWatch comment above.
+          // Mechanism-B self-heal (freeze-watchdog.md phase 4) — see stallWatch comment
+          // above. <video>-element-specific; codec-path decks have no `v` and no WebKit
+          // media-player pipeline to wedge in the first place (the whole point of this
+          // design, see docs/design/webcodecs-video-path.md "Why this exists"), so this
+          // block naturally never runs for them.
           if (v) {
             const deckId = deck.id;
             let st = stallWatch.get(deckId);
@@ -931,7 +1103,10 @@
           // position moves correctly but the UI (timestamp, waveform playhead) sits
           // frozen at wherever it was when the gesture started.
           const scratching = isScratching(deck.id);
-          if ((deck.playing || scratching) && v && !pendingPos.get(deck.id)) {
+          // Audio is the master clock for BOTH backends — codec-path decks have no `v`
+          // but still need contentPos fed to setDeckAudioTime (waveform) and to the codec
+          // player's clock, so this poll is gated on `v || codecPlayer`, not `v` alone.
+          if ((deck.playing || scratching) && (v || codecPlayer) && !pendingPos.get(deck.id)) {
             pendingPos.set(deck.id, true);
             const capturedDeckId = deck.id;
             const pollStartMs = performance.now();
@@ -939,7 +1114,7 @@
               pendingPos.delete(capturedDeckId);
               const pollMs = performance.now() - pollStartMs;
               if (pollMs > 300) debugLog(`[position-poll] ${capturedDeckId} took ${pollMs.toFixed(0)}ms, audioPos=${audioPos}`);
-              if (audioPos === null || !v) return;
+              if (audioPos === null) return;
               const nowMs = performance.now();
               let contentPos: number;
               if (scratching) {
@@ -1004,8 +1179,21 @@
               // it cuts how often the deadlock's trigger condition (a seek landing while the
               // video pipeline is mid-flight) can occur. 250ms of AV drift is imperceptible
               // for VJ visuals synced by eye to a beat, unlike e.g. lip-synced dialogue.
-              if (!scratching && Math.abs(v.currentTime - contentPos) > 0.25) {
+              if (!scratching && v && Math.abs(v.currentTime - contentPos) > 0.25) {
                 v.currentTime = contentPos; // snap video to audio clock
+              }
+              if (codecPlayer) {
+                // Codec-path decks have no <video> ontimeupdate, so this poll is where
+                // the deck's custom loop (loopIn/loopOut) re-anchors the audio clock —
+                // mirrors syncVideoElements' legacy v.ontimeupdate branch exactly, just
+                // driven by the poll instead of a <video> event.
+                const d = get(session).decks.find((dd) => dd.id === capturedDeckId);
+                if (!scratching && d?.loop && d.loopIn !== null && d.loopOut !== null && contentPos >= d.loopOut) {
+                  codecPlayer.notifyLoopWrap(d.loopIn);
+                  audioSeek(capturedDeckId, d.loopIn).catch(console.error);
+                } else {
+                  codecPlayer.setClock(contentPos, d?.playing ?? false);
+                }
               }
             }).catch(() => { pendingPos.delete(capturedDeckId); });
           }

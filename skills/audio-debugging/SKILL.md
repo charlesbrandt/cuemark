@@ -894,6 +894,30 @@ same lesson as "GStreamer/audio still runs for real inside Xvfb" in `verify-ui`'
 level up: even a *result*, not just a mechanism, needs re-confirming once the surrounding env
 (feature ranks, driver versions) can plausibly have shifted since it was recorded.
 
+## WebCodecs frame upload: `texImage2D(gl, VideoFrame)` works direct, no Y-flip (2026-07-25)
+
+Phase 2 of `docs/design/webcodecs-video-path.md` re-verified two open questions from the
+phase 1 spike, on this app's real GPU (not the spike's Xvfb/llvmpipe software GL):
+
+- **`gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, videoFrame)` works
+  directly** — no SIGTRAP, no scratch-canvas detour needed (unlike `<video>`→`texImage2D`,
+  which does crash and is why `fbo.ts`'s `uploadVideoFrame` has the scratch-canvas
+  workaround at all). `DeckFBO.uploadVideoFrameFromCodec()` still keeps a scratch-canvas
+  `drawImage(VideoFrame)` fallback behind a one-time try/catch (cached in a module-level
+  static, not per-instance — this is a GPU/driver capability, not a per-deck one), but on
+  this GPU the direct path is what actually fires, confirmed by the compositor output
+  screenshot rendering correctly with no fallback exception logged.
+- **Do NOT apply `UNPACK_FLIP_Y_WEBGL`** for `VideoFrame` uploads — `uploadVideoFrame`'s
+  flip (needed because canvas Y=0 is top but WebGL texture Y=0 is bottom) does **not**
+  apply here. A `VideoFrame`'s pixel data from `VideoDecoder` output is already in the
+  orientation WebGL expects. Confirmed by screenshot: applying the flip renders upside
+  down; omitting it (what `uploadVideoFrameFromCodec` does) renders correctly.
+
+Both findings verified via `canvas.toDataURL()` screenshot comparison against the legacy
+`<video>` path rendering the same source file, not just by absence-of-error — a black or
+garbled frame is a failure even if no exception was thrown (see `verify-ui`'s new gotcha
+on why `toDataURL()` was used instead of WebDriver's `/screenshot` endpoint).
+
 ## Clipping / muddy output — gain chain and master volume
 
 **Symptom**: output sounds clipped or distorted even when per-deck volume and gain sliders are

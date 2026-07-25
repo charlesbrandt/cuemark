@@ -5,6 +5,14 @@ export class DeckFBO {
   // video→texImage2D which triggers assertion failures in WebKitGTK.
   private scratch: HTMLCanvasElement;
   private scratchCtx: CanvasRenderingContext2D;
+  // Cached across all decks/instances (module-level, not per-FBO): whether
+  // texImage2D(gl, VideoFrame) works directly on this GPU/driver, decided once by the
+  // first real codec-path frame rather than a synthetic startup probe (see
+  // uploadVideoFrameFromCodec). docs/design/webcodecs-video-path.md's spike found this
+  // works with no SIGTRAP on a DOM-canvas GL context (unlike direct <video>→texImage2D,
+  // which is why uploadVideoFrame above needs the scratch-canvas detour at all) — but
+  // that was measured under Xvfb/llvmpipe software GL, so re-verify per real GPU here.
+  private static codecUploadMode: "direct" | "scratch" | null = null;
 
   constructor(
     private gl: WebGL2RenderingContext,
@@ -53,6 +61,32 @@ export class DeckFBO {
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.scratch);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  }
+
+  /**
+   * Uploads a decoded WebCodecs VideoFrame directly, no scratch-canvas detour needed on
+   * this GPU (falls back to one if texImage2D throws). Every source frame from a
+   * VideoDecoder is already right-side-up in WebKitGTK's pixel format — do NOT apply the
+   * UNPACK_FLIP_Y_WEBGL flip uploadVideoFrame() uses for <video>/canvas sources (verified
+   * by screenshot compare; getting this wrong renders codec-path video upside down).
+   */
+  uploadVideoFrameFromCodec(frame: VideoFrame) {
+    const gl = this.gl;
+    if (DeckFBO.codecUploadMode !== "scratch") {
+      try {
+        gl.bindTexture(gl.TEXTURE_2D, this.texture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+        gl.bindTexture(gl.TEXTURE_2D, null);
+        DeckFBO.codecUploadMode = "direct";
+        return;
+      } catch {
+        DeckFBO.codecUploadMode = "scratch";
+      }
+    }
+    this.scratchCtx.drawImage(frame, 0, 0, this.width, this.height);
+    gl.bindTexture(gl.TEXTURE_2D, this.texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.scratch);
     gl.bindTexture(gl.TEXTURE_2D, null);
   }
 

@@ -255,6 +255,37 @@ post-reload state:
 
 ## Gotchas
 
+- **WebDriver's full-window `GET /session/$SESSION/screenshot` can hang indefinitely in
+  this environment** — confirmed 2026-07-25 while verifying `docs/design/
+  webcodecs-video-path.md` phase 2: repeated 20-45s timeouts with zero response, even
+  against an empty session with no decks loaded (so it isn't specific to WebCodecs/WebGL
+  load). Matches the precedent already in `journal.md`'s 2026-07-06 entry, which switched
+  to canvas pixel extraction for exactly this reason. **Use `canvas.toDataURL('image/png')`
+  via `/execute/sync` instead** — reads back the actual rendered content of any canvas
+  (main compositor output, a `DeckCard` preview, a waveform) and returns promptly:
+  ```sh
+  RESULT=$(js_sync "return document.querySelectorAll('canvas')[0].toDataURL('image/png');")
+  echo "$RESULT" | python3 -c "
+  import sys, json, base64
+  d = json.load(sys.stdin)
+  open('/tmp/shot.png','wb').write(base64.b64decode(d['value'].split(',',1)[1]))
+  "
+  ```
+  Then read `/tmp/shot.png` back with the Read tool as usual — same "blank/black is a
+  failure, not a pass" rule applies.
+- **A leftover `WebKitWebDriver` process from an earlier session on the same Xvfb display
+  can silently steal tauri-driver's native-driver port** (`4445` = webdriver-port+1) —
+  the *new* tauri-driver still accepts a session and answers `/execute/sync` fine (looks
+  completely healthy), but its own log (`/tmp/tauri-driver.log`) shows `FATAL: Unable to
+  listen for HTTP server at host 127.0.0.1 and port 4445`, and other operations (notably
+  screenshot) hang. Before trusting a "clean" session, check
+  `ps -o pid,lstart,cmd -p $(pgrep -f WebKitWebDriver)` for more than one process and
+  compare start times against your own `Xvfb`/`tauri-driver` pids — kill anything stale
+  that predates your own launch **and confirm its `DISPLAY` env var matches your own
+  `:99`-style virtual display first** (`tr '\0' '\n' < /proc/<pid>/environ | grep DISPLAY`)
+  — never kill a process whose `DISPLAY=:0` (or `wayland-0`), that's the user's real
+  desktop session, potentially their own legitimate `cargo tauri dev` instance.
+
 - **`dpkg -L webkit2gtk-driver | grep WebKitWebDriver` matches two lines**, not one — the
   binary (`/usr/bin/WebKitWebDriver`) and its man page (`/usr/share/man/man1/
   WebKitWebDriver.1.gz`, which also contains the string). `$WEBKIT_DRIVER` then holds both
