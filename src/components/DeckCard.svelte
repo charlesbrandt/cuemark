@@ -221,10 +221,10 @@
     </span>
     <button
       class="bpm-btn"
-      class:active={masterBpm !== null && deck.bpm !== null && masterBpm === deck.bpm}
-      onclick={() => deck.bpm !== null && setMasterBpm(deck.bpm)}
+      class:active={masterBpm !== null && deck.bpm !== null && Math.abs(masterBpm - deck.bpm * deck.playbackRate) < 0.01}
+      onclick={() => deck.bpm !== null && setMasterBpm(deck.bpm * deck.playbackRate)}
       disabled={deck.bpm === null}
-      title="Set this deck as the main beat reference"
+      title="Set this deck's current playing tempo as the main beat reference"
     >
       Main Beat
     </button>

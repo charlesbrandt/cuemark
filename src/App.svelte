@@ -711,14 +711,16 @@
         {#each $session.decks as deck (deck.id)}
           <div class="waveform-row">
             <span class="waveform-label">{deck.id}</span>
-            <!-- downbeat is auto-set from the beat-grid fit on every track load (beat-level
-                 anchor; also clears a stale downbeat carried over from the previous track).
-                 SET BEAT in DeckCard remains the manual override. -->
-            <WaveformCanvas {deck} onAnalyzed={({ bpm, gridOffset }) => {
+            <!-- downbeat defaults to track start (0) on every auto-fit load — extrapolating
+                 the grid from t=0 rather than the comb-fit's arbitrary beat phase (also
+                 clears a stale downbeat carried over from the previous track). This is
+                 intentionally a guess: SET BEAT in DeckCard is the manual override, and
+                 only a manual SET BEAT persists locally / pushes to Digger. -->
+            <WaveformCanvas {deck} onAnalyzed={({ bpm }) => {
               // A saved grid (sidecar or Digger) always wins over the auto-fit — see the
               // race-ordering comment at the gridGetSaved() call site above.
               if (deck.source?.type === 'video' && !hasSavedGrid(deck.id, deck.source.filePath)) {
-                updateDeck(deck.id, { bpm, downbeat: gridOffset });
+                updateDeck(deck.id, { bpm, downbeat: 0 });
               }
             }} />
           </div>
