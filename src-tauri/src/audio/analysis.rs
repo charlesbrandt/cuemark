@@ -208,3 +208,54 @@ mod tests {
         let _ = std::fs::remove_file(&wav_path);
     }
 }
+
+// ── Analysis cache (freeze-watchdog.md phase 2) ───────────────────────────────
+
+/// Caches the last few `compute_analysis` results so session recovery's waveform
+/// re-fetch (every deck re-runs `audio_analyze_file` on rehydration, since the JS-side
+/// peaks/envelope arrays died with the old webview) returns instantly instead of
+/// re-decoding the whole file for seconds per deck. Also speeds ordinary repeat loads
+/// (same track loaded onto a different deck, or reloaded after being swapped out).
+/// Capacity of 8 comfortably covers "every deck in a set" without unbounded growth.
+const CACHE_CAPACITY: usize = 8;
+
+struct AnalysisCacheInner {
+    // Insertion order for FIFO eviction — small enough that a Vec scan beats the
+    // bookkeeping of a real LRU for a cache this size.
+    order: std::collections::VecDeque<std::path::PathBuf>,
+    entries: std::collections::HashMap<std::path::PathBuf, AnalysisData>,
+}
+
+pub struct AnalysisCache {
+    inner: std::sync::Mutex<AnalysisCacheInner>,
+}
+
+impl AnalysisCache {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(AnalysisCacheInner {
+                order: std::collections::VecDeque::new(),
+                entries: std::collections::HashMap::new(),
+            }),
+        }
+    }
+
+    /// Returns a cached result for `file_path` if present, otherwise runs
+    /// `compute_analysis` and caches the result before returning it.
+    pub fn get_or_compute(&self, file_path: &str) -> Result<AnalysisData, String> {
+        let key = std::path::PathBuf::from(file_path);
+        if let Some(hit) = self.inner.lock().unwrap().entries.get(&key) {
+            return Ok(hit.clone());
+        }
+        let data = compute_analysis(file_path)?;
+        let mut inner = self.inner.lock().unwrap();
+        inner.order.push_back(key.clone());
+        inner.entries.insert(key, data.clone());
+        if inner.order.len() > CACHE_CAPACITY {
+            if let Some(evict) = inner.order.pop_front() {
+                inner.entries.remove(&evict);
+            }
+        }
+        Ok(data)
+    }
+}

@@ -14,6 +14,7 @@
   } from "./lib/audio/pipeline";
   import { clearSavedGrid, markGridSaved, hasSavedGrid } from "./lib/audio/gridSource";
   import { syncRate, syncGain, syncVolume, clearDeckAudioSync, averageRateOverWindow } from "./lib/audio/audioSync";
+  import { startSessionSync } from "./lib/state/sessionRecovery";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { listen } from "@tauri-apps/api/event";
   import { registerVideoEl, unregisterVideoEl, setDeckAudioTime, getDeckTime, getVideoEl, seekDeck, getPendingSeekTarget, clearPendingSeekTarget, isScratching } from "./lib/renderer/seekBus";
@@ -24,8 +25,8 @@
   import AudioSettings from "./components/AudioSettings.svelte";
   import DiggerQueue from "./components/DiggerQueue.svelte";
   import { mainOutputDeviceIds, cueOutputDeviceId, cueGain } from "./lib/audio/audioSettings";
-  import type { Deck } from "./lib/state/types";
-  import { audioGetPosition } from "./lib/audio/pipeline";
+  import type { Deck, Session } from "./lib/state/types";
+  import { audioGetPosition, sessionRestore } from "./lib/audio/pipeline";
   import { debugLog } from "./lib/debugLog";
 
   function openOutputWindow() {
@@ -35,6 +36,14 @@
   let midiUnlisten: (() => void) | undefined;
   let dragDropUnlisten: (() => void) | undefined;
   let eosUnlisten: (() => void) | undefined;
+  let stopSessionSync: (() => void) | undefined;
+  // Decks awaiting adoption after a recovery boot (freeze-watchdog.md phase 2): the
+  // Rust pipeline survived the freeze/reload and is still playing, so syncVideoElements
+  // must skip audioLoad() for these and just point the fresh <video> element at the
+  // live position instead. Populated in onMount before the first session.set(restored),
+  // consumed (and cleared per-deck) the first time syncVideoElements creates that
+  // deck's video element.
+  const pendingAdoption = new Map<string, { positionSecs: number; playing: boolean }>();
   let tapTimestamps: number[] = [];
   let tapResetTimer: ReturnType<typeof setTimeout> | undefined;
   let showAudioSettings = $state(false);
@@ -270,37 +279,82 @@
     }
     midiUnlisten = await startMidiListener();
 
-    // Restore last-seen MIDI control positions from the persist file.
-    // This pre-populates faders/knobs so the software matches the controller on startup
-    // without requiring the user to touch every control. Applied before any track loads
-    // so the values are in the session when the first audioLoad pipeline is created.
+    // Session-of-record rehydration (docs/design/freeze-watchdog.md phase 2), before any
+    // other init that would otherwise construct decks from the default empty session.
+    // A recovery boot is when BOTH a prior snapshot exists AND at least one live Rust
+    // pipeline still reports a loaded file — a stale session-recovery.json from a
+    // previous app run must not ghost-restore decks into a genuinely clean boot (the
+    // AudioManager is fresh with zero pipelines in that case, so `audio` comes back
+    // empty and this check correctly declines).
+    let isRecoveryBoot = false;
     try {
-      const saved = await invoke<Record<string, number>>('midi_get_saved_state');
-      const deckPatches = new Map<string, Record<string, number>>();
-      for (const [key, value] of Object.entries(saved)) {
-        if (key === 'crossfader') {
-          setCrossfader(value);
-        } else if (key === 'masterVolume') {
-          setMasterVolume(value);
-        } else if (key === 'cueGain') {
-          cueGain.set(value);
-        } else {
-          const dot = key.indexOf('.');
-          if (dot > 0) {
-            const deckId = key.slice(0, dot);
-            const field = key.slice(dot + 1);
-            const patch = deckPatches.get(deckId) ?? {};
-            (patch as Record<string, number>)[field] = value;
-            deckPatches.set(deckId, patch);
+      const recovery = await sessionRestore();
+      isRecoveryBoot = !!recovery.snapshot && recovery.audio.some((a) => a.filePath);
+      if (isRecoveryBoot) {
+        const restored = recovery.snapshot as Session;
+        debugLog(`[recovery] rehydrating session — ${recovery.audio.length} live pipeline(s)`);
+        // The trust map that gates saved-grid vs. auto-fit precedence (gridSource.ts) is
+        // a module-level Map that died with the old page — it's already empty after this
+        // reload, but clear explicitly anyway per the design doc, defensively, in case a
+        // future caller invokes this rehydration path without a full page reload. Without
+        // it, this is exactly the stale-trust bug class fixed in 060de16.
+        for (const deck of restored.decks) clearSavedGrid(deck.id);
+        for (const status of recovery.audio) {
+          if (status.filePath) {
+            // Audio wins on disagreement (design doc "Session-of-record"): the pipeline's
+            // playing state is ground truth, the JS snapshot can be up to ~1s stale.
+            const deck = restored.decks.find((d) => d.id === status.deckId);
+            if (deck) deck.playing = status.playing;
+            pendingAdoption.set(status.deckId, {
+              positionSecs: status.positionSecs ?? 0,
+              playing: status.playing,
+            });
           }
         }
-      }
-      for (const [deckId, patch] of deckPatches) {
-        updateDeck(deckId, patch as Parameters<typeof updateDeck>[1]);
+        session.set(restored);
       }
     } catch (e) {
-      console.warn('[midi-state] failed to restore saved state:', e);
+      console.error('[recovery] session_restore failed, starting fresh:', e);
     }
+
+    if (!isRecoveryBoot) {
+      // Restore last-seen MIDI control positions from the persist file.
+      // This pre-populates faders/knobs so the software matches the controller on startup
+      // without requiring the user to touch every control. Applied before any track loads
+      // so the values are in the session when the first audioLoad pipeline is created.
+      // Skipped on a recovery boot: the just-restored session snapshot already carries
+      // the exact pre-freeze fader positions, which is strictly more accurate than this
+      // separate per-control persist file (last-seen values, not necessarily in sync).
+      try {
+        const saved = await invoke<Record<string, number>>('midi_get_saved_state');
+        const deckPatches = new Map<string, Record<string, number>>();
+        for (const [key, value] of Object.entries(saved)) {
+          if (key === 'crossfader') {
+            setCrossfader(value);
+          } else if (key === 'masterVolume') {
+            setMasterVolume(value);
+          } else if (key === 'cueGain') {
+            cueGain.set(value);
+          } else {
+            const dot = key.indexOf('.');
+            if (dot > 0) {
+              const deckId = key.slice(0, dot);
+              const field = key.slice(dot + 1);
+              const patch = deckPatches.get(deckId) ?? {};
+              (patch as Record<string, number>)[field] = value;
+              deckPatches.set(deckId, patch);
+            }
+          }
+        }
+        for (const [deckId, patch] of deckPatches) {
+          updateDeck(deckId, patch as Parameters<typeof updateDeck>[1]);
+        }
+      } catch (e) {
+        console.warn('[midi-state] failed to restore saved state:', e);
+      }
+    }
+
+    stopSessionSync = startSessionSync();
 
     // Freeze-watchdog heartbeat (docs/design/freeze-watchdog.md phase 1: observe + log
     // only, no recovery yet). Deliberately a setInterval, not tied to the rAF loop —
@@ -357,6 +411,7 @@
     midiUnlisten?.();
     dragDropUnlisten?.();
     eosUnlisten?.();
+    stopSessionSync?.();
     clearInterval(watchdogIntervalId);
     cancelAnimationFrame(rafId);
     fftUnlisten?.();
@@ -484,30 +539,51 @@
             }
           }).catch(console.error);
         }
-        // The <video> element's loadedmetadata never fires when WebKitGTK lacks a decoder
-        // for the file's video codec (e.g. AV1/H264) — but the audio-only GStreamer pipeline
-        // still decodes fine and knows the real duration. Use it as a fallback so the
-        // waveform isn't stuck waiting on a duration that will never arrive from the video
-        // element. Don't clobber a duration loadedmetadata already supplied.
-        audioLoad(deck.id, filePath).then((duration) => {
-          // A new DeckAudioPipeline is created with default gain/rate/volume=1.0.
-          // Re-apply current session values so saved MIDI state (or UI slider changes
-          // made before this track was loaded) take effect on the fresh pipeline.
-          const d = get(session).decks.find((d) => d.id === deckId);
-          if (d) {
-            clearDeckAudioSync(deckId);
-            syncGain(deckId, d.gain);
-            syncRate(deckId, d.playbackRate);
-            syncVolume(deckId, d.volume);
-          }
-          const s = get(session).decks.find((d) => d.id === deckId)?.source;
-          if (duration && s?.type === "video" && s.filePath === filePath && (!s.duration || !Number.isFinite(s.duration))) {
-            updateDeck(deckId, { source: { type: "video", filePath, duration } });
-          }
-        }).catch(console.error);
-        // Reset audio state tracker so the next sync re-applies play/pause to the new pipeline.
-        lastAudioPlaying.delete(deck.id);
-        // New track loads to position 0; reset content-position integrator.
+        const adopted = pendingAdoption.get(deck.id);
+        if (adopted) {
+          pendingAdoption.delete(deck.id);
+          // Recovery adoption (freeze-watchdog.md phase 2): this deck's Rust/GStreamer
+          // pipeline survived the freeze/reload and may already be playing — calling
+          // audioLoad() here would tear it down and reload from scratch, audibly
+          // glitching the one thing this feature must never do (see the "Adoption bugs"
+          // risk in the design doc, and the matching assertion log in audio_load).
+          // The fresh <video> element still needs its own normal decode-only load
+          // (v.src / v.load() above already did that); just point its clock at the live
+          // audio position once metadata is available, and let the play/pause branch
+          // below start it if the pipeline was playing.
+          v.addEventListener('loadedmetadata', () => {
+            v!.currentTime = adopted.positionSecs;
+          }, { once: true });
+          lastAudioPlaying.set(deck.id, adopted.playing);
+          debugLog(`[recovery] adopted ${deck.id} at ${adopted.positionSecs.toFixed(2)}s playing=${adopted.playing}`);
+        } else {
+          // The <video> element's loadedmetadata never fires when WebKitGTK lacks a decoder
+          // for the file's video codec (e.g. AV1/H264) — but the audio-only GStreamer pipeline
+          // still decodes fine and knows the real duration. Use it as a fallback so the
+          // waveform isn't stuck waiting on a duration that will never arrive from the video
+          // element. Don't clobber a duration loadedmetadata already supplied.
+          audioLoad(deck.id, filePath).then((duration) => {
+            // A new DeckAudioPipeline is created with default gain/rate/volume=1.0.
+            // Re-apply current session values so saved MIDI state (or UI slider changes
+            // made before this track was loaded) take effect on the fresh pipeline.
+            const d = get(session).decks.find((d) => d.id === deckId);
+            if (d) {
+              clearDeckAudioSync(deckId);
+              syncGain(deckId, d.gain);
+              syncRate(deckId, d.playbackRate);
+              syncVolume(deckId, d.volume);
+            }
+            const s = get(session).decks.find((d) => d.id === deckId)?.source;
+            if (duration && s?.type === "video" && s.filePath === filePath && (!s.duration || !Number.isFinite(s.duration))) {
+              updateDeck(deckId, { source: { type: "video", filePath, duration } });
+            }
+          }).catch(console.error);
+          // Reset audio state tracker so the next sync re-applies play/pause to the new pipeline.
+          lastAudioPlaying.delete(deck.id);
+        }
+        // New track loads to position 0 (or, on recovery adoption, the live audio
+        // position handled above); either way reset the content-position integrator so
+        // it reinitializes cleanly from the first position poll.
         contentPosTracker.delete(deck.id);
         // Report state after a short delay so we can see if the network request started
         setTimeout(() => {

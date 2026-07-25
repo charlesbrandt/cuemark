@@ -181,3 +181,32 @@ export function gridGetSaved(filePath: string): Promise<SavedGrid | null> {
 export function gridSave(filePath: string, bpm: number, downbeat: number): Promise<void> {
   return invoke("grid_save", { filePath, bpm, downbeat });
 }
+
+// ── Session-of-record (freeze-watchdog.md phase 2) ───────────────────────────
+
+/** Live status of one deck's Rust/GStreamer pipeline — the ground truth for recovery. */
+export interface DeckAudioStatus {
+  deckId: string;
+  filePath: string | null;
+  positionSecs: number | null;
+  playing: boolean;
+  rate: number;
+}
+
+export interface SessionRestoreResult {
+  /** Opaque last-synced Session snapshot, or null on a genuinely clean boot. */
+  snapshot: unknown | null;
+  audio: DeckAudioStatus[];
+}
+
+/** Pushes a debounced snapshot of the Session store so a webview reload/restart has
+ *  something authoritative to rebuild from. See sessionRecovery.ts for the call site. */
+export function sessionSync(snapshot: unknown): Promise<void> {
+  return invoke("session_sync", { snapshot });
+}
+
+/** Fetches the last-synced snapshot plus live per-deck audio status. Called once from
+ *  App.svelte's onMount, before other init — see freeze-watchdog.md "Frontend rehydration". */
+export function sessionRestore(): Promise<SessionRestoreResult> {
+  return invoke("session_restore");
+}

@@ -1167,6 +1167,19 @@ impl DeckAudioPipeline {
         Some(f64::from_bits(feeder.cursor_frames_bits.load(Ordering::Relaxed)))
     }
 
+    /// True when the user has pressed play (survives device rebuilds; see the `playing`
+    /// field doc comment). Used by session_store.rs to report live state for a deck
+    /// whose webview died — the pipeline is the ground truth, not the (possibly stale)
+    /// JS-side snapshot.
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    /// Current tempo multiplier (see `set_rate`).
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
     /// Current playback position in seconds. None if no pipeline is loaded.
     pub fn position(&self) -> Option<f64> {
         let inner = self.inner.as_ref()?;

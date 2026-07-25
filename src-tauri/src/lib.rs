@@ -4,6 +4,7 @@ pub mod media_cache;
 pub mod media_server;
 pub mod midi;
 pub mod midi_state;
+pub mod session_store;
 pub mod watchdog;
 
 use std::sync::Arc;
@@ -121,6 +122,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(audio::AudioState::new(audio::AudioManager::new()))
+        .manage(Arc::new(audio::analysis::AnalysisCache::new()))
+        .manage(session_store::SessionStoreState::new())
         .invoke_handler(tauri::generate_handler![
             open_output_window,
             media_server_port,
@@ -128,6 +131,8 @@ pub fn run() {
             midi_state::midi_get_saved_state,
             midi_state::midi_benchmark_save,
             watchdog::watchdog_heartbeat,
+            session_store::session_sync,
+            session_store::session_restore,
             grid_store::grid_get_saved,
             grid_store::grid_save,
             audio::list_audio_devices,

@@ -49,6 +49,35 @@ impl AudioManager {
             .get_mut(deck_id)
             .ok_or_else(|| format!("no audio pipeline for deck '{deck_id}'"))
     }
+
+    /// Live status of every loaded pipeline — the ground truth for session recovery
+    /// (docs/design/freeze-watchdog.md phase 2). A webview freeze/reload loses all JS
+    /// state, but these pipelines are a separate OS process's objects and never stop;
+    /// session_store.rs's `session_restore()` blends this on top of the (possibly ~1s
+    /// stale) JSON snapshot the frontend last pushed.
+    pub fn audio_status(&self) -> Vec<DeckAudioStatus> {
+        self.pipelines
+            .values()
+            .map(|p| DeckAudioStatus {
+                deck_id: p.deck_id.clone(),
+                file_path: p.file_path.clone(),
+                position_secs: p.position(),
+                playing: p.is_playing(),
+                rate: p.rate(),
+            })
+            .collect()
+    }
+}
+
+/// Live snapshot of one deck's audio pipeline. See `AudioManager::audio_status`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeckAudioStatus {
+    pub deck_id: String,
+    pub file_path: Option<String>,
+    pub position_secs: Option<f64>,
+    pub playing: bool,
+    pub rate: f64,
 }
 
 pub type AudioState = Mutex<AudioManager>;
@@ -115,6 +144,21 @@ pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, cache: St
     // for the full preroll duration, making the UI unresponsive on first track load.
     let mut pipeline = {
         let mut mgr = state.lock().unwrap();
+        // Temporary assertion (freeze-watchdog.md phases 2-3, "Adoption bugs" risk):
+        // session recovery must NEVER call audio_load on a deck whose pipeline is
+        // already loaded+playing — that's the one way rehydration could audibly
+        // glitch a track that survived the freeze untouched. Any real caller hitting
+        // this is a bug in the adoption-skip logic (App.svelte's pendingAdoption),
+        // not an expected state; log loudly instead of silently reloading.
+        if let Some(existing) = mgr.pipelines.get(&deck_id) {
+            if existing.is_playing() {
+                log::error!(
+                    "[audio/{deck_id}] audio_load called while pipeline is already playing \
+                     (pos={:?}) — this will audibly glitch; see freeze-watchdog.md \"Adoption bugs\" risk",
+                    existing.position()
+                );
+            }
+        }
         let main_devices = mgr.main_devices.clone();
         let cue_device = mgr.cue_device.clone();
         let master_volume = mgr.master_volume;
@@ -300,18 +344,23 @@ pub fn audio_record_stop(state: State<'_, AudioState>) -> Result<(), String> {
 /// `spawn_blocking` runs compute_analysis on a dedicated OS thread so it doesn't starve
 /// the async executor.
 #[tauri::command]
-pub async fn audio_analyze_file(cache: State<'_, Arc<MediaCache>>, file_path: String) -> Result<analysis::AnalysisData, String> {
+pub async fn audio_analyze_file(
+    cache: State<'_, Arc<MediaCache>>,
+    analysis_cache: State<'_, Arc<analysis::AnalysisCache>>,
+    file_path: String,
+) -> Result<analysis::AnalysisData, String> {
     // Waits out an in-progress ensure_cached() copy (see media_cache.rs's lookup_wait())
     // instead of a bare best-effort lookup — this runs independently of/racing with
     // audio_load, so without waiting it could resolve to the original (network) path for
     // the whole analysis pass. A path never requested to be cached still falls back
     // immediately. Done inside spawn_blocking since lookup_wait() can block synchronously.
     let cache = cache.inner().clone();
+    let analysis_cache = analysis_cache.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let path = cache
             .lookup_wait(&file_path, std::time::Duration::from_secs(10))
             .unwrap_or(file_path);
-        analysis::compute_analysis(&path)
+        analysis_cache.get_or_compute(&path)
     })
         .await
         .map_err(|e| e.to_string())?

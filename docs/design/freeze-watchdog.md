@@ -1,6 +1,7 @@
 # Freeze watchdog and session recovery (design)
 
-Status: **Phase 1 (observe-only) implemented and live-verified 2026-07-25.** Heartbeat
+Status: **Phase 1 (observe-only) implemented and live-verified 2026-07-25. Phase 2
+(session-of-record) implemented 2026-07-25, not yet live-tested.** Heartbeat
 (`App.svelte`/`output.ts` → `watchdog_heartbeat`), the Rust watchdog thread
 (`src-tauri/src/watchdog.rs`), and diagnostics logging are in; recovery is still
 disabled. Verified live: `kill -STOP` on the real `WebKitWebProcess` produced a
@@ -8,10 +9,29 @@ trigger log (with the process's `T` state and zero utime/stime delta flagged as 
 known deadlock signature) ~5.5s after the last heartbeat, and `kill -CONT` produced a
 "heartbeat resumed after Ns silence" log — no false triggers across ~35s of otherwise
 idle operation. Also added the `freezeMainThread`/`killRafLoop` debug hooks from the
-"Debug/simulation hooks" section below. Phases 2–4 (session-of-record, armed recovery,
-mechanism-B self-heal) not started. Ships before (and independently of)
-`webcodecs-video-path.md`. Rationale discussion: 2026-07-25 session; background:
-`pcm-buffer-playback.md` mechanisms Nine/Ten/Eleven and the
+"Debug/simulation hooks" section below.
+
+Phase 2 adds: `src-tauri/src/session_store.rs` (`session_sync`/`session_restore`
+commands, in-memory + atomic write-through to `session-recovery.json`); `DeckAudioStatus`
++ `AudioManager::audio_status()` in `audio/mod.rs` (live per-deck deck_id/file_path/
+position/playing/rate, the ground truth for recovery); an 8-entry FIFO analysis cache
+(`audio/analysis.rs`'s `AnalysisCache`) so a recovery boot's waveform re-fetch is instant
+instead of re-decoding; `src/lib/state/sessionRecovery.ts` (1s-debounced push on every
+Session store change, via a plain store subscription rather than hooking individual
+mutation call sites); and `App.svelte` onMount rehydration — calls `session_restore()`
+before other init, and on a recovery boot (snapshot present AND at least one live
+pipeline reports a loaded file) rebuilds the store from the snapshot with `playing`
+overridden from live audio status ("audio wins"), skips the MIDI-saved-state restore
+pass (the snapshot already has more accurate fader positions), and routes adopted decks'
+video-element creation around `audioLoad()` via a `pendingAdoption` map in
+`syncVideoElements` (mirrors the temporary assertion log added in `audio_load` for the
+same risk). Only exercised so far via `cargo check`/`npm run check`; the design doc's
+own gate for this phase — forced-reload rehydration seamless 5/5 runs, headless + real
+desktop — has not been run yet.
+
+Phases 3–4 (armed recovery, mechanism-B self-heal) not started. Ships before (and
+independently of) `webcodecs-video-path.md`. Rationale discussion: 2026-07-25 session;
+background: `pcm-buffer-playback.md` mechanisms Nine/Ten/Eleven and the
 `project_webkit_freeze_mechanisms` memory.
 
 ## Goal
@@ -195,7 +215,11 @@ never hiccups and by eye that the UI returns with decks intact.
 2. **Session-of-record**: `session_sync`/`session_restore` + rehydration, exercised
    via a debug-hook forced reload (recovery still not automatic). Gate:
    forced-reload rehydration is seamless (audio uninterrupted, decks/positions/grids
-   correct) 5/5 runs, headless + real desktop.
+   correct) 5/5 runs, headless + real desktop. **Implemented 2026-07-25** — gate not
+   yet run; next step is a `verify-ui`-driven forced-reload test (load a track, let it
+   play a few seconds, trigger a webview reload via WebDriver, assert the deck comes
+   back with source/bpm/downbeat intact and audio position continuous) plus a live
+   desktop pass.
 3. **Arm recovery tiers** + `watchdog-test.sh` green.
 4. **Mechanism-B self-heal** (smallest piece, riskiest history — the Eleventh
    mechanism was four failed iterations of a *cousin* of this; the difference here is
