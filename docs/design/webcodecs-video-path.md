@@ -23,9 +23,21 @@ toward a generic WebKitGTK `NetworkProcess` bug than an app-level cause — see
 It's tracked as a lower-urgency item (the watchdog already covers it in
 practice), not a Phase 5 blocker. See "Phase 4 results" below for full
 evidence on both. The MIDI-burst and CPU-baseline conditions completed cleanly
-(no freezes). **A human real-desktop session (playing/listening on the actual
-machine) is still required and has not happened** — nothing in this document
-should be read as claiming that gate is closed.
+(no freezes).
+
+**Human real-desktop verification (2026-07-26): done, one new finding, fixed.**
+A real (non-Xvfb) `cargo tauri dev` session on the actual desktop, real GStreamer
+audio device, real DJControl Starlight controller connected, surfaced a third bug:
+a live legacy→webcodecs toggle could silently fail to start audio on the first
+play attempt (self-recovering on the next click) — root-caused to a Svelte
+reactivity gap, **not** a WebKit/GStreamer issue this time. Fixed and verified
+live the same session. See "Finding: live-toggle play stall..." below. The same
+session also independently reproduced finding (2) above — the
+`WebKitNetworkProcess` deadlock — twice in a row on the real desktop (not just
+Xvfb), both times caught and auto-recovered by the watchdog within 7–11s. This
+closes the human-verification gate for the play-stall bug and adds further
+real-desktop confirmation that (2) is a genuine, if still unresolved, WebKitGTK
+issue that the watchdog fully covers in practice.
 Phase 3 (done 2026-07-25): audited and live-tested the legacy/codec-path
 isolation Phase 2 already built; zero code gaps found, one live-test proof instrumentation
 added (kept permanently). See "Phase 3 results" below. Phase 2: full playback path
@@ -231,17 +243,20 @@ every phase; new soak test added in Phase 4. One phase per PR/branch; do not com
    of those call sites for a missing guard, and proving the isolation live rather than
    trusting the code review. See "Phase 3 results" below — zero gaps found; one
    permanent proof-instrumentation hook added (`__cuemarkDebug.getLegacyVideoOpCounts`).
-4. **Soak + live testing — STATUS: automated soak done, human real-desktop
-   verification still required; NOT closed.** (`feedback_audio_midi_live_testing`
+4. **Soak + live testing — STATUS: DONE, both automated and human real-desktop
+   verification closed (2026-07-26).** (`feedback_audio_midi_live_testing`
    applies in full): headless soak — off-tempo (0.87×) full-track playback to
    natural end, repeated ×10 (mechanism B's repro conditions: was 2-of-3
    stall); sustained off-tempo playback with a loop for 30+ min (mechanism
    A's exposure profile); MIDI-rate burst via `latency-test.sh`. Then
    real-desktop sessions with human eyes/ears — the automated pass alone is
-   insufficient (proven twice), and **has not been performed as part of this
-   phase 4 work** — nothing here substitutes for it. Success bar: zero
-   freezes under conditions where legacy reliably froze, AV sync subjectively
-   tight, CPU within `perf-idle-test.sh` baselines.
+   insufficient (proven twice) — completed 2026-07-26 on the real desktop with
+   physical MIDI hardware connected; found and fixed one new bug (the
+   live-toggle play-stall, a Svelte reactivity gap — see "Real-desktop human
+   verification" below) and gathered fresh confirmation of the still-open
+   `WebKitNetworkProcess` finding. Success bar: zero freezes under conditions
+   where legacy reliably froze, AV sync subjectively tight, CPU within
+   `perf-idle-test.sh` baselines.
    **Result: two findings, both detailed in "Phase 4 results" below.** (1)
    The ×10 natural-EOS soak found a new, 100%-reproducible freeze — not in
    WebCodecs, but in the shared Rust `DeckAudioPipeline` — that must be fixed
@@ -802,6 +817,93 @@ All Xvfb/tauri-driver/app processes launched for this phase were torn down
 after every test; confirmed via `pgrep -af "tauri-driver|Xvfb|target/debug/cuemark|WebKitWebDriver"`
 returning clean (only the user's own unrelated real-desktop processes, none
 touched) at the end of the session.
+
+## Real-desktop human verification (2026-07-26)
+
+**Method**: a real (non-Xvfb) `cargo tauri dev` session on the user's actual desktop
+(`DISPLAY=:0`), real audio output, a physical DJControl Starlight controller connected
+(covering the MIDI-feel condition with real hardware rather than the simulated burst).
+The user drove the app directly per a checklist (load → toggle CODEC → play, sustained
+loop, MIDI feel, subjective AV sync) while the Rust log was tailed live for freeze/error
+signals.
+
+### Finding: live legacy→webcodecs toggle could silently fail to start audio on the first play attempt — a Svelte reactivity gap, not WebKit/GStreamer
+
+**Symptom**: load a track (legacy by default), toggle the deck to CODEC, click Play —
+no audio, video stuck on the first frame, zero console errors, zero Rust log activity
+for the click (no `[bus/<deck>] pipeline: Paused → Playing` line). The very next
+play/pause click, or a raw `window.__TAURI__.core.invoke('audio_play', ...)` from
+devtools, worked immediately. 100% reproducible across three attempts (with and
+without an intervening legacy play).
+
+**Root cause**: `backendState` (`App.svelte`, tracks each deck's `legacy` |
+`pending` | `webcodecs` | `legacy-fallback` state) is a plain JS `Map`, not a Svelte
+store. `syncVideoElements` only runs inside an rAF callback scheduled by a `$effect`
+that tracks `$session.decks` — so it re-runs whenever deck state changes, but nothing
+about `backendState` itself is reactive. `startCodecPath()`'s async resolution (the
+`video_demux_load` round trip) flips `backendState`'s `kind` to `'webcodecs'` once
+the demux completes, entirely outside of Svelte's reactivity. If a play/pause intent
+was already latent at that moment (`deck.playing` already `true`, the per-deck
+`lastAudioPlaying` guard still `false` from before the toggle), the mismatch just sat
+there — unnoticed — until some *unrelated* future store mutation (the user's next
+click) happened to re-run the `$effect` and let `syncVideoElements` catch up.
+
+**Diagnosis**: three sparse `debugLog()` calls added at the toggle entry, the
+`startCodecPath` success point, and the `audioPlay()` call site (all one-shot,
+state-transition events, not per-frame — same discipline as the project's other
+`debugLog` usage) pinned the exact gap on a live repro:
+
+```
+15:33:33.826  live-toggle legacy->webcodecs: deck.playing=true lastAudioPlaying=false
+15:33:34.083  entered webcodecs state:        deck.playing=true lastAudioPlaying=false
+15:33:43.442  webcodecs branch: calling audioPlay (was=false)      ← 9.36s later
+15:33:43.443  [bus/deck-1] pipeline: Paused → Playing
+```
+
+The trigger condition (`deck.playing !== lastAudioPlaying`) was already satisfied at
+`34.083`, immediately after the codec player came up — but nothing re-evaluated it
+until the user's next click at `43.442`.
+
+**Fix** (`App.svelte`, `startCodecPath()`): explicitly call
+`syncVideoElements(get(session).decks)` once at the end of the function, after either
+the success path (`kind: 'webcodecs'`) or the fallback path (`kind:
+'legacy-fallback'`) settles — rather than relying on an incidental future store
+change to re-trigger it. Verified live: three repeats of load → toggle CODEC → play,
+audio started immediately every time, no stale-latency window.
+
+**Not a WebKitGTK/GStreamer bug** — pure frontend reactivity gap between an
+async-resolved plain `Map` and a Svelte-effect-gated sync function. Doesn't implicate
+mechanism A/B, the EOS-stall fix, or the open `WebKitNetworkProcess` finding below.
+
+### Fresh confirmation of the open `WebKitNetworkProcess` deadlock finding, on a real desktop
+
+During the same real-desktop session (app uptime ~3h44m, well past the ~28-minute
+mark from the original Xvfb finding), the watchdog caught and recovered **two**
+spontaneous freezes in quick succession:
+
+```
+15:36:43  TRIGGER: window 'main' silent for >= 6s
+          descendant WebKitNetworkPr / WebKitWebProces — Δutime=0 Δstime=0, all-parked
+          recovery tier1 (eval reload) → tier2 (native reload)
+          heartbeat resumed after 11.3s
+15:36:54  TRIGGER: silent for >= 6s again, immediately after recovery
+          recovery sequence succeeded
+          [recovery] rehydrating session — 1 live pipeline(s)
+          [recovery] adopted deck-1 at 0.00s playing=false
+          heartbeat resumed after 7.0s
+```
+
+This is the same freeze class as the phase-4 28-minute Xvfb finding (parked
+`WebKitNetworkProcess`/`WebKitWebProcess`, near-0% CPU, matching signature) —
+confirming it's a genuine, real-desktop-reproducible WebKitGTK issue, not an
+Xvfb/software-GL artifact, and that it isn't tied specifically to a ~28-minute
+threshold (it recurred here at a very different point in a long session). Both
+times, the watchdog's tiered recovery worked exactly as designed with no lasting
+damage beyond the deck-1 position being rehydrated at 0.00s rather than its true
+pre-freeze position (a rehydration-accuracy gap, not a freeze-recovery failure —
+worth a closer look if it recurs, but not re-investigated this session). Still
+tracked as the one lower-priority open item below; this is additional evidence, not
+a root cause.
 
 ## Risks and open items
 

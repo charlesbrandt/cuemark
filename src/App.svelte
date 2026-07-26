@@ -825,6 +825,8 @@
       const player = new CodecPlayer(deckId, port, demux);
       registerCodecPlayer(deckId, player);
       backendState.set(deckId, { filePath, kind: 'webcodecs' });
+      const curPlaying = get(session).decks.find((d) => d.id === deckId)?.playing;
+      debugLog(`[video-path] ${deckId} entered webcodecs state: deck.playing=${curPlaying} lastAudioPlaying=${lastAudioPlaying.get(deckId)} adoptedPos=${adoptedPos}`);
       if (adoptedPos !== undefined) player.seek(adoptedPos);
       const s = get(session).decks.find((d) => d.id === deckId)?.source;
       if (s?.type === 'video' && s.filePath === filePath && (!s.duration || !Number.isFinite(s.duration)) && demux.duration) {
@@ -835,6 +837,13 @@
       const prev = backendState.get(deckId);
       backendState.set(deckId, { filePath, kind: 'legacy-fallback', adoptedPos: prev?.adoptedPos });
     }
+    // backendState is a plain Map, not a Svelte store — flipping `kind` above does not
+    // re-trigger the $effect that schedules syncVideoElements. If a play/pause intent was
+    // already latent (e.g. deck.playing flipped true while this awaited), it would
+    // otherwise sit unactioned until some unrelated store change happened to re-run the
+    // effect (confirmed live: a 9+ second stall until the next click). Re-sync explicitly
+    // now so the transition is applied immediately instead of waiting on a coincidence.
+    syncVideoElements(get(session).decks);
   }
 
   function syncVideoElements(decks: Deck[]) {
@@ -883,6 +892,7 @@
         // Live per-deck A/B toggle to codec path — audio pipeline (and its already-applied
         // gain/rate/volume) survives untouched; only the presentation backend changes.
         const resumeAt = getDeckTime(deckId) ?? undefined;
+        debugLog(`[video-path] ${deckId} live-toggle legacy->webcodecs: deck.playing=${deck.playing} resumeAt=${resumeAt} lastAudioPlaying=${lastAudioPlaying.get(deckId)}`);
         const v = videoEls.get(deckId);
         if (v) { v.pause(); v.remove(); unregisterVideoEl(deckId); videoEls.delete(deckId); lastUploadedTime.delete(deckId); }
         backendState.set(deckId, { filePath, kind: 'pending' });
@@ -913,8 +923,12 @@
         const wasAudioPlaying = lastAudioPlaying.get(deckId);
         if (deck.playing !== wasAudioPlaying) {
           lastAudioPlaying.set(deckId, deck.playing);
-          if (deck.playing) audioPlay(deckId).catch(console.error);
-          else audioPause(deckId).catch(console.error);
+          if (deck.playing) {
+            debugLog(`[video-path] ${deckId} webcodecs branch: calling audioPlay (was=${wasAudioPlaying})`);
+            audioPlay(deckId).catch((e) => { debugLog(`[video-path] ${deckId} audioPlay FAILED: ${e}`); console.error(e); });
+          } else {
+            audioPause(deckId).catch(console.error);
+          }
         }
         continue;
       }
