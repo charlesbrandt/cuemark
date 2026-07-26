@@ -1,24 +1,31 @@
 # WebCodecs video path: replacing the `<video>` element for deck playback (design)
 
-Status: **phase 4 (soak + live testing) automated portion done, BLOCKED on two
-new findings (2026-07-25)** — (1) the ×10 natural-EOS soak surfaced a
-100%-reproducible silent stall in the shared Rust `DeckAudioPipeline` a
-fraction of a second before every track's true end, independent of playback
-rate, file, and video backend (confirmed on both `legacy` and `webcodecs`) —
-**not a WebCodecs regression**, since it reproduces identically on a
-`legacy`-backend deck (both backends share the same Rust audio clock); (2)
-the 30-minute sustained-loop test ran clean for 28 minutes, then hit a real,
-spontaneous `WebKitNetworkProcess` deadlock — a previously-uncaught freeze
-class, plausibly tied to the webcodecs path's HTTP AU-fetch transport under
-sustained load — that `freeze-watchdog.md`'s recovery machinery caught and
-fixed automatically in ~14s (a genuine, uncontrived save, the strongest
-evidence yet that the watchdog works). Both findings block a clean phase 4
-sign-off and (1) especially must be fixed before Phase 5. See "Phase 4
-results" below for full evidence. The MIDI-burst and CPU-baseline conditions
-completed cleanly (no freezes). **A human real-desktop session
-(playing/listening on the actual machine) is still required and has not
-happened** — nothing in this document should be read as
-claiming that gate is closed.
+Status: **phase 4 (soak + live testing) automated portion done; one of two
+2026-07-25 findings fixed and verified 2026-07-26, one still open** — (1) the
+×10 natural-EOS soak surfaced a 100%-reproducible silent stall in the shared
+Rust `DeckAudioPipeline` a fraction of a second before every track's true end,
+independent of playback rate, file, and video backend (confirmed on both
+`legacy` and `webcodecs`) — **not a WebCodecs regression** (it reproduces on a
+plain `legacy` deck too, since both backends share the same Rust audio clock)
+and, as it turned out, **not the `input_selector`/scratch topology originally
+suspected** either — root-caused 2026-07-26 to `cue_valve` silently swallowing
+the EOS event whenever the headphone cue is off (its default state), fixed,
+and verified via a new deterministic regression test (see "Finding: silent
+stall..." below for the full root-cause chain and fix). (2) the 30-minute
+sustained-loop test ran clean for 28 minutes, then hit a real, spontaneous
+`WebKitNetworkProcess` deadlock — a previously-uncaught freeze class — that
+`freeze-watchdog.md`'s recovery machinery caught and fixed automatically in
+~14s (a genuine, uncontrived save, the strongest evidence yet that the
+watchdog works). This one is **still open**: a 2026-07-26 code review of the
+webcodecs HTTP AU-fetch path found no smoking gun on our side and points more
+toward a generic WebKitGTK `NetworkProcess` bug than an app-level cause — see
+"Risks and open items" for why, and what a real root-cause session would need.
+It's tracked as a lower-urgency item (the watchdog already covers it in
+practice), not a Phase 5 blocker. See "Phase 4 results" below for full
+evidence on both. The MIDI-burst and CPU-baseline conditions completed cleanly
+(no freezes). **A human real-desktop session (playing/listening on the actual
+machine) is still required and has not happened** — nothing in this document
+should be read as claiming that gate is closed.
 Phase 3 (done 2026-07-25): audited and live-tested the legacy/codec-path
 isolation Phase 2 already built; zero code gaps found, one live-test proof instrumentation
 added (kept permanently). See "Phase 3 results" below. Phase 2: full playback path
@@ -601,11 +608,43 @@ specific to, the WebCodecs work** — it affects the pre-existing shared Rust au
 pipeline that both backends depend on as their master clock, confirmed by run #3
 above reproducing on a plain `legacy` deck.
 
-**Disposition**: this blocks a clean phase 4 close and must be fixed (in
-`src-tauri/src/audio/pipeline.rs`, most likely around the `input_selector`/
-`output_queue` tail-of-stream handling) before Phase 5, independent of WebCodecs'
-own status. Filed here rather than silently worked around, per this document's own
-instruction not to soften a genuine freeze finding.
+**Root-caused and fixed (2026-07-26).** The `input_selector`/`output_queue`
+hypothesis above was wrong. Root cause: **`cue_valve` (a `valve` element, gating
+the headphone-cue branch) silently swallows the EOS event, not just data
+buffers, whenever `drop=true`** — which is its state on every deck by default
+(cue off) until a user explicitly enables headphone cue. `GstBin` only posts its
+aggregate pipeline-level EOS message to the bus once *every* sink element has
+posted its own; with `cue_sink` never seeing EOS, the bus message never arrives,
+even though the main output branch reaches real EOS cleanly. This is a stock
+GStreamer gotcha (confirmed in isolation: `gst-launch-1.0 audiotestsrc
+num-buffers=20 ! valve drop=true ! fakesink` hangs forever on EOS; the same
+pipeline with `drop=false` exits immediately) that has existed since the cue
+branch was first added — unrelated to the `input_selector`/scratch work — and
+was simply never exercised by a natural-EOS run before (all prior testing used
+loops/seeks that never reach true end of file with the cue branch idling).
+
+Found via: a new deterministic regression test (`eos_stall_repro` in
+`pipeline.rs`, using the existing local 5.6s test file — reproduces the stall in
+~6s, no webview/Xvfb needed), a live `gdb` catch of the blocked `queue0:src`
+thread (`scripts/gdb-eos-stall-catcher.py`, adapted from the existing stall
+catcher — this bug's 100% reproducibility made it a one-shot catch, no retries
+needed), and a pad-probe trace (`eos_stall_probe_trace`) that pinpointed the
+exact last pad EOS reached (`cue_valve`'s sink pad) by walking the real pad
+graph rather than guessing from a symbol-stripped backtrace.
+
+**Fix**: `make_eos_passthrough_valve()` in `pipeline.rs` installs a downstream-
+event probe on a valve's sink pad that flips `drop` to `false` the instant an
+EOS event arrives, then lets it `Pass` through the valve's own already-correct
+forwarding logic — applied to both `cue_valve` and `valve_normal` (the scratch
+gate, same latent risk in principle). An earlier version of the fix tried
+manually re-pushing a cloned EOS event past the valve instead; that "worked" but
+triggered a `gst_mini_object_unref: assertion 'mini_object != NULL' failed`
+GStreamer-CRITICAL, root-caused (again via `gdb`, `G_DEBUG=fatal-criticals`) to
+a reentrant `gst_pad_push_event` call corrupting `tee`'s own in-progress
+`gst_pad_forward` fan-out across its other src pads. The `drop`-flip approach
+needs no reentrant push and shows no criticals across repeated runs.
+`eos_stall_repro` now passes cleanly (`at_eos` flips true, pipeline self-pauses
+correctly); `scratch_smoke`/`vinyl_hold_smoke` still pass unaffected.
 
 ### Off-tempo natural-EOS soak (×10 target)
 
@@ -766,19 +805,33 @@ touched) at the end of the session.
 
 ## Risks and open items
 
-- **Two open freeze/stall findings from phase 4, neither fixed yet**: (1) a
-  shared Rust `DeckAudioPipeline` stall a fraction of a second before every
-  track's true end (100% reproducible, independent of rate/file/backend —
-  blocks Phase 5, not webcodecs-specific); (2) a `WebKitNetworkProcess`
-  deadlock caught once during a 28-minute webcodecs soak, recovered
-  automatically by `freeze-watchdog.md`'s tiered reload in ~14s. See "Phase 4
-  results" for full evidence on both. Root-causing either would benefit from
-  a live `gdb` backtrace at the moment of the stall (the technique
-  `skills/audio-debugging` already documents) — not obtained this session
-  because `ptrace_scope=1` blocked attaching to the already-running process
-  and no passwordless `sudo` was available; a future session with `sudo`
-  access (or launching the target process under `gdb --args` from the start,
-  per the skill's own workaround) should get much further.
+- **Two open freeze/stall findings from phase 4 — (1) fixed, (2) still open**:
+  (1) the shared Rust `DeckAudioPipeline` near-end-of-track stall is
+  root-caused and fixed (2026-07-26) — see "Finding: silent stall..." above;
+  `cue_valve` was swallowing EOS, not the `input_selector` topology originally
+  suspected. (2) the `WebKitNetworkProcess` deadlock caught once during the
+  28-minute webcodecs soak, recovered automatically by `freeze-watchdog.md`'s
+  tiered reload in ~14s, is **still open** — a 2026-07-26 code review of
+  `codecWorker.ts`'s AU-fetch loop and `media_server.rs` found no obvious
+  deadlock-causing pattern on our side: `auCache` never evicts, so once a
+  loop's region is cached (the 28-minute soak used a fixed 8s loop), steady-
+  state HTTP request volume drops to ~zero — which actually argues *against*
+  "sustained HTTP load" being the direct trigger, and toward this being a
+  generic WebKitGTK `NetworkProcess` longevity/idle-connection bug (same
+  general class as the already-documented `MediaPlayerPrivateGStreamer`
+  mechanisms in `skills/audio-debugging`, just a different WebKit process).
+  `media_cache.rs`'s `lookup_wait()` (in the server's hot path) is
+  Condvar-based with a bounded 10s timeout, not a source of an unbounded
+  block. Root-causing (2) further needs a live `gdb -p <pid>` backtrace of the
+  actual `WebKitNetworkProcess` at the moment of a fresh freeze — which needs
+  a full ~30+ minute real-desktop re-soak (uncertain timing: this triggered
+  once at ~28 minutes, not on a fixed schedule) plus root ptrace access for
+  attaching to an already-running process (unlike (1), the target here can't
+  be launched fresh under `gdb --args` — the freeze only shows up deep into a
+  long real session). Given the watchdog already provides a working ~14s
+  automatic recovery, this is tracked as a lower-urgency open item rather than
+  a Phase 5 blocker — revisit with a dedicated long-soak session (ideally with
+  `sudo` available) rather than folding it into a normal work session.
 - **WebCodecs implementation quality in WebKitGTK**: it is GStreamer-backed too, but
   decoder-element-only — none of `MediaPlayerPrivateGStreamer`, `multiqueue`
   rate-scaled buffering, or segment/EOS machinery is involved. The `VideoEncoder`

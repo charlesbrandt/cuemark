@@ -55,3 +55,19 @@ be able to form a cycle with a main-thread-initiated synchronous pipeline event.
 **Workaround in the app**: raising the drift threshold to 250 ms (fewer seeks) lowers
 the incidence but cannot eliminate it; the app is migrating video playback off the
 media element entirely.
+
+**Related but distinct prior bugs** (checked before filing — none is a duplicate):
+several GStreamer/WebKit deadlocks with a similar shape were fixed in 2024, all
+before this WebKitGTK 2.52.3 build:
+- Bug 260796 — qtdemux `gst_pad_pause_task` vs. `gst_download_buffer_wait_for_data`
+  (fixed 2024-03)
+- Bug 272912 — deadlock in `webKitWebSrcCreate` on non-flushing seeks (fixed 2024-04)
+- Bug 285988 — deadlock rendering frames to canvas, OffscreenCanvas/mediastream
+  (fixed 2025-01)
+
+None of these match the mechanism here: this deadlock is a synchronous
+`currentTime`-triggered `gst_element_send_event()` holding an element mutex, cycling
+against a streaming thread parked on `WTF::ParkingLot` waiting for the *main thread's
+run loop* to service a new-sample/repaint handoff — not a pad-task-pause or
+web-src-creation lock. Flagging the prior fixes in case a triager recognizes this as
+a regression of one of them; from the outside it looks like a new cycle.

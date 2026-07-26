@@ -47,6 +47,60 @@ fn make_el(factory: &str) -> Result<gst::Element, String> {
         .map_err(|e| format!("GStreamer element '{factory}' not found: {e}"))
 }
 
+/// A `valve` with `drop=true` silently swallows the EOS event too, not just data
+/// buffers — confirmed empirically (`gst-launch-1.0 audiotestsrc num-buffers=20 !
+/// valve drop=true ! fakesink` hangs forever instead of exiting on EOS; the same
+/// pipeline with `drop=false` exits immediately). `GstBin` only posts its
+/// aggregate pipeline-level EOS message to the bus once *every* sink element has
+/// posted its own — so any permanently-closed valve upstream of a sink (the
+/// headphone `cue_valve`, closed by default on every deck until a user enables
+/// cue; the scratch `valve_normal`, briefly closed mid-gesture) means that sink
+/// never sees EOS and the whole pipeline's EOS message never arrives, even though
+/// every other branch (e.g. the main audio output) reached real EOS cleanly.
+///
+/// This was the actual root cause of the "silent stall a fraction of a second
+/// before every track's true end" finding in docs/design/webcodecs-video-path.md
+/// — root-caused via a pad-probe trace of a natural-EOS repro
+/// (`eos_stall_probe_trace` in this module's tests) that showed EOS reaching the
+/// main branch's sink cleanly but stopping dead at `cue_valve`'s sink pad. The
+/// original hypothesis blamed the `input_selector`/scratch topology; that topology
+/// was actually unrelated — this valve-swallows-EOS behavior is a stock GStreamer
+/// gotcha, present since the cue branch was first added, and simply never
+/// exercised by a natural-EOS run before (all prior testing used loops/seeks that
+/// never reach true end of file with the cue branch idling).
+///
+/// Fix: a downstream-event probe on the valve's sink pad that flips `drop` to
+/// `false` the instant an EOS event is about to be handled, then lets it `Pass`
+/// through the valve's own (already-correct, already-tested) forwarding logic —
+/// rather than manually re-pushing the event ourselves. An earlier version of this
+/// fix tried exactly that manual re-push (clone the event, push it onto the
+/// valve's src pad, return `Drop`), which "worked" (EOS reached the sink) but
+/// triggered a `gst_mini_object_unref: assertion 'mini_object != NULL' failed`
+/// GStreamer-CRITICAL — confirmed via `gdb` (`G_DEBUG=fatal-criticals` turns the
+/// critical into a trappable signal) to originate one frame away, inside `tee`'s
+/// own `gst_pad_forward` fan-out: pushing a second, independently-owned event
+/// clone from *within* a probe callback that's itself running *inside* that same
+/// synchronous fan-out over multiple src pads corrupts whatever bookkeeping
+/// `gst_pad_forward` does across the pads it hasn't visited yet. Flipping `drop`
+/// and returning `Pass` needs no reentrant push — GStreamer's own single already-
+/// correct code path does the forwarding. Permanently leaving `drop=false` after
+/// EOS is harmless: EOS means no more buffers are coming on this pad, and
+/// `load()` rebuilds a fresh valve (with `drop` set from live state) on every
+/// track load, so nothing leaks across loads.
+fn make_eos_passthrough_valve(valve: &gst::Element) {
+    let valve_weak = valve.downgrade();
+    let sink_pad = valve.static_pad("sink").expect("valve has a sink pad");
+    sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        let Some(event) = info.event() else { return gst::PadProbeReturn::Ok };
+        if event.type_() == gst::EventType::Eos {
+            if let Some(valve) = valve_weak.upgrade() {
+                valve.set_property("drop", false);
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
 /// Encode a filesystem path as a file:// URI suitable for uridecodebin.
 ///
 /// Each byte is examined individually so multi-byte UTF-8 sequences (e.g. 'ç' → 0xC3 0xA7)
@@ -419,6 +473,7 @@ impl DeckAudioPipeline {
         let capsfilter2 = make_el("capsfilter")?;
         let valve_normal = make_el("valve")?;
         valve_normal.set_property("drop", false);
+        make_eos_passthrough_valve(&valve_normal);
         let input_selector = make_el("input-selector")?;
 
         // One (volume, sink) pair per main output device. Empty devices list = single default.
@@ -548,6 +603,7 @@ impl DeckAudioPipeline {
         output_queue.set_property("max-size-time", OUTPUT_QUEUE_STEADY_CAP_NS);
 
         cue_valve.set_property("drop", !self.cue_enabled);
+        make_eos_passthrough_valve(&cue_valve);
         cue_volume.set_property("volume", (self.gain * self.cue_gain) as f64);
         cue_queue.set_property("max-size-buffers", 2u32);
         cue_queue.set_property("max-size-bytes", 0u32);
@@ -1477,6 +1533,175 @@ mod scratch_smoke_test {
 
         pipeline.pause().expect("final pause");
         println!("scratch_smoke OK");
+    }
+
+    /// Repro for the phase-4 "silent stall a fraction of a second before every
+    /// track's true end" finding (docs/design/webcodecs-video-path.md). Plays the
+    /// short local test file to its natural end with plain (non-scratch) playback —
+    /// no input-selector switch, no appsrc branch ever touched — and polls
+    /// `position()` + the bus thread's `at_eos` flag every 100ms. If the bug
+    /// reproduces, position stops advancing a fraction of a second before the
+    /// real duration and `at_eos` never flips true (the bus thread's EOS handler
+    /// never runs because no EOS message ever arrives — see the design doc's
+    /// "zero bus messages after Paused→Playing" observation). Run under gdb via
+    /// scripts/gdb-stall-catcher.py (adapted) to catch the exact blocked thread.
+    #[test]
+    #[ignore]
+    fn eos_stall_repro() {
+        init_test_logger();
+        gst::init().expect("gst init");
+        let path = "/home/account/Downloads/audio.wav";
+
+        let mut pipeline = DeckAudioPipeline::new("test-deck-eos");
+        let duration = pipeline.load(path).expect("load").expect("duration");
+        println!("loaded, duration={duration:.6}s");
+
+        pipeline.play().expect("play");
+
+        let start = Instant::now();
+        let mut last_pos: Option<f64> = None;
+        let mut stuck_polls = 0u32;
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let pos = pipeline.position();
+            let at_eos = pipeline.inner.as_ref().unwrap().at_eos.load(Ordering::Relaxed);
+            let state = pipeline.inner.as_ref().unwrap().pipeline.current_state();
+            let elapsed = start.elapsed().as_secs_f64();
+            println!(
+                "t={elapsed:.3}s pos={pos:?} at_eos={at_eos} state={state:?} gap_from_end={:?}",
+                pos.map(|p| duration - p)
+            );
+
+            if at_eos {
+                println!("eos_stall_repro OK: at_eos flipped true, pipeline self-paused correctly");
+                return;
+            }
+
+            match (last_pos, pos) {
+                (Some(l), Some(p)) if (p - l).abs() < 1e-9 => {
+                    stuck_polls += 1;
+                    if stuck_polls >= 5 {
+                        panic!(
+                            "REPRODUCED THE BUG: position stuck at {p:.6}s for {stuck_polls} \
+                             consecutive polls ({}ms), {:.3}s short of the true {duration:.6}s \
+                             duration, and at_eos never fired — pipeline silently stalled near \
+                             end of track. See docs/design/webcodecs-video-path.md phase 4 results.",
+                            stuck_polls * 100, duration - p
+                        );
+                    }
+                }
+                _ => stuck_polls = 0,
+            }
+            last_pos = pos;
+
+            if elapsed > 20.0 {
+                panic!(
+                    "timed out after 20s waiting for natural EOS (duration={duration:.6}s, \
+                     last pos={last_pos:?}) — neither a clean EOS nor the expected stall pattern"
+                );
+            }
+        }
+    }
+
+    /// Traces exactly how far the EOS event travels through the topology before
+    /// `eos_stall_repro` freezes, via pad probes at every hop from `pitch` through
+    /// the final sinks. A `gdb` backtrace of the stalled `queue0:src` thread (the
+    /// uridecodebin-side `queue`'s own streaming thread) showed it blocked in
+    /// `g_cond_wait` deep inside `libgstcoreelements.so`, having already synchronously
+    /// pushed the event through `pitch` (`libgstsoundtouch.so` appears in the trace)
+    /// and several more core elements — consistent with EOS reaching at least
+    /// `valve_normal`/`input_selector` before blocking, but stripped release binaries
+    /// give no symbol names for exactly which core element's sink event handler is
+    /// the one actually blocking. This test pinpoints it precisely by logging the
+    /// last pad an EOS event is observed at, walking the actual pad graph (via
+    /// `peer()`) from `output_queue`'s src pad through `tee` and every branch —
+    /// no hardcoded element names, so it can't drift out of sync with `load()`'s
+    /// topology.
+    #[test]
+    #[ignore]
+    fn eos_stall_probe_trace() {
+        init_test_logger();
+        gst::init().expect("gst init");
+        let path = "/home/account/Downloads/audio.wav";
+
+        let mut pipeline = DeckAudioPipeline::new("test-deck-probe");
+        let duration = pipeline.load(path).expect("load").expect("duration");
+        println!("loaded, duration={duration:.6}s");
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        fn probe(pad: &gst::Pad, label: &str, seen: Arc<Mutex<Vec<String>>>) {
+            let label = label.to_string();
+            pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+                if let Some(ev) = info.event() {
+                    if ev.type_() == gst::EventType::Eos {
+                        seen.lock().unwrap().push(label.clone());
+                        println!("[probe] EOS at {label}");
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
+
+        {
+            let inner = pipeline.inner.as_ref().expect("pipeline loaded");
+            probe(&inner.pitch_el.static_pad("src").unwrap(), "pitch:src", seen.clone());
+            probe(&inner.valve_normal_el.static_pad("src").unwrap(), "valve_normal:src", seen.clone());
+            probe(&inner.sel_normal_pad, "selector:sink_normal", seen.clone());
+            probe(&inner.input_selector.static_pad("src").unwrap(), "selector:src", seen.clone());
+            probe(&inner.output_queue_el.static_pad("sink").unwrap(), "output_queue:sink", seen.clone());
+            let oq_src = inner.output_queue_el.static_pad("src").unwrap();
+            probe(&oq_src, "output_queue:src", seen.clone());
+
+            // Walk the real pad graph from here on, rather than hardcoding names —
+            // tee's sink, every one of its requested src pads, and one hop further
+            // into whatever each of those connects to (volume/valve/sink elements).
+            if let Some(tee_sink) = oq_src.peer() {
+                probe(&tee_sink, "tee:sink", seen.clone());
+                let tee_el = tee_sink.parent_element().expect("tee sink pad has a parent");
+                let pad_iter = tee_el.pads();
+                for pad in pad_iter {
+                    if pad.direction() != gst::PadDirection::Src { continue; }
+                    let name = pad.name().to_string();
+                    probe(&pad, &format!("tee:{name}"), seen.clone());
+                    if let Some(next_sink) = pad.peer() {
+                        let next_el = next_sink.parent_element().expect("peer pad has a parent");
+                        let next_el_name = next_el.name().to_string();
+                        probe(&next_sink, &format!("{next_el_name}:sink"), seen.clone());
+                        // One more hop (e.g. volume -> real sink, or cue_valve -> cue_volume).
+                        if let Some(next_src) = next_el.static_pad("src") {
+                            if let Some(final_sink) = next_src.peer() {
+                                let final_el = final_sink.parent_element().expect("peer pad has a parent");
+                                probe(&final_sink, &format!("{}:sink", final_el.name()), seen.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        pipeline.play().expect("play");
+
+        let start = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let pos = pipeline.position();
+            let at_eos = pipeline.inner.as_ref().unwrap().at_eos.load(Ordering::Relaxed);
+            let elapsed = start.elapsed().as_secs_f64();
+            println!("t={elapsed:.3}s pos={pos:?} at_eos={at_eos}");
+
+            if at_eos {
+                println!("eos_stall_probe_trace: at_eos flipped true — no stall this run, EOS reached: {:?}", seen.lock().unwrap());
+                return;
+            }
+            if elapsed > 10.0 {
+                println!(
+                    "STALL: after {elapsed:.1}s, EOS was observed at exactly these pads (in order): {:?}",
+                    seen.lock().unwrap()
+                );
+                panic!("EOS probe trace complete — see printed list above for the last pad EOS reached before the stall");
+            }
+        }
     }
 
     /// Vinyl-mode regression guard: a short `hold_ms` should freeze the feeder soon
