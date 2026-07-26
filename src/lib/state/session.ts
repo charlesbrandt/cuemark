@@ -41,10 +41,19 @@ const initial: Session = {
 
 export const session = writable<Session>(initial);
 
+function nextDeckIndex(decks: Deck[]): number {
+  let max = -1;
+  for (const d of decks) {
+    const m = /^deck-(\d+)$/.exec(d.id);
+    if (m) max = Math.max(max, parseInt(m[1], 10));
+  }
+  return max + 1;
+}
+
 export function addDeck() {
   session.update((s) => ({
     ...s,
-    decks: [...s.decks, makeDeck(s.decks.length)],
+    decks: [...s.decks, makeDeck(nextDeckIndex(s.decks))],
   }));
 }
 
