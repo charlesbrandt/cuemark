@@ -1,6 +1,25 @@
 # WebCodecs video path: replacing the `<video>` element for deck playback (design)
 
-Status: **phase 3 done (2026-07-25)** — audited and live-tested the legacy/codec-path
+Status: **phase 4 (soak + live testing) automated portion done, BLOCKED on two
+new findings (2026-07-25)** — (1) the ×10 natural-EOS soak surfaced a
+100%-reproducible silent stall in the shared Rust `DeckAudioPipeline` a
+fraction of a second before every track's true end, independent of playback
+rate, file, and video backend (confirmed on both `legacy` and `webcodecs`) —
+**not a WebCodecs regression**, since it reproduces identically on a
+`legacy`-backend deck (both backends share the same Rust audio clock); (2)
+the 30-minute sustained-loop test ran clean for 28 minutes, then hit a real,
+spontaneous `WebKitNetworkProcess` deadlock — a previously-uncaught freeze
+class, plausibly tied to the webcodecs path's HTTP AU-fetch transport under
+sustained load — that `freeze-watchdog.md`'s recovery machinery caught and
+fixed automatically in ~14s (a genuine, uncontrived save, the strongest
+evidence yet that the watchdog works). Both findings block a clean phase 4
+sign-off and (1) especially must be fixed before Phase 5. See "Phase 4
+results" below for full evidence. The MIDI-burst and CPU-baseline conditions
+completed cleanly (no freezes). **A human real-desktop session
+(playing/listening on the actual machine) is still required and has not
+happened** — nothing in this document should be read as
+claiming that gate is closed.
+Phase 3 (done 2026-07-25): audited and live-tested the legacy/codec-path
 isolation Phase 2 already built; zero code gaps found, one live-test proof instrumentation
 added (kept permanently). See "Phase 3 results" below. Phase 2: full playback path
 (`codecPlayer.ts`/`codecWorker.ts`), feature flag + live per-deck A/B toggle, `App.svelte`
@@ -205,14 +224,27 @@ every phase; new soak test added in Phase 4. One phase per PR/branch; do not com
    of those call sites for a missing guard, and proving the isolation live rather than
    trusting the code review. See "Phase 3 results" below — zero gaps found; one
    permanent proof-instrumentation hook added (`__cuemarkDebug.getLegacyVideoOpCounts`).
-4. **Soak + live testing** (`feedback_audio_midi_live_testing` applies in full):
-   headless soak — off-tempo (0.87×) full-track playback to natural end, repeated
-   ×10 (mechanism B's repro conditions: was 2-of-3 stall); sustained off-tempo
-   playback with a 4-bar loop for 30+ min (mechanism A's exposure profile);
-   MIDI-rate burst via `latency-test.sh`. Then real-desktop sessions with human
-   eyes/ears — the automated pass alone is insufficient (proven twice).
-   Success bar: zero freezes under conditions where legacy reliably froze, AV sync
-   subjectively tight, CPU within `perf-idle-test.sh` baselines.
+4. **Soak + live testing — STATUS: automated soak done, human real-desktop
+   verification still required; NOT closed.** (`feedback_audio_midi_live_testing`
+   applies in full): headless soak — off-tempo (0.87×) full-track playback to
+   natural end, repeated ×10 (mechanism B's repro conditions: was 2-of-3
+   stall); sustained off-tempo playback with a loop for 30+ min (mechanism
+   A's exposure profile); MIDI-rate burst via `latency-test.sh`. Then
+   real-desktop sessions with human eyes/ears — the automated pass alone is
+   insufficient (proven twice), and **has not been performed as part of this
+   phase 4 work** — nothing here substitutes for it. Success bar: zero
+   freezes under conditions where legacy reliably froze, AV sync subjectively
+   tight, CPU within `perf-idle-test.sh` baselines.
+   **Result: two findings, both detailed in "Phase 4 results" below.** (1)
+   The ×10 natural-EOS soak found a new, 100%-reproducible freeze — not in
+   WebCodecs, but in the shared Rust `DeckAudioPipeline` — that must be fixed
+   before Phase 5, independent of WebCodecs' own rollout status. (2) The
+   30-minute sustained-loop test ran clean for 28 minutes, then hit a real
+   `WebKitNetworkProcess` deadlock that `freeze-watchdog.md`'s recovery
+   caught and fixed automatically in ~14s — a genuine, uncontrived proof the
+   watchdog works, but also a previously-uncaught freeze class worth
+   root-causing. The MIDI-burst and CPU-baseline conditions completed
+   cleanly (no freezes) on the webcodecs backend.
 5. **Flip the default.** Keep legacy `<video>` as automatic fallback for
    unsupported codecs; reassess deleting it entirely after a few weeks of use.
 
@@ -492,8 +524,261 @@ running fire-and-forget in the page regardless (confirmed: audio position kept
 advancing, and a smaller bounded re-run completed and reported real numbers), so a
 timed-out response is not itself a failure signal for this particular hook.
 
+## Phase 4 results (2026-07-25)
+
+**Method**: `verify-ui` (tauri-driver + Xvfb, `VITE_ENABLE_DEBUG_HOOK=1 cargo tauri
+build --debug --no-bundle` — binary confirmed rebuilt after phase 3's commit
+`4b9671f`). Two cached library files used throughout (`project_media_library_smb_mount`):
+the 25.693s H.264 clip (`02d9ad35e5ffb8e1-20875734.mp4`) for the EOS soak, and the
+265.08s H.264 clip (`a3f47c64298e7849-36194713.mp4`) for the sustained-loop test and
+a spot-check.
+
+### Finding: silent stall a fraction of a second before every track's true end — NOT WebCodecs-specific
+
+**Symptom**: partway through the ×10 natural-EOS soak, `getAudioTime(deckId)` (the
+shared audio clock both video backends read) stopped advancing a few hundred
+milliseconds before the file's real duration and never moved again. `deck.playing`
+stayed `true` forever — the Rust EOS self-pause (`pipeline.rs`'s bus thread, see
+CLAUDE.md "EOS handling") never fired, because no `EOS` bus message was ever posted.
+
+**Reproduced 5/5, with escalating isolation to rule out WebCodecs/rate/file-specific
+causes:**
+
+| # | File | Rate | Backend | Froze at (content pos) | Duration | Gap from true end |
+|---|---|---|---|---|---|---|
+| 1 | 25.693s clip | 0.87× | webcodecs (deck-0) | 22.317409832960006s | 25.693s | 3.38s of *content* remaining (3.88s wall-clock at 0.87×) |
+| 2 | 25.693s clip | 0.87× | webcodecs (deck-0, fresh reload) | 22.31740983296s (bit-identical to #1) | 25.693s | same |
+| 3 | 25.693s clip | 0.87× | **legacy** (deck-1, same moment as #2) | 22.317409832959996s (bit-identical to #1/#2) | 25.693s | same |
+| 4 | 25.693s clip | **1.0×** (control) | webcodecs (deck-0) | 25.650666666s | 25.693s | 0.042s |
+| 5 | 265.08s clip | 1.0×, seeked to near end | webcodecs (deck-0) | 265.078979166s | 265.079996416s | 0.001s |
+
+Runs #2 and #3 were **simultaneous, independent pipeline instances** (two decks, two
+`DeckAudioPipeline`s) that froze at the same wall-clock moment at a bit-identical
+content position — this rules out both a WebCodecs-side bug and a frontend-only
+caching bug (two independent Rust pipelines don't coincidentally agree to 11 decimal
+places by chance; this is deterministic given the same file/rate). Run #4 (rate=1.0,
+the classic "does a rate-hypothesis-predicted-clean control still fail?" check from
+`skills/audio-debugging`'s own diagnostic guidance) still froze, just much closer to
+the true end — **this is not the previously-documented rate-dependent "mechanism B"**
+(WebKit `<video>`-internal EOS/segment mishandling at non-1.0 rate); it reproduces at
+1.0× too, and there is no `<video>` element involved on the webcodecs deck at all.
+Run #5 (a completely different, much longer file, approached via seek rather than
+full playback) still froze within 1ms of true EOS, showing this isn't specific to the
+short test clip's encoding.
+
+**Confirmed genuinely frozen at the source, not a frontend artifact** — the
+`audio-debugging` skill's own "raw vs. cached" diagnostic
+(`window.__TAURI__.core.invoke('audio_get_position', {deckId})`, bypassing every
+frontend cache/derivation) returned the exact same value across repeated polls
+seconds apart (e.g. `25.650999808` three times, 3s apart). `pw-top -b` showed the
+deck's PipeWire stream in state `R` (still "running") with **ERR (xrun count)
+climbing continuously** (~47/s: 36737 → 37064 over 7 samples) — PipeWire keeps
+scheduling the stream every ~21ms and getting nothing back, forever. `pidstat -t`
+on every thread in the app process showed ~0% CPU across the board during the
+stall — **blocked, not spinning** — consistent with an ordinary GStreamer queue/
+segment deadlock (same general class as the `gst_pad_push()`/`GstQueue`
+backpressure stall found and root-caused via `gdb` in a previous session, per
+`audio-debugging`'s "Catching an intermittent GStreamer-side stall" section —
+not re-diagnosed with `gdb` this session: `ptrace_scope=1` blocked attaching to
+the already-running process and no passwordless `sudo` was available to lower
+it). The app log showed **zero** bus messages of any kind (no `EOS`, `ERROR`,
+`WARNING`, `StateChanged`) after the `Paused → Playing` transition — the pipeline
+doesn't even reach a state GStreamer itself recognizes as wrong; it just stops
+producing data. The rAF heartbeat kept ticking at ~1/sec throughout every one of
+these stalls — **the JS main thread stayed fully alive** the entire time; this is
+not a UI freeze (mechanism A/B in `skills/audio-debugging`) at all, and self-heal
+(which only watches `<video>`-element symptoms) correctly never fired — it isn't
+built to catch this.
+
+**Why this reached a fresh discovery only now**: `pipeline.rs` gained an
+`input_selector`-based topology (normal decode path vs. an `appsrc`-fed PCM-scratch
+branch) in recent scratch-feature work, and no prior test in this project ran a
+plain track to its own natural end, repeatedly, under continuous automated
+observation — prior sessions used seeks, short bursts, and loops, which this bug
+doesn't affect (see the clean 30-minute sustained-loop result below — a loop that
+never approaches the file's true end never hits this). It is **not caused by, or
+specific to, the WebCodecs work** — it affects the pre-existing shared Rust audio
+pipeline that both backends depend on as their master clock, confirmed by run #3
+above reproducing on a plain `legacy` deck.
+
+**Disposition**: this blocks a clean phase 4 close and must be fixed (in
+`src-tauri/src/audio/pipeline.rs`, most likely around the `input_selector`/
+`output_queue` tail-of-stream handling) before Phase 5, independent of WebCodecs'
+own status. Filed here rather than silently worked around, per this document's own
+instruction not to soften a genuine freeze finding.
+
+### Off-tempo natural-EOS soak (×10 target)
+
+Could not be completed as specified — the deterministic stall above meant every
+attempt on the 25.693s clip at 0.87× stalled at the identical point before a track
+ever reached one full natural pass. **3 attempts, 3 stalls, 0 clean completions**
+(see rows #1–#3 above) — further repetitions would only reproduce the same
+deterministic failure, so the remaining 7 reps were not run; the useful signal (a
+100%-reproducible stall, not an intermittent one) was already established.
+
+### Sustained off-tempo + loop, 30+ minutes — clean for 28 minutes, then a real freeze caught and recovered by freeze-watchdog
+
+Deck-0 forced `webcodecs`, 265.08s clip, `playbackRate=0.87`, `loopIn=60`/
+`loopOut=68` (an 8s loop well clear of both the start and the EOS-stall zone
+above). Polled every 45s, cross-checked with two extended (90–120s)
+`pidstat` CPU samples and an `pw-top` xrun check mid-run.
+
+**First 28 minutes (1666s, 37 polls): clean.** `getAudioTime` oscillated
+correctly within the 56–68s loop window on every poll (confirmed multiple full
+wrap cycles, including brief exact-match readings between `getAudioTime` and
+`getCodecFramePts`, e.g. poll 26: both 58.4x); `getLegacyVideoOpCounts('deck-0')`
+stayed all-zero (`currentTime`/`playbackRate`/`playPause`/`hasVideoEl:false`) on
+every single poll — zero legacy `<video>` DOM writes across the entire run;
+rAF heartbeat never gapped (checked directly in the app log, not just inferred
+from successful polls); `pw-top` showed the xrun ERR counter low and stable
+(106, non-climbing) — no cascade, unlike the EOS-stall condition. Extended
+`pidstat` sampling (uncontaminated by concurrent WebDriver polling, unlike the
+per-poll numbers) put steady-state WebKitWebProcess CPU at **~97–100% average**
+across four separate 90–120s windows spanning the run.
+
+**At ~28 minutes (2026-07-26 00:28:17 UTC / 20:28:17 EDT): a real, spontaneous
+freeze — and the freeze-watchdog caught and recovered it correctly.** The app
+log shows:
+```
+[watchdog] TRIGGER: window 'main' silent for >= 6s — last stats: {...,"lastRafMs":153}
+[watchdog]   descendant pid=2632100 comm=WebKitNetworkPr state=S etimes=3092s
+             Δutime=0 Δstime=0 [near-0%-CPU, all-parked — matches known deadlock signature]
+[watchdog] recovery tier1 (eval reload): window 'main'
+[watchdog] recovery tier2 (native reload): window 'main'
+[watchdog] window 'main' heartbeat resumed after 11.4s silence
+[recovery] rehydrating session — 1 live pipeline(s)
+[recovery] adopted deck-0 at 66.17s playing=true
+[watchdog] recovery sequence for 'main' succeeded
+```
+The watchdog identified a parked `WebKitNetworkProcess` descendant (not
+`WebKitWebProcess` — the process that owns the webview's `fetch()` calls,
+notably including `codecWorker.ts`'s AU-fetch requests to the local media
+server) as matching its known-deadlock signature, tier1 (JS eval reload)
+didn't resolve it within 3s, tier2 (native window reload) did. Total time
+from actual freeze onset to recovered/rehydrated: **~14 seconds** (11.4s
+silent + ~3s to complete rehydration). Heartbeat resumed cleanly and kept
+ticking for 90+ seconds of further observation with no additional triggers or
+`[self-heal]` lines. **This is a genuine, previously-uncaught freeze — a
+`WebKitNetworkProcess` deadlock, not mechanism A or B (both specific to
+`WebKitWebProcess`'s internal `<video>`-element GStreamer pipeline, which
+this deck doesn't have at all) — plausibly related to the webcodecs path's
+HTTP-based AU-fetch transport under sustained load.** Not root-caused this
+session (would need the same `gdb`/network-process-specific investigation the
+EOS-stall finding above couldn't get either, for the same `ptrace_scope`
+reason). Filed as a second, distinct freeze-class finding, separate from the
+EOS-stall bug — but note the practical outcome: the system recovered
+automatically in ~14s with **no user-visible failure beyond a brief reload**,
+which is exactly the safety net `freeze-watchdog.md` was built to provide.
+This is a real, uncontrived freeze-watchdog save, not a synthetic
+`kill -STOP`/`freezeMainThread()` test — the strongest evidence yet that the
+watchdog works as designed.
+
+(The WebDriver session itself died at this point — "session deleted because
+of page crash or hang" — consistent with `verify-ui`'s documented gotcha that
+a Rust-triggered native reload breaks the WebDriver session even though the
+page itself recovers correctly; recovery was confirmed via the app log per
+that skill's own guidance, not by polling the dead session.)
+
+**Minor secondary observation, not root-caused**: during this test,
+`getCodecFramePts('deck-0')` intermittently returned values wildly
+inconsistent with `getAudioTime` (e.g. audio at ~61s, frame pts reading
+~208–233s) on most polls, self-correcting on at least one poll (#26, both
+~58.4x). The wrong values are suspiciously exact multiples of a ~24fps frame
+interval (`208.333333 × 24 = 5000.0` exactly; `226.333333 × 24 = 5432.0`
+exactly; similarly for others), suggesting a frame is occasionally being
+mislabeled with an index-derived pts rather than its real decoded pts —
+possibly in the loop-prefetch path. No visible symptom was confirmed (a
+`toDataURL()` screenshot during the anomaly showed static album-art content
+typical of this file, so a wrong-frame selection wouldn't be perceptible
+here) — flagged for follow-up investigation, not conflated with either freeze
+finding above.
+
+### MIDI-rate burst via `latency-test.sh`
+
+`scripts/latency-test.sh` gained a `[backend]` argument (`legacy`, default, or
+`webcodecs`) — a small, structure-preserving addition: forces deck-0's A/B
+override before loading (explicitly, on **both** branches — see gotcha below),
+swaps the "video position" reads in steps 4/7/8 from `getVideoTime()` (no
+`<video>` element on webcodecs) to `getCodecFramePts()`, and adds a step 10
+asserting `getLegacyVideoOpCounts('deck-0')` stayed all-zero through the
+entire run, including the MIDI burst.
+
+**Gotcha found and fixed while writing this**: the first legacy run showed 2
+failures (steps 4 and 7, position stuck at 0). Root cause: `cuemark:videoPathOverride`
+is a `persistentWritable` backed by WebKit's `localStorage` for the app's
+origin, which **survives across app process restarts**, not just page
+reloads. Manual `setVideoPathOverride('deck-0','webcodecs')` calls from
+earlier in this same phase 4 session had persisted `{"deck-0":"webcodecs"}`
+to disk; the "legacy" test run never explicitly reset it, so deck-0 silently
+resolved to `webcodecs` (confirmed via `getVideoBackend()` + reading
+`localStorage.getItem('cuemark:videoPathOverride')` directly) — `getVideoTime()`
+correctly returned null/0 for a deck with no `<video>` element. **Not a
+product bug** — audio, IPC, and MIDI-burst all worked fine underneath; only
+the position-source assertions in the test were affected. Fixed by forcing
+the override explicitly for both `legacy` and `webcodecs` (previously only
+the `webcodecs` branch did this).
+
+Final clean results after the fix:
+- **legacy**: 10/10 passed. IPC round-trip `p50=20ms p99=45ms`; MIDI burst
+  200 events in 3.87s, WebKitWebProcess avg CPU 59.80% during the burst;
+  post-burst IPC `p99=3ms`; 2×-rate position check `+6.15s` in 3s (expected
+  ~6s).
+- **webcodecs**: 14/14 passed (10 shared + step 10's zero-regression check).
+  IPC round-trip `p50=95ms p99=105ms` (higher — consistent with the general
+  host load during this run, see the CPU baseline note below, not a
+  backend-specific IPC cost: both backends' IPC goes through the identical
+  Rust `audio_set_rate` command); MIDI burst 200 events in 13.9s (throttled
+  under load — `setInterval` throttling under CPU pressure is an
+  already-documented `verify-ui` gotcha, not new), CPU 70.78% during burst;
+  post-burst IPC `p99=2ms`; 2×-rate check `+6.13s` in 3s;
+  `getLegacyVideoOpCounts('deck-0')` all-zero (`hasVideoEl:false`) through
+  the entire run including the burst.
+
+### CPU baseline (`perf-idle-test.sh`)
+
+| Scenario | This run | Phase 2/3 baseline |
+|---|---|---|
+| empty | 3.12% | — |
+| visualization-layer-animating | 88.75% | — |
+| video-deck-paused | 3.62% | — |
+| two-video-decks-paused | 4.38% | — |
+| video-deck-playing (legacy) | 112.13% | 46–50% |
+| webcodecs-deck-playing | 111.38% | ~50% |
+
+Both playing scenarios are well above the phase 2/3 baseline **in absolute
+terms**, but legacy and webcodecs remain at parity with each other (111–112%,
+~1% apart) — the number that actually matters for a regression check.
+Checked the host at the time: `load average: 2.6` on a 4-core box, `top`
+showing **68.8% iowait and 4.1 GB of swap in use** — the machine was under
+genuine memory/IO pressure from ~45 minutes of cumulative Xvfb/WebKit test
+sessions (EOS-stall repros, extended `pidstat` sampling, the 28-minute soak),
+not a code-level CPU regression. Both backends degrading by the same
+proportion supports host contention over a webcodecs-specific issue. Re-run
+on a quiesced host before trusting the absolute numbers for a real go/no-go
+CPU decision.
+
+### Cleanup
+
+All Xvfb/tauri-driver/app processes launched for this phase were torn down
+after every test; confirmed via `pgrep -af "tauri-driver|Xvfb|target/debug/cuemark|WebKitWebDriver"`
+returning clean (only the user's own unrelated real-desktop processes, none
+touched) at the end of the session.
+
 ## Risks and open items
 
+- **Two open freeze/stall findings from phase 4, neither fixed yet**: (1) a
+  shared Rust `DeckAudioPipeline` stall a fraction of a second before every
+  track's true end (100% reproducible, independent of rate/file/backend —
+  blocks Phase 5, not webcodecs-specific); (2) a `WebKitNetworkProcess`
+  deadlock caught once during a 28-minute webcodecs soak, recovered
+  automatically by `freeze-watchdog.md`'s tiered reload in ~14s. See "Phase 4
+  results" for full evidence on both. Root-causing either would benefit from
+  a live `gdb` backtrace at the moment of the stall (the technique
+  `skills/audio-debugging` already documents) — not obtained this session
+  because `ptrace_scope=1` blocked attaching to the already-running process
+  and no passwordless `sudo` was available; a future session with `sudo`
+  access (or launching the target process under `gdb --args` from the start,
+  per the skill's own workaround) should get much further.
 - **WebCodecs implementation quality in WebKitGTK**: it is GStreamer-backed too, but
   decoder-element-only — none of `MediaPlayerPrivateGStreamer`, `multiqueue`
   rate-scaled buffering, or segment/EOS machinery is involved. The `VideoEncoder`

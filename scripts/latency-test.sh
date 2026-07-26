@@ -7,7 +7,8 @@
 #   1. Debug hook is present
 #   2. Load a track on deck-0 via the hook
 #   3. Waveform canvas renders non-black pixels
-#   4. Playback advances video.currentTime
+#   4. Playback advances the deck's position clock (video.currentTime on legacy,
+#      codec frame pts on webcodecs — see BACKEND below)
 #   5. audio_set_rate IPC round-trips: reports {min, p50, p99, max, mean} ms
 #   6. MIDI-rate burst (200 events @ 200 Hz): reports CPU% + confirms pipeline survives
 #
@@ -15,12 +16,22 @@
 # (see skills/verify-ui/SKILL.md for full setup)
 #
 # Usage:
-#   ./scripts/latency-test.sh <video_file>
+#   ./scripts/latency-test.sh <video_file> [backend]
+#
+# backend: "legacy" (default) or "webcodecs" — forces deck-0's per-deck A/B
+# override (docs/design/webcodecs-video-path.md phase 2) before loading. On
+# webcodecs, steps 4/7/8's "video position" reads come from
+# getCodecFramePts() (the decoded-frame clock) instead of getVideoTime() (no
+# <video> element exists for this deck at all on that backend), and a final
+# step confirms getLegacyVideoOpCounts('deck-0') stayed all-zero for the whole
+# run — the standing proof-instrumentation from phase 3 that no legacy <video>
+# DOM write ever reached this deck, including during the MIDI burst.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VIDEO_FILE="${1:?Usage: $0 <video_file>}"
+VIDEO_FILE="${1:?Usage: $0 <video_file> [backend]}"
+BACKEND="${2:-legacy}"
 BINARY="$(pwd)/src-tauri/target/debug/cuemark"
 DRIVER_PORT=4444
 DISPLAY_NUM=99
@@ -105,6 +116,20 @@ webkit_pid() {
   pgrep -P "$main_pid" -f WebKitWebProcess | head -1
 }
 
+# Deck-0's "video position" clock: v.currentTime on legacy (a real <video>
+# element exists), or the codec player's currently-selected frame pts on
+# webcodecs (no <video> element on this backend at all — see
+# docs/design/webcodecs-video-path.md phase 2/3). Empty/null result on
+# webcodecs usually means the worker hasn't decoded a frame yet; callers
+# already sleep before reading.
+video_pos() {
+  if [ "$BACKEND" = "webcodecs" ]; then
+    js_sync "return window.__cuemarkDebug.getCodecFramePts('deck-0')"
+  else
+    js_sync "return window.__cuemarkDebug.getVideoTime('deck-0')"
+  fi
+}
+
 PASS=0
 FAIL=0
 
@@ -138,6 +163,18 @@ HOOK_OK=$(js_sync "return typeof window.__cuemarkDebug !== 'undefined'")
 check_eq "debug hook present" "$HOOK_OK" "true"
 
 echo
+echo "=== Step 1b: force deck-0 to the ${BACKEND} backend ==="
+# Explicit even for the legacy default: cuemark:videoPathOverride is a persistentWritable
+# (WebKit localStorage, keyed by origin — survives app restarts, not just page reloads).
+# A prior manual/debug session that toggled deck-0 to webcodecs leaves that override on
+# disk; without forcing it back here, a "legacy" run silently inherits webcodecs instead
+# (found live running phase 4 of docs/design/webcodecs-video-path.md — steps 4/7 "failed"
+# with position stuck at 0 because getVideoTime() correctly returns null/0 for a deck with
+# no <video> element at all, not because legacy playback was actually broken).
+js_sync "window.__cuemarkDebug.setVideoPathOverride('deck-0', '$BACKEND');" >/dev/null
+echo "  override set (docs/design/webcodecs-video-path.md phase 2 A/B toggle)"
+
+echo
 echo "=== Step 2: load track on deck-0 ==="
 # Escape the file path for embedding in a JSON string
 ESCAPED_PATH=$(printf '%s' "$VIDEO_FILE" | sed 's/\\/\\\\/g; s/"/\\"/g')
@@ -162,16 +199,16 @@ WAVEFORM_PIXELS=$(js_sync "
 check_nonzero "waveform has non-black pixels" "$WAVEFORM_PIXELS"
 
 echo
-echo "=== Step 4: playback advances video.currentTime ==="
+echo "=== Step 4: playback advances the deck's position clock (${BACKEND}) ==="
 js_sync "window.__cuemarkDebug.updateDeck('deck-0', {playing:true});" >/dev/null
 sleep 2
 
-T1=$(js_sync "return window.__cuemarkDebug.getVideoTime('deck-0') ?? 0")
+T1=$(video_pos); T1=${T1:-0}; [ "$T1" = "null" ] && T1=0
 sleep 1
-T2=$(js_sync "return window.__cuemarkDebug.getVideoTime('deck-0') ?? 0")
-echo "  video.currentTime: $T1 → $T2"
+T2=$(video_pos); T2=${T2:-0}; [ "$T2" = "null" ] && T2=0
+echo "  position (${BACKEND}): $T1 → $T2"
 ADVANCED=$(awk "BEGIN{print ($T2 > $T1) ? \"true\" : \"false\"}" 2>/dev/null || echo "false")
-check_eq "video.currentTime advancing" "$ADVANCED" "true"
+check_eq "position advancing" "$ADVANCED" "true"
 
 echo
 echo "=== Step 5: audio_set_rate IPC latency (20 sequential round-trips) ==="
@@ -255,12 +292,12 @@ echo "=== Step 7: position tracks content time at 2× rate ==="
 # After seeking, give the GStreamer seek extra time on heavy videos (may take >500ms to flush,
 # re-preroll, and start returning the new position from query_position).
 js_sync "window.__cuemarkDebug.updateDeck('deck-0', {playing: true, playbackRate: 2.0});" >/dev/null
-sleep 0.2  # let WebKit rebuild settle before seeking
+sleep 0.2  # let WebKit rebuild settle before seeking (legacy) / rate has no pipeline effect at all (webcodecs)
 js_sync "window.__cuemarkDebug.seek('deck-0', 0);" >/dev/null
 sleep 1.2  # let GStreamer seek + preroll complete; pendingSeekTarget filters stale IPC responses
-P_RATE2_START=$(js_sync "return window.__cuemarkDebug.getVideoTime('deck-0') ?? 0")
+P_RATE2_START=$(video_pos); P_RATE2_START=${P_RATE2_START:-0}; [ "$P_RATE2_START" = "null" ] && P_RATE2_START=0
 sleep 3
-P_RATE2_END=$(js_sync "return window.__cuemarkDebug.getVideoTime('deck-0') ?? 0")
+P_RATE2_END=$(video_pos); P_RATE2_END=${P_RATE2_END:-0}; [ "$P_RATE2_END" = "null" ] && P_RATE2_END=0
 RATE2_ADV=$(awk "BEGIN{printf \"%.2f\", $P_RATE2_END - $P_RATE2_START}")
 echo "  at 2×: $P_RATE2_START → $P_RATE2_END (+${RATE2_ADV}s in 3s real time; expect ~6s)"
 RATE2_OK=$(awk "BEGIN{print ($RATE2_ADV >= 4.0 && $RATE2_ADV <= 9.0) ? \"true\" : \"false\"}")
@@ -269,24 +306,28 @@ js_sync "window.__cuemarkDebug.updateDeck('deck-0', {playbackRate: 1.0});" >/dev
 sleep 0.5  # let rate settle back to 1×
 
 echo
-echo "=== Step 8: waveform audio time matches video time ==="
-# getDeckTime (what the waveform reads) and video.currentTime should both reflect content
-# position (rate-corrected). A large difference means one of them is still tracking
-# wall-clock time instead of content time.
+echo "=== Step 8: waveform audio time matches ${BACKEND} position (${BACKEND}) ==="
+# getDeckTime (what the waveform reads) and the deck's own position clock should both
+# reflect content position (rate-corrected). A large difference means one of them is
+# still tracking wall-clock time instead of content time. On legacy that's
+# video.currentTime; on webcodecs it's the codec player's selected frame pts
+# (getCodecFramePts) — same comparison, different position source per backend.
 #
 # Seek to a stable mid-video position and let one IPC round-trip complete before reading.
 # This avoids the transient divergence right after a rate change: stale capturedRate
 # (now fixed in App.svelte) and WebKit's internal pipeline rebuild from v.playbackRate
-# writes can both cause brief mismatches within the first ~200ms post-rate-change.
+# writes can both cause brief mismatches within the first ~200ms post-rate-change
+# (webcodecs has no v.playbackRate write at all, so this settle window mostly matters
+# for legacy — kept the same on both for a fair comparison).
 js_sync "window.__cuemarkDebug.seek('deck-0', 30.0);" >/dev/null
 js_sync "window.__cuemarkDebug.updateDeck('deck-0', {playing: true, playbackRate: 1.0});" >/dev/null
 sleep 1.0  # two IPC round-trips (~2 × 200ms) + margin to settle snap and audioTimes
-VID_T=$(js_sync "return window.__cuemarkDebug.getVideoTime('deck-0') ?? 0")
+VID_T=$(video_pos); VID_T=${VID_T:-0}; [ "$VID_T" = "null" ] && VID_T=0
 AUD_T=$(js_sync "return window.__cuemarkDebug.getAudioTime('deck-0') ?? 0")
-echo "  videoTime=$VID_T  audioTime(waveform)=$AUD_T"
+echo "  ${BACKEND}Position=$VID_T  audioTime(waveform)=$AUD_T"
 WAVEFORM_DIFF=$(awk "BEGIN{printf \"%.3f\", ($VID_T > $AUD_T) ? $VID_T - $AUD_T : $AUD_T - $VID_T}")
 WAVEFORM_OK=$(awk "BEGIN{print ($WAVEFORM_DIFF < 0.5) ? \"true\" : \"false\"}")
-check_eq "waveform time within 500ms of video time" "$WAVEFORM_OK" "true"
+check_eq "waveform time within 500ms of ${BACKEND} position" "$WAVEFORM_OK" "true"
 
 echo
 echo "=== Step 9: MIDI state save I/O benchmark (100 atomic writes) ==="
@@ -304,6 +345,25 @@ SAVE_P99=$(echo "$SAVE_STATS" | jq -r '.p99_ms // 9999' 2>/dev/null || echo 9999
 # Each write is ~200 bytes (6 keys). On a typical SSD fsync latency is 0.1–2ms;
 # threshold is 20ms to accommodate slow mechanical drives or tmpfs under load.
 check_lt "MIDI save p99 < 20 ms" "$SAVE_P99" 20
+
+if [ "$BACKEND" = "webcodecs" ]; then
+  echo
+  echo "=== Step 10: legacy <video> op counts stayed zero for the whole run ==="
+  # Standing zero-regression check from phase 3 (docs/design/webcodecs-video-path.md):
+  # a webcodecs-backend deck must never reach a v.currentTime/v.playbackRate/play()/
+  # pause() call site or hold a <video> element at all, including through this script's
+  # own load/seek/rate-change/MIDI-burst steps above.
+  OPCOUNTS=$(js_sync "return JSON.stringify(window.__cuemarkDebug.getLegacyVideoOpCounts('deck-0'));")
+  echo "  $OPCOUNTS"
+  CT=$(echo "$OPCOUNTS" | jq -r '.currentTime // -1')
+  PR=$(echo "$OPCOUNTS" | jq -r '.playbackRate // -1')
+  PP=$(echo "$OPCOUNTS" | jq -r '.playPause // -1')
+  HV=$(echo "$OPCOUNTS" | jq -r '.hasVideoEl')
+  check_eq "legacy currentTime writes == 0" "$CT" "0"
+  check_eq "legacy playbackRate writes == 0" "$PR" "0"
+  check_eq "legacy play/pause calls == 0" "$PP" "0"
+  check_eq "no <video> element registered" "$HV" "false"
+fi
 
 echo
 echo "========================================"
