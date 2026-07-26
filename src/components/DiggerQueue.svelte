@@ -10,6 +10,7 @@
     type DiggerTrack, type DiggerQueueItem,
   } from '../lib/digger/api';
   import { markGridSaved } from '../lib/audio/gridSource';
+  import { setPendingTrackMeta } from '../lib/state/history';
 
   let queue = $state<DiggerQueueItem[]>([]);
   let searchResults = $state<DiggerTrack[]>([]);
@@ -124,6 +125,9 @@
       // Only apply bpm/downbeat as a pair — a downbeat is only meaningful relative to
       // the bpm it was set against, so a partial grid would produce an inconsistent one.
       const hasGrid = bpm !== null && downbeat !== null;
+      // Deck has no title/artist fields — stash them for history.ts's session-store
+      // subscriber to pick up right after this updateDeck() call lands.
+      setPendingTrackMeta(deckId, item.title, item.artist);
       updateDeck(deckId, {
         source: { type: 'video', filePath: payload.filePath, duration: 0 },
         playing: false,

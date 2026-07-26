@@ -109,7 +109,10 @@
       filters: [{ name: "Video", extensions: ["mp4", "webm", "mkv", "mov", "avi", "ogv"] }],
     });
     if (typeof file === "string") {
-      updateDeck(deck.id, { source: { type: "video", filePath: file, duration: 0 }, playing: false });
+      // diggerTrackId must be cleared here — it's never reset elsewhere, so loading a
+      // local file over a deck that previously held a Digger track would otherwise
+      // leave marker pushes (SET BEAT, cue, hot cues) silently writing to the old track.
+      updateDeck(deck.id, { source: { type: "video", filePath: file, duration: 0 }, playing: false, diggerTrackId: null });
     }
   }
 
@@ -230,7 +233,14 @@
         ⏮
       </button>
       <button
-        onclick={() => { const t = getDeckTime(deck.id); if (t !== null) updateDeck(deck.id, { cuePoint: t }); }}
+        onclick={() => {
+          const t = getDeckTime(deck.id);
+          if (t === null) return;
+          updateDeck(deck.id, { cuePoint: t });
+          if (deck.diggerTrackId !== null) {
+            pushMarker(deck.diggerTrackId, Math.round(t * 1000), 'cue').catch(console.error);
+          }
+        }}
         title="Set cue point at current position"
       >
         SET
@@ -395,9 +405,13 @@
           } else {
             const now = getDeckTime(deck.id);
             if (now !== null) {
+              const quantized = quantizeToGrid(deck.id, now);
               const cues = [...deck.hotCues];
-              cues[i] = quantizeToGrid(deck.id, now);
+              cues[i] = quantized;
               updateDeck(deck.id, { hotCues: cues });
+              if (deck.diggerTrackId !== null) {
+                pushMarker(deck.diggerTrackId, Math.round(quantized * 1000), 'hot_cue', `Hot cue ${i + 1}`).catch(console.error);
+              }
             }
           }
         }}

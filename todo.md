@@ -317,12 +317,30 @@ Cuemark does not embed a file browser — Digger feeds cuemark.
 - Drag-to-reorder; remove items from queue
 - Auto-advance option: when a deck's clip ends, auto-load next queue item to that deck
 
-### session playback history
-- Running log of what has played this session: deck id, title, artist, timestamp, duration played
-- Scrollable history panel (sidebar or below decks)
-- "Re-add to queue" action per history entry
-- "Push markers to Digger" — after editing cue/hot-cues on a loaded track, write them back
-  via `POST /tracks/{id}/markers`; requires cuemark to track which Digger track ID is on each deck
+### session playback history [done, 2026-07-26]
+- `src/lib/state/history.ts`: running log derived by subscribing to the `session` store
+  (deck id, title, artist, file path, load timestamp, accumulated played-ms) rather than
+  instrumenting every play/pause call site — there are several (DeckCard's transport
+  button, App.svelte's EOS handler, the MIDI handler, `video.onended`, sync_toggle) and a
+  low-frequency store subscription is the right tool for a discrete-action log like this
+  (unlike the continuous MIDI controls that must bypass the store — see
+  `docs/design/av-sync-architecture.md`).
+- `src/components/HistoryPanel.svelte`: scrollable panel (toolbar "History" toggle,
+  same sidebar slot pattern as the Queue panel), ticks the currently-playing entry's
+  duration once per second.
+- "Re-add to queue" action per entry — calls `addToQueue(diggerTrackId)`; disabled for
+  entries with no Digger track id (locally-loaded files).
+- "Push markers to Digger" — cue point (SET button) and hot cues (DeckCard) now call
+  `pushMarker(diggerTrackId, positionMs, 'cue' | 'hot_cue')` on set, same best-effort
+  fire-and-forget pattern already used for SET BEAT's downbeat/bpm push. Title/artist for
+  history entries come from `setPendingTrackMeta()`, called by `DiggerQueue.svelte`'s
+  `loadToDeck()` right before `updateDeck()` sets the new source (Deck itself has no
+  title/artist fields); local-file loads fall back to the filename.
+- **Fixed a latent bug found while wiring this up**: `DeckCard.svelte`'s `loadVideo()`
+  never reset `diggerTrackId` to `null` when loading a local file over a deck that
+  previously held a Digger track — every marker push (including the pre-existing SET
+  BEAT one) would have silently written to the stale track id. Now cleared alongside
+  `source` in the same `updateDeck()` call.
 
 ### Digger connection
 - Quick search widget in toolbar: text input → `GET /search?q=` → mini dropdown of results →

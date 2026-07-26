@@ -24,6 +24,7 @@
   import WaveformCanvas from "./components/WaveformCanvas.svelte";
   import AudioSettings from "./components/AudioSettings.svelte";
   import DiggerQueue from "./components/DiggerQueue.svelte";
+  import HistoryPanel from "./components/HistoryPanel.svelte";
   import { mainOutputDeviceIds, cueOutputDeviceId, cueGain } from "./lib/audio/audioSettings";
   import { CodecPlayer, type DemuxInfo } from "./lib/video/codecPlayer";
   import { videoPathOverrides, videoPathDefault, resolveVideoPath, setVideoPathOverride } from "./lib/video/videoPathSettings";
@@ -50,6 +51,7 @@
   let tapResetTimer: ReturnType<typeof setTimeout> | undefined;
   let showAudioSettings = $state(false);
   let showDiggerQueue = $state(true);
+  let showHistory = $state(false);
   let showVisualizationPanel = $state(false);
 
   function handleTap() {
@@ -1304,6 +1306,11 @@
     >Queue</button>
     <button
       class="output-btn"
+      class:active={showHistory}
+      onclick={() => { showHistory = !showHistory; }}
+    >History</button>
+    <button
+      class="output-btn"
       class:active={showVisualizationPanel}
       onclick={() => { showVisualizationPanel = !showVisualizationPanel; }}
     >Visualization</button>
@@ -1385,6 +1392,12 @@
     {#if showDiggerQueue}
       <aside class="queue-sidebar">
         <DiggerQueue />
+      </aside>
+    {/if}
+
+    {#if showHistory}
+      <aside class="queue-sidebar">
+        <HistoryPanel />
       </aside>
     {/if}
   </div>

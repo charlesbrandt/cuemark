@@ -62,8 +62,14 @@ sidebar.
 ## What cuemark owns
 
 - Current play queue — ordered list of upcoming loads; may be populated from Digger or manually
-- Session playback history — what has played this session (deck, title, artist, timestamp)
-- Runtime cue/hot-cue state; persisting them across sessions = push back to Digger markers API
+- Session playback history [done, 2026-07-26] — `src/lib/state/history.ts` + `HistoryPanel.svelte`;
+  derived from the `session` store rather than instrumenting every play/pause call site. Title/artist
+  come from `setPendingTrackMeta()` (called by `loadToDeck()` before the new source lands) since `Deck`
+  itself has no title/artist fields; local-file loads fall back to the filename.
+- Runtime cue/hot-cue state; persisting them across sessions = push back to Digger markers API.
+  `pushMarker(trackId, positionMs, type)` is called for `'cue'` (DeckCard SET button), `'hot_cue'`
+  (DeckCard hot cue buttons), and `'downbeat'` (SET BEAT) — all best-effort/fire-and-forget, all
+  gated on `deck.diggerTrackId !== null`.
 
 ## Boundary rules
 
