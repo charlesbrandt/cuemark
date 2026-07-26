@@ -1,6 +1,17 @@
 # WebCodecs video path: replacing the `<video>` element for deck playback (design)
 
-Status: **phase 4 (soak + live testing) automated portion done; one of two
+Status: **phase 5 (flip the default) done, 2026-07-26** — `videoPathSettings.ts`'s
+`envDefault` now resolves to `webcodecs` unless `VITE_VIDEO_PATH=legacy` is set at
+build time; legacy remains available as a per-deck override and as the automatic
+fallback for codecs the demuxer/decoder can't handle. Gate scripts re-run clean on
+both backends after the flip (`npm run check` 0 errors; `perf-idle-test.sh`
+`webcodecs-deck-playing` 98.38% vs. `video-deck-playing` 103.25%, parity as in
+prior phases; `latency-test.sh` 10/10 legacy, 14/14 webcodecs). See "Phase 5
+results" below. Only the doc's own suggested next step — "reassess deleting
+[legacy] entirely after a few weeks of use" — remains open, and is deliberately
+deferred, not attempted this session.
+
+Previously: phase 4 (soak + live testing) automated portion done; one of two
 2026-07-25 findings fixed and verified 2026-07-26, one still open** — (1) the
 ×10 natural-EOS soak surfaced a 100%-reproducible silent stall in the shared
 Rust `DeckAudioPipeline` a fraction of a second before every track's true end,
@@ -267,8 +278,10 @@ every phase; new soak test added in Phase 4. One phase per PR/branch; do not com
    watchdog works, but also a previously-uncaught freeze class worth
    root-causing. The MIDI-burst and CPU-baseline conditions completed
    cleanly (no freezes) on the webcodecs backend.
-5. **Flip the default.** Keep legacy `<video>` as automatic fallback for
-   unsupported codecs; reassess deleting it entirely after a few weeks of use.
+5. **DONE (2026-07-26). Flip the default.** Legacy `<video>` remains the
+   automatic fallback for unsupported codecs; reassess deleting it entirely
+   after a few weeks of use (not attempted this session — see "Phase 5
+   results").
 
 ## Phase 1 results (2026-07-25)
 
@@ -904,6 +917,39 @@ pre-freeze position (a rehydration-accuracy gap, not a freeze-recovery failure �
 worth a closer look if it recurs, but not re-investigated this session). Still
 tracked as the one lower-priority open item below; this is additional evidence, not
 a root cause.
+
+## Phase 5 results (2026-07-26)
+
+**Change**: `src/lib/video/videoPathSettings.ts`'s `envDefault` flipped from
+`legacy`-unless-`VITE_VIDEO_PATH=webcodecs` to `webcodecs`-unless-
+`VITE_VIDEO_PATH=legacy`. This is the only code change — `resolveVideoPath()`,
+the per-deck override map, and the `legacy-fallback` path for codecs the
+demuxer/decoder can't handle are all untouched, so a deck whose file fails
+WebCodecs decode still transparently falls back to the legacy `<video>` path
+exactly as before. Per `persistentWritable`'s existing first-run-only
+semantics (already documented in the file), this only changes the *default*
+for installs with no persisted `cuemark:videoPathDefault` value yet — any
+machine that already has one (including this project's own long-running dev
+sessions from phases 2–4's manual A/B toggling) keeps its existing persisted
+choice until a user explicitly changes it.
+
+**Verification** (rebuilt with `VITE_ENABLE_DEBUG_HOOK=1 cargo tauri build
+--debug --no-bundle` after the flip, per `verify-ui`):
+
+- `npm run check` — clean, 230 files, 0 errors/warnings.
+- `scripts/perf-idle-test.sh` (25.693s clip): `webcodecs-deck-playing` 98.38%
+  vs. `video-deck-playing` 103.25% — parity with prior phases' recorded
+  baselines, no regression from the flip.
+- `scripts/latency-test.sh` (8s light clip, both backends forced via the A/B
+  override to re-confirm each path independently of the new default):
+  **legacy 10/10 passed** (IPC `p50=157ms p99=181ms`; MIDI burst 200 events/
+  3.66s, CPU 11.68%); **webcodecs 14/14 passed** (IPC `p50=4ms p99=111ms`;
+  MIDI burst 200 events/5.09s, CPU 16.45%; `getLegacyVideoOpCounts` all-zero
+  throughout, confirming no legacy `<video>` DOM writes leak from a
+  webcodecs-backed deck).
+
+No new findings this phase — the flip is a one-line default change riding on
+infrastructure phases 1–4 already built and verified.
 
 ## Risks and open items
 

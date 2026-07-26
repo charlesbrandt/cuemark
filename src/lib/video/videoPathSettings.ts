@@ -34,11 +34,14 @@ function persistentWritable<T>(key: string, defaultValue: T) {
   };
 }
 
-// VITE_VIDEO_PATH=webcodecs seeds the default only on a machine's first run — once
+// VITE_VIDEO_PATH=legacy seeds the default only on a machine's first run — once
 // localStorage has a value (persistentWritable's `raw !== null` branch), it wins
 // forever regardless of the env var, so a build-time flag never fights a user's
 // already-persisted choice on every load.
-const envDefault: VideoPath = import.meta.env.VITE_VIDEO_PATH === "webcodecs" ? "webcodecs" : "legacy";
+// webcodecs is the default as of docs/design/webcodecs-video-path.md phase 5 —
+// legacy remains available as a per-deck override and as the automatic fallback
+// for codecs the demuxer/decoder can't handle (see resolveVideoPath / legacy-fallback).
+const envDefault: VideoPath = import.meta.env.VITE_VIDEO_PATH === "legacy" ? "legacy" : "webcodecs";
 
 /** Global default video path for decks with no per-deck override. Persisted. */
 export const videoPathDefault = persistentWritable<VideoPath>("cuemark:videoPathDefault", envDefault);
