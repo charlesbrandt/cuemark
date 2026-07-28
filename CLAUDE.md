@@ -329,6 +329,16 @@ but **the old binary keeps running until the rebuild finishes and the window res
 If managing the dev server from Claude Code: kill the background process before making Rust changes,
 then restart after. A change that was edited but never recompiled has no effect at runtime.
 
+**The desktop-launcher release binary is a separate build that never auto-rebuilds** — unlike
+`cargo tauri dev`, nothing watches `src-tauri/` for the launcher build (`~/.local/bin/cuemark`,
+see `run-app` skill's "Desktop launcher" section). It only updates when someone explicitly runs
+`npm run tauri build -- --no-bundle`. Caught stale by a month on 2026-07-26: a live-session freeze
+was diagnosed against a binary built 2026-06-22, missing the *entire* webcodecs-video-path effort
+(phases 1-5) and everything after — the freeze was old, already-fixed behavior, not a regression.
+**Rebuild the launcher binary periodically, and always after a troubleshooting/design-doc session
+that touched `src-tauri/`, before trusting a direct (non-`cargo tauri dev`) launch to reflect
+current code.**
+
 **First-time / new machine setup** (in addition to Rust + Node toolchains):
 ```bash
 # GStreamer dev headers — runtime packages alone aren't enough

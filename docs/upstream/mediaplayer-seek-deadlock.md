@@ -56,6 +56,9 @@ be able to form a cycle with a main-thread-initiated synchronous pipeline event.
 the incidence but cannot eliminate it; the app is migrating video playback off the
 media element entirely.
 
+**See also**: bug 320327 (WebCodecs `VideoEncoder` crash, same build) — a separate defect
+found during the same investigation, filed first as it's trivially reproducible.
+
 **Related but distinct prior bugs** (checked before filing — none is a duplicate):
 several GStreamer/WebKit deadlocks with a similar shape were fixed in 2024, all
 before this WebKitGTK 2.52.3 build:

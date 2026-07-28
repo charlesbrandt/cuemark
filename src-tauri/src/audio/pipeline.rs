@@ -882,6 +882,9 @@ impl DeckAudioPipeline {
             None => return Ok(()),
         };
 
+        // position() returns the seek/output-domain value (same domain query_position
+        // lives in — see seek()'s doc comment). Restore via seek_output_domain, not
+        // seek(), which would treat it as content time and wrongly divide by rate again.
         let position = self.position().unwrap_or(0.0);
         let was_playing = self
             .inner
@@ -892,7 +895,7 @@ impl DeckAudioPipeline {
         self.load(&file_path)?;
 
         if position > 0.01 {
-            let _ = self.seek(position);
+            let _ = self.seek_output_domain(position);
         }
         if was_playing {
             self.play()?;
@@ -910,6 +913,7 @@ impl DeckAudioPipeline {
             None => return Ok(()),
         };
 
+        // See set_devices()'s comment: position() is already in the seek/output domain.
         let position = self.position().unwrap_or(0.0);
         let was_playing = self
             .inner
@@ -920,7 +924,7 @@ impl DeckAudioPipeline {
         self.load(&file_path)?;
 
         if position > 0.01 {
-            let _ = self.seek(position);
+            let _ = self.seek_output_domain(position);
         }
         if was_playing {
             self.play()?;
@@ -962,7 +966,29 @@ impl DeckAudioPipeline {
         Ok(())
     }
 
+    /// Seek to a position in **content time** (the file's own timeline — what the
+    /// waveform, cue points, hot cues, and loop bounds all use).
+    ///
+    /// `pitch` (soundtouch) scales seek positions by the `tempo` ratio when it forwards
+    /// them upstream to the decoder: a `seek_simple(V)` on this pipeline lands the actual
+    /// decoded content at `V * tempo`, not at `V` — confirmed empirically with an
+    /// `identity` probe inserted upstream of `pitch` (see docs/design/rate-position-drift.md,
+    /// "seek-domain scaling bug"). This matches `query_position`/`query_duration`, which
+    /// also live in this same tempo-scaled "seek domain": a 288.5s file at tempo 0.852
+    /// reports `query_duration` = 338.6s (288.5 / 0.852). So to land content at the
+    /// caller's requested `secs`, the seek must be issued at `secs / self.rate`.
+    /// Bypassed at rate 1.0 (no-op division) and by `seek_output_domain` for internal
+    /// callers that already have a value in the scaled domain (e.g. `position()`'s
+    /// return value, when restoring position across a device-switch pipeline rebuild).
     pub fn seek(&mut self, secs: f64) -> Result<(), String> {
+        self.seek_output_domain(secs / self.rate)
+    }
+
+    /// Seek to a raw position in the pipeline's own seek/position domain — i.e. exactly
+    /// what `query_position`/`position()` return, already tempo-scaled. Used internally
+    /// where the caller already holds a value in that domain rather than content time
+    /// (see `seek`'s doc comment for why the two differ at any rate != 1.0).
+    fn seek_output_domain(&mut self, secs: f64) -> Result<(), String> {
         let inner = self.inner.as_ref().ok_or_else(|| "no pipeline loaded".to_string())?;
         // An explicit seek means the user chose a new position — don't restart from 0 on next play().
         inner.at_eos.store(false, Ordering::Relaxed);
@@ -1066,11 +1092,20 @@ impl DeckAudioPipeline {
             return Ok(());
         }
 
+        // query_position() is in the seek/output domain (see seek()'s doc comment) —
+        // scale by self.rate (the tempo currently in effect) to recover true content
+        // time before indexing into the PCM buffer, which is authored at real content
+        // time (scratch bypasses `pitch` entirely — see the module doc comment on
+        // this branch). Without this, starting a scratch gesture after playing at a
+        // non-1.0 rate begins the feeder from the wrong point in the file, off by the
+        // same tempo ratio as the seek-domain bug in seek() (see
+        // docs/design/rate-position-drift.md).
         let start_secs = inner
             .pipeline
             .query_position::<gst::ClockTime>()
             .map(|t| (t.nseconds() as f64 / 1_000_000_000.0).max(0.0))
-            .unwrap_or(0.0);
+            .unwrap_or(0.0)
+            * self.rate;
         let start_frame = start_secs * pcm.rate as f64;
 
         inner.input_selector.set_property("active-pad", &inner.sel_scratch_pad);
@@ -1176,8 +1211,19 @@ impl DeckAudioPipeline {
         // appeared to resume from a keyframe-quantized spot instead of where the wheel
         // actually left off). ACCURATE costs a bit more (decode from the prior keyframe
         // up to target) but this is a discrete once-per-gesture seek, not a hot path.
+        //
+        // This seek travels through `pitch` (the normal branch is now active — see the
+        // input_selector switch above), which scales seek positions by `tempo`/`rate`
+        // (docs/design/rate-position-drift.md, "seek-domain scaling bug"). `pos`/`target`
+        // is real content time (the PCM buffer's own cursor, which bypasses pitch during
+        // scratch), so it must be divided by self.rate before being handed to a seek that
+        // crosses pitch — otherwise, at any non-1.0 rate, the normal branch resumes from
+        // the wrong content position after every scratch gesture.
+        let target_output_domain = gst::ClockTime::from_nseconds(
+            ((pos / self.rate) * 1_000_000_000.0) as u64
+        );
         let t_seek2 = Instant::now();
-        let _ = inner.pipeline.seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, target);
+        let _ = inner.pipeline.seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, target_output_domain);
         let seek2_ms = t_seek2.elapsed().as_secs_f64() * 1000.0;
 
         // Per-phase timing — added after a live session reported the app "choking up"

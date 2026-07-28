@@ -82,9 +82,16 @@
   // property doesn't issue a rate-seek, so the GStreamer segment rate never changes).
   // That means audioPos advances at 1× wall-clock regardless of deck.playbackRate.
   // We integrate per-frame deltas at deck.playbackRate to recover actual content position.
-  // A delta >500ms between consecutive frames (impossible at any real playback rate) signals
-  // a seek — after a seek, GStreamer immediately returns the seek target, which IS the correct
-  // content position, so we use it directly as the new reference.
+  // Seek detection compares the audioPos delta against the WALL-CLOCK time that actually
+  // elapsed since the last poll (nowMs - prev.tsMs), not a fixed 500ms magnitude — since
+  // audioPos is literally wall-clock, a normal (non-seek) poll always has audioPos delta
+  // ≈ elapsed wall time, however long that gap was. A fixed magnitude threshold
+  // false-positives whenever an IPC round-trip is slow (observed >300ms under Mutex
+  // contention, see IPC latency baseline in memory) — a "seek" misdetection snaps
+  // contentPos to the raw unscaled audioPos, permanently drifting the displayed position
+  // ahead of the true (rate-scaled) content position for the rest of playback whenever
+  // rate != 1.0. After a REAL seek, GStreamer immediately returns the seek target, which
+  // IS the correct content position, so we use it directly as the new reference.
   // `tsMs` (performance.now() at the moment this entry was computed) lets the next resolution
   // ask audioSync.ts's rate-history log for the time-weighted average rate actually in effect
   // across the gap, instead of a single instantaneous snapshot (see averageRateOverWindow).
@@ -1174,7 +1181,8 @@
               } else {
                 // Recover content position from wall-clock audioPos (see contentPosTracker comment).
                 const prev = contentPosTracker.get(capturedDeckId);
-                if (prev && Math.abs(audioPos - prev.audioPos) < 0.5) {
+                const wallElapsedSec = prev ? (nowMs - prev.tsMs) / 1000 : 0;
+                if (prev && Math.abs((audioPos - prev.audioPos) - wallElapsedSec) < 0.5) {
                   // Use the time-weighted average rate actually in effect across
                   // [prev.tsMs, nowMs], not just the rate at resolution time. During
                   // active tempo/pitch adjustment the rate can change several times within
@@ -1187,7 +1195,19 @@
                   const rate = averageRateOverWindow(capturedDeckId, prev.tsMs, nowMs, currentRate);
                   contentPos = prev.contentPos + (audioPos - prev.audioPos) * rate;
                 } else {
-                  contentPos = audioPos; // large jump = seek; audioPos IS correct content pos post-seek
+                  // large jump = seek. audioPos is in the seek/output domain (same
+                  // domain query_position always reports in, regardless of rate) — a
+                  // seek issued at content time C now lands the pipeline at C/rate
+                  // (DeckAudioPipeline::seek() divides by rate before calling
+                  // GStreamer, since `pitch` scales seek positions by tempo — see
+                  // docs/design/rate-position-drift.md, "seek-domain scaling bug"),
+                  // so query_position reads back ≈ C/rate right after. Scale by the
+                  // current rate to recover the true content position; using a plain
+                  // snapshot (not averageRateOverWindow) is correct here because a
+                  // seek is a discontinuity — there's no meaningful "previous content
+                  // position" to integrate a rate change across.
+                  const seekRate = get(session).decks.find(d => d.id === capturedDeckId)?.playbackRate ?? 1.0;
+                  contentPos = audioPos * seekRate;
                 }
                 // Filter out stale pre-seek IPC responses. On a heavy video, GStreamer
                 // can take >1s to complete a seek, returning the pre-seek position the

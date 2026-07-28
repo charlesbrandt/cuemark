@@ -324,6 +324,22 @@ are picked up automatically. Launch via the Windows/Super key → type "Cuemark"
 `npm run tauri build -- --no-bundle` — the symlink means no reinstall step, just relaunch
 from the app grid (or `gtk-launch cuemark`) to pick up the new binary.
 
+**This build never auto-rebuilds — it will silently go stale.** Unlike `cargo tauri dev`, nothing
+watches `src-tauri/` for the launcher binary; it only changes when this command is rerun by hand.
+Confirmed the hard way (2026-07-26): a live-session freeze was diagnosed against a launcher binary
+built 2026-06-22 — over a month stale, missing the entire webcodecs-video-path effort (phases 1-5)
+and everything after, so the "freeze" was already-fixed pre-webcodecs behavior, not a regression.
+Rebuild periodically, and always after a troubleshooting or design-doc session that touched
+`src-tauri/`, before trusting a direct launcher-build session to reflect current code:
+```bash
+npm run tauri build -- --no-bundle
+```
+Quick staleness check — compare the binary's mtime against the newest commit touching `src-tauri/`:
+```bash
+stat -c '%y' src-tauri/target/release/cuemark
+git log -1 --format='%ci' -- src-tauri/
+```
+
 **Always use `npm run tauri build -- --no-bundle` for this, never plain `cargo build --release`.**
 A plain `cargo build` bakes in the unmodified `tauri.conf.json`, which still points `devUrl` at the
 Vite dev server — the resulting binary shows "Could not connect to localhost: Connection refused"

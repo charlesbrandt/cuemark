@@ -100,6 +100,17 @@ npm run check
 cd src-tauri && cargo check
 ```
 
+## Logging
+
+Backend logs (audio pipeline, MIDI, device enumeration, GStreamer bus messages) are always
+written to `~/.local/share/com.cuemark.app/logs/cuemark.log`, regardless of how the app was
+launched — `cargo tauri dev`, a release build, or the desktop launcher (even with no attached
+terminal). Tail it live:
+
+```sh
+tail -f ~/.local/share/com.cuemark.app/logs/cuemark.log
+```
+
 ## Hardware
 
 Developed for the **Hercules DJControl Starlight** USB MIDI controller. Plug in before

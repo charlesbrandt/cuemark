@@ -15,11 +15,32 @@ reintroduce if the code is refactored without this context.
 **`query_position` always returns wall-clock stream time** — the soundtouch `tempo` property never issues a
 rate-seek, so the GStreamer segment rate stays 1.0 regardless of `deck.playbackRate`. To recover actual content
 position, `App.svelte` integrates per-frame deltas at `deck.playbackRate` via the `contentPosTracker` Map:
-`contentPos += Δaudio × playbackRate`. A jump > 500 ms between consecutive frames signals a seek, after which
-`audioPos` IS the correct content position. **`resolvedRate` is read at IPC resolution time** (not at IPC start
-time) — if the rate changed while the call was in flight (e.g. 2× → 1×), using the start rate would overshoot
-`contentPos` by `IPC-latency × rate-diff`. The computed `contentPos` is written to `setDeckAudioTime(deckId,
-contentPos)` in `seekBus.ts` where the waveform reads it, and snapped to `v.currentTime` if drift exceeds 80 ms.
+`contentPos += Δaudio × playbackRate`. A seek is detected by comparing `Δaudio` against the wall-clock time that
+actually elapsed since the last poll (`nowMs - prev.tsMs`) — since `audioPos` is literally wall-clock, a normal
+poll always has `Δaudio ≈ elapsed wall time`, however long the IPC round-trip took; only a real seek makes them
+diverge by more than ~500 ms. **Fixed 2026-07-26**: this used to compare `Δaudio`'s raw magnitude against a fixed
+500 ms constant, which false-positived as a "seek" whenever an IPC round-trip ran long (Mutex contention can push
+it past 500 ms) — misdetection snapped `contentPos` to the raw unscaled `audioPos`, permanently drifting the
+displayed position ahead of true content position for the rest of playback at any non-1.0 rate. **`resolvedRate`
+is read at IPC resolution time** (not at IPC start time) — if the rate changed while the call was in flight (e.g.
+2× → 1×), using the start rate would overshoot `contentPos` by `IPC-latency × rate-diff`. The computed `contentPos`
+is written to `setDeckAudioTime(deckId, contentPos)` in `seekBus.ts` where the waveform reads it, and snapped to
+`v.currentTime` if drift exceeds 80 ms.
+
+**Seeks must be converted from content time to `query_position`'s domain before being issued — they are NOT the
+same domain at any rate != 1.0.** `pitch` (soundtouch) scales every seek position it forwards upstream to the
+decoder by the `tempo` ratio, but `query_position`/`query_duration` (and therefore `audioPos` above) stay in that
+same tempo-scaled "output" domain (`query_duration` on a 288.5s file at tempo 0.852 reports 338.6s = 288.5/0.852).
+Content time = `audioPos × rate`; conversely a seek to content time `C` must be issued at `C / rate`, or the
+audio lands at `C × rate` instead — confirmed empirically with a GStreamer `identity` probe upstream of `pitch`
+(**fixed 2026-07-27**, `docs/design/rate-position-drift.md` "Bug #0"). Once a real seek IS detected in the RAF
+loop above, `contentPos = audioPos * currentRate` — NOT `audioPos` directly, which was the bug (self-consistent
+with the also-broken seek value, so the display looked "right" while the actual audio was off by the same ratio).
+`DeckAudioPipeline::seek()` (`pipeline.rs`) does this conversion once, at the single Rust choke point every
+content-time seek call site (`seekBus.ts`, MIDI cue jumps, loop wrap-around) goes through — plus two related
+instances of the same domain mix-up in the scratch code path (`scratch()`'s PCM-buffer start position,
+`stop_scratch_feeder()`'s post-gesture resync seek), fixed the same way. See the design doc for the full
+before/after measurements.
 
 **`pendingSeekTarget` filter in `seekBus.ts`** — on a heavy video, GStreamer can take >1 s to process a seek
 while still returning the pre-seek position from `query_position`. `seekDeck()` records the seek target in

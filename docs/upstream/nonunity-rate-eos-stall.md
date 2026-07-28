@@ -44,3 +44,7 @@ computed in rate-scaled time and never fires.
 software syncing video to a tempo-adjusted audio clock), every track that plays to
 its natural end at an adjusted rate has a high chance of wedging the element; the
 only recovery is resetting the element (`load()`).
+
+**See also**: bug 320327 (WebCodecs `VideoEncoder` crash, same build) and bug 320329
+(`currentTime` seek deadlock, same build) — separate defects found during the same
+investigation.

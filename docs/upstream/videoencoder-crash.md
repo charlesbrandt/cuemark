@@ -80,3 +80,7 @@ Gtk.main()
 Expected: title becomes `SUPPORTED:true` / `SUPPORTED:false`. Actual:
 `web-process-terminated` (`crashed`) with the assertion output above; the promise
 never settles.
+
+**See also**: bug 320329 (`currentTime` seek deadlock, same build) and the
+non-unity-rate EOS stall report — separate defects found during the same
+investigation.
