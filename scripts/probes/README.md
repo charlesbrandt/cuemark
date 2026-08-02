@@ -28,3 +28,22 @@ mirror `main.rs` so results reflect the app's real conditions.
 
 Prereqs (all present on this machine): `python3-gi`, `gir1.2-webkit2-4.1`, `Xvfb`,
 GStreamer with `x264enc` (`gstreamer1.0-plugins-ugly`).
+
+## Audio-stack probes (GStreamer/PipeWire, no webview)
+
+Same `python3-gi` technique, but these exercise the *audio* stack directly — no WebKit,
+no Xvfb, no env-var preamble. Run them plainly: `python3 scripts/probes/<probe>.py …`.
+
+| Probe | What it answers | 2026-08-02 result on this machine (PipeWire 1.6.2 / GStreamer 1.28.2) |
+|---|---|---|
+| `pipewiresink_multisink_deadlock.py` | Does N `pipewiresink` elements in one process deadlock on PAUSED→PLAYING? (`SINK_FACTORY=pulsesink` to A/B) | `pipewiresink` ×1 0/6, ×2 4/6, ×3 6/6 deadlocked; `pulsesink` ×2 and ×3 both 0/6. Analysis: `docs/design/pipewiresink-play-hang.md` |
+
+⚠️ A reproduced deadlock **hangs every PipeWire client on the machine** (including
+`pw-cli`, `wpctl` and any music you have playing) until the probe process is killed. The
+probe deliberately stays alive on failure so it can be inspected under `gdb`; kill it when
+you're done. Pass a target node name from `wpctl status`, e.g.:
+
+```sh
+python3 scripts/probes/pipewiresink_multisink_deadlock.py \
+  alsa_output.pci-0000_00_1b.0.analog-stereo 3
+```

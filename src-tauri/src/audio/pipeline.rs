@@ -5,7 +5,7 @@
 ///     → capsfilter(48kHz) → pitch → [spectrum] → output_queue → tee
 ///         ├─ volume₀ → sink₀  ┐
 ///         ├─ volume₁ → sink₁  ┤  one branch per main output device (≥1; empty → system default)
-///         └─ cue_valve → cue_volume → cue_queue → pipewiresink(cue) | fakesink
+///         └─ cue_valve → cue_volume → cue_queue → pulsesink(cue) | fakesink
 ///
 /// The cue branch is always wired. `cue_valve` (drop-buffers=true when cue is off)
 /// gates it without blocking the tee. A `fakesink` is used when no cue device is
@@ -126,12 +126,6 @@ pub(super) fn file_to_uri(path: &str) -> String {
     out
 }
 
-/// Build the audio output sink element.
-///
-/// Prefers `pipewiresink` (direct PipeWire stream) over `autoaudiosink`.
-/// On a PipeWire+pipewire-pulse system, `autoaudiosink` picks `pulsesink` and routes
-/// audio through extra layers with additional buffering.
-/// Direct `pipewiresink` removes that hop and keeps latency predictable.
 /// Map a PipeWire channel name to its GStreamer audio channel-mask bit position.
 fn pw_channel_to_gst_bit(ch: &str) -> Option<u32> {
     match ch {
@@ -165,15 +159,30 @@ struct CueRemap {
 /// routes to the first pair), we output an N-channel stream matching the sink's full
 /// channel count. PipeWire then does a 1:1 port connection, and the silence/audio
 /// values in each channel end up in the correct physical output.
-fn compute_cue_remap(target: &str, full_layout: &str) -> Option<CueRemap> {
+///
+/// Returns `Ok(None)` when the target is the default front pair (no remap needed —
+/// safe to route straight to the node), and `Err` when `target`/`full_layout` can't
+/// be parsed as channel-position tokens (e.g. a corrupted persisted device id). The
+/// `Err` case matters: silently treating an unparseable non-default target as "no
+/// remap needed" would send a plain stereo stream straight at the shared node, same
+/// as a second sink using the *default* pair — a same-channel collision between two
+/// `pipewiresink` clients on one node that, live on 2026-08-02, deadlocked PipeWire's
+/// own node-negotiation thread system-wide (confirmed via gdb: the *daemon's* graph
+/// thread hung in `pw_impl_node_set_state()`, blocking even unrelated `pw-cli`
+/// queries, until the offending cuemark process was killed). The persisted device id
+/// that triggered it was corrupted (stray `[`/`]`/space characters around the channel
+/// lists — origin unconfirmed, possibly a stale value from manual devtools testing),
+/// so this can recur any time a malformed id reaches this parser. Callers must fall
+/// back to `fakesink` on `Err`, never to an unmapped real sink.
+fn compute_cue_remap(target: &str, full_layout: &str) -> Result<Option<CueRemap>, String> {
     if target == "FL,FR" || full_layout.is_empty() {
-        return None; // default front pair — no remap needed
+        return Ok(None); // default front pair — no remap needed
     }
 
     let all_channels: Vec<&str> = full_layout.split(',').map(str::trim).collect();
     let n = all_channels.len();
     if n <= 2 {
-        return None;
+        return Ok(None);
     }
 
     let target_chs: Vec<&str> = target.split(',').map(str::trim).collect();
@@ -181,7 +190,8 @@ fn compute_cue_remap(target: &str, full_layout: &str) -> Option<CueRemap> {
     // Compute GStreamer channel-mask covering all channels in the full layout.
     let mut mask: u64 = 0;
     for &ch in &all_channels {
-        let bit = pw_channel_to_gst_bit(ch)?;
+        let bit = pw_channel_to_gst_bit(ch)
+            .ok_or_else(|| format!("unrecognized channel token {ch:?} in full_layout {full_layout:?}"))?;
         mask |= 1u64 << bit;
     }
 
@@ -189,11 +199,14 @@ fn compute_cue_remap(target: &str, full_layout: &str) -> Option<CueRemap> {
     // Index = number of set bits in mask that are strictly below this channel's bit.
     let target_indices: Vec<usize> = target_chs.iter()
         .map(|&ch| {
-            let bit = pw_channel_to_gst_bit(ch)? as u64;
-            if mask & (1 << bit) == 0 { return None; }
-            Some((0..bit).filter(|&b| mask & (1 << b) != 0).count())
+            let bit = pw_channel_to_gst_bit(ch)
+                .ok_or_else(|| format!("unrecognized channel token {ch:?} in target {target:?}"))? as u64;
+            if mask & (1 << bit) == 0 {
+                return Err(format!("target channel {ch:?} not present in full_layout {full_layout:?}"));
+            }
+            Ok((0..bit).filter(|&b| mask & (1 << b) != 0).count())
         })
-        .collect::<Option<Vec<_>>>()?;
+        .collect::<Result<Vec<_>, String>>()?;
 
     // Build N×2 mix-matrix: most rows are silence; target rows get left/right audio.
     let mut matrix_rows = vec![[0.0f32, 0.0f32]; n];
@@ -206,14 +219,32 @@ fn compute_cue_remap(target: &str, full_layout: &str) -> Option<CueRemap> {
     log::info!(
         "[audio/cue] remap: target={target} full={full_layout} n_ch={n} mask={mask:#x} idx={target_indices:?}"
     );
-    Some(CueRemap { out_channels: n as i32, channel_mask: mask, matrix_rows })
+    Ok(Some(CueRemap { out_channels: n as i32, channel_mask: mask, matrix_rows }))
 }
 
+/// Build one output sink targeting `device`.
+///
+/// **Uses `pulsesink`, deliberately not `pipewiresink`** (changed 2026-08-02). On a
+/// PipeWire system `pulsesink` talks to `pipewire-pulse`, so this is still PipeWire —
+/// just reached through the Pulse compat layer rather than the native GStreamer element.
+///
+/// The native `pipewiresink` cannot be used here: `libgstpipewire` (gst-plugin-pipewire
+/// 1.6.2) has an AB-BA lock inversion that deadlocks whenever **two or more
+/// `pipewiresink` elements in one process** go PAUSED→PLAYING with any delay between the
+/// transitions. cuemark always has at least two (≥1 main output + the cue branch), and
+/// more with multiple decks, so it fires on essentially every play. Measured 4/6 runs
+/// with two sinks and 6/6 with three, versus 0/6 for `pulsesink` at both. When it fires
+/// it strands the client node mid-state-change and hangs *every* PipeWire client on the
+/// machine — not just cuemark — until the process is killed. Full analysis, gdb stacks
+/// and the reproducer: `docs/design/pipewiresink-play-hang.md` and
+/// `scripts/probes/pipewiresink_multisink_deadlock.py`. Do not switch back without
+/// re-running that probe.
 fn make_sink(device: &str, deck_id: &str) -> Result<gst::Element, String> {
     // Device string may encode a stereo-pair target: "node-name@CH1,CH2".
     // Strip the @suffix here — the actual channel remapping is done via GStreamer caps
-    // inserted before this sink by the caller (pipewiresink uses caps channel positions
-    // for PipeWire port routing, not stream-property metadata).
+    // inserted before this sink by the caller (the sink routes by caps channel positions,
+    // not by stream-property metadata). The bare node name that survives this strip is
+    // PipeWire's `node.name`, which is exactly what pulsesink's `device` property expects.
     let node_name = match device.find('@') {
         Some(at) => &device[..at],
         None => device,
@@ -222,23 +253,31 @@ fn make_sink(device: &str, deck_id: &str) -> Result<gst::Element, String> {
     const BUFFER_TIME_US: i64 = 50_000;
     const LATENCY_TIME_US: i64 = 10_000;
 
-    if let Ok(sink) = gst::ElementFactory::make("pipewiresink").build() {
+    if let Ok(sink) = gst::ElementFactory::make("pulsesink").build() {
         if !node_name.is_empty() {
-            sink.set_property("target-object", node_name);
+            // NOTE: unlike pipewiresink's `target-object`, an unresolvable `device` here
+            // does NOT error — pulsesink silently falls back to the system default sink.
+            // A stale/corrupted persisted device id therefore shows up as "audio came out
+            // of the wrong device", never as a failure. AudioSettings.svelte's on-mount
+            // auto-heal (drops persisted ids absent from the live device list) is the
+            // guard for that; this log line is how you confirm what was actually asked for.
+            sink.set_property("device", node_name);
         }
-        let stream_props = gst::Structure::builder("props")
-            .field("node.latency", "1024/48000")
-            .build();
-        sink.set_property("stream-properties", &stream_props);
+        // pulsesink is a GstAudioBaseSink, so latency is set directly here rather than
+        // through PipeWire stream-properties (pipewiresink extends GstBaseSink and has
+        // neither of these properties — it needed `node.latency=1024/48000` instead).
+        sink.set_property("buffer-time", BUFFER_TIME_US);
+        sink.set_property("latency-time", LATENCY_TIME_US);
+        sink.set_property("client-name", "cuemark");
         log::info!(
-            "[audio/{}] sink: pipewiresink target={:?} node.latency=1024/48000 (~21ms)",
-            deck_id, node_name
+            "[audio/{}] sink: pulsesink device={:?} buffer-time={}us latency-time={}us",
+            deck_id, node_name, BUFFER_TIME_US, LATENCY_TIME_US
         );
         return Ok(sink);
     }
 
     log::warn!(
-        "[audio/{}] pipewiresink unavailable (apt install gstreamer1.0-pipewire); \
+        "[audio/{}] pulsesink unavailable (apt install gstreamer1.0-plugins-good); \
          falling back to autoaudiosink",
         deck_id
     );
@@ -506,60 +545,77 @@ impl DeckAudioPipeline {
         let cue_volume = make_el("volume")?;
         // Small queue so pipewiresink's pull callback always finds data when cue is active.
         let cue_queue  = make_el("queue")?;
-        // Use a real sink only when a device is configured; fakesink otherwise so that
-        // the pipeline loads cleanly even when no headphone device is selected.
-        let cue_sink = if self.cue_device.is_empty() {
-            log::warn!("[audio/{}-cue] no device set — cue output routed to fakesink", self.deck_id);
-            let fs = make_el("fakesink")?;
-            fs.set_property("sync", false);
-            fs
+        // Decide the cue routing *before* building any sink: a device id that requests
+        // a non-default channel pair but fails to parse must never fall through to a
+        // plain sink targeting the shared node (see compute_cue_remap's doc comment —
+        // that exact failure mode deadlocked PipeWire system-wide on 2026-08-02).
+        //
+        // Device ID format: `node@target!full_layout` e.g. `alsa_out...@RL,RR!FL,FR,RL,RR`
+        let cue_remap_outcome: Result<Option<CueRemap>, String> = if self.cue_device.is_empty() {
+            Ok(None)
+        } else if let Some(at) = self.cue_device.find('@') {
+            let after = &self.cue_device[at + 1..];
+            match after.find('!') {
+                Some(bang) => compute_cue_remap(&after[..bang], &after[bang + 1..]),
+                None => Err(format!("malformed device id (missing '!' after '@'): {:?}", self.cue_device)),
+            }
         } else {
-            make_sink(&self.cue_device, &format!("{}-cue", self.deck_id))?
+            Ok(None) // plain single-purpose device id — no remap needed
         };
+
+        // Use a real sink only when a device is configured and (for multi-channel
+        // targets) its channel remap parsed cleanly; fakesink otherwise so the
+        // pipeline loads cleanly and never risks two sinks colliding on one node.
+        let (cue_sink, cue_channel_remap): (gst::Element, Option<(gst::Element, gst::Element)>) =
+            match &cue_remap_outcome {
+                _ if self.cue_device.is_empty() => {
+                    log::warn!("[audio/{}-cue] no device set — cue output routed to fakesink", self.deck_id);
+                    let fs = make_el("fakesink")?;
+                    fs.set_property("sync", false);
+                    (fs, None)
+                }
+                Err(e) => {
+                    log::error!(
+                        "[audio/{}-cue] cue device id {:?} failed to parse ({e}) — routing to \
+                         fakesink instead of risking a same-channel collision with another sink \
+                         on the shared node (see compute_cue_remap's doc comment). Re-select the \
+                         cue device in Settings to clear the stale/corrupted id.",
+                        self.deck_id, self.cue_device
+                    );
+                    let fs = make_el("fakesink")?;
+                    fs.set_property("sync", false);
+                    (fs, None)
+                }
+                Ok(remap) => {
+                    let sink = make_sink(&self.cue_device, &format!("{}-cue", self.deck_id))?;
+                    let channel_remap = match remap {
+                        Some(r) => {
+                            let ch_conv = make_el("audioconvert")?;
+
+                            // N×2 mix-matrix: routes the two input (stereo) channels into the
+                            // correct output channel slots; all other output channels stay silent.
+                            let matrix_arrays: Vec<gst::Array> = r.matrix_rows.iter()
+                                .map(|row| gst::Array::new([row[0], row[1]]))
+                                .collect();
+                            ch_conv.set_property("mix-matrix", gst::Array::new(matrix_arrays));
+
+                            let ch_caps = make_el("capsfilter")?;
+                            ch_caps.set_property("caps", &gst::Caps::builder("audio/x-raw")
+                                .field("channels", r.out_channels)
+                                .field("channel-mask", gst::Bitmask(r.channel_mask))
+                                .build());
+
+                            Some((ch_conv, ch_caps))
+                        }
+                        None => None,
+                    };
+                    (sink, channel_remap)
+                }
+            };
         // The cue branch is a monitoring output. async=false means it never participates in
         // pipeline preroll, so the valve dropping all buffers (cue off) doesn't block the
         // pipeline from completing PAUSED — only the main sink controls preroll timing.
         cue_sink.set_property("async", false);
-
-        // Optional channel remapping for multi-channel sinks (e.g. DJControl Starlight Rear).
-        //
-        // WirePlumber (PipeWire session manager) always routes stereo streams to the first pair
-        // of a multi-channel sink regardless of channel-position labels in the GStreamer caps.
-        // The fix: output an N-channel stream (matching the sink's full channel count) with audio
-        // only in the target channels and silence elsewhere. PipeWire does a 1:1 port connection
-        // for same-count streams, so audio ends up exactly in the right physical output.
-        //
-        // Device ID format: `node@target!full_layout` e.g. `alsa_out...@RL,RR!FL,FR,RL,RR`
-        let cue_channel_remap: Option<(gst::Element, gst::Element)> = {
-            let remap = self.cue_device.find('@').and_then(|at| {
-                let after = &self.cue_device[at + 1..];
-                let bang = after.find('!')?;
-                let target = &after[..bang];
-                let full   = &after[bang + 1..];
-                compute_cue_remap(target, full)
-            });
-
-            if let Some(r) = remap {
-                let ch_conv = make_el("audioconvert")?;
-
-                // N×2 mix-matrix: routes the two input (stereo) channels into the correct
-                // output channel slots; all other output channels stay at 0 (silence).
-                let matrix_arrays: Vec<gst::Array> = r.matrix_rows.iter()
-                    .map(|row| gst::Array::new([row[0], row[1]]))
-                    .collect();
-                ch_conv.set_property("mix-matrix", gst::Array::new(matrix_arrays));
-
-                let ch_caps = make_el("capsfilter")?;
-                ch_caps.set_property("caps", &gst::Caps::builder("audio/x-raw")
-                    .field("channels", r.out_channels)
-                    .field("channel-mask", gst::Bitmask(r.channel_mask))
-                    .build());
-
-                Some((ch_conv, ch_caps))
-            } else {
-                None
-            }
-        };
 
         let caps_48k = gst::Caps::builder("audio/x-raw")
             .field("rate", 48_000i32)

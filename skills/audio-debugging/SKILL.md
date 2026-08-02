@@ -67,21 +67,40 @@ preroll, the pipeline never returns to PLAYING. See journal.md (2026-05-05) for 
 
 ---
 
-## Current sink: pipewiresink (direct PipeWire)
+## Current sink: pulsesink (PipeWire via the Pulse compat layer)
 
-`make_sink()` prefers `pipewiresink` over `autoaudiosink`. On a PipeWire+pipewire-pulse system,
-`autoaudiosink` picks `pulsesink` (rank 266 > pipewiresink rank 0), routing audio through three layers
-with extra buffering. Direct `pipewiresink` removes that hop.
+> ⚠️ **Changed 2026-08-02: `make_sink()` now uses `pulsesink`, NOT `pipewiresink`.**
+> The native element has an AB-BA lock inversion in `libgstpipewire.so`
+> (gst-plugin-pipewire 1.6.2) that deadlocks whenever **two or more `pipewiresink`
+> elements in one process** go PAUSED→PLAYING with any delay between the transitions —
+> which cuemark does on every play, since each deck has ≥1 main sink plus the cue branch.
+> Measured 4/6 runs with two sinks, 6/6 with three, 0/6 with one; `pulsesink` is 0/6 at
+> both. When it fires it hangs *every* PipeWire client on the machine until the process is
+> killed. Full analysis: `docs/design/pipewiresink-play-hang.md`. Reproducer:
+> `scripts/probes/pipewiresink_multisink_deadlock.py` — re-run it before switching back.
 
-**pipewiresink has no `buffer-time` / `latency-time` properties** — those are `GstAudioBaseSink`-specific.
-pipewiresink extends `GstBaseSink`. Latency is controlled via PipeWire stream properties:
+`pulsesink` still reaches PipeWire, via `pipewire-pulse.service`. Its `device` property takes the
+same PipeWire `node.name` that `pipewiresink`'s `target-object` did, so cuemark's
+`node@target!full_layout` device-id format is unchanged. Empty `device` = system default.
+
+**Gotcha: an unresolvable `device` does not error.** `pulsesink` silently falls back to the default
+sink, so a stale/corrupted persisted device id shows up as "wrong device", never as a failure —
+unlike a bad `target-object`. `AudioSettings.svelte`'s on-mount auto-heal is the only guard.
+
+`pulsesink` is a `GstAudioBaseSink`, so latency uses the real properties (50 ms / 10 ms):
 
 ```rust
-let stream_props = gst::Structure::builder("props")
-    .field("node.latency", "1024/48000")  // ~21ms
-    .build();
-sink.set_property("stream-properties", &stream_props);
+sink.set_property("device", node_name);       // PipeWire node.name
+sink.set_property("buffer-time", 50_000i64);  // us
+sink.set_property("latency-time", 10_000i64); // us
 ```
+
+For contrast, `pipewiresink` extends plain `GstBaseSink` and has **no** `buffer-time`/`latency-time`;
+it needed `stream-properties` `node.latency=1024/48000` (~21 ms) instead. If you ever see that
+pattern in old code or notes, it predates this change.
+
+`libgstpulseaudio.so` ships in **`gstreamer1.0-plugins-good`** (not a `gstreamer1.0-pulseaudio`
+package — that name does not exist).
 
 **pw-top diagnostics** — two modes:
 
@@ -345,6 +364,37 @@ it is not centralized.**
 ---
 
 ## Known failure modes
+
+### Play never starts, and the whole machine's audio hangs with it (pipewiresink deadlock)
+
+**Symptom**: pressing Play does nothing — no audio, position clock never advances, no bus
+ERROR, no crash, just silence after the Playing transition begins. Simultaneously *every
+other* audio app on the machine stalls, and `pw-cli` / `pw-dump` / `wpctl` / `pw-play` /
+`gst-launch-1.0` all hang. Looks exactly like the PipeWire daemon has died. It has not.
+
+**Root cause**: AB-BA lock inversion in `libgstpipewire.so`. cuemark's PipeWire
+thread-loop, holding its own loop lock, dispatches a node state change and calls into
+gstpipewire, which waits on a `GCond` only the GStreamer state-change thread can signal —
+and that thread is blocked acquiring the loop lock. Needs ≥2 `pipewiresink` elements in
+one process plus a delay between PAUSED and PLAYING. See
+`docs/design/pipewiresink-play-hang.md`.
+
+**Triage, in order**:
+
+1. `pgrep -a cuemark` — **do this before trusting any external tool.** A stuck cuemark
+   makes every PipeWire client on the box hang, so any "it reproduces without our code"
+   test run while one is alive is meaningless. This mis-diagnosed the bug for a whole
+   session as an OS/PipeWire-release problem.
+2. `cat /proc/<pid>/task/*/comm` + `/proc/<pid>/task/*/wchan` — a `pipewire-main-l` thread
+   in `futex_do_wait` confirms it. No debugger needed.
+3. `wpctl status` — stream links stuck in `[init]` instead of `[active]`, and `pw-top -b`
+   showing quantum `0` on every node, both mean the graph never started.
+4. `kill <cuemark-pid>` (the client, **not** the daemon) — releases the whole system
+   immediately.
+
+**Not the cause** (all separately ruled out): the cue channel remap, a starved cue valve,
+two sinks sharing one node, `async=false`, `node.latency`, the Hercules Starlight, or its
+44100-only rate. The built-in HDA card deadlocks identically.
 
 ### UI freeze on first track load (mutex held during preroll)
 

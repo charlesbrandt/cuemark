@@ -9,7 +9,7 @@ Domain: cuemark.com (Charles Brandt's former DJ name)
 
 - **Tauri** (Rust backend + WebKit frontend) — cross-platform, Wayland-native on Linux via GTK4
 - **WebGL** — GPU-accelerated rendering, FBO-per-deck compositing
-- **GStreamer** (Rust, `gstreamer` + `gstreamer-audio` crates, `features = ["v1_18"]` required) — audio playback, gain/EQ, device routing, headphone cue mix, recording. Each deck has its own `DeckAudioPipeline` (uridecodebin → queue → audioconvert → audioresample → capsfilter(48kHz) → pitch → output_queue → volume → pipewiresink/autoaudiosink). Audio is the master clock; video element syncs to it.
+- **GStreamer** (Rust, `gstreamer` + `gstreamer-audio` crates, `features = ["v1_18"]` required) — audio playback, gain/EQ, device routing, headphone cue mix, recording. Each deck has its own `DeckAudioPipeline` (uridecodebin → queue → audioconvert → audioresample → capsfilter(48kHz) → pitch → output_queue → volume → pulsesink/autoaudiosink). Audio is the master clock; video element syncs to it.
 - **Web Audio API** — FFT analysis for BPM detection and audio-reactive visuals (not used for playback or waveform peak extraction — that runs in Rust via `audio_analyze_file` to avoid VA-API corruption)
 - **GLSL shaders** — effects and audio-reactive visualizations
 - **Rust `midir` crate** — MIDI input (Web MIDI API unreliable in WebKitGTK); events piped to frontend via Tauri IPC
@@ -48,7 +48,12 @@ pipeline to the frontend. The frontend wrapper lives in `src/lib/audio/pipeline.
 integrates GStreamer position deltas (via `contentPosTracker`) to recover actual content position at
 `deck.playbackRate`, since `query_position` always returns wall-clock stream time. Rate changes go through
 the `pitch` (soundtouch) element's `tempo` property (0.1–4.0) — pitch-preserving, no seek/flush needed.
-Device routing defaults to `autoaudiosink`, or a specific `pipewiresink target-object=<node-name>`.
+Device routing uses `pulsesink device=<pipewire-node-name>` (empty device = system default),
+falling back to `autoaudiosink` if `pulsesink` is unavailable. **Not `pipewiresink`** — the native
+element deadlocks whenever two or more of them in one process go PAUSED→PLAYING with any delay,
+which cuemark does on every play (≥1 main sink + the cue branch per deck). See
+`docs/design/pipewiresink-play-hang.md` before changing the sink; re-run
+`scripts/probes/pipewiresink_multisink_deadlock.py` if you do.
 
 **Full gotchas and rationale** — position-tracking drift math, the `pendingSeekTarget` seek-race filter,
 why `v.playbackRate` writes must be rAF-throttled, rate-then-seek ordering, EOS handling, PipeWire quantum

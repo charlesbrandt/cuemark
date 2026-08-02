@@ -1452,3 +1452,108 @@ verification this session was headless/automated via the repro test).
 | `docs/design/pcm-buffer-playback.md` | New "Eighth mechanism" section (the fix, the wrong-first-attempt/self-inflicted-stall finding, and verification data); `Status` section updated to "fixed" |
 | `journal.md` | This entry |
 | `src-tauri/src/audio/pipeline.rs` | `output_queue` cap now widens for a scratch gesture's duration (`scratch()`) and narrows back on gesture end (`stop_scratch_feeder()`); new `output_queue_el` field on `PipelineInner` |
+
+# 2026.08.02 — pipewiresink Paused→Playing hang: root cause found, previous "it's PipeWire's fault" conclusion overturned
+
+## Problem
+
+`docs/design/pipewiresink-play-hang.md` ended the 2026-08-01/02 session with an OPEN
+issue concluding the Paused→Playing hang was a PipeWire-level bug on this fresh Ubuntu
+26.04 / PipeWire 1.6.2 install, "not specific to cuemark" — on the strength of a bare
+`gst-launch-1.0 … ! pipewiresink` pipeline that hung with no cuemark code involved.
+
+## Root cause
+
+That bare-pipeline test **was run while an already-deadlocked cuemark process was still
+resident**, and a deadlocked `pipewiresink` client wedges the shared PipeWire graph for
+every other client on the machine. Same machine, nothing else changed:
+
+| test | stuck cuemark resident | after `kill <cuemark>` |
+|---|---|---|
+| `pw-play --target=37 test.wav` | hangs until killed | exits 0 in 4.8s |
+| `gst-launch-1.0 … ! pipewiresink` | hangs until killed | `Got EOS`, clean exit in 2.4s |
+
+The real bug is an **AB-BA lock inversion in `libgstpipewire.so`** (gst-plugin-pipewire
+1.6.2). The PipeWire thread-loop, holding its own loop lock, dispatches a node state
+change and calls into gstpipewire, which waits on a `GCond` only the GStreamer
+state-change thread can signal — and that thread is blocked in `pw_thread_loop_lock()`
+waiting for the lock the pw thread holds. Captured under gdb from a standalone Python
+reproducer (no cuemark, no Tauri, no GTK, no WebKit); the two stacks match the live
+cuemark captures from the previous session byte for byte.
+
+Trigger is **≥2 `pipewiresink` elements in one process, plus any delay between the PAUSED
+and PLAYING transitions**. Measured over 6 runs per config:
+
+| config | deadlock rate |
+|---|---|
+| `pipewiresink` ×1 | 0/6 |
+| `pipewiresink` ×2 | 4/6 |
+| `pipewiresink` ×3 | 6/6 |
+| `pulsesink` ×2 / ×3 | 0/6 |
+
+cuemark has ≥2 per deck (≥1 main output + cue branch), so it fires essentially every
+play. Separately ruled out as irrelevant: the 4-channel cue remap, a starved cue valve,
+two sinks sharing one node, `async=false`, `node.latency`, the Hercules Starlight
+specifically, and its 44100-only rate — the built-in HDA card deadlocks identically.
+
+Two corrections to the previous session's reading of its own gdb output: the PipeWire
+daemon is never deadlocked (all three threads sit in `ep_poll` throughout), and the
+`pw_impl_node_set_state()` / `libspa-audioconvert` frames are **client-side** — in
+cuemark's own process — because `pipewiresink` runs an in-process client node. Also,
+`pw-play --target=37` was still linked by WirePlumber to the Starlight, so the earlier
+"retested with Main routed to local analog only" test never actually routed away from
+the Hercules and could not have ruled the device out.
+
+## Fix
+
+`make_sink()` switched from `pipewiresink` to `pulsesink` (0/6 deadlocks at both 2 and 3
+sinks). Still PipeWire underneath — `pipewire-pulse.service` — just a different GStreamer
+element. Device ids are unchanged: they are built from PipeWire's `node.name`, which is
+exactly what `pulsesink`'s `device` expects, so the `node@target!full_layout` format and
+the `@`-strip both stay. Latency moves to real `buffer-time`/`latency-time` properties
+(50 ms / 10 ms) since `pulsesink` is a `GstAudioBaseSink`; the
+`stream-properties node.latency=1024/48000` workaround existed only because
+`pipewiresink` extends plain `GstBaseSink` and has neither. The 4-channel cue mix-matrix
+remap works unchanged.
+
+Two incidental fixes: an orphaned doc comment ("Prefers `pipewiresink`…") that had drifted
+onto `pw_channel_to_gst_bit` was removed, and the fallback message now names
+`gstreamer1.0-plugins-good` — which actually ships `libgstpulseaudio.so` — instead of the
+non-existent `gstreamer1.0-pulseaudio`.
+
+**Behavioural regression to watch:** an unresolvable `device` does not error; `pulsesink`
+silently falls back to the system default sink. A stale/corrupted persisted device id now
+presents as "wrong device", never as a failure, which makes `AudioSettings.svelte`'s
+on-mount auto-heal load-bearing rather than cosmetic.
+
+Verified: `cargo check` clean, `cargo test` 6/6, and the full deck-topology replica
+(uridecodebin → tee → main + remapped cue sink, with PAUSED idle, tempo sweep, mid-stream
+cue-valve open, pause/play) 3/3 clean with correct position advance and zero xruns — the
+exact config that deadlocked 3/3 on `pipewiresink`. Rear/cue-pair listening tests clean.
+
+**Not yet verified: the real app has not been run against this change** — everything so
+far is the standalone replica. Also unresolved: a "steady jitter" heard once during replica
+testing that did not reproduce on a rebuilt equivalent topology (likeliest explanation is
+residue from deadlocked `pipewiresink` processes resident at the time, unconfirmed), and a
+reproducible but minor 1–2 sample drop on the PLAYING→PAUSED→PLAYING cycle.
+
+Collapsing to one `pipewiresink` per process remains the alternative, but needs the shared
+`audiomixer` topology stubbed in `mixer.rs`. Worth reporting upstream either way — the
+probe is a clean, dependency-free reproducer.
+
+Also found: `~/.local/share/com.cuemark.app/logs/cuemark.log` at the end of the hung
+session contained **nothing but `[frontend] [heartbeat] rAF alive` lines**, one per
+second — sink config, remap decisions and bus messages had all been flushed out of the
+rotation window. That heartbeat should drop to `debug` or be rate-limited.
+
+## Files touched
+
+| File | Change |
+|---|---|
+| `src-tauri/src/audio/pipeline.rs` | `make_sink()` switched to `pulsesink` (`device` + `buffer-time`/`latency-time`); orphaned stale doc comment removed; corrected fallback package name |
+| `CLAUDE.md` | Topology line and "Device routing" paragraph updated to `pulsesink`, with a warning not to switch back |
+| `docs/design/pipewiresink-play-hang.md` | Old conclusion struck through with the reason it was invalid; new Correction / Actual root cause / Trigger-and-rates / Fix-options / Debugging-notes sections; bug #3's diagnosis annotated as wrong (its parser fixes remain correct) |
+| `scripts/probes/pipewiresink_multisink_deadlock.py` | New standalone reproducer (`SINK_FACTORY=pulsesink` to A/B) |
+| `scripts/probes/README.md` | New "Audio-stack probes" section (README previously covered WebKit probes only) |
+| `skills/audio-debugging/SKILL.md` | Warning on the "Current sink: pipewiresink" recommendation; new "Play never starts, and the whole machine's audio hangs with it" failure mode with triage order |
+| `journal.md` | This entry |

@@ -13,6 +13,25 @@
     } catch (e) {
       error = String(e);
       console.error("[AudioSettings] device enumeration failed:", e);
+      return;
+    }
+    // Drop persisted device ids that no longer match anything in the current device
+    // list — otherwise they linger forever, invisible to the checkboxes/<select> below
+    // (which only render checked/selected state for ids present in `devices`), with no
+    // way for the user to un-stick them short of editing localStorage directly. Confirmed
+    // live 2026-08-02: a corrupted `cueOutputDeviceId` survived a full re-pick in Settings
+    // because the stale value never matched any <option>, so the bound store never changed.
+    const knownIds = new Set(["", ...devices.map(d => d.id)]);
+    mainOutputDeviceIds.update(ids => {
+      const kept = ids.filter(id => knownIds.has(id));
+      if (kept.length !== ids.length) {
+        console.warn("[AudioSettings] dropped stale main device id(s):", ids.filter(id => !knownIds.has(id)));
+      }
+      return kept.length > 0 ? kept : [""];
+    });
+    if (!knownIds.has($cueOutputDeviceId)) {
+      console.warn("[AudioSettings] dropped stale cue device id:", $cueOutputDeviceId);
+      cueOutputDeviceId.set("");
     }
   });
 
