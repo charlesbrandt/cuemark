@@ -72,6 +72,25 @@ function post(msg: unknown, transfer: Transferable[] = []) {
   (self as unknown as Worker).postMessage(msg, transfer);
 }
 
+// configure() throws synchronously on an invalid config (bad codec string, malformed
+// description, decoder already closed, …). Every call site below used to call it bare —
+// a synchronous throw inside handleInit/handleSeek/maybeStartLoopPrefetch (all async
+// functions invoked fire-and-forget from self.onmessage) becomes an unhandled rejection
+// in the Worker with no `self.onerror` handler registered, so it never reaches
+// codecPlayer.ts's `error` message handling and never prints anywhere — the decoder
+// then just sits in a non-"configured" state forever and pump()'s state guards silently
+// stop feeding it. See docs/design/webcodecs-video-not-rendering.md.
+function configureDecoder(d: VideoDecoder, config: VideoDecoderConfig, context: string): boolean {
+  try {
+    d.configure(config);
+    warnedNeverConfigured = false; // re-arm the pump() one-shot for the next failure, if any
+    return true;
+  } catch (e) {
+    post({ type: "error", message: `${context}: configure() threw: ${e}` });
+    return false;
+  }
+}
+
 async function fetchAus(from: number, count: number): Promise<Au[]> {
   const res = await fetch(
     `http://127.0.0.1:${port}/demux/${encodeURIComponent(deckId)}/aus?from=${from}&count=${count}`,
@@ -140,7 +159,16 @@ function makeLoopDecoder(): VideoDecoder {
 }
 
 let pumping = false;
+let warnedNeverConfigured = false;
 async function pump() {
+  if (decoder && decoder.state !== "configured" && !warnedNeverConfigured) {
+    // decoder exists but isn't "configured" — either configure() failed (now caught and
+    // reported separately by configureDecoder()) or it's between reset()/close() and a
+    // fresh configure(). This guard would otherwise stall every frame with nothing logged;
+    // one-shot so a legitimate transient (teardown, in-flight reconfigure) doesn't spam.
+    warnedNeverConfigured = true;
+    post({ type: "error", message: `pump(): decoder.state=${decoder.state}, not feeding` });
+  }
   if (pumping || !decoder || decoder.state !== "configured" || eos) return;
   pumping = true;
   try {
@@ -161,12 +189,21 @@ async function pump() {
       // run between awaits, but that's exactly where this checks back in) — re-check state
       // right before the call instead of trusting the entry guard at the top of pump().
       if (!decoder || decoder.state !== "configured") break;
-      decoder.decode(new EncodedVideoChunk({
-        type: au.key ? "key" : "delta",
-        timestamp: au.ptsUs,
-        duration: au.durUs,
-        data: annexBToAvc(au.data),
-      }));
+      const data = annexBToAvc(au.data);
+      // Some access units carry only non-VCL NALs (seen live: AUD + SEI, no slice at
+      // all — docs/design/webcodecs-video-not-rendering.md) — annexBToAvc's slice-only
+      // filter (type 1/5) then yields zero bytes. Feeding VideoDecoder.decode() an empty
+      // chunk throws "EncodingError: Empty frame" and *closes the decoder*, permanently
+      // killing this deck. There's no picture to decode here, so just skip it — advance
+      // past it like any other AU without calling decode().
+      if (data.length > 0) {
+        decoder.decode(new EncodedVideoChunk({
+          type: au.key ? "key" : "delta",
+          timestamp: au.ptsUs,
+          duration: au.durUs,
+          data,
+        }));
+      }
       nextFeedIndex++;
     }
   } finally {
@@ -183,12 +220,17 @@ async function feedLoopFrames() {
     // Same reasoning as pump()'s state re-check: loopClear/destroy/a second loop-wrap can
     // close loopDecoder (or null it out) while this loop was suspended on the await above.
     if (!loopDecoder || loopDecoder.state !== "configured") break;
-    loopDecoder.decode(new EncodedVideoChunk({
-      type: au.key ? "key" : "delta",
-      timestamp: au.ptsUs,
-      duration: au.durUs,
-      data: annexBToAvc(au.data),
-    }));
+    // See the identical guard + comment in pump() — an AU with no VCL NALs (e.g.
+    // AUD+SEI-only) must not be fed to decode() as an empty chunk.
+    const data = annexBToAvc(au.data);
+    if (data.length > 0) {
+      loopDecoder.decode(new EncodedVideoChunk({
+        type: au.key ? "key" : "delta",
+        timestamp: au.ptsUs,
+        duration: au.durUs,
+        data,
+      }));
+    }
     loopFeedIndex++;
   }
 }
@@ -200,7 +242,11 @@ async function maybeStartLoopPrefetch() {
   loopIsNowPrimary = false;
   loopFramesReady = [];
   loopDecoder = makeLoopDecoder();
-  loopDecoder.configure({ codec, description });
+  if (!configureDecoder(loopDecoder, { codec, description }, "loop decoder")) {
+    loopDecoder = null;
+    loopPrefetchStarted = false;
+    return;
+  }
   loopFeedIndex = keyframeAuIndexAtOrBefore(loopBounds.inPos);
   await feedLoopFrames();
 }
@@ -233,7 +279,7 @@ function handleSeek(target: number) {
   if (!decoder || !description) return;
   eos = false;
   decoder.reset();
-  decoder.configure({ codec, description });
+  if (!configureDecoder(decoder, { codec, description }, "seek")) return;
   nextFeedIndex = keyframeAuIndexAtOrBefore(target);
   dropBeforeUs = Math.round(target * 1_000_000);
   clockPos = target;
@@ -257,7 +303,7 @@ async function handleInit(msg: InitMsg) {
   }
   description = buildAvcDescription(sps.bytes, pps.bytes);
   decoder = makeDecoder();
-  decoder.configure({ codec, description });
+  if (!configureDecoder(decoder, { codec, description }, "init")) { decoder = null; return; }
   pump();
 }
 
@@ -270,6 +316,17 @@ function teardown() {
   for (const f of loopFramesReady) f.close();
   loopFramesReady = [];
 }
+
+// General safety net: an uncaught throw inside any of the fire-and-forget async handlers
+// below (handleInit/pump/feedLoopFrames/maybeStartLoopPrefetch, all invoked without being
+// awaited from self.onmessage) becomes an unhandled promise rejection, not a synchronous
+// error — `self.onerror`/the Worker's own onerror handler does NOT catch these. Without
+// this listener such a throw vanishes with zero signal anywhere. Every specific throw site
+// found so far (configure()) is now caught explicitly via configureDecoder(); this is the
+// catch-all for whatever the next one turns out to be.
+self.addEventListener("unhandledrejection", (e: PromiseRejectionEvent) => {
+  post({ type: "error", message: `unhandled rejection: ${e.reason}` });
+});
 
 self.onmessage = (e: MessageEvent<InMsg>) => {
   const msg = e.data;

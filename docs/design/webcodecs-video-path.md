@@ -962,6 +962,45 @@ choice until a user explicitly changes it.
 No new findings this phase — the flip is a one-line default change riding on
 infrastructure phases 1–4 already built and verified.
 
+## Phase 6: black-screen bug hunt (2026-08-02)
+
+Full writeup: `docs/design/webcodecs-video-not-rendering.md`. First live use after the
+Phase 5 default flip: audio played, video stayed black, no error visible anywhere. Three
+independent bugs, all fixed and confirmed live:
+
+1. **`video_demux.rs` read `coded_width`/`coded_height`/`fps_hint` off `parsebin`'s pad at
+   `pad-added` time** — before any buffer had flowed, when the pad often only has
+   template (unfixed) caps. Silently produced `0×0` via `.unwrap_or(0)`. Fixed by reading
+   dimensions from the first pulled `gst::Sample`'s own `.caps()` instead (guaranteed
+   negotiated by then), and hard-erroring if still `0×0`. Turned out *not* to be what
+   broke rendering (`coded_width`/`coded_height` aren't even wired into
+   `VideoDecoder.configure()` on the real playback path — only into the unrelated
+   `probeWebCodecs` debug hook), but was a real, separately-worth-fixing bug the field log
+   plainly showed (`0x0@0.00` vs. GStreamer's own caps reading `1280x720`).
+2. **`codecWorker.ts`'s `decoder.configure()` calls weren't wrapped in `try/catch`** —
+   `handleInit`/`handleSeek`/`maybeStartLoopPrefetch` are async, fire-and-forget from
+   `self.onmessage`; a synchronous throw there would become an unhandled Promise
+   rejection with no `self.onerror` catching it, invisible everywhere. Added a
+   `configureDecoder()` wrapper + a `self.addEventListener("unhandledrejection", …)`
+   catch-all. Also not what broke rendering this time (`configure()` was succeeding) —
+   but this instrumentation pass (specifically, piping worker errors through `debugLog()`
+   so they land in `cuemark.log` instead of only an unattached WebKit devtools console)
+   is what surfaced bug 3 within one more live play attempt.
+3. **The actual cause: some access units have no picture data at all.** This file's H.264
+   stream has AUs consisting only of an Access Unit Delimiter + SEI message (no slice
+   NAL) — e.g. `au[1]` right after the opening keyframe: `nal_types=[9, 6]`, no `1`/`5`.
+   `h264.ts`'s `annexBToAvc()` correctly filters to slice-only NALs per the AVC re-mux
+   spec, so that AU re-muxes to zero bytes. Feeding `VideoDecoder.decode()` an empty
+   `EncodedVideoChunk` throws `EncodingError: Empty frame`, which per the WebCodecs spec
+   transitions the decoder to `"closed"` — permanently killing the deck. Fixed in
+   `pump()`/`feedLoopFrames()`: compute the AVC bytes first, skip the `decode()` call
+   (still advancing past the AU normally) when they come back empty.
+
+**Takeaway for any future AU-handling code on this path**: never assume a demuxed "one
+buffer = one access unit" always contains a decodable picture. Treat "re-muxes to zero
+picture bytes" as a normal, skippable case in the AU→`EncodedVideoChunk` translation
+layer, not an input to hand straight to `decoder.decode()`.
+
 ## Risks and open items
 
 - **Two open freeze/stall findings from phase 4 — (1) fixed, (2) still open**:

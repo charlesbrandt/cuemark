@@ -7,6 +7,7 @@
  * Rate changes need nothing here: the audio clock (contentPos, fed via setClock) already
  * advances at the deck's rate — there's no v.playbackRate-equivalent on this path.
  */
+import { debugLog } from "../debugLog";
 
 export interface DemuxInfo {
   codec: string;
@@ -28,10 +29,20 @@ export class CodecPlayer {
   private frames: VideoFrame[] = []; // kept pts-ascending
   private lastClockPos = 0;
   private destroyed = false;
+  private loggedFirstFrame = false;
 
   constructor(readonly deckId: string, port: number, demux: DemuxInfo) {
     this.worker = new Worker(new URL("./codecWorker.ts", import.meta.url), { type: "module" });
     this.worker.onmessage = (e: MessageEvent) => this.handleMessage(e.data);
+    // Worker construction failures / uncaught synchronous throws at the worker's top level
+    // (e.g. a module import error) fire here — otherwise these vanish with no signal at all
+    // on this app's headless/no-devtools launch path. Does NOT catch async unhandled
+    // rejections (codecWorker.ts's own `unhandledrejection` listener covers those) — see
+    // docs/design/webcodecs-video-not-rendering.md.
+    this.worker.onerror = (e) => {
+      debugLog(`[codecPlayer:${deckId}] worker.onerror: ${e.message} (${e.filename}:${e.lineno})`);
+      console.error(`[codecPlayer:${deckId}] worker.onerror:`, e);
+    };
     this.worker.postMessage({
       type: "init",
       deckId,
@@ -46,10 +57,16 @@ export class CodecPlayer {
   private handleMessage(msg: { type: string; frame?: VideoFrame; message?: string }) {
     if (msg.type === "frame" && msg.frame) {
       if (this.destroyed) { msg.frame.close(); return; }
+      if (!this.loggedFirstFrame) {
+        this.loggedFirstFrame = true;
+        debugLog(`[codecPlayer:${this.deckId}] first decoded frame: pts=${msg.frame.timestamp} ` +
+          `${msg.frame.displayWidth}x${msg.frame.displayHeight}`);
+      }
       this.frames.push(msg.frame);
       this.frames.sort((a, b) => a.timestamp - b.timestamp);
       while (this.frames.length > HELD_FRAMES) this.frames.shift()!.close();
     } else if (msg.type === "error") {
+      debugLog(`[codecPlayer:${this.deckId}] worker error: ${msg.message}`);
       console.error(`[codecPlayer:${this.deckId}] worker error:`, msg.message);
     }
   }

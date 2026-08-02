@@ -148,7 +148,16 @@ impl Drop for PipelineGuard {
 /// Outcome of parsebin exposing its first video pad, sent from the (GStreamer streaming
 /// thread's) `pad-added` callback back to `demux_file`'s calling thread.
 enum PadResult {
-    Supported { width: i32, height: i32, fps_hint: f64 },
+    // `width`/`height`/`fps_hint` are deliberately NOT captured here — at pad-added
+    // time parsebin's exposed pad frequently only has template (unfixed) caps, since
+    // our own downstream `h264parse` hasn't parsed a real SPS out of the byte stream
+    // yet (that requires buffers to actually flow, which only happens once the
+    // pipeline reaches PLAYING and pulls resume in the appsink loop below). Reading
+    // width/height here silently produced 0×0 for streams where the pad's initial
+    // caps weren't fixed — see docs/design/webcodecs-video-not-rendering.md. The real
+    // dimensions are read per-`gst::Sample` in the AU-pull loop instead, which carries
+    // the actual negotiated caps for that buffer.
+    Supported,
     Unsupported(String),
 }
 
@@ -224,15 +233,6 @@ fn demux_file(path: &str) -> Result<DemuxedVideo, String> {
             return;
         }
 
-        let width = s.get::<i32>("width").unwrap_or(0);
-        let height = s.get::<i32>("height").unwrap_or(0);
-        let fps_hint = s
-            .get::<gst::Fraction>("framerate")
-            .ok()
-            .filter(|f| f.denom() != 0)
-            .map(|f| f.numer() as f64 / f.denom() as f64)
-            .unwrap_or(0.0);
-
         let link_result = (|| -> Result<(), String> {
             let pipeline = pipeline_weak.upgrade().ok_or("pipeline dropped mid-negotiation")?;
             let h264parse = make_el("h264parse")?;
@@ -263,7 +263,7 @@ fn demux_file(path: &str) -> Result<DemuxedVideo, String> {
         })();
 
         let _ = tx.lock().unwrap().send(match link_result {
-            Ok(()) => PadResult::Supported { width, height, fps_hint },
+            Ok(()) => PadResult::Supported,
             Err(e) => PadResult::Unsupported(e),
         });
     });
@@ -272,13 +272,15 @@ fn demux_file(path: &str) -> Result<DemuxedVideo, String> {
         .set_state(gst::State::Playing)
         .map_err(|e| format!("set_state(Playing): {e}"))?;
 
-    let (coded_width, coded_height, fps_hint) =
-        match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(PadResult::Supported { width, height, fps_hint }) => (width, height, fps_hint),
-            Ok(PadResult::Unsupported(e)) => return Err(e),
-            Err(_) => return Err("timed out waiting for parsebin to expose a video stream".into()),
-        };
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(PadResult::Supported) => {}
+        Ok(PadResult::Unsupported(e)) => return Err(e),
+        Err(_) => return Err("timed out waiting for parsebin to expose a video stream".into()),
+    };
 
+    let mut coded_width = 0i32;
+    let mut coded_height = 0i32;
+    let mut fps_hint = 0.0f64;
     let mut aus = Vec::new();
     let mut keyframes = Vec::new();
     let mut max_end_us = 0i64;
@@ -290,6 +292,21 @@ fn demux_file(path: &str) -> Result<DemuxedVideo, String> {
         }
         match sink.try_pull_sample(gst::ClockTime::from_mseconds(500)) {
             Some(sample) => {
+                if coded_width == 0 || coded_height == 0 {
+                    // Read dimensions off this sample's own negotiated caps, not the
+                    // pad's caps at pad-added time (see the `PadResult::Supported`
+                    // comment above) — this is the first point they're guaranteed fixed.
+                    if let Some(s) = sample.caps().and_then(|c| c.structure(0).map(|s| s.to_owned())) {
+                        coded_width = s.get::<i32>("width").unwrap_or(0);
+                        coded_height = s.get::<i32>("height").unwrap_or(0);
+                        fps_hint = s
+                            .get::<gst::Fraction>("framerate")
+                            .ok()
+                            .filter(|f| f.denom() != 0)
+                            .map(|f| f.numer() as f64 / f.denom() as f64)
+                            .unwrap_or(0.0);
+                    }
+                }
                 let Some(buf) = sample.buffer() else { continue };
                 let Ok(map) = buf.map_readable() else { continue };
                 let pts_us = buf.pts().map(|t| t.useconds() as i64).unwrap_or(0);
@@ -320,6 +337,14 @@ fn demux_file(path: &str) -> Result<DemuxedVideo, String> {
 
     if aus.is_empty() {
         return Err("no access units demuxed (empty or unreadable video stream)".into());
+    }
+
+    if coded_width == 0 || coded_height == 0 {
+        return Err(format!(
+            "demuxed {} access units but never negotiated real dimensions \
+             ({coded_width}x{coded_height}) — refusing to hand WebCodecs a 0x0 configure()",
+            aus.len()
+        ));
     }
 
     let codec = aus
@@ -384,4 +409,43 @@ pub async fn video_demux_load(
 pub fn video_demux_unload(registry: State<'_, Arc<VideoDemuxRegistry>>, deck_id: String) -> Result<(), String> {
     registry.remove(&deck_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for docs/design/webcodecs-video-not-rendering.md: `demux_file` used
+    /// to read width/height off `parsebin`'s pad at `pad-added` time, which frequently only
+    /// has template (unfixed) caps before any buffer has flowed — silently yielding 0x0 via
+    /// `.unwrap_or(0)`. Synthesizes a real H.264-in-MP4 file (same shape as the field repro:
+    /// libx264 producing an mp4 container) and asserts `demux_file` recovers the real,
+    /// non-zero dimensions instead.
+    #[test]
+    fn demux_file_recovers_real_dimensions() {
+        gst::init().expect("gstreamer init");
+        let mp4_path = std::env::temp_dir().join("cuemark-video-demux-test.mp4");
+        let mp4_str = mp4_path.to_str().unwrap();
+
+        let launch = format!(
+            "videotestsrc num-buffers=50 ! video/x-raw,width=640,height=480,framerate=25/1 \
+             ! x264enc ! h264parse ! mp4mux ! filesink location={mp4_str}"
+        );
+        let pipeline = gst::parse::launch(&launch).expect("parse_launch");
+        pipeline.set_state(gst::State::Playing).expect("play");
+        let bus = pipeline.bus().unwrap();
+        bus.timed_pop_filtered(
+            gst::ClockTime::from_seconds(30),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        pipeline.set_state(gst::State::Null).expect("null");
+
+        let video = demux_file(mp4_str).expect("demux_file");
+        assert_eq!(video.coded_width, 640);
+        assert_eq!(video.coded_height, 480);
+        assert!(!video.aus.is_empty());
+        assert!(!video.codec.is_empty());
+
+        let _ = std::fs::remove_file(mp4_path);
+    }
 }
