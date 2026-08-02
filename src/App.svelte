@@ -97,10 +97,16 @@
   // ask audioSync.ts's rate-history log for the time-weighted average rate actually in effect
   // across the gap, instead of a single instantaneous snapshot (see averageRateOverWindow).
   const contentPosTracker = new Map<string, { audioPos: number; contentPos: number; tsMs: number }>();
-  // Debug: rAF heartbeat, throttled to ~1/sec, so a live "chokes up" repro can be
-  // read against Rust-side timestamps to tell a fully-frozen main thread (no
-  // heartbeat lines during the stall) apart from an IPC round-trip that's merely
-  // slow (heartbeat keeps ticking fine) — see debugLog.ts.
+  // Timestamp of the previous rAF tick, used to report main-thread stalls. This used to
+  // emit a "[heartbeat] rAF alive" line every single second unconditionally, which meant
+  // every log file was ~100% heartbeat noise — actively hostile to reading a live repro
+  // (the 2026-08-02 choppy-audio session opened a 32KB log whose entire visible tail was
+  // nothing but heartbeats). Liveness is already reported to Rust once a second by the
+  // watchdog_heartbeat invoke below, so this only logs the interesting case now: an
+  // actual gap, with its measured duration, which is more useful than a missing line in
+  // a wall of identical ones. Still distinguishes a frozen main thread from a merely
+  // slow IPC round-trip — see debugLog.ts and docs/design/freeze-watchdog.md.
+  const RAF_STALL_LOG_MS = 1000;
   let lastHeartbeatAt = 0;
   // Timestamp of the most recent frame() call, updated unconditionally every rAF tick
   // (unlike lastHeartbeatAt above, which is throttled). Read by the watchdog heartbeat
@@ -1075,10 +1081,12 @@
   function frame() {
     const nowMs = performance.now();
     lastRafTickAt = nowMs;
-    if (nowMs - lastHeartbeatAt > 1000) {
-      lastHeartbeatAt = nowMs;
-      debugLog(`[heartbeat] rAF alive`);
+    // lastHeartbeatAt starts at 0, so skip the first tick — its "gap" is the whole
+    // uptime since page load, not a stall.
+    if (lastHeartbeatAt !== 0 && nowMs - lastHeartbeatAt > RAF_STALL_LOG_MS) {
+      debugLog(`[heartbeat] rAF stalled ${Math.round(nowMs - lastHeartbeatAt)}ms`);
     }
+    lastHeartbeatAt = nowMs;
     try {
     if (compositor) {
       const { decks, visualization, visualizationOpacity } = get(session);
