@@ -436,3 +436,28 @@ post-reload state:
   reproduce the same way. When in doubt for *any* timing- or load-sensitive bug (not just sandbox
   questions), prefer a direct terminal launch over this skill and use the production `devtools`/
   `withGlobalTauri` setup to get a real devtools console on the actual binary instead.
+- **`org.gnome.Shell.Screenshot` over D-Bus returns `AccessDenied` in this environment** — not worth
+  retrying or hunting for a workaround (`grim`/`gnome-screenshot`/`scrot`/`import` are also not
+  installed). For a bug on the user's live desktop session, just ask them to paste a screenshot
+  directly into chat — confirmed 2026-08-01 chasing the deck-flip bug below: the user's pasted
+  screenshot of both windows side-by-side was what actually cracked it, after a much slower headless
+  attempt via this skill's normal flow stalled on cold SMB-backed media loading (see next entry).
+  Reach for headless repro when the user *can't* easily screenshot themselves or when the bug needs
+  DOM/state inspection a screenshot can't show — not as the default first move for a purely visual
+  live-desktop bug.
+- **A visual bug that's WebGL-specific vs. source-data-specific: compare the `DeckCard` preview
+  against the Output window in the same screenshot before touching any code.** `DeckCard`'s own
+  preview canvas (`DeckCard.svelte`) is a plain 2D-context `drawImage()` from the same `<video>`
+  element or `VideoFrame` the compositor uploads — it has no `UNPACK_FLIP_Y_WEBGL`/texture-coordinate
+  logic at all, so it's a flip-agnostic ground truth for "is the decoded frame itself oriented
+  correctly." The Output window is downstream of the full WebGL path (`fbo.ts` upload →
+  `compositor.ts` composite → `BroadcastChannel` → `output.ts`'s 2D blit, which is itself also
+  flip-agnostic). If the preview is correct and Output is flipped/garbled, the bug is confined to
+  `fbo.ts`/`compositor.ts`'s WebGL texture handling — skip investigating container rotation
+  matrices, codec pixel formats, or demux logic entirely. This is what pinned the 2026-08-01
+  deck-flip bug to `uploadVideoFrameFromCodec`'s direct `texImage2D(VideoFrame)` branch (missing
+  the flip on real GPU hardware — see `docs/design/webcodecs-video-path.md`'s 2026-08-01
+  correction) in one screenshot, after headless reproduction had stalled for several minutes on
+  cold-cache SMB loading and a `getDeckTime()`-gated frame-upload path that never fires while
+  `playing:false`. For this whole class of bug (orientation/color/distortion), try the live
+  screenshot comparison before setting up a headless `tauri-driver` repro.

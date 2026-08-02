@@ -250,18 +250,25 @@
     currentTime: number, duration: number
   ) {
     const p = peaks!;
-    const leadSecs = zoomSeconds * ZOOM_LEAD_RATIO;
+    // zoomSeconds is a REAL-TIME (wall-clock) window width shared across decks so two
+    // decks synced to the same effective BPM (nativeBpm * playbackRate) show the same
+    // pixel-per-beat spacing and their grids visually line up — content advances at
+    // `playbackRate` content-seconds per real second (see rate-position-drift.md), so
+    // the actual content-time span shown must be scaled by rate, not left at zoomSeconds
+    // directly. At rate 1.0 this is a no-op (contentSpan === zoomSeconds).
+    const contentSpan = zoomSeconds * Math.max(0.01, deck.playbackRate);
+    const leadSecs = contentSpan * ZOOM_LEAD_RATIO;
     const timeStart = currentTime - leadSecs;
-    const timeEnd = timeStart + zoomSeconds;
+    const timeEnd = timeStart + contentSpan;
     const playheadX = ZOOM_LEAD_RATIO * W;
 
     // Shade out-of-bounds (before track start / after track end)
     if (timeStart < 0) {
       ctx.fillStyle = '#040609';
-      ctx.fillRect(0, 0, Math.min(W, (-timeStart / zoomSeconds) * W), H);
+      ctx.fillRect(0, 0, Math.min(W, (-timeStart / contentSpan) * W), H);
     }
     if (timeEnd > duration) {
-      const x = Math.max(0, ((duration - timeStart) / zoomSeconds) * W);
+      const x = Math.max(0, ((duration - timeStart) / contentSpan) * W);
       ctx.fillStyle = '#040609';
       ctx.fillRect(x, 0, W - x, H);
     }
@@ -269,11 +276,11 @@
     const peakDuration = duration / p.length;
     const firstIdx = Math.max(0, Math.floor((Math.max(0, timeStart) / duration) * p.length));
     const lastIdx = Math.min(p.length - 1, Math.ceil((Math.min(duration, timeEnd) / duration) * p.length));
-    const barW = (peakDuration / zoomSeconds) * W;
+    const barW = (peakDuration / contentSpan) * W;
 
     for (let i = firstIdx; i <= lastIdx; i++) {
       const t = (i / p.length) * duration;
-      const x = ((t - timeStart) / zoomSeconds) * W;
+      const x = ((t - timeStart) / contentSpan) * W;
       const amp = p[i] * deck.gain;
       const h = Math.max(1, amp * mid * 0.92);
       const colorIdx = Math.min(255, Math.floor(amp * 255));
@@ -282,14 +289,14 @@
     }
 
     if (deck.bpm !== null && deck.downbeat !== null) {
-      drawBeatGrid(ctx, W, mid, timeStart, timeEnd, deck.bpm, deck.downbeat);
+      drawBeatGrid(ctx, W, mid, timeStart, timeEnd, contentSpan, deck.bpm, deck.downbeat);
     } else {
       // Tick marks every second (longer ticks every 4s)
       ctx.lineWidth = 1;
       const firstTick = Math.ceil(Math.max(0, timeStart));
       const lastTick = Math.floor(Math.min(duration, timeEnd));
       for (let t = firstTick; t <= lastTick; t++) {
-        const x = ((t - timeStart) / zoomSeconds) * W;
+        const x = ((t - timeStart) / contentSpan) * W;
         const tickH = t % 4 === 0 ? mid * 0.35 : mid * 0.15;
         ctx.strokeStyle = t % 4 === 0 ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.08)';
         ctx.beginPath();
@@ -299,7 +306,7 @@
       }
     }
 
-    drawMarkers(ctx, W, H, (t) => ((t - timeStart) / zoomSeconds) * W);
+    drawMarkers(ctx, W, H, (t) => ((t - timeStart) / contentSpan) * W);
 
     // Playhead pinned at fixed position
     ctx.strokeStyle = '#e04040';
@@ -313,41 +320,44 @@
   function drawBeatGrid(
     ctx: CanvasRenderingContext2D,
     W: number, mid: number,
-    timeStart: number, timeEnd: number,
+    timeStart: number, timeEnd: number, span: number,
     bpm: number, downbeat: number
   ) {
+    const H = mid * 2;
     const period = 60 / bpm;
     const kStart = Math.ceil((timeStart - downbeat) / period);
     const kEnd = Math.floor((timeEnd - downbeat) / period);
 
-    const normalH = mid * 0.15;
-    const accentH = mid * 0.4;
     let normalPath: number[] = [];
     let accentPath: number[] = [];
 
     for (let k = kStart; k <= kEnd; k++) {
       const t = downbeat + k * period;
-      const x = ((t - timeStart) / zoomSeconds) * W;
+      const x = ((t - timeStart) / span) * W;
       // k can be negative (downbeat is just one reference beat, not beat 0) —
       // JS's % keeps the sign of the dividend, so -4 % 4 === -0, not 0.
       const isAccent = ((k % 4) + 4) % 4 === 0;
       (isAccent ? accentPath : normalPath).push(x);
     }
 
+    // Full-height, magenta: the waveform's own amplitude gradient (waveform.ts) runs
+    // blue -> cyan -> green -> yellow -> orange, so magenta is the one hue guaranteed
+    // never to appear in a bar and get lost against a loud (orange) peak.
     ctx.lineWidth = 1;
-    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.strokeStyle = 'rgba(255,0,220,0.45)';
     ctx.beginPath();
     for (const x of normalPath) {
-      ctx.moveTo(x, mid - normalH);
-      ctx.lineTo(x, mid + normalH);
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, H);
     }
     ctx.stroke();
 
-    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = 'rgba(255,0,220,0.85)';
     ctx.beginPath();
     for (const x of accentPath) {
-      ctx.moveTo(x, mid - accentH);
-      ctx.lineTo(x, mid + accentH);
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, H);
     }
     ctx.stroke();
   }
@@ -408,8 +418,10 @@
 
     if (zoom) {
       const currentTime = getDeckTime(deck.id) ?? 0;
-      const timeStart = currentTime - zoomSeconds * ZOOM_LEAD_RATIO;
-      const t = timeStart + ratio * zoomSeconds;
+      // Must match drawZoom's contentSpan scaling or clicks land off from what's drawn.
+      const contentSpan = zoomSeconds * Math.max(0.01, deck.playbackRate);
+      const timeStart = currentTime - contentSpan * ZOOM_LEAD_RATIO;
+      const t = timeStart + ratio * contentSpan;
       seekDeck(deck.id, Math.max(0, Math.min(duration, quantizeToGrid(deck.id, t))));
     } else {
       seekDeck(deck.id, Math.max(0, Math.min(duration, quantizeToGrid(deck.id, ratio * duration))));

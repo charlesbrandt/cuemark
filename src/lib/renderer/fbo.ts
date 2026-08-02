@@ -66,17 +66,29 @@ export class DeckFBO {
 
   /**
    * Uploads a decoded WebCodecs VideoFrame directly, no scratch-canvas detour needed on
-   * this GPU (falls back to one if texImage2D throws). Every source frame from a
-   * VideoDecoder is already right-side-up in WebKitGTK's pixel format — do NOT apply the
-   * UNPACK_FLIP_Y_WEBGL flip uploadVideoFrame() uses for <video>/canvas sources (verified
-   * by screenshot compare; getting this wrong renders codec-path video upside down).
+   * this GPU (falls back to one if texImage2D throws). Needs the same UNPACK_FLIP_Y_WEBGL
+   * flip as uploadVideoFrame() — a VideoFrame source uses the same top-left-origin row
+   * layout as a <video>/canvas source, so both need the flip to land right-side-up in a
+   * bottom-left-origin WebGL texture.
+   *
+   * Earlier comment here claimed the direct branch must NOT flip ("frames arrive already
+   * right-side-up", "verified by screenshot compare") — that was only checked under
+   * Xvfb/llvmpipe software GL during the webcodecs-video-path spike, exactly the caveat
+   * the codecUploadMode doc comment above already flagged ("re-verify per real GPU").
+   * On real hardware it renders upside-down: caught 2026-08-01 (deck-0 on the codec/direct
+   * path was flipped in the Output window while deck-1, on the legacy path, was not; each
+   * DeckCard's own 2D-canvas preview — a separate, flip-agnostic drawImage() — stayed
+   * correct throughout, which is what pinned this down to the WebGL upload rather than the
+   * decoded frame data itself).
    */
   uploadVideoFrameFromCodec(frame: VideoFrame) {
     const gl = this.gl;
     if (DeckFBO.codecUploadMode !== "scratch") {
       try {
         gl.bindTexture(gl.TEXTURE_2D, this.texture);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
         gl.bindTexture(gl.TEXTURE_2D, null);
         DeckFBO.codecUploadMode = "direct";
         return;
@@ -86,7 +98,10 @@ export class DeckFBO {
     }
     this.scratchCtx.drawImage(frame, 0, 0, this.width, this.height);
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
+    // Same canvas-intermediary path as uploadVideoFrame() above — needs the same flip.
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.scratch);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.bindTexture(gl.TEXTURE_2D, null);
   }
 

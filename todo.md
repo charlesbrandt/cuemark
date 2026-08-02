@@ -99,20 +99,14 @@ What now exists (context for the remaining steps):
   "plausible but 0.2% off" is the exact failure mode this feature exists to kill).
   Rust smoke test: `cd src-tauri && cargo test analysis_rates`.
 
-### Step 2 — Beat grid rendering in WaveformCanvas
+### Step 2 — Beat grid rendering in WaveformCanvas [done]
 
-- In `drawZoom()`: when `deck.bpm !== null && deck.downbeat !== null`, draw beat
-  lines instead of the current 1-second ticks (keep the second-ticks fallback when
-  no grid). Beat times: `t = downbeat + k·(60/bpm)` for all k with t in
-  [timeStart, timeEnd]; x via the existing `timeToX`. Make every 4th beat
-  (`k % 4 === 0`) brighter/taller — e.g. `rgba(255,255,255,0.25)` vs `(0.10)`.
-- Overview mode: skip the grid (too dense); at most draw the downbeat anchor.
-- Both decks' zoom views already pin the playhead at the same 25% x-position
-  (`ZOOM_LEAD_RATIO`), so once beat lines exist, beat matching = visually lining
-  up verticals across the two waveforms. That's the payoff of this step.
-- Perf: this is inside the playing-deck RAF redraw — batch lines into two
-  `beginPath()` passes (normal, accented), no per-line style changes.
-  Run `scripts/perf-idle-test.sh` after (WaveformCanvas is on its watch list).
+- `drawZoom()` calls `drawBeatGrid()` when `deck.bpm !== null && deck.downbeat !== null`
+  (falls back to 1-second ticks otherwise); every 4th beat is brighter/taller.
+  Overview mode intentionally has no grid (too dense).
+- Both decks' zoom views pin the playhead at the same 25% x-position
+  (`ZOOM_LEAD_RATIO`), so beat matching = lining up verticals across the two waveforms.
+- Lines are batched into two `beginPath()` passes (normal, accented) per the perf note.
 
 ### Step 3 — Sync path correctness fixes [done, 2026-07-05]
 
