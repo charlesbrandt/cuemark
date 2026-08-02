@@ -2,6 +2,17 @@
 
 ## Known issues
 
+### Video not rendering on the webcodecs path [open, 2026-08-02]
+
+Deck plays audio correctly but shows no picture. `video_demux` returns
+`coded_width=0, coded_height=0, fps_hint=0.0` for a file GStreamer reads as 1280x720@25
+in the same run, while AU/keyframe parsing succeeds — so `VideoDecoder.configure()` is
+almost certainly being handed an invalid 0x0. Compounded by new (uncommitted)
+`decoder.state !== "configured"` guards in `codecWorker.ts` that `break` silently, so it
+fails with nothing logged. Full writeup, red herrings to avoid, and first steps:
+`docs/design/webcodecs-video-not-rendering.md`.
+
+
 ### Frontend had no uncaught-exception/rejection logging [fixed, 2026-07-24]
 
 Found while investigating a live UI freeze (2:44 into playback, dropped BPM 120.1 ->

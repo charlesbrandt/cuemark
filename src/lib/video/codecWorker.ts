@@ -156,6 +156,11 @@ async function pump() {
       // clock. Skipped while paused or for the very first AU, so a frame is ready the
       // instant playback starts / right after init.
       if (playing && nextFeedIndex > 0 && au.ptsUs / 1_000_000 - clockPos > aheadSeconds()) break;
+      // decoder can be reset/closed by a concurrent seek/loop-wrap/destroy message while
+      // this loop was suspended on the ensureAuFetched() await above (worker messages only
+      // run between awaits, but that's exactly where this checks back in) — re-check state
+      // right before the call instead of trusting the entry guard at the top of pump().
+      if (!decoder || decoder.state !== "configured") break;
       decoder.decode(new EncodedVideoChunk({
         type: au.key ? "key" : "delta",
         timestamp: au.ptsUs,
@@ -175,6 +180,9 @@ async function feedLoopFrames() {
     let au = auCache.get(loopFeedIndex);
     if (!au) au = await ensureAuFetched(loopFeedIndex);
     if (!au) break;
+    // Same reasoning as pump()'s state re-check: loopClear/destroy/a second loop-wrap can
+    // close loopDecoder (or null it out) while this loop was suspended on the await above.
+    if (!loopDecoder || loopDecoder.state !== "configured") break;
     loopDecoder.decode(new EncodedVideoChunk({
       type: au.key ? "key" : "delta",
       timestamp: au.ptsUs,
