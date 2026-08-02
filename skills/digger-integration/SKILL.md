@@ -46,6 +46,26 @@ only resolvable in the browser, not from the separate Rust process. Set an absol
 `http://10.20.2.99:8200`) via the Home/Local toggle in `DiggerQueue.svelte` for this fallback to
 work.
 
+**Gotcha — every `MediaCache` consumer needs its own `fallback_url`, not just `audio_load`.**
+`audio_analyze_file` (waveform) and `video_demux_load` (webcodecs path) each race `audio_load` for
+the same file on a fresh track load — `WaveformCanvas.svelte`'s `$effect` fires off the same
+`deck.source` change on Svelte's own scheduler, independent of `audio_load`'s call inside
+`App.svelte`'s rAF-scheduled `syncVideoElements`. `MediaCache::lookup_wait()` only waits out a copy
+that's *already* `InProgress` — if a caller reaches it before `audio_load`'s `ensure_cached()` has
+inserted that marker, there's nothing to wait on and it returns `None` immediately, silently
+falling back to the original (possibly unreachable) path. With a local NAS mount this race was
+always there but invisible — a local `fs::copy` starts near-instantly, so the window was
+microseconds. A ~6s Digger network fetch blows that window wide open: confirmed live 2026-08-01,
+waveform analysis lost the race and rendered blank/silent while the fetch was still in flight.
+Fixed by having `audio_analyze_file` and `video_demux_load` call `ensure_cached()` directly
+(same as `audio_load`, both now take an `Option<String>` fallback URL param) instead of a passive
+`lookup_wait()` — `ensure_cached()`'s `InProgress` branch already coordinates concurrent callers
+safely, so whichever arrives first does the fetch and the other(s) wait on it. **Not fixed**:
+`media_server.rs`'s legacy-`<video>`-element HTTP handler still uses bare `lookup_wait()` — it's a
+plain HTTP server with no IPC-parameter path for a fallback URL, and only serves the
+legacy-fallback backend (non-webcodecs decks), not the webcodecs-default path. Same latent race
+there if a legacy-backend deck's first HTTP video request beats `audio_load`'s `ensure_cached()`.
+
 **Gotcha — Digger omits unset `bpm`/`downbeat` instead of sending JSON `null`.** cuemark's
 `CuemarkPayload` TS interface declares `bpm: number | null`, but that's just a type annotation —
 if the FastAPI response body simply omits the key (e.g. a Pydantic model with

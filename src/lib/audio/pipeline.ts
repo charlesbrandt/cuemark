@@ -161,8 +161,8 @@ export interface AudioAnalysisData {
 /** Decode audio in Rust and return waveform peaks (30/s) plus a beat-grid RMS
  *  envelope (210/s). Avoids decodeAudioData which triggers vaav1dec on
  *  video+audio containers in WebKitGTK. */
-export function audioAnalyzeFile(filePath: string): Promise<AudioAnalysisData> {
-  return invoke("audio_analyze_file", { filePath });
+export function audioAnalyzeFile(filePath: string, fallbackUrl?: string): Promise<AudioAnalysisData> {
+  return invoke("audio_analyze_file", { filePath, fallbackUrl });
 }
 
 // ── Grid persistence (local sidecar) ─────────────────────────────────────────

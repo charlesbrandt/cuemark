@@ -66,11 +66,11 @@ export interface AnalysisResult {
   gridOffset: number | null; // seconds; a beat lies at gridOffset + k·(60/bpm). null = no grid fit
 }
 
-export async function analyzeFile(filePath: string): Promise<AnalysisResult> {
+export async function analyzeFile(filePath: string, fallbackUrl?: string): Promise<AnalysisResult> {
   const { audioAnalyzeFile } = await import('./pipeline');
   // Rust decodes audio with video decoders disabled, avoiding the vaav1dec VA-API
   // corruption that decodeAudioData triggers on video+audio containers in WebKitGTK.
-  const raw = await audioAnalyzeFile(filePath);
+  const raw = await audioAnalyzeFile(filePath, fallbackUrl);
   const peaks = new Float32Array(raw.peaks);
   const envelope = new Float32Array(raw.envelope);
   const { detectBeatGrid, detectBpm } = await import('./bpm');

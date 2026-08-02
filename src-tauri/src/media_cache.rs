@@ -143,6 +143,35 @@ impl MediaCache {
                 Err(local_err) => {
                     let url = remote_fallback
                         .ok_or_else(|| format!("stat {original_path}: {local_err}"))?;
+
+                    // A previous run may have already fetched this exact file into the cache
+                    // dir — the in-memory `resolved` map (what the InProgress/Ready check at
+                    // the top of this function looks at) resets on every process restart, but
+                    // the file on disk doesn't. Without this check, every restart re-downloads
+                    // the whole file from Digger even when a byte-identical copy already sits
+                    // locally, needlessly widening the exact ensure_cached()-vs-lookup_wait()
+                    // race this fallback was built to close (see digger-integration/SKILL.md).
+                    // The remote-fetch cache key can't be predicted up front (filename embeds
+                    // the downloaded byte count, unlike the local-stat branch above, which
+                    // knows the size from fs::metadata) — scan for any file already using this
+                    // path's hash prefix instead.
+                    let prefix = format!("{:016x}-", path_hash(original_path));
+                    let existing = fs::read_dir(&self.dir).ok().and_then(|entries| {
+                        entries.filter_map(|e| e.ok()).find_map(|e| {
+                            let name = e.file_name();
+                            let name = name.to_str()?;
+                            (name.starts_with(&prefix) && name.ends_with(&format!(".{ext}")))
+                                .then(|| self.dir.join(name))
+                        })
+                    });
+                    if let Some(cached_path) = existing {
+                        log::info!(
+                            "[media_cache] {original_path} not found locally, reusing existing cache {}",
+                            cached_path.display()
+                        );
+                        return Ok(cached_path.to_string_lossy().into_owned());
+                    }
+
                     log::info!("[media_cache] {original_path} not found locally, fetching from {url}");
 
                     let resp = ureq::get(url)

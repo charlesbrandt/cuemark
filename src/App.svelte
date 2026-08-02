@@ -120,6 +120,33 @@
   // toggle arriving in that window finds v.paused=true, matches neither branch, and
   // audioPause is never called — leaving GStreamer playing with the deck appearing frozen.
   const lastAudioPlaying = new Map<string, boolean>();
+  // audioPlay/audioPause can legitimately race ahead of audio_load finishing pipeline
+  // creation (Digger fetch + GStreamer preroll can take several seconds) and fail with
+  // "no audio pipeline for deck". syncVideoElements only re-runs in response to a session
+  // store mutation (or the once-per-mount rAF after one), NOT on every animation frame —
+  // so relying on "the next tick will retry" (the old comment here) is false whenever
+  // nothing else happens to touch the store in the meantime. Confirmed live 2026-08-01:
+  // a failed audioPlay sat unretried for 4+ seconds after the pipeline actually became
+  // ready, during a Digger-fallback load. This helper schedules its own retry via
+  // setTimeout instead of depending on incidental store churn, capped so a genuinely
+  // dead pipeline (audio_load itself failed) doesn't retry forever.
+  const AUDIO_TRANSPORT_RETRY_MS = 200;
+  const AUDIO_TRANSPORT_MAX_RETRIES = 50; // ~10s
+  function reconcileAudioTransport(deckId: string, playing: boolean, attempt = 0) {
+    const action = playing ? audioPlay(deckId) : audioPause(deckId);
+    action
+      .then(() => { lastAudioPlaying.set(deckId, playing); })
+      .catch((e) => {
+        // Superseded: the deck moved on to a different desired state since this call
+        // was scheduled — the newer reconcileAudioTransport call owns the retry.
+        if (get(session).decks.find((d) => d.id === deckId)?.playing !== playing) return;
+        if (attempt >= AUDIO_TRANSPORT_MAX_RETRIES) {
+          console.error(`[audio-transport] ${deckId} giving up after ${attempt} retries:`, e);
+          return;
+        }
+        setTimeout(() => reconcileAudioTransport(deckId, playing, attempt + 1), AUDIO_TRANSPORT_RETRY_MS);
+      });
+  }
   // Per-deck audio rate/gain/volume are synced via audioSync.ts (module-level Maps shared
   // with handler.ts). No per-component Maps needed here.
   // Phase 3 proof instrumentation (docs/design/webcodecs-video-path.md "Phase 3 results"):
@@ -825,9 +852,9 @@
   // syncVideoElements then creates a normal <video> element for this deck, same as if
   // 'legacy' had been requested. adoptedPos, if given, is a recovery-boot or live-toggle
   // position to seek the fresh player to once constructed.
-  async function startCodecPath(deckId: string, filePath: string, adoptedPos?: number) {
+  async function startCodecPath(deckId: string, filePath: string, adoptedPos?: number, fallbackUrl?: string) {
     try {
-      const demux = await invoke<DemuxInfo>('video_demux_load', { deckId, filePath });
+      const demux = await invoke<DemuxInfo>('video_demux_load', { deckId, filePath, fallbackUrl });
       // Guard: the deck's source may have changed again while this awaited.
       const cur = get(session).decks.find((d) => d.id === deckId)?.source;
       if (!cur || cur.type !== 'video' || cur.filePath !== filePath) {
@@ -891,7 +918,8 @@
         const adopted = ensureAudioLoaded(deck, filePath);
         if (desired === 'webcodecs') {
           backendState.set(deckId, { filePath, kind: 'pending', adoptedPos: adopted?.positionSecs });
-          startCodecPath(deckId, filePath, adopted?.positionSecs);
+          const fallbackUrl = deck.diggerFileId != null ? getDiggerFileUrl(deck.diggerFileId) : undefined;
+          startCodecPath(deckId, filePath, adopted?.positionSecs, fallbackUrl);
         } else {
           backendState.set(deckId, { filePath, kind: 'legacy', adoptedPos: adopted?.positionSecs });
           createLegacyVideoEl(deck, filePath, adopted);
@@ -935,13 +963,14 @@
         }
         const wasAudioPlaying = lastAudioPlaying.get(deckId);
         if (deck.playing !== wasAudioPlaying) {
-          lastAudioPlaying.set(deckId, deck.playing);
-          if (deck.playing) {
-            debugLog(`[video-path] ${deckId} webcodecs branch: calling audioPlay (was=${wasAudioPlaying})`);
-            audioPlay(deckId).catch((e) => { debugLog(`[video-path] ${deckId} audioPlay FAILED: ${e}`); console.error(e); });
-          } else {
-            audioPause(deckId).catch(console.error);
-          }
+          // Only mark this play/pause as handled once the IPC call actually succeeds —
+          // audio_load can still be mid-flight (Digger fetch + GStreamer preroll can take
+          // several seconds), so audioPlay racing ahead of pipeline creation fails with
+          // "no audio pipeline for deck". reconcileAudioTransport retries on its own timer
+          // instead of depending on syncVideoElements running again (it doesn't, on every
+          // tick — see the lastAudioPlaying declaration comment).
+          debugLog(`[video-path] ${deckId} webcodecs branch: calling audio${deck.playing ? 'Play' : 'Pause'} (was=${wasAudioPlaying})`);
+          reconcileAudioTransport(deckId, deck.playing);
         }
         continue;
       }
@@ -1033,12 +1062,11 @@
       // always fires when deck.playing flips to false, regardless of the video element state.
       const wasAudioPlaying = lastAudioPlaying.get(deckId);
       if (deck.playing !== wasAudioPlaying) {
-        lastAudioPlaying.set(deckId, deck.playing);
-        if (deck.playing) {
-          audioPlay(deckId).catch(console.error);
-        } else {
-          audioPause(deckId).catch(console.error);
-        }
+        // See reconcileAudioTransport's doc comment (lastAudioPlaying declaration) — only
+        // marks this play/pause as handled once the IPC call actually succeeds, and
+        // retries on its own timer rather than depending on syncVideoElements running
+        // again.
+        reconcileAudioTransport(deckId, deck.playing);
       }
     }
   }

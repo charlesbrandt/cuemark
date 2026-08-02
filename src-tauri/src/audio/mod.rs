@@ -8,7 +8,7 @@ pub mod record;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 
 use crate::media_cache::MediaCache;
 use self::devices::AudioDevice;
@@ -122,69 +122,85 @@ pub fn list_audio_devices(_state: State<'_, AudioState>) -> Vec<AudioDevice> {
     devices::list_audio_devices()
 }
 
+// Async + spawn_blocking, same pattern as audio_analyze_file/video_demux_load below —
+// necessary since ensure_cached() can now block on a multi-second network fetch (Digger
+// fallback, media_cache.rs) rather than just a fast local stat/copy. A synchronous
+// #[tauri::command] blocking for several seconds froze the whole window (confirmed live:
+// tripped the freeze-watchdog's 6s threshold, cascaded through all three recovery tiers,
+// and tier3's SIGKILL didn't bring the app back). `cache` is cloned to an owned Arc before
+// spawning (State's borrow isn't 'static); `AudioState` (a bare Mutex, not Clone) is
+// re-fetched inside the blocking closure via the cloned AppHandle's `.state::<AudioState>()`
+// — same underlying managed Mutex<AudioManager>, not a new instance.
 #[tauri::command]
-pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, cache: State<'_, Arc<MediaCache>>, deck_id: String, file_path: String, fallback_url: Option<String>) -> Result<Option<f64>, String> {
-    // Resolve to a local disk copy before touching GStreamer at all — see media_cache.rs.
-    // The library here is served over SMB/CIFS; scratch leaves the normal playback
-    // branch idle for a whole gesture, and resuming it against the network share after
-    // that idle period was measured blocking for ~10s on a live repro (SMB
-    // re-negotiation). PCM decode and uridecodebin preroll below both read this same
-    // local path, so the network is touched at most once per track, not repeatedly.
-    // Caching is an optimization, not a requirement: fall back to the original path on
-    // any failure (permissions, disk full, source not stat-able yet) rather than
-    // failing the load outright. `fallback_url`, when the local path doesn't stat at
-    // all, lets ensure_cached() fetch from Digger instead — see its doc comment.
-    let load_path = cache.ensure_cached(&file_path, fallback_url.as_deref()).unwrap_or_else(|e| {
-        log::warn!("[audio/{deck_id}] media cache miss, loading directly from source: {e}");
-        file_path.clone()
-    });
+pub async fn audio_load(app: tauri::AppHandle, cache: State<'_, Arc<MediaCache>>, deck_id: String, file_path: String, fallback_url: Option<String>) -> Result<Option<f64>, String> {
+    let cache = cache.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AudioState>();
 
-    // Pull the pipeline out of the map before calling load() so the mutex is not held
-    // during GStreamer preroll (which can block for up to 5 seconds). Without this,
-    // every other audio command (audio_get_position, audio_play, …) waits on the mutex
-    // for the full preroll duration, making the UI unresponsive on first track load.
-    let mut pipeline = {
-        let mut mgr = state.lock().unwrap();
-        // Temporary assertion (freeze-watchdog.md phases 2-3, "Adoption bugs" risk):
-        // session recovery must NEVER call audio_load on a deck whose pipeline is
-        // already loaded+playing — that's the one way rehydration could audibly
-        // glitch a track that survived the freeze untouched. Any real caller hitting
-        // this is a bug in the adoption-skip logic (App.svelte's pendingAdoption),
-        // not an expected state; log loudly instead of silently reloading.
-        if let Some(existing) = mgr.pipelines.get(&deck_id) {
-            if existing.is_playing() {
-                log::error!(
-                    "[audio/{deck_id}] audio_load called while pipeline is already playing \
-                     (pos={:?}) — this will audibly glitch; see freeze-watchdog.md \"Adoption bugs\" risk",
-                    existing.position()
-                );
+        // Resolve to a local disk copy before touching GStreamer at all — see media_cache.rs.
+        // The library here is served over SMB/CIFS; scratch leaves the normal playback
+        // branch idle for a whole gesture, and resuming it against the network share after
+        // that idle period was measured blocking for ~10s on a live repro (SMB
+        // re-negotiation). PCM decode and uridecodebin preroll below both read this same
+        // local path, so the network is touched at most once per track, not repeatedly.
+        // Caching is an optimization, not a requirement: fall back to the original path on
+        // any failure (permissions, disk full, source not stat-able yet) rather than
+        // failing the load outright. `fallback_url`, when the local path doesn't stat at
+        // all, lets ensure_cached() fetch from Digger instead — see its doc comment.
+        let load_path = cache.ensure_cached(&file_path, fallback_url.as_deref()).unwrap_or_else(|e| {
+            log::warn!("[audio/{deck_id}] media cache miss, loading directly from source: {e}");
+            file_path.clone()
+        });
+
+        // Pull the pipeline out of the map before calling load() so the mutex is not held
+        // during GStreamer preroll (which can block for up to 5 seconds). Without this,
+        // every other audio command (audio_get_position, audio_play, …) waits on the mutex
+        // for the full preroll duration, making the UI unresponsive on first track load.
+        let mut pipeline = {
+            let mut mgr = state.lock().unwrap();
+            // Temporary assertion (freeze-watchdog.md phases 2-3, "Adoption bugs" risk):
+            // session recovery must NEVER call audio_load on a deck whose pipeline is
+            // already loaded+playing — that's the one way rehydration could audibly
+            // glitch a track that survived the freeze untouched. Any real caller hitting
+            // this is a bug in the adoption-skip logic (App.svelte's pendingAdoption),
+            // not an expected state; log loudly instead of silently reloading.
+            if let Some(existing) = mgr.pipelines.get(&deck_id) {
+                if existing.is_playing() {
+                    log::error!(
+                        "[audio/{deck_id}] audio_load called while pipeline is already playing \
+                         (pos={:?}) — this will audibly glitch; see freeze-watchdog.md \"Adoption bugs\" risk",
+                        existing.position()
+                    );
+                }
             }
-        }
-        let main_devices = mgr.main_devices.clone();
-        let cue_device = mgr.cue_device.clone();
-        let master_volume = mgr.master_volume;
-        mgr.pipelines.remove(&deck_id).unwrap_or_else(|| {
-            let mut p = DeckAudioPipeline::new(&deck_id);
-            p.devices = main_devices;
-            p.cue_device = cue_device;
-            p.master_volume = master_volume;
-            let app_clone = app.clone();
-            let did = deck_id.clone();
-            p.set_eos_callback(move || {
-                let _ = app_clone.emit("deck-eos", did.clone());
-            });
-            p
-        })
-        // mutex released here
-    };
+            let main_devices = mgr.main_devices.clone();
+            let cue_device = mgr.cue_device.clone();
+            let master_volume = mgr.master_volume;
+            mgr.pipelines.remove(&deck_id).unwrap_or_else(|| {
+                let mut p = DeckAudioPipeline::new(&deck_id);
+                p.devices = main_devices;
+                p.cue_device = cue_device;
+                p.master_volume = master_volume;
+                let app_clone = app.clone();
+                let did = deck_id.clone();
+                p.set_eos_callback(move || {
+                    let _ = app_clone.emit("deck-eos", did.clone());
+                });
+                p
+            })
+            // mutex released here
+        };
 
-    pipeline.set_app(app.clone());
-    let result = pipeline.load(&load_path); // preroll runs without holding the mutex
+        pipeline.set_app(app.clone());
+        let result = pipeline.load(&load_path); // preroll runs without holding the mutex
 
-    // Re-insert the pipeline (even on error, to preserve the object for future loads).
-    state.lock().unwrap().pipelines.insert(deck_id, pipeline);
+        // Re-insert the pipeline (even on error, to preserve the object for future loads).
+        state.lock().unwrap().pipelines.insert(deck_id, pipeline);
 
-    result
+        result
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -194,17 +210,52 @@ pub fn audio_unload(state: State<'_, AudioState>, deck_id: String) -> Result<(),
     Ok(())
 }
 
+// Async + spawn_blocking (2026-08-01 live incident): `play()`'s gstreamer set_state(Playing)
+// call can block on PipeWire's pw_thread_loop_lock() — confirmed live via gdb on a hung
+// `cuemark` process: the GTK main thread (which every Tauri IPC dispatch, and therefore
+// every WebKitWebProcess frame/event delivery, runs through) was parked inside exactly
+// that lock, for a pipewiresink targeting a real USB audio interface for the first time
+// that session (previously fakesink/default-target sinks negotiated fast enough that this
+// never surfaced). WebKitWebProcess itself was NOT deadlocked (its own gdb backtrace showed
+// every thread idle) — it was simply starved, since its parent process's main loop had
+// stopped pumping entirely. A synchronous #[tauri::command] here blocks that same main
+// thread for however long PipeWire takes to grant the lock, freezing the whole app, not
+// just this deck's audio.
+//
+// The first fix attempt (spawn_blocking alone, still holding `state.lock()` across the
+// whole `.play()` call) did NOT resolve this — a second live incident on the same night
+// reproduced an identical-looking freeze, and a follow-up gdb capture showed why: the
+// spawn_blocking thread was parked in `pw_thread_loop_lock()` *while still holding the
+// `Mutex<AudioManager>`*, and `audio_get_position` (still fully synchronous, polled every
+// rAF frame from the GTK main thread) piled up behind that same mutex — so the app-wide
+// freeze reproduced via lock contention instead of a direct blocking call on the main
+// thread. Fixed by switching to `with_pipeline_detached`, the same pattern `audio_pause`
+// already used correctly below: the mutex is held only for the brief HashMap
+// remove/insert around `.play()`, not for the call itself, so `audio_get_position` and
+// every other deck's IPC never wait on PipeWire.
 #[tauri::command]
-pub fn audio_play(state: State<'_, AudioState>, deck_id: String) -> Result<(), String> {
-    state.lock().unwrap().pipeline_mut(&deck_id)?.play()
+pub async fn audio_play(app: tauri::AppHandle, deck_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AudioState>();
+        with_pipeline_detached(&state, &deck_id, |p| p.play())?
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
+// Async + spawn_blocking — same reasoning as audio_play above; pause() calls the identical
+// gstreamer set_state() path (Playing -> Paused), equally capable of blocking on PipeWire.
 #[tauri::command]
-pub fn audio_pause(state: State<'_, AudioState>, deck_id: String) -> Result<(), String> {
-    // Detached: pause() may run stop_scratch_feeder()'s ~130-400ms teardown+resync
-    // (drain sleep + two flush seeks) if a scratch was active — see
-    // with_pipeline_detached's doc comment above.
-    with_pipeline_detached(&state, &deck_id, |p| p.pause())?
+pub async fn audio_pause(app: tauri::AppHandle, deck_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AudioState>();
+        // Detached: pause() may run stop_scratch_feeder()'s ~130-400ms teardown+resync
+        // (drain sleep + two flush seeks) if a scratch was active — see
+        // with_pipeline_detached's doc comment above.
+        with_pipeline_detached(&state, &deck_id, |p| p.pause())?
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -279,50 +330,92 @@ pub fn audio_set_master_volume(state: State<'_, AudioState>, volume: f32) -> Res
     Ok(())
 }
 
+// Async + spawn_blocking (2026-08-01 live incident — see audio_play's doc comment for the
+// full gdb-confirmed root cause). `set_devices()`/`set_cue_device()` below are an even
+// bigger exposure than plain play/pause: they unconditionally tear down and rebuild each
+// pipeline's GStreamer graph, including brand-new pipewiresink negotiation with PipeWire —
+// exactly the call path caught blocked on `pw_thread_loop_lock()` in the live incident.
+// This was previously invisible because every prior test tonight used fakesink or an empty
+// (system-default) target; it reproduced the moment a real USB hardware device was set as
+// the cue output for the first time.
+//
+// Like audio_play, spawn_blocking alone wasn't enough — the original version below held
+// `state.lock()` for the ENTIRE per-pipeline loop, so one pipeline stuck in
+// `pw_thread_loop_lock()` blocked `audio_get_position` (and every other deck command) via
+// mutex contention for as long as PipeWire took, reproducing the same app-wide freeze.
+// Fixed by taking the lock only for the no-op check / bookkeeping / device-id snapshot,
+// then detaching each pipeline via `with_pipeline_detached` for its own `set_devices()`/
+// `set_cue_device()` call, same as `audio_play` above.
 #[tauri::command]
-pub fn audio_set_main_devices(state: State<'_, AudioState>, device_ids: Vec<String>) -> Result<(), String> {
-    let mut mgr = state.lock().unwrap();
-    // No-op guard: the frontend calls this unconditionally on every mount (App.svelte's
-    // `$effect` syncing the persisted `mainOutputDeviceIds` store has no change check),
-    // and `DeckAudioPipeline::set_devices` unconditionally tears down and rebuilds the
-    // GStreamer pipeline (PipeWire's pipewiresink can't retarget at runtime). On a normal
-    // cold boot `pipelines` is still empty so the rebuild is free — but on a freeze-watchdog
-    // recovery-boot reload (docs/design/freeze-watchdog.md phase 2), the pipeline the
-    // frontend just finished carefully *adopting* without an audioLoad call gets torn down
-    // and rebuilt seconds later by this unrelated call, producing an audible glitch (brief
-    // stutter, position rewound slightly) — confirmed live 2026-07-25. Same fix pattern as
-    // `audio_set_cue_device` below.
-    if mgr.main_devices == device_ids {
-        return Ok(());
-    }
-    mgr.main_devices = device_ids.clone();
-    // MasterMix uses the first device as its primary target (or empty = default).
-    let primary = device_ids.first().map(|s| s.as_str()).unwrap_or("");
-    mgr.mixer.set_main_device(primary)?;
-    for pipeline in mgr.pipelines.values_mut() {
-        if let Err(e) = pipeline.set_devices(&device_ids) {
-            log::error!("[audio] set_devices failed for {}: {e}", pipeline.deck_id);
+pub async fn audio_set_main_devices(app: tauri::AppHandle, device_ids: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AudioState>();
+        let deck_ids: Vec<String> = {
+            let mut mgr = state.lock().unwrap();
+            // No-op guard: the frontend calls this unconditionally on every mount (App.svelte's
+            // `$effect` syncing the persisted `mainOutputDeviceIds` store has no change check),
+            // and `DeckAudioPipeline::set_devices` unconditionally tears down and rebuilds the
+            // GStreamer pipeline (PipeWire's pipewiresink can't retarget at runtime). On a normal
+            // cold boot `pipelines` is still empty so the rebuild is free — but on a freeze-watchdog
+            // recovery-boot reload (docs/design/freeze-watchdog.md phase 2), the pipeline the
+            // frontend just finished carefully *adopting* without an audioLoad call gets torn down
+            // and rebuilt seconds later by this unrelated call, producing an audible glitch (brief
+            // stutter, position rewound slightly) — confirmed live 2026-07-25. Same fix pattern as
+            // `audio_set_cue_device` below.
+            if mgr.main_devices == device_ids {
+                return Ok(());
+            }
+            mgr.main_devices = device_ids.clone();
+            // MasterMix uses the first device as its primary target (or empty = default).
+            let primary = device_ids.first().map(|s| s.as_str()).unwrap_or("");
+            mgr.mixer.set_main_device(primary)?;
+            mgr.pipelines.keys().cloned().collect()
+            // mutex released here
+        };
+        for deck_id in deck_ids {
+            let device_ids = device_ids.clone();
+            let outcome = with_pipeline_detached(&state, &deck_id, move |p| p.set_devices(&device_ids));
+            match outcome {
+                Ok(Err(e)) => log::error!("[audio] set_devices failed for {deck_id}: {e}"),
+                Err(e) => log::error!("[audio] set_devices: pipeline vanished for {deck_id}: {e}"),
+                Ok(Ok(())) => {}
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn audio_set_cue_device(state: State<'_, AudioState>, device_id: String) -> Result<(), String> {
-    let mut mgr = state.lock().unwrap();
-    // No-op guard — see the matching comment in audio_set_main_devices above; same bug,
-    // same fix, for the headphone cue output's `$effect` in App.svelte.
-    if mgr.cue_device == device_id {
-        return Ok(());
-    }
-    mgr.cue_device = device_id.clone();
-    mgr.mixer.set_cue_device(&device_id)?;
-    for pipeline in mgr.pipelines.values_mut() {
-        if let Err(e) = pipeline.set_cue_device(&device_id) {
-            log::error!("[audio] set_cue_device failed for {}: {e}", pipeline.deck_id);
+pub async fn audio_set_cue_device(app: tauri::AppHandle, device_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AudioState>();
+        let deck_ids: Vec<String> = {
+            let mut mgr = state.lock().unwrap();
+            // No-op guard — see the matching comment in audio_set_main_devices above; same bug,
+            // same fix, for the headphone cue output's `$effect` in App.svelte.
+            if mgr.cue_device == device_id {
+                return Ok(());
+            }
+            mgr.cue_device = device_id.clone();
+            mgr.mixer.set_cue_device(&device_id)?;
+            mgr.pipelines.keys().cloned().collect()
+            // mutex released here
+        };
+        for deck_id in deck_ids {
+            let device_id = device_id.clone();
+            let outcome = with_pipeline_detached(&state, &deck_id, move |p| p.set_cue_device(&device_id));
+            match outcome {
+                Ok(Err(e)) => log::error!("[audio] set_cue_device failed for {deck_id}: {e}"),
+                Err(e) => log::error!("[audio] set_cue_device: pipeline vanished for {deck_id}: {e}"),
+                Ok(Ok(())) => {}
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -367,18 +460,24 @@ pub async fn audio_analyze_file(
     cache: State<'_, Arc<MediaCache>>,
     analysis_cache: State<'_, Arc<analysis::AnalysisCache>>,
     file_path: String,
+    fallback_url: Option<String>,
 ) -> Result<analysis::AnalysisData, String> {
-    // Waits out an in-progress ensure_cached() copy (see media_cache.rs's lookup_wait())
-    // instead of a bare best-effort lookup — this runs independently of/racing with
-    // audio_load, so without waiting it could resolve to the original (network) path for
-    // the whole analysis pass. A path never requested to be cached still falls back
-    // immediately. Done inside spawn_blocking since lookup_wait() can block synchronously.
+    // Calls ensure_cached() directly (same as audio_load) rather than a passive
+    // lookup_wait() — this runs independently of/racing with audio_load (WaveformCanvas's
+    // $effect fires off the same deck.source change, on Svelte's own scheduler, not
+    // App.svelte's rAF-scheduled syncVideoElements), and lookup_wait() only waits out a
+    // copy that is *already* InProgress — if this call reaches MediaCache before
+    // audio_load's ensure_cached() has inserted that marker, lookup_wait() sees no entry
+    // at all and returns immediately, silently falling back to the original (possibly
+    // unreachable, e.g. no local NAS mount) path. Confirmed live 2026-08-01: analysis
+    // failed and the waveform rendered blank/silent while audio_load's own fetch was still
+    // in flight. ensure_cached()'s InProgress branch already coordinates concurrent
+    // callers safely (whichever arrives first does the copy/fetch, the other waits), so
+    // calling it here directly closes the race instead of depending on call-order luck.
     let cache = cache.inner().clone();
     let analysis_cache = analysis_cache.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let path = cache
-            .lookup_wait(&file_path, std::time::Duration::from_secs(10))
-            .unwrap_or(file_path);
+        let path = cache.ensure_cached(&file_path, fallback_url.as_deref())?;
         analysis_cache.get_or_compute(&path)
     })
         .await

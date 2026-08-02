@@ -1,6 +1,7 @@
 <script lang="ts">
   import { analyzeFile, COLOR_UPCOMING, COLOR_PLAYED } from '../lib/audio/waveform';
   import { seekDeck, getDeckTime, quantizeToGrid, scratchingDecks } from '../lib/renderer/seekBus';
+  import { getDiggerFileUrl } from '../lib/digger/api';
   import type { Deck } from '../lib/state/types';
 
   let {
@@ -37,7 +38,8 @@
     peaks = null;
     analyzedPath = filePath;
     loading = true;
-    analyzeFile(filePath).then((result) => {
+    const fallbackUrl = deck.diggerFileId != null ? getDiggerFileUrl(deck.diggerFileId) : undefined;
+    analyzeFile(filePath, fallbackUrl).then((result) => {
       if (analyzedPath === filePath) {
         peaks = result.peaks;
         loading = false;

@@ -359,16 +359,18 @@ pub async fn video_demux_load(
     registry: State<'_, Arc<VideoDemuxRegistry>>,
     deck_id: String,
     file_path: String,
+    fallback_url: Option<String>,
 ) -> Result<DemuxResult, String> {
     let cache = cache.inner().clone();
     let registry = registry.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        // Waits out an in-progress ensure_cached() copy instead of a bare best-effort
-        // lookup, same reasoning as audio_analyze_file — this can race audio_load's
-        // cache copy for the same file on initial track load.
-        let path = cache
-            .lookup_wait(&file_path, Duration::from_secs(10))
-            .unwrap_or(file_path);
+        // Calls ensure_cached() directly instead of a passive lookup_wait() — this can
+        // race audio_load's own ensure_cached() call for the same file on initial track
+        // load, and lookup_wait() only waits out a copy that's already InProgress; if
+        // this call arrives first there's no entry yet to wait on and it would fall
+        // straight back to the original (possibly unreachable) path. See the identical
+        // fix + incident note on audio_analyze_file in audio/mod.rs (2026-08-01).
+        let path = cache.ensure_cached(&file_path, fallback_url.as_deref())?;
         let video = demux_file(&path)?;
         let result = video.to_result();
         registry.insert(deck_id, video);
