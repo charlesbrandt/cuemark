@@ -123,7 +123,7 @@ pub fn list_audio_devices(_state: State<'_, AudioState>) -> Vec<AudioDevice> {
 }
 
 #[tauri::command]
-pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, cache: State<'_, Arc<MediaCache>>, deck_id: String, file_path: String) -> Result<Option<f64>, String> {
+pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, cache: State<'_, Arc<MediaCache>>, deck_id: String, file_path: String, fallback_url: Option<String>) -> Result<Option<f64>, String> {
     // Resolve to a local disk copy before touching GStreamer at all — see media_cache.rs.
     // The library here is served over SMB/CIFS; scratch leaves the normal playback
     // branch idle for a whole gesture, and resuming it against the network share after
@@ -132,8 +132,9 @@ pub fn audio_load(app: tauri::AppHandle, state: State<'_, AudioState>, cache: St
     // local path, so the network is touched at most once per track, not repeatedly.
     // Caching is an optimization, not a requirement: fall back to the original path on
     // any failure (permissions, disk full, source not stat-able yet) rather than
-    // failing the load outright.
-    let load_path = cache.ensure_cached(&file_path).unwrap_or_else(|e| {
+    // failing the load outright. `fallback_url`, when the local path doesn't stat at
+    // all, lets ensure_cached() fetch from Digger instead — see its doc comment.
+    let load_path = cache.ensure_cached(&file_path, fallback_url.as_deref()).unwrap_or_else(|e| {
         log::warn!("[audio/{deck_id}] media cache miss, loading directly from source: {e}");
         file_path.clone()
     });

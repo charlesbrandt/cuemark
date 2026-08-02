@@ -26,8 +26,8 @@ export function listAudioDevices(): Promise<AudioDevice[]> {
 // video decoder for the file's codec (e.g. AV1/H264) — the muted <video>
 // element's loadedmetadata never fires in that case, but audio-only decode
 // still succeeds and GStreamer can query the demuxed duration directly.
-export function audioLoad(deckId: string, filePath: string): Promise<number | null> {
-  return invoke("audio_load", { deckId, filePath });
+export function audioLoad(deckId: string, filePath: string, fallbackUrl?: string): Promise<number | null> {
+  return invoke("audio_load", { deckId, filePath, fallbackUrl });
 }
 
 export function audioUnload(deckId: string): Promise<void> {

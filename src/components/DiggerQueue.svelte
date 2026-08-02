@@ -134,6 +134,7 @@
         cuePoint: payload.cuePoint ?? 0,
         hotCues: payload.hotCues ?? [],
         diggerTrackId: item.track_id,
+        diggerFileId: payload.fileId ?? null,
         ...(hasGrid ? { bpm, downbeat } : {}),
       });
       // Synchronous with updateDeck above, so this lands before App.svelte's rAF-deferred

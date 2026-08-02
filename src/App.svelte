@@ -31,6 +31,7 @@
   import type { Deck, Session } from "./lib/state/types";
   import { audioGetPosition, sessionRestore } from "./lib/audio/pipeline";
   import { debugLog } from "./lib/debugLog";
+  import { getDiggerFileUrl } from "./lib/digger/api";
 
   function openOutputWindow() {
     invoke('open_output_window').catch(console.error);
@@ -730,7 +731,10 @@
       // never fires when WebKitGTK lacks a decoder for the file's codec, and codec-path
       // decks have no <video> element at all — audio_load's returned duration is the one
       // fallback both backends can rely on.
-      audioLoad(deckId, filePath).then((duration) => {
+      // media_cache.rs tries filePath locally first regardless — this fallback only
+      // matters when that stat fails, e.g. no local NAS mount, Digger reachable instead.
+      const fallbackUrl = deck.diggerFileId != null ? getDiggerFileUrl(deck.diggerFileId) : undefined;
+      audioLoad(deckId, filePath, fallbackUrl).then((duration) => {
         // A new DeckAudioPipeline is created with default gain/rate/volume=1.0. Re-apply
         // current session values so saved MIDI state (or UI slider changes made before
         // this track was loaded) take effect on the fresh pipeline.

@@ -24,6 +24,7 @@ export interface DiggerQueueItem {
 
 export interface CuemarkPayload {
   filePath: string;
+  fileId: number | null;
   cuePoint: number | null;
   hotCues: number[];
   bpm: number | null;
@@ -64,6 +65,18 @@ export function getDiggerWebUrl(): string {
   } catch {
     return 'http://localhost:5173';
   }
+}
+
+// Absolute URL for Digger's GET /files/{id} (Range-capable raw file stream) — the
+// media_cache.rs remote-fetch fallback for when a deck's local mount doesn't have the
+// file (see docs/design/offline-crate.md in the digger repo). Only meaningful for the
+// separate Rust process making its own outbound request, so returns undefined when
+// `_baseUrl` is the dev-mode Vite proxy path (`/digger-api`) — that's relative and
+// browser-only, not reachable from Rust. Every other call in this file goes through
+// fetch() and can ride that proxy just fine; this is the one exception.
+export function getDiggerFileUrl(fileId: number): string | undefined {
+  if (!_baseUrl.startsWith('http')) return undefined;
+  return `${_baseUrl}/files/${fileId}`;
 }
 
 export async function search(q: string, hasFile = true, limit = 50): Promise<DiggerTrack[]> {

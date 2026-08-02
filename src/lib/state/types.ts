@@ -30,6 +30,10 @@ export interface Deck {
   bpm: number | null;      // detected or tapped BPM for this deck
   downbeat: number | null; // absolute playback position (seconds) of beat 1; null = unset
   diggerTrackId: number | null; // Digger track id if loaded from the Digger queue; null = local file
+  diggerFileId: number | null; // Digger `files.id` behind the loaded track — used as a
+                                // remote-fetch fallback (media_cache.rs) when the local
+                                // mount cuemark expects isn't present; null = no known
+                                // Digger file (local load, or Digger had none either)
   loopIn: number | null;   // loop region start (seconds); null = use track start
   loopOut: number | null; // loop region end (seconds); null = use track end
   eq: DeckEQ;

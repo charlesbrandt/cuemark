@@ -109,10 +109,11 @@
       filters: [{ name: "Video", extensions: ["mp4", "webm", "mkv", "mov", "avi", "ogv"] }],
     });
     if (typeof file === "string") {
-      // diggerTrackId must be cleared here — it's never reset elsewhere, so loading a
-      // local file over a deck that previously held a Digger track would otherwise
-      // leave marker pushes (SET BEAT, cue, hot cues) silently writing to the old track.
-      updateDeck(deck.id, { source: { type: "video", filePath: file, duration: 0 }, playing: false, diggerTrackId: null });
+      // diggerTrackId/diggerFileId must be cleared here — neither is reset elsewhere, so
+      // loading a local file over a deck that previously held a Digger track would
+      // otherwise leave marker pushes (SET BEAT, cue, hot cues) silently writing to the
+      // old track, and the old fileId as a stale remote-fetch fallback for this new path.
+      updateDeck(deck.id, { source: { type: "video", filePath: file, duration: 0 }, playing: false, diggerTrackId: null, diggerFileId: null });
     }
   }
 
