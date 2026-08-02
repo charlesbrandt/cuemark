@@ -359,10 +359,21 @@ Built the full playback path:
   property, not a per-deck one). **Finding**: on this real GPU (not just the spike's
   Xvfb/llvmpipe), `texImage2D(gl, VideoFrame)` direct upload works — confirmed by the
   compositor output screenshot below rendering correctly with no fallback exception
-  logged. **No Y-flip is applied** for this path (unlike `uploadVideoFrame`'s
+  logged.
+  **CORRECTION (2026-08-01)**: the "no Y-flip needed" claim directly below was wrong.
+  Live use surfaced a real deck rendering upside-down in the Output window (right-side-up
+  in that deck's own `DeckCard` preview, which uses a separate flip-agnostic 2D-canvas
+  `drawImage` — that split is what proved the bug was in this WebGL upload, not the
+  decoded frame data). `texImage2D(gl, VideoFrame)` needs `UNPACK_FLIP_Y_WEBGL` set, same
+  as the `<video>`/canvas path — a VideoFrame source has the same top-left-origin row
+  layout as those. The "verified by screenshot" check below was only ever run on the
+  Xvfb/llvmpipe software-GL spike rig, exactly the case this section's own finding above
+  flagged as unverified on real GPUs. Fixed in `fbo.ts`; do not reintroduce the no-flip
+  special case for the direct branch.
+  ~~**No Y-flip is applied** for this path (unlike `uploadVideoFrame`'s
   `UNPACK_FLIP_Y_WEBGL`) — verified by screenshot: codec-path frames render right-side-up
   and color-correct with the flip *omitted*, confirming WebCodecs' pixel format is already
-  in the orientation WebGL expects.
+  in the orientation WebGL expects.~~
 - **`seekBus.ts`** extended with a `CodecPlayerHandle` registry (`registerCodecPlayer`/
   `getCodecPlayer`/`codecPlayerDeckIds`) alongside the existing `els` video-element map.
   `seekDeck()` routes to both, so every existing call site (hot cues, loop in/out, cue
