@@ -76,9 +76,20 @@ fn parse_pw_dump(json_text: &str) -> Result<Vec<AudioDevice>, Box<dyn std::error
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|| description.clone());
 
+        // pw-dump's real-world `audio.position` value is bracket-wrapped
+        // (`"[ FL, FR, RL, RR ]"`), not the bare `"FL,FR,RL,RR"` the original parser
+        // assumed — confirmed live 2026-08-02 (`pw-dump` on this machine/PipeWire
+        // version). Trimming each comma-split token only strips whitespace, so the
+        // untrimmed brackets rode straight into the first/last channel tokens (`"[ FL"`,
+        // `"RR ]"`), which then failed `pw_channel_to_gst_bit` matches downstream in
+        // pipeline.rs's `compute_cue_remap` — silently disabling the cue channel remap
+        // and contributing to a PipeWire node-negotiation deadlock (see that function's
+        // doc comment). Strip the outer brackets before splitting so this survives
+        // either format.
         let position: Vec<String> = props
             .get("audio.position")
             .and_then(|v| v.as_str())
+            .map(|s| s.trim().trim_start_matches('[').trim_end_matches(']'))
             .map(|s| s.split(',').map(|ch| ch.trim().to_string()).collect())
             .unwrap_or_default();
 
@@ -276,6 +287,33 @@ mod tests {
         assert_eq!(devs[0].label, "DJControl Starlight — Front");
         assert_eq!(devs[1].id, "alsa_output.usb-Guillemot.analog-surround-40@RL,RR!FL,FR,RL,RR");
         assert_eq!(devs[1].label, "DJControl Starlight — Rear");
+    }
+
+    #[test]
+    fn pw_dump_strips_brackets_from_real_audio_position_format() {
+        // Real `pw-dump` output (confirmed live 2026-08-02) wraps audio.position in
+        // brackets with a space after each comma — not the bare "FL,FR,RL,RR" the
+        // other fixtures use. A parser that only trims whitespace per token leaves
+        // "[ FL" / "RR ]" as the first/last channels, corrupting every downstream id.
+        let json = r#"[
+          {
+            "id": 71,
+            "info": {
+              "props": {
+                "media.class": "Audio/Sink",
+                "node.name": "alsa_output.usb-Guillemot.analog-surround-40",
+                "node.nick": "DJControl Starlight",
+                "node.description": "DJControl Starlight Analog Surround 4.0",
+                "audio.channels": 4,
+                "audio.position": "[ FL, FR, RL, RR ]"
+              }
+            }
+          }
+        ]"#;
+        let devs = parse_pw_dump(json).unwrap();
+        assert_eq!(devs.len(), 2);
+        assert_eq!(devs[0].id, "alsa_output.usb-Guillemot.analog-surround-40@FL,FR!FL,FR,RL,RR");
+        assert_eq!(devs[1].id, "alsa_output.usb-Guillemot.analog-surround-40@RL,RR!FL,FR,RL,RR");
     }
 
     #[test]
