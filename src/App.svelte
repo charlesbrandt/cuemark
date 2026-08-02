@@ -189,6 +189,19 @@
   // doc: "if it recurs, it recurs" — no permanent give-up, unlike the watchdog's 3-strike rule).
   type StallWatch = { lastVideoCt: number; lastChangeMs: number; refAudioPos: number; lastAttemptMs: number };
   const stallWatch = new Map<string, StallWatch>();
+  // Decks whose media has no video stream at all (WebCodecs demux timed out waiting for
+  // parsebin to expose a video pad — confirmed empty container, not a transient failure).
+  // The legacy <video> fallback still gets created for these (it's how the file plays), but
+  // its currentTime never has a video track driving it, so both the per-poll drift-correction
+  // resync (`v.currentTime = contentPos`) and the stall self-heal below treat "currentTime
+  // never moves" as a wedged decoder and either seek or v.load() it — on a real audio-only
+  // file that's a permanent false positive, firing every poll (resync) or every ~10s
+  // (self-heal's v.load() pipeline rebuild) for the deck's entire playback. Both paths funnel
+  // into the same WebKitGTK MediaPlayerPrivateGStreamer seek/rebuild machinery implicated in
+  // the documented main-thread contention (docs/design/pcm-buffer-playback.md, "Ninth
+  // mechanism"; skills/audio-debugging.md "UI frozen solid"), so a deck with no video to
+  // sync should never call either. Cleared on teardown and on a fresh demux attempt.
+  const audioOnlyDecks = new Set<string>();
   // Signature of the last composited frame's static inputs (deck id/source/opacity).
   // Used to skip the composite()+postFrame() GPU readback entirely when nothing visual
   // changed and nothing is animating — otherwise that full-resolution capture + cross-window
@@ -845,7 +858,16 @@
     audioUnload(deckId).catch(console.error);
     playPromises.delete(deckId); lastAudioPlaying.delete(deckId);
     clearDeckAudioSync(deckId); contentPosTracker.delete(deckId); stallWatch.delete(deckId);
-    audioLoadedFor.delete(deckId); backendState.delete(deckId);
+    audioLoadedFor.delete(deckId); backendState.delete(deckId); audioOnlyDecks.delete(deckId);
+    // audioUnload() above drops the Rust-side DeckAudioPipeline entirely (audio/mod.rs
+    // audio_unload removes it from the pipelines map), so a subsequent load builds a brand
+    // new one with cue_enabled defaulting to false (pipeline.rs). The cueEnabled $effect only
+    // calls audioSetCue when deck.cueEnabled differs from _prevCueStates' last-seen value —
+    // without clearing the entry here, a deck reloaded while cue was already on sees no
+    // apparent change and never re-sends audioSetCue, leaving the fresh pipeline's cue valve
+    // silently closed (confirmed live: headphone cue went dead after a deck reload until
+    // manually re-toggled).
+    _prevCueStates.delete(deckId);
   }
 
   // Tears down just the codec-path presentation backend (worker + Rust demux registry
@@ -877,6 +899,7 @@
       const player = new CodecPlayer(deckId, port, demux);
       registerCodecPlayer(deckId, player);
       backendState.set(deckId, { filePath, kind: 'webcodecs', loadSeq: cur.loadSeq });
+      audioOnlyDecks.delete(deckId);
       const curPlaying = get(session).decks.find((d) => d.id === deckId)?.playing;
       debugLog(`[video-path] ${deckId} entered webcodecs state: deck.playing=${curPlaying} lastAudioPlaying=${lastAudioPlaying.get(deckId)} adoptedPos=${adoptedPos}`);
       if (adoptedPos !== undefined) player.seek(adoptedPos);
@@ -890,6 +913,15 @@
       debugLog(`[video-path] ${deckId} demux failed, falling back to legacy <video>: ${e}`);
       const prev = backendState.get(deckId);
       backendState.set(deckId, { filePath, kind: 'legacy-fallback', adoptedPos: prev?.adoptedPos, loadSeq: prev?.loadSeq });
+      // "parsebin never exposed a video pad" specifically means the container has no video
+      // stream at all (e.g. a .wav loaded as a video-typed deck source) — see audioOnlyDecks
+      // doc comment above. Other demux failures (parse errors, unsupported codecs) leave a
+      // real video track for the legacy <video> element to decode, so don't suppress sync there.
+      if (String(e).includes('timed out waiting for parsebin to expose a video stream')) {
+        audioOnlyDecks.add(deckId);
+      } else {
+        audioOnlyDecks.delete(deckId);
+      }
     }
     // backendState is a plain Map, not a Svelte store — flipping `kind` above does not
     // re-trigger the $effect that schedules syncVideoElements. If a play/pause intent was
@@ -910,7 +942,10 @@
         audioUnload(id).catch(console.error);
         playPromises.delete(id); lastAudioPlaying.delete(id);
         clearDeckAudioSync(id); contentPosTracker.delete(id); stallWatch.delete(id);
-        audioLoadedFor.delete(id); backendState.delete(id);
+        audioLoadedFor.delete(id); backendState.delete(id); audioOnlyDecks.delete(id);
+        // See teardownVideoBackendFull's _prevCueStates comment — same stale-guard hazard
+        // if this deck id is ever reused (deck removed then a new one added with the same id).
+        _prevCueStates.delete(id);
       }
     }
     for (const id of codecPlayerDeckIds()) {
@@ -1139,8 +1174,11 @@
           // above. <video>-element-specific; codec-path decks have no `v` and no WebKit
           // media-player pipeline to wedge in the first place (the whole point of this
           // design, see docs/design/webcodecs-video-path.md "Why this exists"), so this
-          // block naturally never runs for them.
-          if (v) {
+          // block naturally never runs for them. Also skipped for audioOnlyDecks (see its
+          // doc comment) — a real audio-only file's v.currentTime never has a video track
+          // driving it, which this block would otherwise misread as a wedged decoder and
+          // "recover" via v.load() every ~10s for the deck's entire playback.
+          if (v && !audioOnlyDecks.has(deck.id)) {
             const deckId = deck.id;
             let st = stallWatch.get(deckId);
             if (!st) {
@@ -1296,7 +1334,7 @@
               // it cuts how often the deadlock's trigger condition (a seek landing while the
               // video pipeline is mid-flight) can occur. 250ms of AV drift is imperceptible
               // for VJ visuals synced by eye to a beat, unlike e.g. lip-synced dialogue.
-              if (!scratching && v && Math.abs(v.currentTime - contentPos) > 0.25) {
+              if (!scratching && v && !audioOnlyDecks.has(capturedDeckId) && Math.abs(v.currentTime - contentPos) > 0.25) {
                 v.currentTime = contentPos; // snap video to audio clock
                 recordLegacyOp(capturedDeckId, 'currentTime');
               }
