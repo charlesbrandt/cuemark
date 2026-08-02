@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { debugLog } from './lib/debugLog';
 
 const channel = new BroadcastChannel('cuemark-output');
 const canvas = document.getElementById('output') as HTMLCanvasElement;
@@ -6,19 +7,41 @@ const ctx = canvas.getContext('2d')!;
 ctx.imageSmoothingEnabled = true;
 ctx.imageSmoothingQuality = 'high';
 
-function resize() {
-  canvas.width = window.innerWidth * devicePixelRatio;
-  canvas.height = window.innerHeight * devicePixelRatio;
+// JS-driven sizing via ResizeObserver, not a one-shot window.innerWidth/innerHeight
+// read + 'resize' listener — see CLAUDE.md's canvas-sizing gotcha. Right after this
+// window is force-reloaded by the freeze-watchdog (tier2/tier3 recovery), GTK can
+// still be settling the recreated window's layout when this script's top level runs;
+// a one-shot read can undersize the canvas buffer with no further 'resize' event ever
+// firing to correct it, leaving stale/uninitialized backing-store pixels visible as
+// noise at the edges. ResizeObserver reports the actual settled size whenever it
+// changes, including immediately on observe().
+function resize(width: number, height: number) {
+  canvas.width = width * devicePixelRatio;
+  canvas.height = height * devicePixelRatio;
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
+  debugLog(
+    `[output] resize: width=${width} height=${height} dpr=${devicePixelRatio} -> canvas=${canvas.width}x${canvas.height}`,
+  );
 }
-resize();
-window.addEventListener('resize', resize);
+new ResizeObserver((entries) => {
+  const { width, height } = entries[0].contentRect;
+  resize(width, height);
+}).observe(document.body);
 
 let lastFrameAt = performance.now();
+let loggedFirstFrame = false;
+let frameCount = 0;
 channel.onmessage = (e: MessageEvent<{ frame: ImageBitmap }>) => {
   const { frame } = e.data;
   lastFrameAt = performance.now();
+  frameCount++;
+  if (!loggedFirstFrame || frameCount % 120 === 0) {
+    loggedFirstFrame = true;
+    debugLog(
+      `[output] frame #${frameCount}: bitmap=${frame.width}x${frame.height} canvas=${canvas.width}x${canvas.height}`,
+    );
+  }
   ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
   frame.close();
 };
