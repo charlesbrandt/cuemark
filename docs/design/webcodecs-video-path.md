@@ -465,12 +465,27 @@ Two decks loaded with the same 8s H.264 file, deck-0 forced `legacy`, deck-1 for
   ready in time, or a hot-cue seek deep into a sparse-keyframe file) pays the full
   from-AU-0 decode cost. Not a phase 2 regression — flagged as a real limitation for
   phase 3/4 soak testing on content with realistic GOP structure.
-- **Reloading the identical file path on a deck is a no-op** for both backends (matches
-  the pre-existing legacy behavior of comparing `v.getAttribute('src')`) — `backendState`
-  tracks `(deckId, filePath)`, so calling `updateDeck(deckId, {source: {...same
-  filePath...}})` doesn't retrigger `audio_load`, `video_demux_load`, or grid lookup.
-  Confirmed via testing but worth remembering when scripting repeated-load test
-  sequences — force a `source: null` clear first if a fresh reload is actually needed.
+- **FIXED (2026-08-02), was: reloading the identical file path on a deck was a no-op**
+  for both backends, because `backendState` tracked `(deckId, filePath)` alone — calling
+  `updateDeck(deckId, {source: {...same filePath...}})` didn't retrigger `audio_load`,
+  `video_demux_load`, or grid lookup. This was flagged here as an accepted limitation for
+  *scripted test sequences*, but the real UI load paths (`DiggerQueue.svelte`'s "load to
+  deck", `App.svelte`'s file drag-drop) never applied the documented `source: null`
+  workaround — so a live user reloading the same track (e.g. after it ended) hit this
+  no-op for real. Worse than a harmless no-op: both call sites unconditionally set
+  `duration: 0` on the new `source`, which the skipped brand-new-file branch is the only
+  code that ever refills — so `WaveformCanvas`'s `if (!duration)` guard
+  (`src/components/WaveformCanvas.svelte`) blanked the waveform permanently and nothing
+  else about the deck (audio pipeline, decoder) actually reloaded either, reading as a
+  frozen deck. Root-caused live via `session-recovery.json` showing a deck's `duration`
+  stuck at `0` despite the Rust log proving GStreamer had loaded it successfully minutes
+  earlier. Fixed by adding `DeckSource.loadSeq` (`src/lib/state/types.ts`) — a token
+  genuine load call sites stamp with `Date.now()`, that `syncVideoElements` compares
+  alongside `filePath` to tell a deliberate reload apart from an internal no-op resync
+  (the legacy↔webcodecs live A/B toggle, or a duration-fill callback). Every internal
+  write to `deck.source` other than the two real load call sites must carry the existing
+  `loadSeq` through unchanged, or it starts looking like another deliberate reload and
+  loops.
 
 ### Known limitations carried into phase 3
 

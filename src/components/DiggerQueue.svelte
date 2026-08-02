@@ -129,7 +129,7 @@
       // subscriber to pick up right after this updateDeck() call lands.
       setPendingTrackMeta(deckId, item.title, item.artist);
       updateDeck(deckId, {
-        source: { type: 'video', filePath: payload.filePath, duration: 0 },
+        source: { type: 'video', filePath: payload.filePath, duration: 0, loadSeq: Date.now() },
         playing: false,
         cuePoint: payload.cuePoint ?? 0,
         hotCues: payload.hotCues ?? [],

@@ -13,6 +13,7 @@ description: Launch the cuemark Tauri dev app and monitor its output. Use when a
 - **Digger proxy errors are normal**: `[vite] http proxy error: /queue … ECONNREFUSED 127.0.0.1:8200` just means the Digger media library service isn't running. The app degrades gracefully — drag-and-drop and manual load still work.
 - **GTK theme warnings are harmless**: `Gtk-WARNING **: Theme parsing error: gtk.css:…` at launch is cosmetic, not a functional issue.
 - **No screenshot tool available**: grim, scrot, gnome-screenshot, spectacle are all absent. Verify the app is running by checking for `WebKitWebProcess` in `ps aux` and confirming log lines (see "Confirm it's up" below). The app window will appear on the user's desktop.
+- **`pactl` is not installed** — for any live PipeWire/audio-routing inspection (sink volumes, mute state, which client streams are actually active) use `wpctl status` or `pw-dump` instead. See "HMR cascade → orphaned PipeWire streams" below for a concrete use case.
 
 ## Prerequisites check
 
@@ -261,6 +262,51 @@ rapid HMR reloads in 11 seconds caused a full app hang confirmed in session 2026
 If multiple logical changes are needed, stage them all in memory and apply with one Edit/Write
 call rather than incremental edits. This applies only to App.svelte — child component HMR
 is lightweight and can be done incrementally.
+
+### HMR cascade → orphaned PipeWire streams (silent audio, no hang, no error)
+
+A quieter variant of the cascade hang above (2026-08-02): several App.svelte edits landed as
+separate saves in a live session (each one touching `src/lib/state/types.ts` too, which forces
+a full webview reload rather than a hot patch). Each reload re-ran `onMount`'s rehydration
+logic against the **same still-running Rust process** — `AudioManager` never restarted, so
+every reload tore down and recreated both decks' `DeckAudioPipeline`s again, ~10 times in under
+a minute. Unlike the cascade-hang case, the app didn't freeze — it stayed fully responsive, the
+log showed normal `Null → Ready → Paused` sequences and steady `position-poll` advancement after
+Play — but no audio actually reached the speakers.
+
+**Why it's silent**: the tee/`async=false` sink topology (CLAUDE.md, `av-sync-architecture.md`)
+deliberately decouples GStreamer's position clock from whether a given sink branch is actually
+delivering — so a pipeline stuck on a dead output still reports healthy state and an advancing
+clock. The real fault was one layer down, at PipeWire: each pipeline recreation opened a new
+`pulsesink` client connection to the DJControl Starlight's 4 output ports, but the *old*
+pipeline's connection wasn't always cleanly dropped first. Result: 4 separate `cuemark`
+PipeWire client streams fighting over the 2 decks' worth of ports (should be 1 per deck), 3 of
+them orphaned and permanently stuck `[paused]`, only 1 actually `[active]` — so at least one
+deck's real audio was silently bound to a dead stream.
+
+**Diagnostic** — `pactl` is not installed in this environment; use `wpctl` (from
+`wireplumber`, confirmed present) instead:
+```bash
+wpctl status | sed -n '/Streams:/,/^$/p'
+```
+Expect exactly one `cuemark` client per currently-loaded deck, all channels `[active]` while
+playing. More `cuemark` clients than loaded decks, or any client stuck `[paused]` while a deck
+is supposedly playing, means orphaned streams — sample it 2-3 times a second apart; a real
+stuck orphan doesn't flip to `[active]` on its own.
+
+**Fix**: kill the whole dev-server process tree (not just the frontend — the leaked PipeWire
+connections live in the Rust process) and relaunch per "Stop the app" above. Killing the process
+drops its PipeWire connection outright, clearing every orphaned stream immediately — confirmed
+via `wpctl status` showing an empty Streams section right after the kill, before relaunch.
+A plain frontend HMR reload does **not** fix this, because `AudioManager` (and its leaked
+PipeWire clients) lives in the Rust process HMR never touches.
+
+**Prevention is the same rule as the cascade-hang entry above**: batch edits to any file that
+forces a full webview reload (notably shared type files like `src/lib/state/types.ts`, not just
+App.svelte) into one pass before letting HMR fire, especially with a live/audible session
+running. If a full restart already happened for another reason mid-edit-session, don't assume
+that alone flushes leaked streams from *before* the restart — check `wpctl status` once
+afterward regardless.
 
 ### MIDI audio lag — root cause chain (two layers)
 

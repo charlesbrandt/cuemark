@@ -1,5 +1,19 @@
 export type DeckSource =
-  | { type: "video"; filePath: string; duration: number }
+  | {
+      type: "video";
+      filePath: string;
+      duration: number;
+      // Set to a fresh value (Date.now()) by every user-initiated load call (drag-drop,
+      // DiggerQueue "load to deck") — including a reload of the file already on this
+      // deck. syncVideoElements compares this alongside filePath to detect a deliberate
+      // reload; filePath alone can't, since backendState is keyed by filePath and treats
+      // "same path" as nothing-to-do (see docs/design/webcodecs-video-path.md's
+      // "reloading the identical file path is a no-op" note). Every internal duration-fill
+      // write (ensureAudioLoaded, startCodecPath, the legacy <video> loadedmetadata
+      // handler) MUST carry the existing loadSeq through unchanged — inventing a new one
+      // there would make that write look like another deliberate reload and loop forever.
+      loadSeq?: number;
+    }
   | null;
 
 // Global visualization layer, composited above all decks in the output stage —

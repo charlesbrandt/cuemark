@@ -209,6 +209,11 @@
     filePath: string;
     kind: 'legacy' | 'pending' | 'webcodecs' | 'legacy-fallback';
     adoptedPos?: number; // recovery-boot position, carried through an in-flight demux probe
+    // Mirrors DeckSource.loadSeq — lets syncVideoElements tell a deliberate reload of the
+    // same file apart from a no-op re-sync. Every write to this map must carry the
+    // current value through except the "brand-new file" branch, which is the only place
+    // allowed to adopt a new one (from deck.source.loadSeq).
+    loadSeq?: number;
   }
   const backendState = new Map<string, VideoBackendState>();
   // deckId -> filePath already passed to audio_load, so switching a deck's *video*
@@ -683,7 +688,7 @@
       const card = el?.closest<HTMLElement>('[data-deck-id]');
       if (card?.dataset.deckId) {
         updateDeck(card.dataset.deckId, {
-          source: { type: 'video', filePath: paths[0], duration: 0 },
+          source: { type: 'video', filePath: paths[0], duration: 0, loadSeq: Date.now() },
           playing: false,
         });
       }
@@ -780,7 +785,8 @@
         }
         const s = get(session).decks.find((d) => d.id === deckId)?.source;
         if (duration && s?.type === "video" && s.filePath === filePath && (!s.duration || !Number.isFinite(s.duration))) {
-          updateDeck(deckId, { source: { type: "video", filePath, duration } });
+          // Preserve s.loadSeq — see DeckSource.loadSeq's doc comment.
+          updateDeck(deckId, { source: { type: "video", filePath, duration, loadSeq: s.loadSeq } });
         }
       }).catch(console.error);
       lastAudioPlaying.delete(deckId);
@@ -870,18 +876,20 @@
       const port = mediaServerPort ?? await invoke<number>('media_server_port');
       const player = new CodecPlayer(deckId, port, demux);
       registerCodecPlayer(deckId, player);
-      backendState.set(deckId, { filePath, kind: 'webcodecs' });
+      backendState.set(deckId, { filePath, kind: 'webcodecs', loadSeq: cur.loadSeq });
       const curPlaying = get(session).decks.find((d) => d.id === deckId)?.playing;
       debugLog(`[video-path] ${deckId} entered webcodecs state: deck.playing=${curPlaying} lastAudioPlaying=${lastAudioPlaying.get(deckId)} adoptedPos=${adoptedPos}`);
       if (adoptedPos !== undefined) player.seek(adoptedPos);
       const s = get(session).decks.find((d) => d.id === deckId)?.source;
       if (s?.type === 'video' && s.filePath === filePath && (!s.duration || !Number.isFinite(s.duration)) && demux.duration) {
-        updateDeck(deckId, { source: { type: 'video', filePath, duration: demux.duration } });
+        // Preserve s.loadSeq — this is a duration-fill on the load already in progress,
+        // not a new deliberate reload (see DeckSource.loadSeq's doc comment).
+        updateDeck(deckId, { source: { type: 'video', filePath, duration: demux.duration, loadSeq: s.loadSeq } });
       }
     } catch (e) {
       debugLog(`[video-path] ${deckId} demux failed, falling back to legacy <video>: ${e}`);
       const prev = backendState.get(deckId);
-      backendState.set(deckId, { filePath, kind: 'legacy-fallback', adoptedPos: prev?.adoptedPos });
+      backendState.set(deckId, { filePath, kind: 'legacy-fallback', adoptedPos: prev?.adoptedPos, loadSeq: prev?.loadSeq });
     }
     // backendState is a plain Map, not a Svelte store — flipping `kind` above does not
     // re-trigger the $effect that schedules syncVideoElements. If a play/pause intent was
@@ -917,17 +925,18 @@
       const desired = resolveVideoPath(deckId, get(videoPathOverrides), get(videoPathDefault));
       const state = backendState.get(deckId);
 
-      if (!state || state.filePath !== filePath) {
-        // Brand-new file for this deck (fresh load or track swap) — tear down whatever
+      if (!state || state.filePath !== filePath || state.loadSeq !== deck.source.loadSeq) {
+        // Brand-new file for this deck (fresh load, track swap, OR a deliberate reload of
+        // the file already here — same filePath but a new loadSeq) — tear down whatever
         // backend was active for the OLD file (including its audio pipeline) first.
         teardownVideoBackendFull(deckId);
         const adopted = ensureAudioLoaded(deck, filePath);
         if (desired === 'webcodecs') {
-          backendState.set(deckId, { filePath, kind: 'pending', adoptedPos: adopted?.positionSecs });
+          backendState.set(deckId, { filePath, kind: 'pending', adoptedPos: adopted?.positionSecs, loadSeq: deck.source.loadSeq });
           const fallbackUrl = deck.diggerFileId != null ? getDiggerFileUrl(deck.diggerFileId) : undefined;
           startCodecPath(deckId, filePath, adopted?.positionSecs, fallbackUrl);
         } else {
-          backendState.set(deckId, { filePath, kind: 'legacy', adoptedPos: adopted?.positionSecs });
+          backendState.set(deckId, { filePath, kind: 'legacy', adoptedPos: adopted?.positionSecs, loadSeq: deck.source.loadSeq });
           createLegacyVideoEl(deck, filePath, adopted);
         }
         continue; // rest of this deck's sync resumes next rAF pass once state settles
@@ -942,14 +951,14 @@
         debugLog(`[video-path] ${deckId} live-toggle legacy->webcodecs: deck.playing=${deck.playing} resumeAt=${resumeAt} lastAudioPlaying=${lastAudioPlaying.get(deckId)}`);
         const v = videoEls.get(deckId);
         if (v) { v.pause(); v.remove(); unregisterVideoEl(deckId); videoEls.delete(deckId); lastUploadedTime.delete(deckId); }
-        backendState.set(deckId, { filePath, kind: 'pending' });
+        backendState.set(deckId, { filePath, kind: 'pending', loadSeq: state.loadSeq });
         startCodecPath(deckId, filePath, resumeAt);
         continue;
       }
       if (desired === 'legacy' && state.kind === 'webcodecs') {
         const resumeAt = getDeckTime(deckId) ?? undefined;
         teardownCodecPlayerOnly(deckId);
-        backendState.set(deckId, { filePath, kind: 'legacy' });
+        backendState.set(deckId, { filePath, kind: 'legacy', loadSeq: state.loadSeq });
         createLegacyVideoEl(deck, filePath, resumeAt !== undefined ? { positionSecs: resumeAt, playing: deck.playing } : undefined);
         continue;
       }
@@ -998,7 +1007,8 @@
         // (`!s.duration` never matches Infinity) and pins the waveform playhead at x=0
         // forever (currentTime / Infinity = 0). Only accept a real, finite duration.
         if (s?.type === "video" && s.filePath === filePath && Number.isFinite(v!.duration)) {
-          updateDeck(deckId, { source: { type: "video", filePath, duration: v!.duration } });
+          // Preserve s.loadSeq — see DeckSource.loadSeq's doc comment.
+          updateDeck(deckId, { source: { type: "video", filePath, duration: v!.duration, loadSeq: s.loadSeq } });
         }
       };
       // Retry play if the user clicked play before the video had loaded enough data
