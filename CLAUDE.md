@@ -342,7 +342,19 @@ was diagnosed against a binary built 2026-06-22, missing the *entire* webcodecs-
 (phases 1-5) and everything after — the freeze was old, already-fixed behavior, not a regression.
 **Rebuild the launcher binary periodically, and always after a troubleshooting/design-doc session
 that touched `src-tauri/`, before trusting a direct (non-`cargo tauri dev`) launch to reflect
-current code.**
+current code.** `scripts/check-launcher-staleness.sh` reports whether it is behind (exit 1 = stale)
+without forcing a slow release build.
+
+**Build provenance is stamped into every run.** `build.rs` emits the git SHA, worktree
+clean/dirty flag, and build timestamp as compile-time env vars; `lib.rs` logs them as the
+first line of `setup()`:
+```
+[build] cuemark e998273 (dirty) profile=debug built=2026-08-02 18:15:04Z exe=…/target/debug/cuemark
+```
+The real hazard is not a stale build, it is not knowing which build is running — `exe=`
+distinguishes the dev binary from the launcher one, and old log files keep their own stamp,
+so a report from last week still identifies its code. Check this line before diagnosing
+anything from a log.
 
 **First-time / new machine setup** (in addition to Rust + Node toolchains):
 ```bash
@@ -393,6 +405,7 @@ Several automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb
 | `scripts/rehydration-test.sh <video>` | `docs/design/freeze-watchdog.md` phase 2 gate — forced-reload session rehydration (deck/bpm/downbeat intact, audio position continuous, no stray `audioLoad`). Run after touching `session_store.rs`, `sessionRecovery.ts`, or `App.svelte`'s onMount rehydration path. |
 | `scripts/watchdog-test.sh <video>` | `docs/design/freeze-watchdog.md` phase 3 gate — tiered recovery (`kill -STOP`/`freezeMainThread(0)`/`kill -KILL`) plus a 15s false-positive smoke check. Run after touching `watchdog.rs` or the recovery/adoption path. |
 | `scripts/watchdog-soak-test.sh <video> [seconds]` | The design doc's full 10-minute false-positive soak (default 600s) — looped playback + a MIDI-rate burst every 60s, asserts zero watchdog triggers. Run before relying on recovery in prod, not on every change. |
+| `scripts/check-launcher-staleness.sh [path]` | Is `~/.local/bin/cuemark` behind the code? Exit 0 fresh / 1 stale / 2 not built. No toolchain or running app needed. Run before diagnosing anything against a non-dev launch. |
 
 ## Constraints
 

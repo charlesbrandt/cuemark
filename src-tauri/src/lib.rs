@@ -11,6 +11,40 @@ pub mod watchdog;
 use std::sync::Arc;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
+/// Log which build this is, as the first line of every run.
+///
+/// Every log file and screenshot then answers "which code produced this?" without
+/// anyone having to reconstruct it later. `exe` is the load-bearing field: it
+/// distinguishes the `cargo tauri dev` binary from the desktop-launcher one
+/// (`~/.local/bin/cuemark`), which never auto-rebuilds. See the `run-app` skill,
+/// "Making sure a change actually reached the running app".
+fn log_build_provenance() {
+    let built_at = env!("CUEMARK_BUILT_AT")
+        .parse::<i64>()
+        .ok()
+        .and_then(|secs| time::OffsetDateTime::from_unix_timestamp(secs).ok())
+        .and_then(|t| {
+            t.format(&time::macros::format_description!(
+                "[year]-[month]-[day] [hour]:[minute]:[second]Z"
+            ))
+            .ok()
+        })
+        .unwrap_or_else(|| "unknown".into());
+
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+
+    log::info!(
+        "[build] cuemark {} ({}) profile={} built={} exe={}",
+        env!("CUEMARK_GIT_SHA"),
+        env!("CUEMARK_GIT_DIRTY"),
+        if cfg!(debug_assertions) { "debug" } else { "release" },
+        built_at,
+        exe
+    );
+}
+
 // Decode %XX sequences in a URL path component
 pub(crate) fn url_decode(s: &str) -> String {
     let b = s.as_bytes();
@@ -162,6 +196,8 @@ pub fn run() {
             video_demux::video_demux_unload,
         ])
         .setup(|app| {
+            log_build_provenance();
+
             let persist = midi_state::new_persist();
             app.manage(persist.clone());
             midi::spawn_listener(app.handle().clone(), persist)?;

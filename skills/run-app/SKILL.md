@@ -126,12 +126,74 @@ window the user is actively looking at. Use the **full absolute path**
 
 - Frontend changes (`.svelte`, `.ts`) → Vite hot-reloads instantly, no restart needed.
 - Rust changes (`src-tauri/`) → must stop + restart; the old binary keeps running until the rebuild finishes and wins, so edits silently have no effect if you skip the restart.
+- **Env-var changes → require a full restart, and the restart must not inherit the old value.**
+  Env is read at process start, so editing a default in Rust while an override is exported in the
+  launching shell tests neither. See "Making sure a change actually reached the running app" below.
+
+## Making sure a change actually reached the running app (2026-08-02)
+
+A change can compile, be committed, and still not be what the app is running. Three distinct
+ways that happened in one day — check all three before concluding a fix "didn't work":
+
+**1. The edit went somewhere that doesn't execute.** A default was "changed" by rewriting only
+its *doc comment*, leaving the function body at the old value. `cargo check` passes — a wrong
+constant is still a valid constant — and the doc then actively lies to the next reader. Type
+checks cannot catch this class at all.
+→ *Verify from the runtime log line, never from the source or from "I made the edit."*
+
+**2. An environment override masked the default.** The dev server had been started with
+`CUEMARK_SINK_BUFFER_MS=200` exported. Every test passed while that shell lived; the unchanged
+default only surfaced on the next "clean" restart, looking like a fresh regression.
+→ Overrides now log at **WARN** on startup:
+```
+[audio] CUEMARK_SINK_BUFFER_MS=200ms OVERRIDE ACTIVE — compiled-in default (200ms) is NOT in effect
+```
+If that line is present, **you are not testing the default.** Restart without the var before
+drawing conclusions about default behavior.
+
+**3. The binary that auto-rebuilds is not the binary being launched.** `cargo tauri dev` watches
+`src-tauri/` and rebuilds; the desktop-launcher release binary (`~/.local/bin/cuemark`) does not,
+and has been caught a *month* stale (see CLAUDE.md). A bug reproduced there may already be fixed.
+
+**Ground-truth checks — cheap, do them instead of assuming:**
+
+```bash
+# Which build is running? First line of every run (build.rs stamps it in).
+grep '\[build\]' ~/.local/share/com.cuemark.app/logs/cuemark.log | tail -1
+# [build] cuemark e998273 (dirty) profile=debug built=2026-08-02 18:15:04Z
+#         exe=/home/account/repos/cuemark/src-tauri/target/debug/cuemark
+
+# Is the running process actually the current binary?
+P=$(pgrep -f 'target/debug/cuemark' | head -1)
+stat -Lc %i /proc/$P/exe; stat -c %i src-tauri/target/debug/cuemark   # inodes must match
+
+# What config is REALLY in effect? (audio example — appears on every track load)
+grep "sink: pulsesink" ~/.local/share/com.cuemark.app/logs/cuemark.log | tail -2
+grep "OVERRIDE ACTIVE" ~/.local/share/com.cuemark.app/logs/cuemark.log
+
+# Is the desktop-launcher binary behind the code? (check, not a forced rebuild)
+scripts/check-launcher-staleness.sh    # exit 0 fresh · 1 stale · 2 not built
+```
+
+**Read the `[build]` line before trusting anything else in the log.** `exe=` says whether
+this was `cargo tauri dev` or the launcher; `(dirty)` says the worktree had uncommitted
+edits, so the SHA alone does not identify the code; `built=` dates it. Old log files
+retain their own stamp, so a report from last week still identifies its build.
+
+**Prefer logging effective config over trusting the build.** Any value worth tuning is worth
+printing at the point it is applied, with its source. That single habit converts all three
+failure modes above from silent to obvious.
 
 ## Reading the log
 
 | Pattern | Meaning |
 |---|---|
 | `VITE … ready` | Frontend dev server up |
+| `[build] cuemark <sha> (clean\|dirty) profile=… exe=…` | First line of every run — **which code produced this log**. Check it before trusting anything below |
+| `[audio] … OVERRIDE ACTIVE` | An env var is overriding a compiled-in default — you are **not** testing default behavior |
+| `[audio/<deck>] output_queue underrun` | Pipeline can't feed the sink — upstream/CPU problem (audio-debugging skill) |
+| `[audio/<deck>] main sink N: first buffer reached the sink` | Audio is actually reaching the device (absence on a silent deck is the diagnosis) |
+| `[heartbeat] rAF stalled <N>ms` | Main thread stalled and recovered, with measured duration |
 | `Running \`target/debug/cuemark\`` | Rust binary launched |
 | `[midi] Hercules Starlight not found` | Normal — controller not plugged in |
 | `[bus/<deck>] ERROR:` | GStreamer pipeline error — load audio-debugging skill |
