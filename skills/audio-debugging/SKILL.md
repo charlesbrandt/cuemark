@@ -194,6 +194,112 @@ in ERROR until the user re-loads the track.
 
 ---
 
+## "Audio is choppy" / "audio is silent" — read `output_queue` first (2026-08-02)
+
+**Start here for any audio symptom**, before touching buffer sizes or tempo code. Reaching
+`Playing` with no bus `ERROR` and the right volume on the right device proves the graph was
+*built and started* — it says nothing about whether samples are *moving*. `pulsesink` reports
+underflows only at `GST_DEBUG` level, so a badly broken audio path can produce a completely
+healthy-looking log.
+
+Two probes in `audio/pipeline.rs` close that gap:
+
+```
+[audio/deck-0] output_queue underrun (total=N) — ...          # instrument_queue_flow()
+[audio/deck-0] main sink 0: first buffer reached the sink     # instrument_sink_flow()
+[audio/deck-0] main sink 0: buffer flow resumed after a 3.2s gap
+```
+
+| Log | Meaning | Where to look |
+|---|---|---|
+| `output_queue underrun` | Upstream can't produce audio in real time | CPU contention — `uridecodebin`/soundtouch vs. the WebKitWebProcess. See "CPU profiling a live chokes-up freeze" below. Widening the sink buffer only delays it. |
+| no `underrun`, still choppy | Samples flow through the queue fine; the gap is past it | The sink's own ringbuffer — see `sink_buffer_times()` below. |
+| deck silent, **no** `first buffer` line | Nothing ever reached the sink | Upstream, in the rebuilt graph — the sink never got data to lose. |
+| deck silent, `first buffer` line present | Audio *was* delivered to the sink | The sink/device — suspect PipeWire/ALSA not releasing the node before a rebuilt `pulsesink` reopened it (the track-reload-silence bug). |
+
+**Why the "did it reach the device" question needs a pad probe, not a queue signal**: a
+sink that has stopped consuming leaves `output_queue` **full**, which is exactly what
+healthy playback also looks like. For the same reason `overrun` is deliberately *not*
+instrumented — with a synced sink, upstream decode runs far faster than real time and
+backpressure holds that queue at its cap for the whole of normal playback, so `overrun`
+fires continuously when nothing is wrong. An empty queue is the anomaly; a full one is the
+steady state. `instrument_sink_flow()` probes each main sink's own sink pad instead, and is
+event-driven (first buffer, plus any resume after a >1s gap) so it stays readable across a
+multi-hour set.
+
+**Sink buffer is runtime-tunable — bisect it by ear, don't rebuild per guess:**
+
+```bash
+CUEMARK_SINK_BUFFER_MS=100 CUEMARK_SINK_LATENCY_MS=20 cargo tauri dev
+```
+
+Defaults are **200ms/20ms since 2026-08-02** (`pulsesink`'s own defaults), raised from 50ms/10ms
+after that value was live-confirmed as the cause of choppy audio on a USB DJ controller. The
+50ms was vestigial — chosen in May 2026 to shorten the overlap when rate changes were FLUSH
+seeks and 200ms of old-rate audio drained into the new segment ("doubled/detuned" artifact).
+Rate changes moved to the `pitch` element's `tempo` (no seek, no flush) long ago, but the value
+carried forward through the `pipewiresink`→`pulsesink` switch, where it began actually binding
+(`pipewiresink` ignored these properties entirely; it extends `GstBaseSink`, not
+`GstAudioBaseSink`).
+
+**Size this against the graph quantum, not by feel.** `pw-top` showed a 2048-frame quantum
+(42.7ms at 48kHz), making 50ms ≈ **1.17 quanta** — one late wakeup from a dropout. 200ms is
+≈4.7 quanta. Lowering it is legitimate (the buffer is pure added output latency and cueing feels
+it), but **always re-test on USB audio**: an onboard codec running native 48kHz has enough margin
+to hide the problem, while a USB device doing 48k→44.1k resampling does not.
+
+**Diagnostic pattern worth reusing**: select *two* main output devices at once so one `tee` feeds
+both. If one branch is clean and the other jitters, every upstream cause (CPU, decode,
+soundtouch) is excluded by construction — they cannot affect one branch and spare its sibling.
+That single observation is what cracked this.
+
+### Occasional brief gap/click that does NOT interrupt playback — multi-device clock drift
+
+**Hypothesis, not yet live-confirmed (2026-08-02).** Distinct from choppiness: a rare,
+almost-imperceptible gap, minutes apart, with playback continuing normally.
+
+A GStreamer pipeline has exactly one clock. With **two or more output devices** selected, one
+`pulsesink` becomes the pipeline clock and the others must slave to it — but each device
+free-runs on its own crystal (typically 20–200 ppm apart), so they cannot stay aligned.
+`GstAudioBaseSink`'s default `slave-method=skew` corrects by jumping the ringbuffer pointer
+(dropping/inserting a block of samples) once drift exceeds `drift-tolerance`, default **40ms**.
+
+Expected period = `drift-tolerance / relative drift`:
+
+| Relative drift | Gap every |
+|---|---|
+| 200 ppm | ~3.3 min |
+| 100 ppm | ~6.7 min |
+| 50 ppm | ~13 min |
+| 20 ppm | ~33 min |
+
+**Free diagnostic — no tooling.** Two sinks on the *same* device share one hardware clock and
+cannot drift, so a main+cue pair on one controller is immune. **Deselect one of two main devices
+and play for a while**: if the gaps stop, confirmed. Same natural-experiment logic that cracked
+the `buffer-time` bug.
+
+**Direct confirmation**: `GST_DEBUG=audiobasesink:5` and grep the output for skew/resync/discont
+decisions, correlating their timestamps against the audible gaps. Verbose (per-render logging) —
+send it to a file and only run it for a couple of minutes.
+
+**Candidate fix**: `CUEMARK_SINK_SLAVE_METHOD=resample` corrects continuously by resampling
+instead of jumping. Costs a little CPU and detunes that device by the drift itself (50 ppm =
+0.0009 semitone, inaudible) in exchange for never producing a discontinuity. Default is
+deliberately left at GStreamer's `skew` until this is confirmed live.
+
+⚠️ A pad probe on the sink pad **cannot** see this — the skew happens inside the sink, after the
+pad, so `instrument_sink_flow()` will report perfectly continuous buffer flow throughout. Don't
+read its silence as evidence against this hypothesis.
+
+⚠️ **`pw-top -b -n 1` in a loop is useless** — its first batch is a priming snapshot with
+all-zero deltas and state `C`, so a loop of one-shot calls reports "nothing is running" no matter
+what is playing. This wasted a cycle on 2026-08-02 and produced a confidently wrong "no playback
+occurred" conclusion. Use **one** long-lived `pw-top -b -n <N>` and parse its stream.
+
+Full context: `docs/design/output-noise-and-track-reload-silence.md`.
+
+---
+
 ## Waveform position clock
 
 The waveform reads position from `getDeckTime(deckId)` in `seekBus.ts`. When playing, that returns
@@ -465,11 +571,51 @@ If a file fails to load and the path contains special characters, check `file_to
 `load()` preroll failure path calls `bus.set_flushing(true)` + `set_state(Null)` before early return.
 `Drop` impl does the same. If you see CRITICAL warnings on teardown, check these paths.
 
+### UI freeze — FIRST check whether it is a spin or a deadlock (they look identical, fixes are opposite)
+
+Before reaching for any freeze playbook, read the watchdog's own diagnostic line for the stuck
+`WebKitWebProcess`:
+
+```
+[watchdog]   descendant pid=NNN comm=WebKitWebProces state=R etimes=295s Δutime=103 Δstime=0
+```
+
+| Reading | Meaning | Where to go |
+|---|---|---|
+| `state=R`, `Δutime` large | **Spin** — running flat out, doing work | `perf top -p <pid>` during the freeze. See "CPU profiling a live chokes-up freeze" below. |
+| `state=S`/`D`, `Δutime≈0` | **Deadlock** — blocked, consuming nothing | The two-mechanism entry below; `gdb` per "Catching an intermittent GStreamer-side stall". |
+
+A deadlock playbook applied to a spin (or vice versa) wastes a whole session — `gdb` on a spinning
+process shows a busy stack that looks meaningless, and `perf` on a blocked one shows nothing at all.
+
+**Known spin (2026-08-02, open)**: ~22s freeze near end of track, `state=R Δutime=103 Δstime=0`,
+clustered around the `EOS` bus message, recovered by watchdog tier3. Pure userspace compute
+(`Δstime=0`), so a tight loop rather than I/O. Suspects are all in the WebCodecs path
+(`codecWorker.ts` `pump()`/`fetchAus()` running off the end of the AU list,
+`maybeStartLoopPrefetch()` re-firing, `codecPlayer.ts` `frames.sort()` with an undrained queue) —
+none of which the freeze-watchdog work covered, since it predates that path becoming default.
+Full writeup: `docs/design/output-noise-and-track-reload-silence.md` Bug E.
+
+**Also note**: `App.svelte`'s rAF heartbeat now logs `[heartbeat] rAF stalled <N>ms` with a measured
+duration on recovery, so a *recovered* stall is a positive log line, not a gap you must spot.
+
 ### UI frozen solid, audio keeps playing, rAF heartbeat log stops forever — check which of two distinct causes
 
-**Shared symptom**: `[heartbeat] rAF alive` (`App.svelte`'s `frame()`, logged once/sec via
-`debugLog`) ticks cleanly then stops permanently — no further log output of any kind —
-while GStreamer's independent Rust audio pipeline keeps playing. Found live, root-caused
+**Shared symptom**: the frontend's rAF loop stops permanently — no further log output of
+any kind — while GStreamer's independent Rust audio pipeline keeps playing.
+
+> **Log-line change (2026-08-02)**: `App.svelte`'s `frame()` used to emit
+> `[heartbeat] rAF alive` once per second unconditionally, and this entry was written
+> against watching those lines stop. It no longer does — every log file was ~100%
+> heartbeat noise, which actively obstructed at least two investigations (see
+> `docs/design/pipewiresink-play-hang.md`, whose live log "contained nothing but
+> `[frontend] [heartbeat] rAF alive` lines"). It now logs only `[heartbeat] rAF stalled
+> <N>ms` when consecutive ticks are >1s apart. **For a permanent freeze the tell is
+> unchanged — no output at all** — but a *recovered* stall now announces itself with a
+> measured duration instead of a gap you have to spot by eye. Rust-side liveness is
+> unaffected: `watchdog_heartbeat` still reports every second (`watchdog.rs`).
+
+Found live, root-caused
 via `gdb`, 2026-07-24/25 — full writeup in `docs/design/pcm-buffer-playback.md`, "Ninth
 mechanism". Two different mechanisms produce this identical externally-observable
 symptom; don't assume it's the first one just because the shape matches:

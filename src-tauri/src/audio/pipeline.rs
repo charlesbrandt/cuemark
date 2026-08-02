@@ -41,6 +41,256 @@ const OUTPUT_QUEUE_STEADY_CAP_NS: u64 = 100_000_000; // 100ms
 /// timer — see its comment) absorbs the catch-up instead of blocking.
 const SCRATCH_STARTUP_QUEUE_CAP_NS: u64 = 2_000_000_000; // 2s
 
+/// Attach rate-limited flow logging to `output_queue` (the queue feeding tee → volume →
+/// sink) — the last point in the graph shared by every output branch.
+///
+/// **Why this exists**: audio symptoms in this app ("it's choppy", "the second track is
+/// silent") all present identically in the existing logs — the pipeline reaches
+/// `Playing`, no bus `ERROR` is posted, and the applied volume is correct. That proves
+/// the graph was *built* and *started*, not that samples are *moving*. `pulsesink`
+/// reports underflows only at `GST_DEBUG` level, so nothing surfaces the difference.
+/// A `queue`'s own `underrun`/`overrun` signals do, and they discriminate three cases
+/// that need completely different fixes:
+///
+/// - **`underrun` while Playing** — `uridecodebin`/`audioconvert`/`pitch` (soundtouch is
+///   the expensive one) can't produce a second of audio per second of wall clock, usually
+///   because the GStreamer streaming thread is losing CPU to the WebKitWebProcess. The
+///   problem is UPSTREAM; widening the sink buffer only delays it.
+/// - **No `underrun`, but audio is still choppy** — samples move through this queue
+///   steadily and the gap happens past it, i.e. in the sink's own ringbuffer. That points
+///   at `sink_buffer_times()` being too small to ride out scheduling jitter.
+///
+/// Only `underrun` is watched, **not `overrun`**: with a synced sink, upstream decode
+/// runs far faster than real time and backpressure holds this queue at or near its cap
+/// for the entire duration of healthy playback, so `overrun` fires continuously when
+/// nothing is wrong. An empty queue is the anomaly here; a full one is the steady state.
+/// (For "did audio reach the device at all", see `instrument_sink_flow()` — a queue
+/// signal cannot answer that, since a stalled sink leaves this queue *full*.)
+///
+/// Gated on `playing` (a `queue` legitimately signals `underrun` while empty during
+/// preroll and at EOS) and rate-limited, since a real episode fires continuously.
+///
+/// `playing` is a plain `AtomicBool` written by the bus thread rather than a
+/// `current_state()` query, deliberately: these signals are emitted **from the queue's
+/// own streaming thread while it holds the queue lock**, and querying element state
+/// there would take `GST_OBJECT_LOCK` underneath it. This project has already lost
+/// multiple sessions to lock-ordering deadlocks in the audio path
+/// (`docs/design/pipewiresink-play-hang.md`), so a diagnostic must not introduce a new
+/// lock acquisition on a streaming thread. A relaxed atomic load costs nothing and
+/// cannot deadlock; being one bus-message late on a state change is irrelevant here.
+fn instrument_queue_flow(output_queue: &gst::Element, deck_id: &str, playing: &Arc<AtomicBool>) {
+    const LOG_EVERY: Duration = Duration::from_secs(5);
+
+    fn connect_counted(
+        queue: &gst::Element,
+        signal: &'static str,
+        deck_id: String,
+        playing: Arc<AtomicBool>,
+        message: &'static str,
+    ) {
+        // (events seen, last time one was logged). The first event logs immediately so
+        // the onset is timestamped precisely; the rest collapse into a running total.
+        let state = Arc::new(Mutex::new((0u64, None::<Instant>)));
+        let _ = queue.connect(signal, false, move |_args| {
+            if !playing.load(Ordering::Relaxed) {
+                return None; // preroll/paused/EOS — an empty or backed-up queue is expected
+            }
+            let mut st = state.lock().unwrap();
+            st.0 += 1;
+            if st.1.is_none_or(|last| last.elapsed() >= LOG_EVERY) {
+                st.1 = Some(Instant::now());
+                log::warn!(
+                    "[audio/{deck_id}] output_queue {signal} (total={}) — {message} \
+                     See instrument_queue_flow()'s doc comment for how to read this.",
+                    st.0
+                );
+            }
+            None
+        });
+    }
+
+    connect_counted(
+        output_queue,
+        "underrun",
+        deck_id.to_string(),
+        playing.clone(),
+        "the pipeline is not producing audio fast enough to keep the sink fed; expect \
+         audible choppiness. Points UPSTREAM (decode/soundtouch/CPU contention), NOT at \
+         the sink buffer.",
+    );
+}
+
+/// Log the first buffer that actually reaches a main output sink, and any resumption
+/// after a gap of more than a second.
+///
+/// **Why this exists**: reaching `Playing` with no bus `ERROR`, the right volume and the
+/// right device proves the graph was *built and started*. It does not prove a single
+/// sample ever reached the hardware. That distinction is the whole of Bug B in
+/// `docs/design/output-noise-and-track-reload-silence.md` — load a second track onto a
+/// deck and it plays silently, with a bus log identical, line for line, to the load that
+/// worked. `instrument_queue_flow()` above cannot answer it either: a sink that has
+/// stopped consuming leaves `output_queue` *full*, which is also what healthy playback
+/// looks like.
+///
+/// So: a pad probe on the sink's own sink pad, which is the last measurable point before
+/// the device. On a silent deck, the single line this emits (or doesn't) splits Bug B in
+/// half — no line at all means nothing reached the sink and the fault is upstream in the
+/// rebuilt graph; a line means audio *was* delivered and the fault is the sink/device
+/// (hypothesis 1: PipeWire/ALSA not releasing the node before the rebuilt `pulsesink`
+/// reopened it).
+///
+/// Deliberately event-driven rather than periodic — one line per load, plus one per
+/// recovered stall — so this stays readable across a multi-hour set instead of becoming
+/// the next thing that drowns the log.
+fn instrument_sink_flow(sink: &gst::Element, deck_id: &str, label: &str) {
+    let Some(pad) = sink.static_pad("sink") else {
+        log::warn!("[audio/{deck_id}] {label}: no sink pad to probe for flow diagnostics");
+        return;
+    };
+    let deck_id = deck_id.to_string();
+    let label = label.to_string();
+    // None until the first buffer arrives; then the arrival time of the most recent one.
+    let last_seen = Arc::new(Mutex::new(None::<Instant>));
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+        let now = Instant::now();
+        let mut seen = last_seen.lock().unwrap();
+        match *seen {
+            None => log::info!(
+                "[audio/{deck_id}] {label}: first buffer reached the sink — audio is \
+                 being delivered to the device"
+            ),
+            Some(prev) if now.duration_since(prev) > Duration::from_secs(1) => log::warn!(
+                "[audio/{deck_id}] {label}: buffer flow resumed after a {:.1}s gap — the \
+                 device received no audio for that span",
+                now.duration_since(prev).as_secs_f64()
+            ),
+            Some(_) => {}
+        }
+        *seen = Some(now);
+        gst::PadProbeReturn::Ok
+    });
+}
+
+/// Sink ringbuffer sizing as `(buffer_time_us, latency_time_us)`. `buffer-time` is the
+/// total playback buffer the sink keeps queued at the device; `latency-time` is how much
+/// it writes per wakeup.
+///
+/// **Was 50ms/10ms until 2026-08-02; now 200ms/20ms (`pulsesink`'s own defaults), which
+/// fixed live-reproduced choppiness and silence on a USB DJ controller.**
+///
+/// The old 50ms was vestigial. It was chosen in May 2026 (see journal.md) for a problem
+/// that no longer exists: a rate change was a FLUSH seek back then, and the sink's
+/// default 200ms of already-buffered old-rate audio drained *while* the new segment
+/// started, producing an audible "doubled/detuned" artifact — so the buffer was cut to
+/// shorten the overlap. Rate changes now go through the `pitch` element's `tempo`
+/// property with no seek and no flush at all (see CLAUDE.md), so nothing requires a
+/// small buffer anymore. The 50ms was nonetheless carried forward unexamined across the
+/// 2026-08-02 `pipewiresink`→`pulsesink` switch, where it began binding far harder:
+/// `pipewiresink` ignored these properties entirely (it extends `GstBaseSink`, not
+/// `GstAudioBaseSink`) and took a `node.latency` quantum instead, whereas on `pulsesink`
+/// this really is the PulseAudio/pipewire-pulse ringbuffer.
+///
+/// **How this was proven, because the symptom pointed everywhere else first.** Audio was
+/// choppy and, with headphone cue enabled, the master output was silent outright. The
+/// decisive observation came from a deck configured with *two* main sinks at once — an
+/// onboard PCI codec and a USB DJ controller — fed by one `tee`. Identical decode,
+/// identical soundtouch output, identical CPU: the PCI branch was clean and the USB
+/// branch jittered. That rules out every upstream cause (CPU contention, decode,
+/// soundtouch) by construction, since those cannot affect one branch and spare its
+/// sibling. `instrument_queue_flow()` agreed — zero underruns all session. USB audio has
+/// far more scheduling jitter than an onboard codec, so 50ms of ringbuffer written 10ms
+/// at a time was simply too tight for it. At 200ms/20ms the user confirmed every device
+/// clean, with zero underruns and zero sink-flow gaps across ~106s of playback, and all
+/// three expected PipeWire streams present where previously only one existed.
+///
+/// Still overridable, now mainly to trade latency back for tighter cueing on hardware
+/// that tolerates it:
+/// ```text
+/// CUEMARK_SINK_BUFFER_MS=100 CUEMARK_SINK_LATENCY_MS=20 cargo tauri dev
+/// ```
+/// This buffer is pure added output latency, so it is worth bisecting downward on a
+/// given rig — but **do not lower the default again without re-testing on USB audio**,
+/// which is where it broke.
+/// How a sink corrects for its device clock running at a different real rate than the
+/// pipeline clock. Returns `None` to leave GStreamer's default alone.
+///
+/// **Why this is a knob.** A GStreamer pipeline has exactly one clock. With more than one
+/// output device selected, one `pulsesink` becomes the pipeline clock and every other
+/// sink must slave to it — but each device free-runs on its own crystal, typically
+/// 20–200 ppm apart, so they cannot stay aligned. `GstAudioBaseSink`'s default
+/// `slave-method=skew` absorbs the difference by jumping the ringbuffer pointer —
+/// dropping or inserting a block of samples — once it exceeds `drift-tolerance` (40ms
+/// by default). Audibly that is a brief gap or click that does not interrupt playback,
+/// recurring on a period of `drift_tolerance / relative_drift`: roughly every 3 minutes
+/// at 200 ppm, every 13 at 50 ppm.
+///
+/// `resample` instead corrects continuously by resampling to match the master clock. It
+/// costs a little CPU and detunes that device by the drift itself — 50 ppm is 0.0009 of
+/// a semitone, inaudible — in exchange for never producing a discontinuity. For a VJ/DJ
+/// tool driving several outputs at once that is usually the better trade, which is why
+/// this is exposed rather than hardcoded.
+///
+/// **Only matters across distinct devices.** Two sinks on the *same* device share one
+/// hardware clock and cannot drift, so a main+cue pair on one controller is unaffected.
+///
+/// ```text
+/// CUEMARK_SINK_SLAVE_METHOD=resample cargo tauri dev
+/// ```
+/// Accepts `resample`, `skew` (GStreamer's default), `none`. Default is unchanged until
+/// the drift mechanism is confirmed live — see docs/design/output-noise-and-track-reload-silence.md.
+fn sink_slave_method() -> Option<i32> {
+    let raw = std::env::var("CUEMARK_SINK_SLAVE_METHOD").ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "resample" => Some(0),
+        "skew" => Some(1),
+        "none" => Some(2),
+        other => {
+            log::warn!(
+                "[audio] ignoring CUEMARK_SINK_SLAVE_METHOD={other:?} — expected \
+                 resample|skew|none; leaving GStreamer's default (skew)"
+            );
+            None
+        }
+    }
+}
+
+fn sink_buffer_times() -> (i64, i64) {
+    fn from_env(var: &str, default_us: i64) -> i64 {
+        let Ok(raw) = std::env::var(var) else { return default_us };
+        match raw.trim().parse::<i64>() {
+            Ok(ms) if ms > 0 => {
+                // WARN, not info: an active override means the running app is NOT using the
+                // compiled-in default, and that divergence is invisible otherwise. On
+                // 2026-08-02 a shell still exporting CUEMARK_SINK_BUFFER_MS=200 masked the
+                // fact that a "fixed" default had only been changed in the doc comment and
+                // not in the code — the regression reappeared on the next clean restart and
+                // cost a debugging cycle. If this line is in the log, the default is not
+                // what is being tested.
+                log::warn!(
+                    "[audio] {var}={ms}ms OVERRIDE ACTIVE — compiled-in default ({}ms) is NOT \
+                     in effect; unset it to test the default",
+                    default_us / 1_000
+                );
+                ms * 1_000
+            }
+            _ => {
+                log::warn!(
+                    "[audio] ignoring {var}={raw:?} — expected a positive whole number of \
+                     milliseconds; using default {}us",
+                    default_us
+                );
+                default_us
+            }
+        }
+    }
+    (
+        // 200ms/20ms, NOT the old 50ms/10ms — see this fn's doc comment. The old value
+        // was ~1.17 graph quanta and caused live-confirmed choppiness on USB audio.
+        from_env("CUEMARK_SINK_BUFFER_MS", 200_000),
+        from_env("CUEMARK_SINK_LATENCY_MS", 20_000),
+    )
+}
+
 fn make_el(factory: &str) -> Result<gst::Element, String> {
     gst::ElementFactory::make(factory)
         .build()
@@ -250,8 +500,10 @@ fn make_sink(device: &str, deck_id: &str) -> Result<gst::Element, String> {
         None => device,
     };
 
-    const BUFFER_TIME_US: i64 = 50_000;
-    const LATENCY_TIME_US: i64 = 10_000;
+    // Not constants: overridable via CUEMARK_SINK_BUFFER_MS / CUEMARK_SINK_LATENCY_MS so
+    // a choppy-audio repro can be bisected by ear without a rebuild per value. See
+    // sink_buffer_times() for why the 50ms default is suspect in the first place.
+    let (buffer_time_us, latency_time_us) = sink_buffer_times();
 
     if let Ok(sink) = gst::ElementFactory::make("pulsesink").build() {
         if !node_name.is_empty() {
@@ -266,12 +518,43 @@ fn make_sink(device: &str, deck_id: &str) -> Result<gst::Element, String> {
         // pulsesink is a GstAudioBaseSink, so latency is set directly here rather than
         // through PipeWire stream-properties (pipewiresink extends GstBaseSink and has
         // neither of these properties — it needed `node.latency=1024/48000` instead).
-        sink.set_property("buffer-time", BUFFER_TIME_US);
-        sink.set_property("latency-time", LATENCY_TIME_US);
+        sink.set_property("buffer-time", buffer_time_us);
+        sink.set_property("latency-time", latency_time_us);
         sink.set_property("client-name", "cuemark");
+        if let Some(method) = sink_slave_method() {
+            // Set via GValue on the enum property — see sink_slave_method()'s doc comment
+            // for what this trades off and when it matters.
+            sink.set_property_from_str("slave-method", match method {
+                0 => "resample",
+                2 => "none",
+                _ => "skew",
+            });
+            log::info!("[audio/{}] sink: slave-method override -> {}", deck_id, method);
+        }
+        // Tag this stream with the branch that owns it, so `pw-dump` can say which
+        // cuemark output each PipeWire node actually is.
+        //
+        // Uses a custom `cuemark.branch` key, NOT `media.name`: setting `media.name` here
+        // appears to work but is silently overwritten once the track's tags arrive, so
+        // every branch ends up displaying the same title (verified live 2026-08-02 — all
+        // three streams still read as the track name after this was set). A private key
+        // survives because nothing else writes it.
+        //
+        // This matters because the branches are otherwise indistinguishable in the graph:
+        // pipewire-pulse maps even a plain stereo stream onto all of a 4-channel device's
+        // ports, so a stereo main sink and a 4-channel remapped cue sink both present as
+        // FL/FR/RL/RR (confirmed by scripts/probes/pulsesink_shared_device_silence.py).
+        // During the 2026-08-02 "no audio output" investigation that ambiguity produced a
+        // wrong conclusion — the single surviving stream was identified as the cue branch
+        // purely from its port count, which cannot tell them apart. `deck_id` here already
+        // encodes the branch ("deck-0/0" for main sink 0, "deck-0-cue" for cue).
+        let stream_props = gst::Structure::builder("props")
+            .field("cuemark.branch", deck_id)
+            .build();
+        sink.set_property("stream-properties", &stream_props);
         log::info!(
             "[audio/{}] sink: pulsesink device={:?} buffer-time={}us latency-time={}us",
-            deck_id, node_name, BUFFER_TIME_US, LATENCY_TIME_US
+            deck_id, node_name, buffer_time_us, latency_time_us
         );
         return Ok(sink);
     }
@@ -293,8 +576,8 @@ fn make_sink(device: &str, deck_id: &str) -> Result<gst::Element, String> {
             .and_then(|v| v.get::<glib::Object>().ok())
             .and_then(|o| o.downcast::<gst::Element>().ok());
         let Some(child) = child else { return None };
-        child.set_property("buffer-time", BUFFER_TIME_US);
-        child.set_property("latency-time", LATENCY_TIME_US);
+        child.set_property("buffer-time", buffer_time_us);
+        child.set_property("latency-time", latency_time_us);
         let factory = child
             .factory()
             .map(|f| f.name().to_string())
@@ -532,6 +815,7 @@ impl DeckAudioPipeline {
             if i > 0 {
                 snk.set_property("async", false);
             }
+            instrument_sink_flow(&snk, &self.deck_id, &format!("main sink {i}"));
             volume_els.push(vol);
             main_sinks.push(snk);
         }
@@ -643,8 +927,18 @@ impl DeckAudioPipeline {
                 .and_then(glib::EnumClass::with_type)?;
             enum_class.to_value(result_int)
         });
+        log::info!(
+            "[audio/{}] load(): applying gain={:.3} vol={:.3} master_volume={:.3} -> volume={:.3} to {} main sink(s)",
+            self.deck_id, self.gain, self.vol, self.master_volume,
+            self.gain * self.vol * self.master_volume, volume_els.len()
+        );
         for vol in &volume_els {
-            vol.set_property("volume", (self.gain * self.vol) as f64);
+            // Bug fix: this omitted master_volume (unlike apply_volume(), the canonical
+            // helper set_gain/set_volume/set_master_volume_factor all go through) — a
+            // rebuild here always used to reset each sink's volume back to gain*vol alone,
+            // silently dropping whatever master-volume attenuation was in effect until the
+            // next explicit master-volume change nudged apply_volume() again.
+            vol.set_property("volume", (self.gain * self.vol * self.master_volume) as f64);
         }
         pitch.set_property("tempo", self.rate as f32);
         queue.set_property("max-size-buffers", 2u32);
@@ -652,15 +946,24 @@ impl DeckAudioPipeline {
         queue.set_property("max-size-time", 0u64);
         // Time-based output queue: absorb soundtouch's variable-sized output chunks
         // (~82ms WSOLA window) while keeping tempo-change latency audibly tight.
-        // 100ms gives ~5× the PipeWire quantum (21ms) of headroom; 500ms caused
-        // up to 500ms of old-rate audio to drain before the new tempo was audible.
+        // 100ms was sized against pipewiresink's 21ms quantum (~5× headroom); since the
+        // 2026-08-02 switch to pulsesink the downstream buffer is `sink_buffer_times()`
+        // instead, so this is now ~2× a 50ms sink buffer. 500ms caused up to 500ms of
+        // old-rate audio to drain before a new tempo was audible, so don't just widen it
+        // — instrument_queue_flow() below reports if this cap is actually the binding
+        // constraint.
         output_queue.set_property("max-size-buffers", 0u32);
         output_queue.set_property("max-size-bytes", 0u32);
         output_queue.set_property("max-size-time", OUTPUT_QUEUE_STEADY_CAP_NS);
+        // Written by the bus thread's StateChanged handler below, read lock-free by the
+        // underrun/overrun handlers on the queue's streaming thread — see
+        // instrument_queue_flow() for why this isn't a current_state() query.
+        let at_playing = Arc::new(AtomicBool::new(false));
+        instrument_queue_flow(&output_queue, &self.deck_id, &at_playing);
 
         cue_valve.set_property("drop", !self.cue_enabled);
         make_eos_passthrough_valve(&cue_valve);
-        cue_volume.set_property("volume", (self.gain * self.cue_gain) as f64);
+        cue_volume.set_property("volume", (self.gain * self.cue_gain * self.master_volume) as f64);
         cue_queue.set_property("max-size-buffers", 2u32);
         cue_queue.set_property("max-size-bytes", 0u32);
         cue_queue.set_property("max-size-time", 0u64);
@@ -774,6 +1077,7 @@ impl DeckAudioPipeline {
         // Logs the first received spectrum message so we can confirm the signal path.
         let fft_logged = Arc::new(AtomicBool::new(false));
         let fft_logged_thread = fft_logged.clone();
+        let at_playing_thread = at_playing.clone();
         let bus_thread = bus.clone();
         let deck_id_log = self.deck_id.clone();
         let eos_cb = self.eos_callback.clone();
@@ -823,6 +1127,11 @@ impl DeckAudioPipeline {
                         if src.starts_with("pipeline") {
                             log::info!("[bus/{}] pipeline: {:?} → {:?} (pending {:?})",
                                 deck_id_log, s.old(), s.current(), s.pending());
+                            // Gates the output_queue underrun/overrun diagnostics so they
+                            // don't fire on the legitimately-empty queue during preroll or
+                            // after EOS — see instrument_queue_flow().
+                            at_playing_thread
+                                .store(s.current() == gst::State::Playing, Ordering::Relaxed);
                         }
                     }
                     gst::MessageView::Element(_) => {
