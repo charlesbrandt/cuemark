@@ -1,6 +1,6 @@
 <script lang="ts">
   import { open } from "@tauri-apps/plugin-dialog";
-  import { session, updateDeck, removeDeck, setMasterBpm } from "../lib/state/session";
+  import { session, updateDeck, removeDeck, setMasterDeck } from "../lib/state/session";
   import { seekDeck, getDeckTime, getPhase, getVideoEl, getCodecPlayer, quantizeToGrid } from "../lib/renderer/seekBus";
   import { nudgePhaseToMaster } from "../lib/audio/phaseNudge";
   import { tempoRange } from "../lib/audio/audioSettings";
@@ -12,6 +12,7 @@
 
   let { deck }: { deck: Deck } = $props();
   let masterBpm = $derived($session.bpm);
+  let masterDeckId = $derived($session.masterDeckId);
   let resolvedVideoPath = $derived(resolveVideoPath(deck.id, $videoPathOverrides, $videoPathDefault));
   let isDragOver = $state(false);
   let previewCanvas = $state<HTMLCanvasElement | null>(null);
@@ -266,10 +267,10 @@
     </span>
     <button
       class="bpm-btn"
-      class:active={masterBpm !== null && deck.bpm !== null && Math.abs(masterBpm - deck.bpm * deck.playbackRate) < 0.01}
-      onclick={() => deck.bpm !== null && setMasterBpm(deck.bpm * deck.playbackRate)}
+      class:active={masterDeckId === deck.id}
+      onclick={() => setMasterDeck(deck.id)}
       disabled={deck.bpm === null}
-      title="Set this deck's current playing tempo as the main beat reference"
+      title="Set this deck as the main beat reference (tracks its tempo live, including pitch changes)"
     >
       Main Beat
     </button>
@@ -277,7 +278,7 @@
       class="bpm-btn"
       onclick={() => {
         if (deck.bpm !== null && masterBpm !== null) {
-          updateDeck(deck.id, { playbackRate: masterBpm / deck.bpm });
+          updateDeck(deck.id, { playbackRate: masterBpm / deck.bpm, syncLocked: false });
           // Wait for WebKit's video-pipeline rebuild (triggered by the playbackRate
           // write above) to settle before seeking — see CLAUDE.md "Rate-then-seek ordering".
           setTimeout(() => nudgePhaseToMaster(deck.id), 200);
@@ -285,10 +286,30 @@
       }}
       disabled={deck.bpm === null || masterBpm === null}
       title={masterBpm !== null && deck.bpm !== null
-        ? `Sync to main beat: set rate to ${(masterBpm / deck.bpm).toFixed(3)}× and align beat phase`
+        ? `Sync to main beat once: set rate to ${(masterBpm / deck.bpm).toFixed(3)}× and align beat phase`
         : 'Sync requires both deck BPM and a main beat reference'}
     >
       Sync
+    </button>
+    <button
+      class="bpm-btn"
+      class:active={deck.syncLocked}
+      onclick={() => {
+        if (deck.syncLocked) {
+          updateDeck(deck.id, { syncLocked: false });
+        } else if (deck.bpm !== null && masterBpm !== null) {
+          updateDeck(deck.id, { syncLocked: true, playbackRate: masterBpm / deck.bpm });
+          setTimeout(() => nudgePhaseToMaster(deck.id), 200);
+        }
+      }}
+      disabled={masterDeckId === deck.id || deck.bpm === null || masterBpm === null}
+      title={masterDeckId === deck.id
+        ? 'This deck is the main beat reference'
+        : deck.syncLocked
+          ? 'Locked to main beat — rate follows it live; click to unlock'
+          : 'Lock rate to main beat: keeps following it live (pitch changes, master reassignment), not just a one-time snap'}
+    >
+      {deck.syncLocked ? '🔒 Lock' : 'Lock'}
     </button>
     <button
       class="bpm-btn"
@@ -466,7 +487,7 @@
         max={1 + $tempoRange / 100}
         step="0.001"
         value={deck.playbackRate}
-        oninput={(e) => updateDeck(deck.id, { playbackRate: +e.currentTarget.value })}
+        oninput={(e) => updateDeck(deck.id, { playbackRate: +e.currentTarget.value, syncLocked: false })}
       />
     </label>
   </div>

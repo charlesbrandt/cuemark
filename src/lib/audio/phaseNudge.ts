@@ -42,23 +42,20 @@ function scheduleRevert(deckId: string, restoreRate: number, durationMs: number)
   activeNudges.set(deckId, { restoreRate: finalRestore, endTime, rafId });
 }
 
-// Find the phase reference for deckId: prefer the deck whose bpm matches session.bpm;
-// fall back to any other deck with both bpm and downbeat set.
+// Find the phase reference for deckId: prefer the tracked master deck (session.masterDeckId);
+// fall back to any other deck with both bpm and downbeat set (e.g. when the reference is
+// an untracked manual/tap-tempo value with no owning deck).
 function findReferenceDeck(deckId: string) {
-  const { decks, bpm: masterBpm } = get(session);
+  const { decks, masterDeckId } = get(session);
   const candidates = decks.filter(
     (d) => d.id !== deckId && d.bpm !== null && d.downbeat !== null
   );
   if (candidates.length === 0) return null;
-  // Tolerance rather than exact equality: bpm is fractional now, and the master
-  // deck's bpm was float-copied into session.bpm — exact match works for that
-  // deck, but a tolerance also survives future re-analysis producing a value
-  // a hundredth of a BPM away.
-  return (
-    candidates.find(
-      (d) => masterBpm !== null && d.bpm !== null && Math.abs(d.bpm - masterBpm) < 0.05,
-    ) ?? candidates[0]
-  );
+  if (masterDeckId !== null) {
+    const master = candidates.find((d) => d.id === masterDeckId);
+    if (master) return master;
+  }
+  return candidates[0];
 }
 
 // Nudge deckId's phase toward the reference deck's phase.

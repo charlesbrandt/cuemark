@@ -52,6 +52,9 @@ export interface Deck {
   loopOut: number | null; // loop region end (seconds); null = use track end
   eq: DeckEQ;
   cueEnabled: boolean;    // route pre-fader signal to headphone cue context
+  syncLocked: boolean;    // continuously re-locks playbackRate to Session.bpm as it changes
+                          // (vs. the one-shot Sync button); cleared automatically by any
+                          // manual rate input (slider, pitch fader, jog nudge) on this deck
 }
 
 export interface AudioAnalysis {
@@ -77,6 +80,10 @@ export interface Session {
   decks: Deck[];          // ordered array; render back-to-front
   masterVolume: number;
   bpm: number | null;
+  // Deck this bpm is live-derived from (kept in sync as that deck's own bpm/playbackRate
+  // change), or null when bpm is an independent manual reference (tap tempo) not tied to
+  // any deck. See reconcileMaster()/refreshMasterBpm() in session.ts.
+  masterDeckId: string | null;
   crossfaderMapping: {
     left: string;         // deck id
     right: string;        // deck id

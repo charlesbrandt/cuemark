@@ -260,7 +260,7 @@ export async function startMidiListener(): Promise<() => void> {
           const range = get(tempoRange) / 100;
           const scaled = 1.0 + delta * range;
           syncRate(deckId, scaled);               // audio: immediate, no Svelte overhead
-          queueDeckPatch(deckId, { playbackRate: scaled }); // UI: rAF-throttled
+          queueDeckPatch(deckId, { playbackRate: scaled, syncLocked: false }); // UI: rAF-throttled
         }
         break;
       case "crossfader":
@@ -362,7 +362,7 @@ export async function startMidiListener(): Promise<() => void> {
         // second (audible pitch runaway + soundtouch buffer stress). See journal.md.
         const nudged = Math.max(0.25, Math.min(4.0, jogBaseRate[deckId] + a.value * 0.02));
         syncRate(d.id, nudged);                    // audio: immediate, no Svelte overhead
-        queueDeckPatch(d.id, { playbackRate: nudged }); // UI: rAF-throttled — see deck_playback_rate
+        queueDeckPatch(d.id, { playbackRate: nudged, syncLocked: false }); // UI: rAF-throttled — see deck_playback_rate
         // above and CLAUDE.md "session store is coarse-grained": a direct updateDeck() here
         // was firing a full Session/Deck rebuild + all-subscriber notify on every single MIDI
         // tick. A sustained jog spin (many ticks/sec, same as the tempo fader) queued reactive
