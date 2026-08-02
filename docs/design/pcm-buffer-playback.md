@@ -1570,3 +1570,57 @@ mitigation entirely:**
   attempted fix for B introduces bug C, that's a signal to stop patching and
   either accept bug A as documented-and-unmitigated or scope the real
   structural fix — not to keep iterating on the same shape of patch.
+
+## Twelfth mechanism: an audio-only file loaded as a video deck source
+## permanently trips the Ninth/self-heal machinery — found and fixed
+## 2026-08-02
+
+User report: "jittery after using the crossfader," with `output_queue
+underrun` and elevated `position-poll` IPC latency (300–500ms vs. the
+~140–190ms baseline) in the log, persisting for minutes after the crossfader
+move and surviving both decks reaching EOS. Live CPU sampling of both
+`WebKitWebProcess` and the Rust process showed neither pegged/spinning at the
+time of investigation, ruling out the Ninth mechanism's full deadlock and the
+separate known EOS-triggered spin — this was a milder, non-freezing member of
+the same family.
+
+**Root cause**: `deck-1`'s source was `{ type: 'video', filePath:
+'.../t1000-concentration_factor.wav' }` — an audio-only WAV loaded as a
+video-typed deck source. `startCodecPath`'s WebCodecs demux naturally times
+out (`"timed out waiting for parsebin to expose a video stream"` — there is
+no video stream to find), forcing the legacy `<video>` fallback. That
+element's `currentTime` never has a video track driving it, so it never
+advances. Two separate per-frame mechanisms in `App.svelte`'s `frame()` both
+read "currentTime never moves" as a wedged decoder and try to fix it:
+
+1. The **drift-correction resync** (`v.currentTime = contentPos` once
+   audio/video drift exceeds 250ms) — fires on essentially every
+   position-poll for a deck playing at a non-1.0 rate (deck-1 was at
+   0.872×), since the gap between real audio position and a
+   permanently-stuck `v.currentTime` only grows.
+2. The **stall self-heal** (freeze-watchdog.md phase 4) — reads the same
+   "stuck `currentTime`, audio still advancing" signal as a genuinely wedged
+   `<video>` pipeline and calls `v.load()` (a full WebKitGTK pipeline
+   rebuild) roughly every 10 seconds, for the deck's entire playback.
+
+Both funnel into the same `gst_element_send_event()`/pipeline-rebuild
+machinery implicated in the Ninth mechanism's confirmed WebKitGTK
+`MediaPlayerPrivateGStreamer` main-thread contention — on a real audio-only
+file this isn't a rare trigger window, it's a permanent, continuous one for
+as long as that deck plays. The crossfader wasn't the root cause; the burst
+of rAF-rate compositing/IPC work from a heavy crossfader sweep just added
+enough scheduling pressure on top of this already-active condition to tip it
+into an audible glitch (one logged `output_queue underrun`).
+
+**Fix** (`src/App.svelte`): track decks whose demux failed with that specific
+"no video stream" error in an `audioOnlyDecks` set (populated in
+`startCodecPath`'s catch branch, cleared on teardown/reload/successful
+demux), and skip both the resync write and the self-heal block entirely for
+decks in that set — there is no video to keep in sync, so neither check
+should ever fire in the first place.
+
+**Reusable lesson**: any per-frame "is this value stuck?" heuristic that
+assumes a driving mechanism exists (here: a video track) needs to verify that
+assumption, not just the symptom — "hasn't changed in N seconds" looks
+identical whether the driver is wedged or absent, but the correct response is
+opposite (recover vs. do nothing).

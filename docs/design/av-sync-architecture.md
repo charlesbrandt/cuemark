@@ -209,3 +209,18 @@ value and flush to the store once per rAF — capping Svelte re-renders at 60fps
 controls (rate/gain/volume), a last-value Map guard alone is not enough — those must go through
 `audioSync.ts` directly from the MIDI handler, not via the store at all. `audioSetCue` still
 uses the guard-only pattern (fires infrequently, on button press).
+
+**Every last-seen-value guard Map keyed by deck ID must be cleared on deck teardown, not just
+on the value it guards.** Found live 2026-08-02: `App.svelte`'s `_prevCueStates` (gating the
+`audioSetCue` guard above) was never cleared in `teardownVideoBackendFull` or the deck-removal
+cleanup loop. `audio_unload` drops the Rust-side `DeckAudioPipeline` entirely, so a reloaded
+deck gets a brand-new pipeline with `cue_enabled` defaulting to `false` — but if `deck.cueEnabled`
+in the *store* was already `true` before the reload, `_prevCueStates` still says `true` too, the
+guard sees no change, and `audioSetCue` never re-fires to open the fresh pipeline's cue valve.
+Symptom: headphone cue goes silently dead after any deck reload, recoverable only by manually
+toggling cue off and back on. The general rule: any Map whose key is a deck ID and whose purpose
+is "only send this again if it changed" is implicitly asserting the receiving side's state is
+still what the Map remembers — that assertion breaks the moment the receiving side gets rebuilt
+from scratch (reload, backend teardown, deck removal + ID reuse), so every such Map needs a
+`.delete(deckId)` alongside the other per-deck Maps (`stallWatch`, `backendState`,
+`contentPosTracker`, etc.) in whichever teardown path rebuilds that deck's backend.
