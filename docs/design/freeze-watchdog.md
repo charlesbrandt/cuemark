@@ -361,6 +361,26 @@ never hiccups and by eye that the UI returns with decks intact.
 
 - **False-positive recovery is the main hazard** (reloading a healthy UI mid-set).
   Hence: observe-first phase, 6 s threshold, eval-first tiering, 15 s backoff.
+
+  **This risk materialised, and none of those mitigations caught it** (2026-08-02; full
+  log capture in `output-noise-and-track-reload-silence.md`, "RESOLVED 2026-08-02 (late)").
+  The design above has a heartbeat *registration* path and no *deregistration* path, so a
+  **closed** window is indistinguishable from a frozen one: its entry lingers, goes silent,
+  and drives the full cascade at a window that no longer exists. tier1/tier2 log
+  `window '<label>' not found` and tier3 — which cannot attribute a `WebKitWebProcess` to a
+  label and so kills *all* of them — SIGKILLs every healthy window's web process as
+  collateral. Observed: closing `output` cost `main` three forced reloads in 62 seconds,
+  with `main`'s `lastRafMs` at `0`, `13`, `9` at each manufactured trigger. Every listed
+  mitigation is about *how confidently* silence means frozen; none of them ask whether the
+  window is still there. Fixed by `watchdog::forget_window` on `Destroyed`/`CloseRequested`
+  plus an existence check before any recovery spawns.
+
+  Generalisation worth carrying into any future liveness check here: **absence of a signal
+  and absence of the thing being signalled are different failures**, and only the second one
+  is diagnosable from the signal's absence. Check the subject exists before acting on its
+  silence. Corollary, since it misled this investigation for two sessions: a *healthy* final
+  heartbeat followed by silence is the signature of a clean shutdown, not of a freeze —
+  evidence against a genuine freeze rather than for one.
 - **Adoption bugs**: rehydration accidentally calling `audioLoad`/`audioSeek` on a
   playing pipeline would audibly glitch — the exact thing this feature must never do.
   Add a temporary assertion log in `pipeline.ts` (`audioLoad` called for a deck whose

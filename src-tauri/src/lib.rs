@@ -195,6 +195,20 @@ pub fn run() {
             video_demux::video_demux_load,
             video_demux::video_demux_unload,
         ])
+        // A closed window must stop being watched. Otherwise its heartbeat entry goes
+        // stale, trips the watchdog's silence threshold, and drives the full recovery
+        // cascade — up to and including tier3's SIGKILL of every WebKit process in the
+        // app — against a window that is gone because the user closed it on purpose.
+        // See watchdog::forget_window for the incident this comes from.
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed | tauri::WindowEvent::CloseRequested { .. }) {
+                // try_state, not state: window events can fire before setup() has run
+                // app.manage(), and a panic on this thread would take the app down.
+                if let Some(state) = window.app_handle().try_state::<watchdog::WatchdogPersist>() {
+                    watchdog::forget_window(&state, window.label());
+                }
+            }
+        })
         .setup(|app| {
             log_build_provenance();
 

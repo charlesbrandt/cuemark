@@ -84,6 +84,28 @@ pub fn new_persist() -> WatchdogPersist {
     Arc::new(Mutex::new(Inner { windows: HashMap::new() }))
 }
 
+/// Drops a window's heartbeat entry. Called when a window is closed/destroyed (see
+/// `lib.rs`'s `on_window_event`).
+///
+/// Without this, a **deliberately closed** window is indistinguishable from a frozen one:
+/// its entry lingers, stops being fed, trips `SILENCE_THRESHOLD` 6s later, and drives the
+/// full recovery cascade against a window that no longer exists. That is not hypothetical
+/// — it is exactly what the `output` window did in the incidents recorded in
+/// `docs/design/output-noise-and-track-reload-silence.md` (Bug A): tier1/tier2 logging
+/// `window 'output' not found` on every attempt, tier3 SIGKILLing *every* WebKit
+/// descendant (including `main`'s perfectly healthy one) as collateral, three sequences
+/// failing, and the watchdog finally giving up. Note that a healthy final `lastRafMs`
+/// followed by silence is the signature of a clean close, **not** of a freeze — that
+/// reading is what made those triggers look genuine.
+///
+/// Reopening the window re-registers it on its next heartbeat via the insert branch
+/// below, so forgetting is safe and needs no corresponding "re-add" path.
+pub fn forget_window(state: &WatchdogPersist, label: &str) {
+    if state.lock().unwrap().windows.remove(label).is_some() {
+        log::info!("[watchdog] window '{label}' closed — dropped from heartbeat tracking");
+    }
+}
+
 #[tauri::command]
 pub fn watchdog_heartbeat(
     window: String,
@@ -232,8 +254,25 @@ fn resumed(state: &WatchdogPersist, label: &str) -> bool {
     state.lock().unwrap().windows.get(label).map(|b| !b.triggered).unwrap_or(false)
 }
 
+// Looks a window up by label, falling back to a scan of every managed webview window.
+//
+// In tauri 2.10.3 these two are keyed identically — `get_webview_window(label)` is
+// `manager().get_webview(label)` filtered by `is_webview_window()`, and
+// `webview_windows()` is the same filter applied to `manager().webviews()` — so the
+// fallback is belt-and-braces, not a real second source. It is worth stating explicitly
+// because the Bug A notes hypothesised an asymmetry between the two (tier1/tier2 using
+// the by-label lookup, tier3 using the map) and that asymmetry does not exist: when
+// tier1/tier2 logged `window 'output' not found`, tier3's `reload_all_windows()` was not
+// quietly succeeding where they failed — it simply had no `output` entry to reload
+// either, and logged nothing because it only reports per-window *errors*. The window was
+// genuinely gone. That is what `forget_window` above now prevents from ever reaching a
+// recovery tier.
+fn find_window(app: &tauri::AppHandle, label: &str) -> Option<tauri::WebviewWindow> {
+    app.get_webview_window(label).or_else(|| app.webview_windows().remove(label))
+}
+
 fn eval_reload(app: &tauri::AppHandle, label: &str) {
-    match app.get_webview_window(label) {
+    match find_window(app, label) {
         Some(w) => {
             if let Err(e) = w.eval("location.reload()") {
                 log::warn!("[watchdog] tier1 eval failed for '{label}': {e}");
@@ -244,7 +283,7 @@ fn eval_reload(app: &tauri::AppHandle, label: &str) {
 }
 
 fn native_reload(app: &tauri::AppHandle, label: &str) {
-    match app.get_webview_window(label) {
+    match find_window(app, label) {
         Some(w) => {
             if let Err(e) = w.reload() {
                 log::warn!("[watchdog] tier2 reload failed for '{label}': {e}");
@@ -259,6 +298,16 @@ fn native_reload(app: &tauri::AppHandle, label: &str) {
 // thread eventually running them) — this is the tier that actually breaks mechanism A's
 // deadlock and any process-level freeze (e.g. `kill -STOP`). Shells out to `kill` rather
 // than adding a libc/nix dependency for one syscall (same tradeoff as CLK_TCK above).
+//
+// ⚠️ This is unconditional and takes healthy windows down with the stuck one: recovering
+// `output` also kills `main`'s WebKitWebProcess, mid-performance. That is not an oversight
+// that can be fixed here — attributing a WebKitWebProcess back to a window label isn't
+// reliable across the sandbox's possible bwrap layer (see `descendant_pids`), so there is
+// nothing to be selective *with*. The mitigation is upstream instead: never let a window
+// that isn't genuinely frozen reach this tier (see the closed-window guard in the poll
+// loop and `forget_window`). If selectivity is ever actually needed, it needs a real
+// attribution mechanism first — e.g. having each window report its own WebKitWebProcess
+// pid alongside its heartbeat — not a guess based on process start order.
 fn kill_webkit_descendants() -> usize {
     let own_pid = std::process::id() as i32;
     let mut killed = 0;
@@ -409,7 +458,25 @@ pub fn spawn_watchdog(state: WatchdogPersist, app: tauri::AppHandle) {
                 }
             }
 
+            // Last line of defence before doing something destructive: confirm the window
+            // is still there. `forget_window` handles the ordinary close path, but it
+            // depends on GTK actually delivering a Destroyed/CloseRequested event, and a
+            // missed event here costs a SIGKILL of every WebKit process in the app. This
+            // check needs no event at all — a label with no window is a closed window, and
+            // the only correct response is to stop tracking it, never to escalate.
+            //
+            // Deliberately done outside the state lock: it reaches into Tauri's window
+            // manager, which takes its own locks, and `watchdog_heartbeat` already holds
+            // ours from inside a command handler. Nesting the two in opposite orders is a
+            // deadlock waiting to happen, and this thread is the one that must never wedge.
             for label in to_recover {
+                if find_window(&app, &label).is_none() {
+                    log::warn!(
+                        "[watchdog] window '{label}' has no live webview — treating as closed, not frozen; skipping recovery"
+                    );
+                    forget_window(&state, &label);
+                    continue;
+                }
                 spawn_recovery_sequence(app.clone(), state.clone(), label);
             }
         }
