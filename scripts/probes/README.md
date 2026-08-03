@@ -25,6 +25,17 @@ mirror `main.rs` so results reflect the app's real conditions.
 | `webcodecs_decode_only_probe.py` | Does `VideoDecoder` actually decode real H.264 annex-B AUs correctly? (host-encodes via GStreamer/x264, pixel-checks output, tests flush+keyframe reseek) | 60/60 frames, pixel-exact, reseek 5 ms |
 | `webcodecs_perf_probe.py` | 1080p decode throughput; `texImage2D(VideoFrame)`→WebGL viability; `drawImage` fallback cost (`PROBE_W/H/N` env to change resolution) | 153–165 fps decode; texImage2D works (no SIGTRAP), 24 ms/f on llvmpipe — re-measure on real GPU; drawImage 6.7 ms/f |
 | `encoder_crash_repro.py` | `VideoEncoder` crash triggers (`isconfig` / `configure` / `construct` arg) | `isConfigSupported` and `configure()` SIGABRT the web process; bare construction survives. Upstream draft: `docs/upstream/videoencoder-crash.md` |
+| `offscreencanvas_webgl_capture_probe.py` | Can pixels be got **out of** a WebGL canvas? Tests `drawImage`, `createImageBitmap`, `OffscreenCanvas`+`transferToImageBitmap`, `readPixels`, `toDataURL`, plus a 2D-canvas control | 2026-08-02: every WebGL route FAILS (transparent / unsupported / `0x502`), 2D control PASSES, identical in both DMA-BUF arms. Upstream draft: `docs/upstream/webgl-canvas-capture-transparent.md` |
+
+**Run `offscreencanvas_webgl_capture_probe.py` before designing anything that moves rendered
+content between windows or processes.** It answered in minutes what three sessions of Bug A
+could not, and it killed a proposed `OffscreenCanvas` rewrite of `compositor.ts` that this
+build cannot support. It needs no Xvfb and takes seconds:
+
+```sh
+python3 scripts/probes/offscreencanvas_webgl_capture_probe.py
+WEBKIT_DISABLE_DMABUF_RENDERER=1 python3 scripts/probes/offscreencanvas_webgl_capture_probe.py
+```
 
 Prereqs (all present on this machine): `python3-gi`, `gir1.2-webkit2-4.1`, `Xvfb`,
 GStreamer with `x264enc` (`gstreamer1.0-plugins-ugly`).

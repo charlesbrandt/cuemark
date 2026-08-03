@@ -206,11 +206,42 @@ legacy `<video>` fallback remains untested with DMA-BUF enabled — see `main.rs
 **displays** correctly on screen. Independent of DMA-BUF (reproduces in both arms). This is
 why `output.ts` measured `centrePixel=rgba(0,0,0,0)` at frame #240 with video playing, even
 though `composite()` clears to `rgba(0,0,0,1)` — an opaque clear that cannot survive as
-transparent through a working capture. Fix direction, not yet implemented: render the
-compositor into a standalone `new OffscreenCanvas(1920,1080)` and ship frames via
-`transferToImageBitmap()`, which never round-trips through a canvas snapshot. Note
-`transferControlToOffscreen()` is *not* usable for this — `transferToImageBitmap()` throws on
-a placeholder-backed offscreen canvas.
+transparent through a working capture.
+
+**Probed 2026-08-02, and it is worse than "one broken call".**
+`scripts/probes/offscreencanvas_webgl_capture_probe.py` reproduces this in a bare
+`Gtk.Window` with no cuemark code at all — it is an upstream WebKitGTK bug, written up in
+`docs/upstream/webgl-canvas-capture-transparent.md`. Identical results in both DMA-BUF arms:
+
+```
+onscreen-drawImage         = FAIL(transparent)
+onscreen-createImageBitmap = FAIL(transparent)   <- what postFrame() does today
+offscreen-webgl2           = UNSUPPORTED(no webgl2 on OffscreenCanvas)
+readPixels                 = FAIL(glError=0x502)
+2d-drawImage               = PASS(rgba(255,0,0,255))
+2d-createImageBitmap       = PASS(rgba(255,0,0,255))
+```
+
+**The `OffscreenCanvas` + `transferToImageBitmap()` fix proposed earlier is not available** —
+this build has no `webgl2` context on `OffscreenCanvas`. Probing it cost minutes and saved a
+structural rewrite of `compositor.ts` that could not have worked. (`transferControlToOffscreen()`
+is not a workaround either: `transferToImageBitmap()` throws on a placeholder-backed canvas.)
+
+What the 2D control case establishes: capture is **not** broken in general on this build, only
+for WebGL-backed canvases. Remaining options, none started:
+
+1. **2D-canvas compositing for the output path.** Known to work here. Costs the GLSL effect
+   chain and the shader visualization layer, which are WebGL by construction — so it is a
+   real feature regression, not a transparent fix.
+2. **Composite inside the output window.** WebGL *display* works fine (the window renders
+   correctly; only readback fails), so the output window could run its own compositor and
+   never capture anything. Requires shipping decoded frames rather than composited bitmaps,
+   and cross-process `VideoFrame` transfer over `BroadcastChannel` in WebKitGTK is unproven —
+   probe before building.
+3. **`docs/design/native-output-pipeline.md`** — GStreamer-native second output, no webview
+   in the loop. CLAUDE.md requires an explicit decision; **do not start without one.**
+4. **Report upstream and accept it on this machine.** The output window works on other
+   systems; this is one WebKitGTK build on 2012 hardware.
 
 **Caveat on this session's own instruments.** The `centreFB`/`centreVia2D` readings added to
 `composite()` are **unreliable**: `gl.readPixels` on the default framebuffer fails with

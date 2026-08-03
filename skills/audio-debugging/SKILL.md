@@ -607,6 +607,22 @@ thread sits at 84% of a core with a *single* deck playing. Full evidence, the A/
 (`CUEMARK_ENABLE_DMABUF=1`: 87% → 62%, 6 rAF stalls → 0) and the remaining open items:
 `docs/design/output-noise-and-track-reload-silence.md`, "Bug E re-diagnosis".
 
+⚠️ **UPDATE 2026-08-02 (late): `WEBKIT_DISABLE_DMABUF_RENDERER=1` is now OFF by default**
+(`CUEMARK_DISABLE_DMABUF=1` restores it). A second, independent condemnation landed the same
+day: it also **corrupts the WebGL compositor canvas**, rendering growing horizontal bands of
+uninitialised memory. That was the long-running "output window renders noise" bug — which was
+never an output-window bug at all. The compositor canvas was `display:none` from `ee91c54`
+until 2026-08-02, so nobody had ever *looked* at what the compositor produced; making it
+visible showed the identical corruption in the **control** window. One stale workaround, two
+bugs that looked unrelated, chased separately for weeks. See "ROOT-CAUSED 2026-08-02 (late)"
+in the same doc.
+
+**Debugging technique worth stealing**: when output is wrong and every log says the data is
+fine, *display the intermediate surface*. Give the hidden canvas a real size and a bright
+border. That single change cracked a bug that survived two fix attempts, permanent
+instrumentation, and a conclusion of "the JS data path is provably healthy" — which was true,
+and irrelevant, because the corruption was upstream of everything being measured.
+
 **Three techniques from that session, reusable:**
 
 - **`scripts/probes/thread-cpu-sampler.sh` before reaching for `perf`.** The watchdog's

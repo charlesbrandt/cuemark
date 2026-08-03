@@ -430,6 +430,15 @@ Several automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb
 | `scripts/watchdog-test.sh <video>` | `docs/design/freeze-watchdog.md` phase 3 gate — tiered recovery (`kill -STOP`/`freezeMainThread(0)`/`kill -KILL`) plus a 15s false-positive smoke check. Run after touching `watchdog.rs` or the recovery/adoption path. |
 | `scripts/watchdog-soak-test.sh <video> [seconds]` | The design doc's full 10-minute false-positive soak (default 600s) — looped playback + a MIDI-rate burst every 60s, asserts zero watchdog triggers. Run before relying on recovery in prod, not on every change. |
 | `scripts/check-launcher-staleness.sh [path]` | Is `~/.local/bin/cuemark` behind the code? Exit 0 fresh / 1 stale / 2 not built. No toolchain or running app needed. Run before diagnosing anything against a non-dev launch. |
+| `scripts/probes/offscreencanvas_webgl_capture_probe.py` | Can pixels be read back out of a WebGL canvas on this WebKitGTK? Run **before designing anything that moves rendered content between windows or processes**, and before trusting any pixel assertion against WebGL output. Seconds, no app, no Xvfb. |
+
+⚠️ **Pixel readback from a WebGL canvas is broken on this machine** (WebKitGTK 2.52.3):
+`createImageBitmap`, `drawImage(glCanvas)`, `toDataURL` and `readPixels` all return
+transparent/fail while the canvas **displays** correctly, and `OffscreenCanvas` has no
+`webgl2` context. None of them throw. A plain 2D canvas captures fine. Consequences:
+`postFrame()` in `outputBus.ts` ships blank frames to the output window here (works on other
+systems), and **automated screenshot/pixel checks of compositor output silently verify
+nothing**. See `docs/upstream/webgl-canvas-capture-transparent.md`.
 
 ## Constraints
 

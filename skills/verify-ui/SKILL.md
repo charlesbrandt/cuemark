@@ -201,8 +201,12 @@ Pattern (full working examples in `scripts/probes/`):
   data in the same script (e.g. encode H.264 AUs to feed a decoder under test).
 - Crash detection: connect `view.connect('web-process-terminated', ...)` — a probe
   that times out with no title is usually a dead web process.
-- Run under `xvfb-run -a`, with the app's env (`WEBKIT_DISABLE_DMABUF_RENDERER=1`,
-  the `GST_PLUGIN_FEATURE_RANK` demotions from `main.rs`) so behavior matches.
+- Run under `xvfb-run -a`, with the app's env (the `GST_PLUGIN_FEATURE_RANK` demotions
+  from `main.rs`) so behavior matches. **`WEBKIT_DISABLE_DMABUF_RENDERER=1` is no longer
+  part of that env** — it was retired as the default on 2026-08-02 (`CUEMARK_DISABLE_DMABUF=1`
+  restores it). Probes that still set it are testing a configuration the app no longer ships;
+  for anything graphics-related, run **both** arms, because that variable changes WebGL
+  canvas behaviour, not just performance.
 - **Always set `APPORT_DISABLE=1`** — a WebKitWebProcess crash inside the probe
   otherwise pops Ubuntu's "application stopped unexpectedly" dialog on the user's
   real desktop session (learned live 2026-07-25, twice).
@@ -211,6 +215,14 @@ Pattern (full working examples in `scripts/probes/`):
   way to check whether an API needs a settings toggle before blaming its absence.
 - **Never touch `VideoEncoder` in probe pages** (`isConfigSupported` or `configure`
   — instant web process SIGABRT on 2.52.3; `docs/upstream/videoencoder-crash.md`).
+- **Pixels cannot be read back out of a WebGL canvas on this build.** `createImageBitmap`,
+  `drawImage(glCanvas)` and `readPixels` all fail (transparent / `INVALID_OPERATION`), while
+  the canvas *displays* correctly; `OffscreenCanvas` has no `webgl2` context at all. A plain
+  2D canvas captures fine. So **a screenshot/pixel assertion against WebGL content proves
+  nothing here** — a blank result is the platform, not your change. Verify WebGL rendering by
+  *looking at the window*, not by capturing it.
+  Probe: `scripts/probes/offscreencanvas_webgl_capture_probe.py`;
+  upstream: `docs/upstream/webgl-canvas-capture-transparent.md`.
 
 ## Simulating freezes and crashes (for watchdog/recovery testing)
 
@@ -275,8 +287,18 @@ post-reload state:
   against an empty session with no decks loaded (so it isn't specific to WebCodecs/WebGL
   load). Matches the precedent already in `journal.md`'s 2026-07-06 entry, which switched
   to canvas pixel extraction for exactly this reason. **Use `canvas.toDataURL('image/png')`
-  via `/execute/sync` instead** — reads back the actual rendered content of any canvas
-  (main compositor output, a `DeckCard` preview, a waveform) and returns promptly:
+  via `/execute/sync` instead** — returns promptly and reads back the actual rendered
+  content of a **2D** canvas (a `DeckCard` preview, a waveform).
+
+  ⚠️ **NOT for the compositor output, or any other WebGL canvas.** Verified 2026-08-02
+  (`scripts/probes/offscreencanvas_webgl_capture_probe.py`): `toDataURL` on a `webgl2`
+  canvas returns **fully transparent** pixels on this WebKitGTK build, as do
+  `createImageBitmap`, `drawImage(glCanvas)` and `readPixels` — while the canvas displays
+  correctly on screen. It does not throw. Any assertion built on it therefore "succeeds"
+  against a blank image, which is worse than no check: this is precisely how three sessions
+  concluded "the data path is provably healthy" while the screen showed garbage. Verify
+  WebGL rendering by looking at the window. Upstream:
+  `docs/upstream/webgl-canvas-capture-transparent.md`.
   ```sh
   RESULT=$(js_sync "return document.querySelectorAll('canvas')[0].toDataURL('image/png');")
   echo "$RESULT" | python3 -c "
