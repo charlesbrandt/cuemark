@@ -106,6 +106,33 @@ fn frontend_log(msg: String) {
     log::info!("[frontend] {msg}");
 }
 
+/// Wall-clock epoch milliseconds — the one clock the Rust process and both webviews
+/// can compare directly (`Date.now()` reads the same clock). `performance.now()` and
+/// `Instant` are per-process monotonic origins and cannot be differenced across the
+/// IPC boundary; epoch ms can, which is what lets `audio_get_position` report *where*
+/// a slow poll spent its time rather than just how long it took.
+pub(crate) fn epoch_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0)
+}
+
+/// Control arm for IPC-latency measurement: does nothing but report when it ran.
+///
+/// A synchronous `#[tauri::command]` runs on the GTK main thread, the same thread that
+/// dispatches every IPC call and pumps the webview. So a round trip measured from JS
+/// covers three legs — JS → GTK main thread, the command body, GTK main thread → JS —
+/// and only the middle one is "the backend being slow". Firing this alongside a real
+/// command isolates the two transport legs from the work: if the no-op is just as slow,
+/// the callee is exonerated and the main thread (or the JS thread that must run the
+/// promise callback) is the bottleneck. See `[position-poll]`/`[ipc-ping]` in
+/// `src/lib/audio/pollStats.ts`.
+#[tauri::command]
+fn ipc_ping() -> f64 {
+    epoch_ms()
+}
+
 struct MediaServerPort(u16);
 
 #[tauri::command]
@@ -146,6 +173,17 @@ pub fn run() {
                         message
                     ))
                 })
+                // The plugin's defaults (40KB, KeepOne) are far too small for this app's log
+                // volume: a single track load emits hundreds of lines, so a session self-
+                // erased in under two minutes and rotation silently deleted the *only* copy
+                // of the window being diagnosed. That happened mid-investigation on
+                // 2026-08-03 — the build-provenance line CLAUDE.md says to check first had
+                // already been rotated away, taking with it the evidence the run existed to
+                // collect. 8MB × KeepAll is a few sessions' worth of history and still
+                // trivial on disk; the date-stamped rotated files are what let a report from
+                // last week still be read.
+                .max_file_size(8 * 1024 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
                 .targets([
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
@@ -164,6 +202,7 @@ pub fn run() {
             open_output_window,
             media_server_port,
             frontend_log,
+            ipc_ping,
             midi_state::midi_get_saved_state,
             midi_state::midi_benchmark_save,
             watchdog::watchdog_heartbeat,

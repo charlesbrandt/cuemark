@@ -108,12 +108,35 @@ export function audioSetCue(deckId: string, enabled: boolean): Promise<void> {
 // ── Position (audio is master clock) ─────────────────────────────────────────
 
 /**
+ * One position reply plus the backend-side timing of how it was served. Mirrors
+ * `PositionSample` in `src-tauri/src/audio/mod.rs` — see that doc comment for why the
+ * timings ride along with every poll rather than living in a separate diagnostic call.
+ * `entryMs`/`exitMs` are epoch ms, comparable to `Date.now()` in this process.
+ */
+export interface PositionSample {
+  pos: number | null;
+  entryMs: number;
+  lockMs: number;
+  queryMs: number;
+  exitMs: number;
+}
+
+/**
  * Returns the GStreamer pipeline's current position in seconds, or null if
  * the pipeline isn't playing yet. The frontend uses this to sync <video>
  * elements: if |video.currentTime - audioPosition| > 80ms, seek the video.
  */
-export function audioGetPosition(deckId: string): Promise<number | null> {
+export function audioGetPosition(deckId: string): Promise<PositionSample> {
   return invoke("audio_get_position", { deckId });
+}
+
+/**
+ * No-op command returning the epoch ms at which it ran on the GTK main thread —
+ * the control arm for position-poll latency. See `ipc_ping` in `src-tauri/src/lib.rs`
+ * and `recordPollSample()` in `pollStats.ts`.
+ */
+export function ipcPing(): Promise<number> {
+  return invoke("ipc_ping");
 }
 
 // ── Master mix ────────────────────────────────────────────────────────────────

@@ -15,7 +15,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import { debugLog } from './lib/debugLog';
 import { Compositor } from './lib/renderer/compositor';
-import { OUTPUT_CHANNEL, type OutputMessage } from './lib/renderer/outputProtocol';
+import {
+  OUTPUT_CHANNEL,
+  OUTPUT_ALIVE_INTERVAL_MS,
+  type OutputMessage,
+} from './lib/renderer/outputProtocol';
 
 const channel = new BroadcastChannel(OUTPUT_CHANNEL);
 const canvas = document.getElementById('output') as HTMLCanvasElement;
@@ -113,6 +117,10 @@ channel.onmessage = (e: MessageEvent<OutputMessage>) => {
 // new frame, which for a paused deck never happens: the sender only ships decks that changed.
 channel.postMessage({ kind: 'hello' });
 debugLog('[output] ready — requested full re-send from control window');
+
+// Liveness beacon — the sender skips all frame construction when nobody is listening.
+// See OutputAliveMessage for why this is a beacon and not a goodbye on unload.
+setInterval(() => channel.postMessage({ kind: 'alive' }), OUTPUT_ALIVE_INTERVAL_MS);
 
 // Freeze-watchdog heartbeat (docs/design/freeze-watchdog.md). This window has no rAF loop of
 // its own — it renders on message arrival — so "lastRafMs" here means "time since the last

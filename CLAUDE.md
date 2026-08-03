@@ -100,6 +100,13 @@ Consequences worth knowing:
 - The control window has **no compositor and no WebGL context at all**. There is no composited
   preview in the control UI; adding one means a real visible canvas plus its own `Compositor`,
   never a hidden one to capture.
+- **`postFrame()` does nothing unless the output window is listening.** It builds a
+  full-resolution `drawImage` + `createImageBitmap` per changed deck at up to 60fps, and until
+  2026-08-03 it did so even with no output window open — the single largest consumer of the
+  control window's frame budget (`docs/design/control-window-frame-budget.md`). The output
+  window beacons `alive` every second; the sender gives up after 3s of silence. It is a beacon
+  rather than a goodbye-on-unload because a window killed by the freeze-watchdog or the window
+  manager never gets to say goodbye, and believing a dead window is alive wastes work forever.
 - Only decks whose frame actually changed carry a bitmap; `bitmap: null` means "reuse the FBO".
   A paused deck costs nothing per frame. The output window sends `{kind:'hello'}` on load to ask
   for a full re-send, which is what makes a window opened mid-set (or reloaded by the
@@ -420,6 +427,19 @@ but **the old binary keeps running until the rebuild finishes and the window res
 If managing the dev server from Claude Code: kill the background process before making Rust changes,
 then restart after. A change that was edited but never recompiled has no effect at runtime.
 
+⚠️ **Vite can serve a stale transform of a file that is correct on disk.** Two rapid successive
+writes to one file in a single command (e.g. a `sed -i` followed by a rewrite) can leave the
+watcher holding the intermediate state, and its mtime-based dedupe then misses the second write.
+On 2026-08-03 this served an `outputBus.ts` missing one import, so `hasListener()` threw a
+`ReferenceError` every frame and the projector stayed black — while the source file was correct
+and `npm run check` passed. **Before trusting a measurement run, diff the served artifact against
+disk**, not just the source:
+```bash
+curl -s http://localhost:1420/src/lib/renderer/outputBus.ts | head -20   # what the app loaded
+```
+`touch`ing the file forces a re-transform. The built artifact is the thing under test, and this
+project's failure modes are overwhelmingly silent — see the "silent-ignore" note in `journal.md`.
+
 **The desktop-launcher release binary is a separate build that never auto-rebuilds** — unlike
 `cargo tauri dev`, nothing watches `src-tauri/` for the launcher build (`~/.local/bin/cuemark`,
 see `run-app` skill's "Desktop launcher" section). It only updates when someone explicitly runs
@@ -462,11 +482,45 @@ cargo install tauri-cli --version "^2"  # CLI subcommand; compiles from source (
 `error!` instead, so output lands in the log file regardless of how the app was launched — including
 from a desktop launcher with no attached terminal.
 
-Log file: `~/.local/share/com.cuemark.app/logs/cuemark.log` (rotates per Tauri's default log plugin
-behavior). Tail it live to see MIDI events, GStreamer bus messages, and pipeline state changes:
+Log file: `~/.local/share/com.cuemark.app/logs/cuemark.log`. Tail it live to see MIDI events,
+GStreamer bus messages, and pipeline state changes:
 ```bash
 tail -f ~/.local/share/com.cuemark.app/logs/cuemark.log
 ```
+
+**Rotation is 8MB + `KeepAll`, deliberately not the plugin's defaults.** 40KB/`KeepOne` let a
+session self-erase in under two minutes at this app's log volume — twice on 2026-08-03 it deleted
+the exact window being diagnosed, including the build-provenance line this file tells you to check
+first. Rotated files are date-stamped, so a report from last week is still readable. If a log looks
+suspiciously short, check whether it rotated before theorizing about what is missing.
+
+### Standing performance instrumentation
+
+`src/lib/audio/pollStats.ts` emits one percentile line per bucket every 5s while a deck plays.
+Threshold-only logging was deliberately abandoned here: `if (ms > 300)` shows the tail and hides
+the distribution, which is what made a slow baseline look like an outlier problem.
+
+```
+[poll-stats] deck-0[/scratch] n=… | total … | toRust … | inRust … (lock …, query …) | toJs …
+[raf]        n=… (~Nfps) | gap … | frame-dur …
+[post-frame] n=… bitmaps=… | sync … | to-postMessage …
+[ipc-ping]   noop n=… | total … | toRust … | toJs …
+```
+
+How to read them (full derivation in `docs/design/control-window-frame-budget.md`):
+
+- A synchronous `#[tauri::command]` runs on the GTK main thread, so an IPC round trip splits into
+  `toRust` (dispatch) / `inRust` (the actual work) / `toJs` (the reply reaching the JS callback).
+  Only `inRust` is the backend. Epoch ms is the **only** clock the Rust process and the webview
+  share — `performance.now()` and `Instant` have per-process origins and cannot be differenced.
+- **`[ipc-ping]` is the control arm.** If a command that does nothing is as slow as the one you
+  are blaming, the callee is exonerated — no leg arithmetic required. During a scratch you get a
+  second free control: `position()` returns the feeder's atomic cursor and never touches GStreamer.
+- **A position poll can never resolve faster than one main-loop turn.** `toJs` tracks the `[raf]`
+  gap almost exactly, so poll latency is a *symptom* of the frame budget, not a backend problem.
+- ⚠️ **Only compare windows with a deck playing.** Idle windows contain no polls at all, so an
+  idle `62fps / frame-dur=0` line is not a control for a playing one. Reading them as comparable
+  produced a wrong conclusion on the first pass.
 
 ## Skills
 

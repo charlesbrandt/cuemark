@@ -69,4 +69,33 @@ export interface OutputHelloMessage {
   kind: 'hello';
 }
 
-export type OutputMessage = OutputFrameMessage | OutputVizMessage | OutputHelloMessage;
+/**
+ * Liveness beacon from the output window, sent every `OUTPUT_ALIVE_INTERVAL_MS`.
+ *
+ * Building a deck frame is expensive — a full-resolution `drawImage` plus a
+ * `createImageBitmap` per changed deck, at up to 60fps — and until 2026-08-03 the sender
+ * paid all of it unconditionally, including when no output window existed at all. The
+ * control window's render loop measured 17fps with a single deck playing and the output
+ * window *closed*, so that waste is real and on the critical path.
+ *
+ * A beacon rather than a goodbye message: a window that crashes, is killed by the
+ * freeze-watchdog, or is closed by the window manager never gets to say goodbye, and the
+ * failure mode of believing a dead window is alive is permanent wasted work. This way the
+ * sender's belief decays on its own, and any 'hello'/'alive' revives it within one
+ * interval. Erring toward "still listening" for a couple of seconds after a close costs
+ * nothing; erring the other way would freeze the projector mid-set.
+ */
+export interface OutputAliveMessage {
+  kind: 'alive';
+}
+
+/** How often the output window beacons. */
+export const OUTPUT_ALIVE_INTERVAL_MS = 1000;
+/** Sender treats the output window as gone after this long without a beacon. */
+export const OUTPUT_ALIVE_TIMEOUT_MS = 3000;
+
+export type OutputMessage =
+  | OutputFrameMessage
+  | OutputVizMessage
+  | OutputHelloMessage
+  | OutputAliveMessage;

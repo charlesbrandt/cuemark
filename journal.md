@@ -1708,3 +1708,97 @@ on this hardware.
 - `scripts/probes/output_window_compositor_probe.py` — sender now drives the real
   `postFrame()` with a `kind:'codec'` source
 - `CLAUDE.md`, `scripts/probes/README.md` — orientation rule restated per source type
+
+# 2026.08.03 (later still) — The slow position poll was never GStreamer: it was the frame budget
+
+## Problem
+
+`audio_get_position` round trips of 300–424ms, sitting directly on the A/V sync path (a
+video resync fires on every poll resolution). The documented baseline of ~140–190ms had
+never been questioned either. Suspicion fell on `query_position`.
+
+Alongside it, two live symptoms: the vinyl-mode jog "jumps around", and the waveform
+playhead struggles to update.
+
+## Root cause
+
+The Rust/GStreamer layer contributes **~0ms**. Measured, in every 5s window, in every
+state: `toRust` 2ms, `inRust` 0ms, `lock` 0ms, `query` 0ms — and `toJs` (reply → the JS
+callback actually running) is the entire remainder, 65–220ms.
+
+`toJs` ≈ the rAF gap, every time. The reply waits for the next turn of a control-window
+main loop that had collapsed to 7–17fps while playing. **A poll can never resolve faster
+than one main-loop turn**; at 8fps that is 125ms regardless of the backend.
+
+The dominant cost was `outputBus.postFrame()`, which built a full-resolution `drawImage` +
+`createImageBitmap` per changed deck at up to 60fps **whether or not an output window
+existed** — no listener gate. With frame construction disabled: poll p50 ~90ms → **19ms**,
+rAF 7–12fps → **20–33fps**, `frame-dur` 13–16ms → **0–1ms**.
+
+Second, independent bug: `reconcileAudioTransport` retry chains multiplied rather than
+converging. `lastAudioPlaying` is set only on success, so while attempts failed
+`syncVideoElements()` — which runs on every store mutation, i.e. every rAF tick during a
+jog — started a *new* 200ms chain each time. Observed as a sustained 200ms-periodic burst
+of 15–25 `detached-pipeline IPC received`/sec. Failures there are routine, not exceptional:
+`with_pipeline_detached` and `audio_load` both remove the pipeline from the map, so every
+concurrent transport call during a load or teardown fails by design.
+
+## Fix
+
+Listener gate via an `alive` beacon from the output window (beacon, not goodbye-on-unload:
+a window killed by the watchdog never says goodbye, and believing a dead window is alive
+wastes work forever). One transport retry chain per deck. Plus: `with_pipeline_detached`
+names its caller, log rotation raised from the plugin's 40KB/`KeepOne` to 8MB/`KeepAll`,
+and `[frame-error]` now logs the exception message rather than a bare stack.
+
+Kept permanently: `src/lib/audio/pollStats.ts` — `[poll-stats]`, `[raf]`, `[post-frame]`,
+`[ipc-ping]`.
+
+**Still open**: playback costs ~23ms/frame beyond idle with `frame-dur` ~1ms. See
+`docs/design/control-window-frame-budget.md` for the pickup steps, and
+`docs/design/scratch-feeder-underruns.md` for the separate feeder bug found on the way.
+
+## Lessons
+
+- **Percentile lines beat threshold lines.** The original instrumentation logged only
+  `> 300ms`, so a run of 300–424ms outliers was indistinguishable from an already-slow
+  baseline. One percentile line per bucket per 5s showed the distribution without flooding
+  the same IPC bridge under measurement.
+- **Carry a control arm you can't argue with.** A no-op `ipc_ping` on the same transport in
+  the same tick settled "is the callee slow" in one line, independent of any leg
+  arithmetic. The scratch bucket is a second free control: `position()` never touches
+  GStreamer during a gesture.
+- **Timestamps must cross the boundary, not just durations.** `performance.now()` and
+  `Instant` have per-process origins; epoch ms is the only shared clock, and it is what
+  turned "the round trip is slow" into "the reply leg is slow".
+- **An idle window is not a control for a busy one.** The first conclusion here —
+  "main thread idle, WebKit starving IPC delivery" — was drawn from 62fps/`frame-dur=0`
+  windows that contained no polls at all, because nothing was playing. Polls and the
+  collapse only ever coexist during playback. Compare like with like.
+- **A passing type check and a correct source file do not mean the app loaded that code.**
+  Vite served a stale transform of `outputBus.ts` (two rapid writes in one command; the
+  watcher latched the intermediate state), so `hasListener()` threw a `ReferenceError`
+  every frame and the projector stayed black. `curl localhost:1420/<path>` and diff against
+  disk before trusting a run — the built artifact is the thing under test.
+- **WebKit's `e.stack` has no message line.** Logging `e.stack ?? e.message` drops the only
+  part that says what went wrong; the above reached the log as an anonymous
+  `hasListener@…outputBus.ts:29:102`.
+- **Anonymous log lines waste the evidence.** 25 `detached-pipeline IPC received`/sec named
+  nothing; adding the calling command turned a mystery burst into a one-line diagnosis.
+- **Check what a log's rotation policy is doing before trusting a session's evidence.** The
+  defaults erased the window being diagnosed, twice, including the build-provenance line.
+
+## Files touched
+
+- `src/lib/audio/pollStats.ts` (new) — percentile accumulation, 5s flush, ping control arm
+- `src-tauri/src/audio/mod.rs` — `PositionSample` (entry/exit epoch stamps, lock/query
+  timing); `with_pipeline_detached` takes an `op` label and times itself
+- `src-tauri/src/lib.rs` — `epoch_ms()`, `ipc_ping`, log rotation 8MB/`KeepAll`
+- `src/lib/audio/pipeline.ts` — `PositionSample`, `ipcPing()`
+- `src/App.svelte` — poll leg recording; rAF gap/duration; one transport retry chain per
+  deck; `[frame-error]` message + stack
+- `src/lib/renderer/outputBus.ts` — listener gate, `recordPostFrame` timing
+- `src/lib/renderer/outputProtocol.ts` — `OutputAliveMessage` + constants
+- `src/output.ts` — `alive` beacon
+- `docs/design/control-window-frame-budget.md`, `docs/design/scratch-feeder-underruns.md`
+  (new), `todo.md`, `CLAUDE.md`

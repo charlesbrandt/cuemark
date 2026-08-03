@@ -96,13 +96,22 @@ pub type AudioState = Mutex<AudioManager>;
 fn with_pipeline_detached<T>(
     state: &Mutex<AudioManager>,
     deck_id: &str,
+    op: &str,
     f: impl FnOnce(&mut DeckAudioPipeline) -> T,
 ) -> Result<T, String> {
     // Logged with millisecond precision (see lib.rs's custom log formatter) so a stall
     // report can be correlated against the last MIDI tick's own timestamp — narrows
     // down "JS-side delay before the IPC call was even issued" vs. "Rust-side work
     // itself took a long time" without guessing.
-    log::info!("[audio/{deck_id}] detached-pipeline IPC received");
+    //
+    // `op` names the calling command. Without it these lines are anonymous, and a burst
+    // of them says only "something detached 25 times a second" — which is exactly the
+    // state a jog-lag report left this log in (2026-08-03): a sustained ~200ms-periodic
+    // burst that could have been play, pause, stop_scratch or a device rebuild, each with
+    // very different cost (stop_scratch alone runs a 130–400ms drain + two flush seeks).
+    // A detach is rare by design; if a burst shows up here, the name is the whole lead.
+    let start = std::time::Instant::now();
+    log::info!("[audio/{deck_id}] detached-pipeline IPC received: {op}");
     let mut pipeline = {
         let mut mgr = state.lock().unwrap();
         mgr.pipelines
@@ -112,6 +121,12 @@ fn with_pipeline_detached<T>(
     };
     let result = f(&mut pipeline);
     state.lock().unwrap().pipelines.insert(deck_id.to_string(), pipeline);
+    // Only the slow ones — a no-op pause is ~0ms and would just double the log volume.
+    // 20ms is well under the 130–400ms scratch teardown but above any healthy state change.
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if elapsed_ms > 20.0 {
+        log::info!("[audio/{deck_id}] {op} held the pipeline detached for {elapsed_ms:.0}ms");
+    }
     Ok(result)
 }
 
@@ -237,7 +252,7 @@ pub fn audio_unload(state: State<'_, AudioState>, deck_id: String) -> Result<(),
 pub async fn audio_play(app: tauri::AppHandle, deck_id: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AudioState>();
-        with_pipeline_detached(&state, &deck_id, |p| p.play())?
+        with_pipeline_detached(&state, &deck_id, "play", |p| p.play())?
     })
     .await
     .map_err(|e| e.to_string())?
@@ -252,7 +267,7 @@ pub async fn audio_pause(app: tauri::AppHandle, deck_id: String) -> Result<(), S
         // Detached: pause() may run stop_scratch_feeder()'s ~130-400ms teardown+resync
         // (drain sleep + two flush seeks) if a scratch was active — see
         // with_pipeline_detached's doc comment above.
-        with_pipeline_detached(&state, &deck_id, |p| p.pause())?
+        with_pipeline_detached(&state, &deck_id, "pause", |p| p.pause())?
     })
     .await
     .map_err(|e| e.to_string())?
@@ -283,7 +298,7 @@ pub fn audio_scratch(state: State<'_, AudioState>, deck_id: String, rate: f64, h
 #[tauri::command]
 pub fn audio_stop_scratch(state: State<'_, AudioState>, deck_id: String) -> Result<(), String> {
     // Detached — same reason as audio_pause above.
-    with_pipeline_detached(&state, &deck_id, |p| p.stop_scratch())?
+    with_pipeline_detached(&state, &deck_id, "stop_scratch", |p| p.stop_scratch())?
 }
 
 #[tauri::command]
@@ -312,11 +327,50 @@ pub fn audio_set_cue(state: State<'_, AudioState>, deck_id: String, enabled: boo
     state.lock().unwrap().pipeline_mut(&deck_id)?.set_cue_enabled(enabled)
 }
 
+/// One `audio_get_position` reply, plus the timing breakdown of how it was served.
+///
+/// The position poll is the master clock's transport — every playing deck runs one per
+/// rAF frame and a video resync hangs off each resolution — so when it goes slow the
+/// first question is always *which layer*. The round trip has three legs: JS → GTK main
+/// thread (this is a synchronous command, so it is dispatched there), the command body,
+/// and GTK main thread → the JS callback. Only the middle leg is the audio backend.
+/// `entry_ms`/`exit_ms` are epoch ms (see `crate::epoch_ms`), directly comparable to the
+/// caller's `Date.now()`, so the frontend can attribute a slow poll instead of guessing.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PositionSample {
+    /// Position in seconds, or null if unknown — the actual payload; everything else
+    /// on this struct is instrumentation.
+    pub pos: Option<f64>,
+    /// Epoch ms at which the command body began running on the GTK main thread.
+    pub entry_ms: f64,
+    /// Ms spent waiting for the `Mutex<AudioManager>` (contention with a detached
+    /// play/pause/device-rebuild — the mechanism behind the 2026-08-01 freeze).
+    pub lock_ms: f64,
+    /// Ms spent inside `DeckAudioPipeline::position()` — i.e. GStreamer's
+    /// `query_position`. Near-zero during a scratch, which reads the feeder's atomic
+    /// cursor and never touches the pipeline at all.
+    pub query_ms: f64,
+    /// Epoch ms at which the command body finished.
+    pub exit_ms: f64,
+}
+
 /// Returns the pipeline's current position in seconds, or null if unknown.
 /// The frontend uses this as the authoritative clock for video sync.
 #[tauri::command]
-pub fn audio_get_position(state: State<'_, AudioState>, deck_id: String) -> Option<f64> {
-    state.lock().unwrap().pipelines.get(&deck_id)?.position()
+pub fn audio_get_position(state: State<'_, AudioState>, deck_id: String) -> PositionSample {
+    let entry_ms = crate::epoch_ms();
+
+    let lock_start = std::time::Instant::now();
+    let mgr = state.lock().unwrap();
+    let lock_ms = lock_start.elapsed().as_secs_f64() * 1000.0;
+
+    let query_start = std::time::Instant::now();
+    let pos = mgr.pipelines.get(&deck_id).and_then(|p| p.position());
+    let query_ms = query_start.elapsed().as_secs_f64() * 1000.0;
+    drop(mgr); // don't hold the lock across the exit timestamp
+
+    PositionSample { pos, entry_ms, lock_ms, query_ms, exit_ms: crate::epoch_ms() }
 }
 
 #[tauri::command]
@@ -374,7 +428,7 @@ pub async fn audio_set_main_devices(app: tauri::AppHandle, device_ids: Vec<Strin
         };
         for deck_id in deck_ids {
             let device_ids = device_ids.clone();
-            let outcome = with_pipeline_detached(&state, &deck_id, move |p| p.set_devices(&device_ids));
+            let outcome = with_pipeline_detached(&state, &deck_id, "set_devices", move |p| p.set_devices(&device_ids));
             match outcome {
                 Ok(Err(e)) => log::error!("[audio] set_devices failed for {deck_id}: {e}"),
                 Err(e) => log::error!("[audio] set_devices: pipeline vanished for {deck_id}: {e}"),
@@ -405,7 +459,7 @@ pub async fn audio_set_cue_device(app: tauri::AppHandle, device_id: String) -> R
         };
         for deck_id in deck_ids {
             let device_id = device_id.clone();
-            let outcome = with_pipeline_detached(&state, &deck_id, move |p| p.set_cue_device(&device_id));
+            let outcome = with_pipeline_detached(&state, &deck_id, "set_cue_device", move |p| p.set_cue_device(&device_id));
             match outcome {
                 Ok(Err(e)) => log::error!("[audio] set_cue_device failed for {deck_id}: {e}"),
                 Err(e) => log::error!("[audio] set_cue_device: pipeline vanished for {deck_id}: {e}"),
@@ -529,7 +583,7 @@ mod concurrency_stress_test {
         let stop_a = stop.clone();
         let deck_a = std::thread::spawn(move || {
             while !stop_a.load(Ordering::Relaxed) {
-                let _ = with_pipeline_detached(&mgr_a, "deck-a", |p| {
+                let _ = with_pipeline_detached(&mgr_a, "deck-a", "test", |p| {
                     let _ = p.scratch(1.0, 100_000);
                     std::thread::sleep(Duration::from_millis(10));
                     let _ = p.pause();
@@ -544,7 +598,7 @@ mod concurrency_stress_test {
         let deck_b = std::thread::spawn(move || {
             while !stop_b.load(Ordering::Relaxed) {
                 let t0 = Instant::now();
-                let _ = with_pipeline_detached(&mgr_b, "deck-b", |p| p.position());
+                let _ = with_pipeline_detached(&mgr_b, "deck-b", "test", |p| p.position());
                 let us = t0.elapsed().as_micros() as u64;
                 max_b.fetch_max(us, Ordering::Relaxed);
                 std::thread::sleep(Duration::from_millis(5));

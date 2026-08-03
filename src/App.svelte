@@ -29,6 +29,7 @@
   import { videoPathOverrides, videoPathDefault, resolveVideoPath, setVideoPathOverride } from "./lib/video/videoPathSettings";
   import type { Deck, Session } from "./lib/state/types";
   import { audioGetPosition, sessionRestore } from "./lib/audio/pipeline";
+  import { recordPollSample, maybePingIpc, recordFrameTiming } from "./lib/audio/pollStats";
   import { debugLog } from "./lib/debugLog";
   import { getDiggerFileUrl } from "./lib/digger/api";
 
@@ -141,20 +142,79 @@
   // dead pipeline (audio_load itself failed) doesn't retry forever.
   const AUDIO_TRANSPORT_RETRY_MS = 200;
   const AUDIO_TRANSPORT_MAX_RETRIES = 50; // ~10s
-  function reconcileAudioTransport(deckId: string, playing: boolean, attempt = 0) {
-    const action = playing ? audioPlay(deckId) : audioPause(deckId);
-    action
-      .then(() => { lastAudioPlaying.set(deckId, playing); })
-      .catch((e) => {
-        // Superseded: the deck moved on to a different desired state since this call
-        // was scheduled — the newer reconcileAudioTransport call owns the retry.
-        if (get(session).decks.find((d) => d.id === deckId)?.playing !== playing) return;
-        if (attempt >= AUDIO_TRANSPORT_MAX_RETRIES) {
-          console.error(`[audio-transport] ${deckId} giving up after ${attempt} retries:`, e);
-          return;
-        }
-        setTimeout(() => reconcileAudioTransport(deckId, playing, attempt + 1), AUDIO_TRANSPORT_RETRY_MS);
-      });
+  // At most one retry chain per deck.
+  //
+  // Without this the retry loop amplifies instead of converging (root-caused 2026-08-03
+  // from a 200ms-periodic burst of ~25 `detached-pipeline IPC received`/sec in the log).
+  // `lastAudioPlaying` is only set once the IPC *succeeds*, so for as long as attempts keep
+  // failing, `deck.playing !== wasAudioPlaying` stays true in syncVideoElements — and
+  // syncVideoElements runs on every session-store mutation, which during a jog gesture is
+  // every rAF tick. Each run started its own independent chain, so chains accumulated
+  // linearly (~60/sec of jogging), each retrying 5×/sec for up to 10s.
+  //
+  // Failures here are not rare or exceptional: `with_pipeline_detached` removes the
+  // pipeline from the map for the duration of a play/pause/stop_scratch, and `audio_load`
+  // removes it for the whole preroll, so *every* concurrent transport call during those
+  // windows fails with "no audio pipeline for deck" by design. A scratch gesture over a
+  // loading or mid-teardown deck is precisely the case that piles chains up.
+  //
+  // The storm lands on the GTK main thread, which dispatches every synchronous Tauri
+  // command — so it inflates the `toRust` leg of every position poll (the master clock's
+  // transport, see pollStats.ts) and delays the `audio_scratch` calls that drive the
+  // scratch feeder's rate, which is felt as the jog wheel jumping around.
+  interface TransportChain { playing: boolean; timer: ReturnType<typeof setTimeout> | null; cancelled: boolean }
+  const transportChains = new Map<string, TransportChain>();
+  function reconcileAudioTransport(deckId: string, playing: boolean) {
+    const existing = transportChains.get(deckId);
+    if (existing) {
+      // Already converging on this exact state — that chain owns the retry.
+      if (existing.playing === playing) return;
+      // Desired state flipped: cancel rather than race. Both chains would otherwise keep
+      // calling, and whichever landed last would win nondeterministically.
+      existing.cancelled = true;
+      if (existing.timer) clearTimeout(existing.timer);
+    }
+    const chain: TransportChain = { playing, timer: null, cancelled: false };
+    transportChains.set(deckId, chain);
+
+    const attempt = (n: number) => {
+      if (chain.cancelled) return;
+      (playing ? audioPlay(deckId) : audioPause(deckId))
+        .then(() => {
+          if (chain.cancelled) return; // a newer chain owns the map entry and the state
+          lastAudioPlaying.set(deckId, playing);
+          transportChains.delete(deckId);
+        })
+        .catch((e) => {
+          if (chain.cancelled) return;
+          // Superseded: the deck moved on to a different desired state since this call
+          // was scheduled — the newer reconcileAudioTransport call owns the retry.
+          if (get(session).decks.find((d) => d.id === deckId)?.playing !== playing) {
+            transportChains.delete(deckId);
+            return;
+          }
+          if (n >= AUDIO_TRANSPORT_MAX_RETRIES) {
+            console.error(`[audio-transport] ${deckId} giving up after ${n} retries:`, e);
+            transportChains.delete(deckId);
+            return;
+          }
+          chain.timer = setTimeout(() => attempt(n + 1), AUDIO_TRANSPORT_RETRY_MS);
+        });
+    };
+    attempt(0);
+  }
+  /**
+   * Stop any pending transport retry for a deck whose pipeline is going away. Without
+   * this, unloading mid-retry leaves a chain calling audioPlay/audioPause against a deck
+   * that no longer has a pipeline — failing on exactly the error it retries on, for the
+   * full 10s budget. Call alongside `lastAudioPlaying.delete(deckId)`.
+   */
+  function cancelAudioTransport(deckId: string) {
+    const chain = transportChains.get(deckId);
+    if (!chain) return;
+    chain.cancelled = true;
+    if (chain.timer) clearTimeout(chain.timer);
+    transportChains.delete(deckId);
   }
   // Per-deck audio rate/gain/volume are synced via audioSync.ts (module-level Maps shared
   // with handler.ts). No per-component Maps needed here.
@@ -870,7 +930,7 @@
     }
     teardownCodecPlayerOnly(deckId);
     audioUnload(deckId).catch(console.error);
-    playPromises.delete(deckId); lastAudioPlaying.delete(deckId);
+    playPromises.delete(deckId); lastAudioPlaying.delete(deckId); cancelAudioTransport(deckId);
     clearDeckAudioSync(deckId); contentPosTracker.delete(deckId); stallWatch.delete(deckId);
     audioLoadedFor.delete(deckId); backendState.delete(deckId); audioOnlyDecks.delete(deckId);
     // audioUnload() above drops the Rust-side DeckAudioPipeline entirely (audio/mod.rs
@@ -954,7 +1014,7 @@
         v.pause(); v.remove(); unregisterVideoEl(id); videoEls.delete(id);
         lastPlaybackRate.delete(id); lastUploadedTime.delete(id);
         audioUnload(id).catch(console.error);
-        playPromises.delete(id); lastAudioPlaying.delete(id);
+        playPromises.delete(id); lastAudioPlaying.delete(id); cancelAudioTransport(id);
         clearDeckAudioSync(id); contentPosTracker.delete(id); stallWatch.delete(id);
         audioLoadedFor.delete(id); backendState.delete(id); audioOnlyDecks.delete(id);
         // See teardownVideoBackendFull's _prevCueStates comment — same stale-guard hazard
@@ -1139,6 +1199,11 @@
   // RAF render loop: upload video frames → composite; sync video to audio clock
   function frame() {
     const nowMs = performance.now();
+    // Gap since the previous tick, before anything in this one runs. Paired with the
+    // duration recorded at the tail, this separates "the main thread is saturated" from
+    // "the main thread is idle but WebKit is delivering IPC replies late" — the two have
+    // identical position-poll symptoms and completely different fixes. See pollStats.ts.
+    const rafGapMs = lastRafTickAt === 0 ? 0 : nowMs - lastRafTickAt;
     lastRafTickAt = nowMs;
     // lastHeartbeatAt starts at 0, so skip the first tick — its "gap" is the whole
     // uptime since page load, not a stall.
@@ -1283,10 +1348,12 @@
             pendingPos.set(deck.id, true);
             const capturedDeckId = deck.id;
             const pollStartMs = performance.now();
-            audioGetPosition(deck.id).then((audioPos) => {
+            const pollStartEpochMs = Date.now();
+            maybePingIpc(); // control arm — see pollStats.ts
+            audioGetPosition(deck.id).then((sample) => {
               pendingPos.delete(capturedDeckId);
-              const pollMs = performance.now() - pollStartMs;
-              if (pollMs > 300) debugLog(`[position-poll] ${capturedDeckId} took ${pollMs.toFixed(0)}ms, audioPos=${audioPos}`);
+              const audioPos = sample.pos;
+              recordPollSample(capturedDeckId, sample, pollStartEpochMs, performance.now() - pollStartMs, scratching);
               if (audioPos === null) return;
               const nowMs = performance.now();
               let contentPos: number;
@@ -1419,8 +1486,21 @@
       // debugLog() reaches the Rust-side log file; console.error doesn't). See the
       // 2026-07-24 investigation in docs/design/pcm-buffer-playback.md. Log and keep the
       // loop alive instead of vanishing silently.
-      debugLog(`[frame-error] ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`);
+      // Message *and* stack. WebKit's `e.stack` is bare frames with no message line
+      // (unlike V8), so logging the stack alone drops the only part that says what went
+      // wrong: a per-frame `ReferenceError: Can't find variable: OUTPUT_ALIVE_TIMEOUT_MS`
+      // reached the log as an anonymous `hasListener@…outputBus.ts:29:102` and read like a
+      // crash inside working code (2026-08-03). Cheap here — this path only runs when a
+      // frame has already thrown.
+      debugLog(
+        `[frame-error] ${e instanceof Error ? `${e.name}: ${e.message}\n${e.stack ?? '(no stack)'}` : String(e)}`,
+      );
     }
+    // Synchronous cost of this tick only. Async work this tick *starts* (createImageBitmap,
+    // the cross-process bitmap clone in outputBus.postFrame) lands outside it — a small
+    // duration next to a large gap is the signature of exactly that kind of off-thread or
+    // deferred work crowding the frame, rather than our own JS being slow.
+    recordFrameTiming(rafGapMs, performance.now() - nowMs);
     // Deliberately outside the try/catch above (which exists precisely to keep the loop
     // alive through errors) — killRafLoop() needs to actually kill it, simulating
     // mechanism B for watchdog-test.sh: rAF dies, setInterval-based heartbeat keeps

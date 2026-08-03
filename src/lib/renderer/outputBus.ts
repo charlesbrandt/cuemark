@@ -1,6 +1,8 @@
 import { debugLog } from '../debugLog';
+import { recordPostFrame } from '../audio/pollStats';
 import {
   OUTPUT_CHANNEL,
+  OUTPUT_ALIVE_TIMEOUT_MS,
   type OutputDeckFrame,
   type OutputMessage,
 } from './outputProtocol';
@@ -41,13 +43,33 @@ let vizSrcSent = false;
 // per-deck "last uploaded" trackers, which makes the next tick re-send every deck.
 let resendAll = false;
 
+// Last time the output window said it was there ('hello' on load, 'alive' every second).
+// 0 = never seen this session. See OutputAliveMessage in outputProtocol.ts.
+let listenerLastSeenAt = 0;
+
 channel.onmessage = (e: MessageEvent<OutputMessage>) => {
   if (e.data?.kind === 'hello') {
+    listenerLastSeenAt = performance.now();
     resendAll = true;
     vizSrcSent = false;
     debugLog('[outputBus] output window connected — re-sending shader and all deck frames');
+  } else if (e.data?.kind === 'alive') {
+    if (listenerLastSeenAt === 0) {
+      // A beacon with no preceding 'hello' means the output window was already open when
+      // this control window loaded — a watchdog reload, or a dev-server hot reload. It has
+      // no idea we restarted and won't re-announce, so treat the beacon as the greeting.
+      resendAll = true;
+      vizSrcSent = false;
+      debugLog('[outputBus] adopted an already-open output window — re-sending everything');
+    }
+    listenerLastSeenAt = performance.now();
   }
 };
+
+/** True while the output window is believed to be listening. */
+function hasListener(): boolean {
+  return listenerLastSeenAt !== 0 && performance.now() - listenerLastSeenAt < OUTPUT_ALIVE_TIMEOUT_MS;
+}
 
 /**
  * True once if the output window needs a full re-send. The caller must respond by
@@ -145,6 +167,22 @@ function bitmapFor(id: string, source: DeckFrameSource): Promise<ImageBitmap> | 
  * the output window keeps showing the last frame it got, and a drop schedules a re-send.
  */
 export function postFrame(state: OutputPostState): void {
+  // Nobody listening: do none of the work. Constructing a frame costs a full-resolution
+  // drawImage plus a createImageBitmap per changed deck, and until 2026-08-03 that was
+  // paid on every tick even with no output window open — measurably, since the control
+  // window's own render loop ran at 17fps with one deck playing and the projector closed.
+  //
+  // Deliberately placed above the `viz` send too: a window that opens later announces
+  // itself with 'hello', which sets resendAll *and* clears vizSrcSent, so the shader and
+  // every deck frame are re-sent on the next tick regardless of what was skipped here.
+  if (!hasListener()) {
+    // The frames being skipped are real ones the caller has already marked as sent, so the
+    // same re-send bookkeeping as the `inFlight` branch below applies — otherwise a deck
+    // that changes once and pauses while the window is closed would never be re-offered.
+    if (state.decks.some((d) => d.source !== null)) resendAll = true;
+    return;
+  }
+
   // The shader source is large and changes rarely — never put it on the per-frame path.
   if (!vizSrcSent || state.vizSrc !== lastVizSrc) {
     lastVizSrc = state.vizSrc;
@@ -162,6 +200,7 @@ export function postFrame(state: OutputPostState): void {
   }
   inFlight = true;
 
+  const t0 = performance.now();
   const ids: string[] = [];
   const pending: Promise<ImageBitmap>[] = [];
   for (const d of state.decks) {
@@ -172,6 +211,10 @@ export function postFrame(state: OutputPostState): void {
       pending.push(p);
     }
   }
+  // Everything above is synchronous inside the caller's rAF tick (drawImage per deck);
+  // everything below lands in a microtask afterwards and is therefore invisible to
+  // App.svelte's frame-duration measurement. See recordPostFrame().
+  const syncMs = performance.now() - t0;
 
   Promise.all(pending)
     .then((bitmaps) => {
@@ -206,6 +249,8 @@ export function postFrame(state: OutputPostState): void {
       // produced at up to 60fps, in the same process as the render loop.
       for (const b of previousBitmaps) b.close();
       previousBitmaps = bitmaps;
+
+      recordPostFrame(syncMs, performance.now() - t0, bitmaps.length);
     })
     .catch((e) => {
       // A rejected createImageBitmap (closed VideoFrame, tainted canvas) must not wedge the

@@ -2,6 +2,35 @@
 
 ## Known issues
 
+### Control window drops to ~25fps while playing [partly fixed, 2026-08-03]
+
+The `audio_get_position` round trips of 300–424ms were never GStreamer: `query_position`,
+the `AudioManager` mutex and the GTK dispatch measure ~0ms/0ms/2ms, and a no-op `ipc_ping`
+control arm is exactly as slow as the real poll. The entire latency is the reply waiting
+for the next turn of a control-window main loop that had collapsed to 7–17fps — **a poll
+can never resolve faster than one main-loop turn.**
+
+Largest cause fixed: `outputBus.postFrame()` built full-resolution `ImageBitmap`s at up to
+60fps even with no output window open. Gating it on an `alive` beacon took poll p50 from
+~90ms to ~19ms and `frame-dur` from ~14ms to ~1ms. Also fixed: transport retry chains that
+multiplied instead of converging (~25 IPC/sec during a jog).
+
+**Still open** — playback costs ~23ms/frame beyond idle (25fps vs 62fps) with `frame-dur`
+~1ms, so a second consumer sits outside the render loop: software H.264 decode, DeckCard
+preview canvases, or `WaveformCanvas`. The A/B against a *working* listener gate has not
+been run yet. Full writeup, measurement method, and step-by-step pickup:
+`docs/design/control-window-frame-budget.md`.
+
+
+### Scratch feeder starves the sink in vinyl mode [open, 2026-08-03]
+
+A slow vinyl-mode jog on a paused deck produced 335 `output_queue underrun`s in 5.0
+seconds (~67/sec — suspiciously exactly 1/15ms, the feeder's own chunk period) for the
+whole duration of the gesture. Not main-thread latency: the frontend was healthy in that
+window (scratch poll p50=39ms at ~25fps, idle timer fired 1ms late). First things to check
+and how to reproduce: `docs/design/scratch-feeder-underruns.md`.
+
+
 ### Video not rendering on the webcodecs path [open, 2026-08-02]
 
 Deck plays audio correctly but shows no picture. `video_demux` returns
