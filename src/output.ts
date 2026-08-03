@@ -18,12 +18,25 @@ ctx.imageSmoothingQuality = 'high';
 function resize(width: number, height: number) {
   canvas.width = width * devicePixelRatio;
   canvas.height = height * devicePixelRatio;
+  // CLAUDE.md's canvas-sizing rule: the element's *layout* size must be set from JS too,
+  // never left to scoped CSS. output.html sizes this canvas with `width:100vw;height:100vh`,
+  // which is exactly the pattern that rule forbids — WebKitGTK does not reliably apply it.
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
   debugLog(
     `[output] resize: width=${width} height=${height} dpr=${devicePixelRatio} -> canvas=${canvas.width}x${canvas.height}`,
   );
 }
+
+// Bug A note for anyone re-instrumenting here: a geometry probe (window/body/canvasRect/
+// client/buffer sizes plus a centre-pixel getImageData) was added during that investigation
+// and removed as settled. It reported `canvasRect=1280.0x673.0@0.0,0.0` against a
+// `win=1280x673` — the canvas covers this window exactly — and a centre pixel of
+// `rgba(0,0,0,0)` while the compositor was clearing to opaque black. Neither number was
+// wrong and neither was the bug: the corruption was upstream, in the compositor's own WebGL
+// canvas in the *control* window. Re-adding probes on this side is very unlikely to help.
 new ResizeObserver((entries) => {
   const { width, height } = entries[0].contentRect;
   resize(width, height);

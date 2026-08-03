@@ -1448,8 +1448,22 @@
     </label>
   </header>
 
-  <!-- Compositor renders here; hidden from control window — visible only in Output Window -->
-  <canvas bind:this={canvas} width={1920} height={1080} style="display:none"></canvas>
+  <!-- Compositor renders here; hidden from control window — visible only in Output Window.
+       NOT `display:none`: that gives the element no renderer at all, and WebKitGTK then
+       snapshots it as fully transparent — `createImageBitmap()` in postFrame() returned an
+       empty bitmap, so the output window received blank frames forever (measured 2026-08-02:
+       centrePixel=rgba(0,0,0,0) at frame #240 with video demonstrably playing). Same family
+       as this codebase's other WebKitGTK boundary failures (custom URI schemes, direct
+       video->texImage2D, VA-API DMA-BUF). Keep it laid out but off-screen and 1x1 in CSS —
+       the WebGL drawing buffer stays 1920x1080 because that is set by the width/height
+       attributes, not by CSS, so the capture is full-resolution while costing ~nothing to
+       composite in the control window. -->
+  <canvas
+    bind:this={canvas}
+    width={1920}
+    height={1080}
+    style="position:fixed; left:0; top:0; width:1px; height:1px; opacity:0.01; pointer-events:none; z-index:-1"
+  ></canvas>
 
   <div class="main-layout">
     <div class="main-content">

@@ -4,7 +4,14 @@
     <meta charset="UTF-8" />
     <style>
       * { margin: 0; padding: 0; box-sizing: border-box; }
-      body { background: #000; overflow: hidden; }
+      /* html is set alongside body deliberately: during Bug A a magenta background here was
+         what proved the page paints the full window, distinguishing "nothing drawn" from
+         "surface never initialised" — black cannot tell those apart, which is exactly what
+         made the corrupt region ambiguous for three sessions. Keep both set to an opaque
+         colour so an undrawn region is unambiguously undrawn. */
+      html, body { background: #000; overflow: hidden; }
+      /* Layout size comes from resize() in output.ts per CLAUDE.md's canvas rule; these are
+         a fallback only, covering the window between first paint and first observe. */
       canvas { display: block; width: 100vw; height: 100vh; }
       #hint {
         position: fixed;

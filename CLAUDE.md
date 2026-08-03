@@ -75,11 +75,35 @@ WebGL texture upload uses `UNPACK_FLIP_Y_WEBGL=true` (HTML canvas Y=0 is top; We
 The crossfader is a UI/MIDI convenience that drives two selected decks' opacities inversely — not a
 structural field in the data model.
 
-**`WEBKIT_DISABLE_DMABUF_RENDERER=1` must be set in `main.rs`** before `cuemark_lib::run()` — prevents
-VA-API DMA-BUF canvas corruption (decoded frames render as random static without it). Also demote broken
-VA-API decoders via `GST_PLUGIN_FEATURE_RANK` in `main.rs` (currently
-`vaav1dec:0,vaapiav1dec:0,vah264dec:0,vaapih264dec:0`). See `audio-debugging` skill for
-the full VA-API investigation, debugging tips, and env-var override pitfalls.
+**`WEBKIT_DISABLE_DMABUF_RENDERER=1` is RETIRED as the default** (2026-08-02) — GPU compositing is now
+on. It was originally set in `main.rs` to prevent VA-API DMA-BUF canvas corruption via
+`drawImage(video)`, but that premise died in `f6b94ea` when WebCodecs became the default video path
+(`VideoDecoder` → `texImage2D(VideoFrame)`, no `<video>` element). Two independent measurements
+condemned it, both same-binary A/Bs with only this variable changed:
+- **Performance**: it forced WebKit to composite the whole page in software on the main thread —
+  55–59% of all main-thread samples in `libwebkit2gtk`'s software rasteriser; 87% → 62% main thread
+  for two decks, rAF stalls 6 → 0.
+- **Correctness**: it *corrupted the WebGL compositor canvas*, rendering growing horizontal bands of
+  uninitialised memory. This was the long-running "output window noise" — which was never an
+  output-window bug; that window faithfully mirrored an already-corrupt compositor canvas. Unset, the
+  canvas is clean. User-confirmed live.
+
+Set `CUEMARK_DISABLE_DMABUF=1` to restore the old behaviour. ⚠️ **One path remains untested**: the
+legacy `<video>` fallback (non-H.264 and audio-only files) has never been checked with the DMA-BUF
+renderer enabled. If VA-API canvas corruption reappears there, fix it with a codec-specific
+`GST_PLUGIN_FEATURE_RANK` demotion, not by re-killing the renderer process-wide. See
+`docs/design/output-noise-and-track-reload-silence.md`, "ROOT-CAUSED 2026-08-02 (late)".
+
+⚠️ **The compositor canvas in `App.svelte` must not be `display:none`.** It was, from `ee91c54` until
+2026-08-02, which meant nobody could see what the compositor actually produced — the single biggest
+reason Bug A went unsolved for three sessions. Keep it laid out but visually negligible (1×1, near-zero
+opacity, off-screen). Its WebGL drawing buffer is 1920×1080 regardless, set by the `width`/`height`
+attributes rather than CSS. To debug compositing, temporarily give it a real size and a bright border —
+that one change is what cracked the bug.
+Also demote broken VA-API decoders via `GST_PLUGIN_FEATURE_RANK` in `main.rs` — **currently only
+`vaav1dec:0,vaapiav1dec:0`; H.264 hardware decode is deliberately live** (re-tested working 2026-06-20).
+See `audio-debugging` skill for the full VA-API investigation, debugging tips, and env-var override
+pitfalls.
 
 **Waveform analysis uses `audio_analyze_file` Tauri command** (Rust/GStreamer, `analysis.rs`), not
 `decodeAudioData` — avoids VA-API corruption in the separate WebKitWebProcess. It returns

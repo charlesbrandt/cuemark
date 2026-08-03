@@ -98,6 +98,132 @@ Neither of these has been confirmed as the noise's root cause — they're plausi
 contributors to *why respawns happen so aggressively*, not proven mechanisms for *why a
 respawn produces garbage pixels*.
 
+### RESOLVED 2026-08-02 (late) — the "freezes" were phantoms: a closed window the watchdog never forgot
+
+**The `output` freezes driving this whole cascade were not freezes.** `watchdog.rs` had no
+way to stop tracking a window: `Inner::windows` was only ever `insert`ed into and
+`get_mut`'d, there was no `on_window_event` handler in `lib.rs`, and nothing anywhere
+called `remove`. So **closing the output window was indistinguishable from it freezing** —
+the entry lingered, stopped being fed, tripped `SILENCE_THRESHOLD` 6s later, and drove the
+full recovery cascade against a window that was gone because the user closed it on purpose.
+
+Captured live, unprompted, mid-session on `00b9129` while investigating something else:
+
+```
+23:33:45  [watchdog]   descendant pid=649924 comm=WebKitNetworkPr  etimes=2480s
+23:33:45  [watchdog]   descendant pid=649941 comm=WebKitWebProces  etimes=2480s
+                       ^^ only TWO descendants — output's web process is already gone
+23:33:45  [watchdog] recovery tier1 (eval reload): window 'output'
+23:33:45  [watchdog] tier1: window 'output' not found
+23:33:48  [watchdog] tier2: window 'output' not found
+23:33:53  [watchdog] recovery tier3 (SIGKILL + reload all windows): window 'output'
+23:33:53  [watchdog] tier3: killed 2 WebKitWebProcess descendant(s)
+23:33:59  [watchdog] TRIGGER: window 'main' silent for >= 6s — last stats: {…,"lastRafMs":0}
+23:34:00  [watchdog] window 'main' heartbeat resumed after 7.5s silence
+   … the same loop twice more, at 23:34:16 and 23:34:40 …
+23:34:55  [watchdog] 'output': 3 consecutive recovery sequences failed — giving up
+23:35:45  [watchdog] window 'output' heartbeat resumed after 126.4s silence   ← reopened
+```
+
+**`main` was killed three times in 62 seconds, and was perfectly healthy every time.** Its
+`lastRafMs` at each manufactured trigger was `0`, `13`, `9` — the control window was
+rendering fine and got its `WebKitWebProcess` SIGKILLed as collateral for a window that
+did not exist. Each of those is a forced reload of the control surface mid-performance.
+
+Corrections to the two bullets above, both of which this supersedes:
+
+- **The tier1/tier2-vs-tier3 asymmetry does not exist.** In tauri 2.10.3 both lookups are
+  keyed identically — `get_webview_window(label)` is `manager().get_webview(label)`
+  filtered by `is_webview_window()`, and `webview_windows()` is that same filter over
+  `manager().webviews()`. When tier1/tier2 logged `not found`, tier3's
+  `reload_all_windows()` was not quietly succeeding where they failed; it had no `output`
+  entry either and logged nothing only because it reports per-window *errors*. All three
+  tiers agreed: the window was genuinely gone.
+- **tier3's unconditional kill is real and is not fixable at that layer.** Attribution of a
+  `WebKitWebProcess` to a window label isn't reliable across the sandbox's possible bwrap
+  layer, so there is nothing to be selective with. The fix is upstream — never let a window
+  that isn't genuinely frozen reach that tier.
+
+**The reasoning that made these triggers look genuine was inverted.** This doc previously
+argued "the last heartbeat before each trigger reported a healthy `lastRafMs`, so this
+isn't a false trigger". A healthy final beat followed by silence is precisely the signature
+of a **clean close**, not of a freeze — and `main`'s `lastRafMs: 0` above is a documented
+false trigger with the healthiest possible last beat. Treat "healthy last heartbeat" as
+evidence *against* a freeze, not for one.
+
+**Fixes applied** (`watchdog.rs` + `lib.rs`):
+
+1. `watchdog::forget_window(state, label)`, called from a `Builder::on_window_event`
+   handler on `Destroyed`/`CloseRequested`. Reopening re-registers on the next heartbeat
+   via the existing insert branch, so no re-add path is needed.
+2. A belt-and-braces existence check in the poll loop: before spawning any recovery
+   sequence, confirm the window is still there via `find_window()`; a label with no live
+   webview is a closed window, so drop it and log rather than escalate. This needs no GTK
+   event to fire, which matters because a missed event costs a SIGKILL of every WebKit
+   process in the app. Deliberately performed outside the state lock — it reaches into
+   Tauri's window manager, which takes its own locks, while `watchdog_heartbeat` already
+   holds ours from inside a command handler.
+3. `find_window()` replaces the bare `get_webview_window` in tier1/tier2, falling back to
+   the `webview_windows()` map. Documented as belt-and-braces rather than a real second
+   source, so the non-existent asymmetry isn't re-hypothesised later.
+
+**What this does and does not settle for Bug A.** It removes the *precondition*: every
+noise observation to date followed at least one watchdog-triggered SIGKILL + respawn, and
+those respawns are now known to have been spurious. It does **not** demonstrate that the
+noise is gone — nobody has looked at a screen since. If noise still appears on a first,
+never-killed output window, the respawn hypothesis dies and the search moves to WebKit's
+cross-process `ImageBitmap` path regardless.
+
+### ROOT-CAUSED 2026-08-02 (late) — it was never an output-window bug
+
+Everything above this line is framed around the output window. **That framing is wrong**, and
+it is why three sessions of fixes missed. The compositor canvas in `App.svelte` has been
+`display:none` since `ee91c54` (2026-04-27), so **nobody had ever looked at it**. Rendering it
+visible (320x180, green border, bottom-right of the control window) showed the *identical*
+corruption — noise band top, black middle, noise band bottom — in the **control** window.
+`outputBus.ts` and `output.ts` were faithfully transporting an already-corrupt source. Both
+prior fix attempts operated on a transport that was working correctly the whole time.
+
+Three independent defects were tangled under one symptom:
+
+| | Defect | Cause | Status |
+|---|---|---|---|
+| **A2** | Noise bands | `WEBKIT_DISABLE_DMABUF_RENDERER=1` corrupts the WebGL canvas | **Fixed** — retired as default in `main.rs` |
+| **A1** | Output window receives blank frames | Snapshotting a WebGL canvas returns **transparent** on this WebKitGTK build | **Root-caused, unfixed** |
+| **A3** | Video flashes then goes black | Deck FBO textures go empty; `composite()` still runs | **Open, new** |
+
+**A2 — the workaround was the bug.** Same binary, one variable, user-confirmed live: with
+`WEBKIT_DISABLE_DMABUF_RENDERER=1` the compositor canvas shows growing bands of
+uninitialised memory; with it unset the same canvas is clean solid black. This is the second
+condemnation of that line in one day — Bug E measured it costing ~26 points of main-thread
+CPU and every rAF stall. Its premise died in `f6b94ea` (WebCodecs made `<video>` +
+`drawImage(video)` non-default), so the trigger had been gone for months while the cost and
+the corruption remained. Now off by default; `CUEMARK_DISABLE_DMABUF=1` restores it. The
+legacy `<video>` fallback remains untested with DMA-BUF enabled — see `main.rs`.
+
+**A1 — WebGL canvas snapshots return transparent here.** `createImageBitmap(canvas)` *and*
+`drawImage(glCanvas, ...)` both yield fully transparent pixels while the same canvas
+**displays** correctly on screen. Independent of DMA-BUF (reproduces in both arms). This is
+why `output.ts` measured `centrePixel=rgba(0,0,0,0)` at frame #240 with video playing, even
+though `composite()` clears to `rgba(0,0,0,1)` — an opaque clear that cannot survive as
+transparent through a working capture. Fix direction, not yet implemented: render the
+compositor into a standalone `new OffscreenCanvas(1920,1080)` and ship frames via
+`transferToImageBitmap()`, which never round-trips through a canvas snapshot. Note
+`transferControlToOffscreen()` is *not* usable for this — `transferToImageBitmap()` throws on
+a placeholder-backed offscreen canvas.
+
+**Caveat on this session's own instruments.** The `centreFB`/`centreVia2D` readings added to
+`composite()` are **unreliable**: `gl.readPixels` on the default framebuffer fails with
+`INVALID_OPERATION` (`0x502`) on this WebKit build in *both* DMA-BUF arms, and a failed
+`readPixels` leaves the array zeroed — which masquerades as a transparent framebuffer.
+An early reading of that error was briefly mistaken for a defect in the composite path; the
+draws are clean (`errAfterDraw=0x0`). Trust the on-screen canvas, not those numbers.
+
+**Machine context (this is not reproducible everywhere).** The user reports the output window
+works on other systems. This one is a 2012 MacBook Pro Retina: Intel HD 4000 (Ivy Bridge) +
+NVIDIA GK107M, 3840x2400 panel at `dpr=2`, Wayland, WebKitGTK 2.52.3. A1 in particular looks
+specific to this WebKit/driver combination.
+
 ### Fix attempts (both real, neither resolved the symptom)
 
 **Attempt 1 — `outputBus.ts`'s `bitmap.close()` race.** The sender was calling
@@ -174,16 +300,27 @@ checking the actual env of the `output` window's spawned process).
    strongly implicates the respawn path itself (GTK/Wayland surface not being fully torn
    down and recreated, vs. just reloading page content) rather than anything in steady-
    state rendering.
-2. **Verify `WEBKIT_DISABLE_DMABUF_RENDERER=1` actually reaches the `output` window's
-   process env**, not just assume it does because it's set process-wide before `run()`.
+2. ~~**Verify `WEBKIT_DISABLE_DMABUF_RENDERER=1` actually reaches the `output` window's
+   process env**~~ — **ANSWERED 2026-08-02 (late): it does, and it exonerates the env.**
+   Read directly from `/proc/<pid>/environ` on a live app. A run launched *without* the
+   A/B flag has `WEBKIT_DISABLE_DMABUF_RENDERER=1` present in the spawned
+   `WebKitWebProcess`'s own environment, so the process-wide `set_var` in `main.rs` does
+   propagate to every child. More decisively: in a two-window run, `main`'s web process and
+   `output`'s web process have **byte-identical** environments — there is no env asymmetry
+   between the window that renders correctly and the one that renders noise. Combined with
+   the Bug E A/B note that Bug A was "present before and after" enabling GPU compositing,
+   **the corruption occurs under both software and GPU compositing.** Bug A is not a
+   DMA-BUF-class bug and not an env-propagation bug; stop treating the VA-API corruption
+   precedent as a lead.
 3. **Consider whether tier3's recovery for `output` should destroy-and-recreate the
    native window object, not just reload its page content** — if the corruption lives in
    the window's GPU-backed surface/compositor state rather than anything page-JS
    controls, a page reload wouldn't reset it but a full window recreation might.
-4. Fix the tier1/tier2 `get_webview_window` lookup gap in `watchdog.rs` regardless — even
-   if unrelated to the noise, tier1/tier2 being permanently dead for `output` in this
-   exact scenario is a real bug worth closing, and might reduce how often tier3's
-   unconditional kill-everything path fires at all.
+4. ~~Fix the tier1/tier2 `get_webview_window` lookup gap in `watchdog.rs`~~ — **DONE
+   2026-08-02 (late), though the gap was not what this item assumed.** There was no
+   lookup gap; there was a closed window nobody had told the watchdog about. See "RESOLVED
+   2026-08-02 (late)" above. The hoped-for side effect landed: spurious `output` cascades,
+   and the tier3 kill-everything storms they caused, should now not fire at all.
 5. `docs/design/native-output-pipeline.md` already documents this whole architecture as
    fragile by design ("today the output window is webview-fed via `BroadcastChannel` and
    dies with the control window") and proposes a structural rewrite (GStreamer-native
@@ -528,7 +665,28 @@ carrying the track title, which is what made the ambiguity above possible at all
 
 ---
 
-## Bug E: UI freeze near end of track — a CPU **spin**, not the documented deadlock
+## Bug E: UI freeze near end of track — **re-diagnosed 2026-08-02 (evening): not a spin, not near-EOS, not in the WebCodecs path**
+
+> **READ THIS FIRST — the framing below the line is superseded.** A live repro
+> session with a per-thread CPU sampler and a `perf` capture established:
+>
+> 1. **There is no spin event.** Slicing `perf` samples to the exact rAF gaps shows
+>    the main thread at 100% CPU *identically inside and outside* the gap, with no
+>    discontinuity at either edge. The stalls are rAF **starvation on a permanently
+>    saturated main thread**, not one long task blocking the loop.
+> 2. **It is not an end-of-track bug.** Playing the last 68s of the exact incident
+>    file to natural EOS was completely clean. The stalls appear during ordinary
+>    two-deck playback, nowhere near EOS.
+> 3. **All three suspects below are eliminated** — they live in the codec Worker
+>    (~1% of CPU) and app JS (`[JIT]`, 1.4%).
+> 4. **The main thread is at 84% of a core with a *single* deck playing.** The app
+>    has no main-thread headroom in steady state; that is the actual bug.
+>
+> Full evidence, root condition and the A/B result: **"Bug E re-diagnosis"** below.
+> The original framing is kept verbatim underneath it because the reasoning that
+> produced it (`state=R`, `Δstime=0` ⇒ "tight userspace loop") is a *correct*
+> inference from the watchdog line alone — it just isn't what was happening, and
+> that gap is the lesson.
 
 **Observed live 2026-08-02, ~17:46.** Fresh symptom, and the first freeze in this project
 captured with positive evidence rather than inferred from an absence of log lines.
@@ -574,6 +732,169 @@ blunt instrument to be relying on.
 above is looping — a `console.time`/counter in `pump()` would settle it quickly, or
 `perf top -p <WebKitWebProcess pid>` during the spin (see the skill's CPU-profiling
 section, which is the right tool here precisely *because* this one burns CPU).
+
+---
+
+## Bug E re-diagnosis (2026-08-02 evening) — chronic main-thread saturation in WebKit's software rasteriser
+
+Live repro on the real desktop, real MIDI hardware, clean tree at `00b9129`, with
+`scripts/probes/thread-cpu-sampler.sh` and `perf record -F 499` attached throughout.
+
+### What reproduced
+
+Six `[heartbeat] rAF stalled` events (1048–1237ms) plus `position-poll` latency of
+p50 546ms / p90 810ms, during two-deck playback — the same signature as the incident.
+Deck-0 was the *same file* that was playing when it froze (identified from the incident
+log: `audioPos=288.4718` matches `219000972d411d6b-80498295.mp4`'s 288.485s duration
+exactly), deck-1 the same audio-only `.wav`.
+
+**`602c279` did not fix this.** The stalls reproduce with the `audioOnlyDecks` fix
+present and active.
+
+### The two measurements that reframed it
+
+**1. Per-thread attribution (`scripts/probes/thread-cpu-sampler.sh`).** During the stall
+windows:
+
+| thread | CPU |
+|---|---|
+| **main thread** | **`state=R`, ~95–100% of a core** |
+| `WebCore: Worker` (codec worker — `pump()`, `fetchAus()`, `maybeStartLoopPrefetch()`) | ~1% |
+| `HeapHelper` / `ollector Thread` (JSC GC) | absent |
+| `eoDecoder queue` (WebCodecs H.264 decode) | ~21% |
+
+That alone retires suspects 1 and 2 (both run in the Worker) and rules out GC.
+
+**2. `perf` samples sliced to the exact rAF gaps.** Convert the log's wall-clock stall
+timestamps to `perf`'s monotonic clock (offset = `time.time() - /proc/uptime`), then
+bucket main-thread samples per 100ms:
+
+```
+  t=93533.9  48 ################################################
+  t=93534.0  49 #################################################   <<< rAF GAP starts
+  ...
+  t=93534.9  51 ##################################################  <<< rAF GAP
+  t=93535.0  37 #####################################               <<< rAF GAP ends
+  t=93535.1  47 ###############################################
+```
+
+At `-F 499`, ~50 samples/100ms **is** 100% CPU. The main thread is pinned flat before,
+during and after the gap — **there is no event at the gap boundaries at all.** A
+1-second rAF gap on a thread that is already 100% busy is starvation, not a spin.
+
+### Where the main thread actually goes
+
+`perf report --sort comm,dso` over the whole capture:
+
+| | share of all samples |
+|---|---|
+| **main thread inside `libwebkit2gtk`** | **55%** (59% during stalls) |
+| `eoDecoder queue` in `libavcodec` (decode) | 14% |
+| `libjavascriptcoregtk` | 2.7% |
+| **`[JIT]` — all of our JavaScript** | **1.4%** |
+
+The hot region is a single 8KB span holding 17% of main-thread WebKit time. Symbols are
+stripped (`nm -D` has only 2259 exports and resolves everything to
+`WebProcessMain+0x28e…`), so it was identified by **disassembling it directly**:
+
+```asm
+movss  (%r8,%r14,4),%xmm4     ; gather 32-bit RGBA pixels at scattered indices
+psrld  $0x8,%xmm10            ; unpack G
+pand   %xmm12,%xmm10          ;   (xmm12 = 0xFF channel mask)
+cvtdq2ps %xmm10,%xmm10        ; -> float
+mulps  %xmm7,%xmm10           ; * 1/255
+mulps  %xmm14,%xmm10          ; * per-tap coefficient from a 16-entry stack array
+addps  %xmm10,%xmm9           ; accumulate, one running sum per channel
+add    $0x10,%r9
+cmp    $0x40,%r9
+jne    <top>                  ; 16 taps
+```
+
+A 16-tap SIMD image-resampling filter. The second hotspot (5.1%) is `rep stos %eax,(%rdi)`
+in a row loop — bulk surface fills. **Roughly a third of main-thread time is software 2D
+rasterisation.**
+
+### Root condition: a workaround whose premise died two architectures ago
+
+`src-tauri/src/main.rs` sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` process-wide, which
+forces WebKit to composite the entire page on the CPU. Its stated reason:
+
+> *"DMA-BUF surfaces from VA-API video decoding don't transfer to 2D canvas pixel reads
+> in WebKitGTK — `drawImage(video)` produces colorful noise."*
+
+That is a statement about `<video>` → `drawImage()` → 2D canvas. **Since `f6b94ea` made
+WebCodecs the default, the video path is `VideoDecoder` → `texImage2D(VideoFrame)` — no
+`<video>` element and no `drawImage(video)` anywhere on the default path.** The trigger
+is gone; the cost is not. This is the same shape as `buffer-time=50ms` in this file's own
+"Lessons" section, and it is the second instance of that pattern in one day.
+
+### A/B result
+
+Gated behind `CUEMARK_ENABLE_DMABUF=1` (default unchanged), following the
+`CUEMARK_SINK_BUFFER_MS` precedent:
+
+| arm | main thread | rAF stalls | polls >300ms | decode |
+|---|---|---|---|---|
+| 1 deck, software composite | 84% | — | — | 18% |
+| 2 decks, software composite (**the stalling run**) | 87% | **6** | **297** | 21% |
+| 2 decks, software composite (2nd window) | 88% | 0 | many | 16% |
+| **2 decks, GPU composite** | **62%** | **0** | **54** | 21% |
+
+~26 points off the main thread (≈30% of its load); rAF stalls to zero; decode unchanged,
+confirming the freed time is compositing rather than decode. **User-confirmed live: no
+visual corruption in the main window / deck previews.** Output-window corruption (Bug A)
+was present before and after — unchanged, not caused by this.
+
+### Still open — do not mark this fixed
+
+1. **No same-binary control arm yet.** Every software-compositing row above came from the
+   *previous* binary; the two differ only by the env gate, but this project's own rule is
+   to A/B the same binary. Relaunch without `CUEMARK_ENABLE_DMABUF=1`, same two decks,
+   output window closed (to match), 90s.
+2. **The 22-second freeze was never reproduced** — only the ~1s stalls. They are the same
+   starvation on the same saturated thread, but that is an argument, not a measurement.
+   In particular the incident's `Δstime=0` is stricter than what reproduced here (~10–15%
+   system time alongside), and nothing yet explains that difference.
+3. **Whether GPU compositing reintroduces VA-API corruption on the paths that still use
+   `<video>`** — the legacy fallback (any non-H.264 file, and audio-only files) — is
+   untested. If it does, the right fix is codec-specific `GST_PLUGIN_FEATURE_RANK`
+   demotions, not a process-wide renderer kill.
+4. 62% of a core for two decks is better, not good. The remaining main-thread load is
+   still mostly WebKit raster.
+
+### Corrections to earlier entries in this file
+
+- **The "identical 379ms position-poll across both decks" lead was an effect, not a
+  cause.** That timer spans `invoke()` → *promise resolution*, and the resolution callback
+  runs on the main thread — so a blocked main thread inflates it directly, and two decks
+  reporting the same number is what one main-thread stall looks like from two in-flight
+  promises. Confirmed by pairing in the recovered log: `took 1056ms` with
+  `rAF stalled 1073ms`, `took 5808ms` with `rAF stalled 4419ms`. Not `AudioManager` mutex
+  contention.
+- **An `imageSmoothingQuality: "high" → "low"` A/B on `DeckCard`'s preview was
+  inconclusive, not negative** — it was scored on main-thread CPU, which was *saturated in
+  both arms*, so it could not move by construction. Reverted. Recorded because the mistake
+  is easy to repeat: **a CPU-delta A/B is meaningless on a pegged resource**; score
+  throughput (stall counts, poll latency) instead.
+- **CLAUDE.md's `GST_PLUGIN_FEATURE_RANK` claim is out of date.** It states
+  `vaav1dec:0,vaapiav1dec:0,vah264dec:0,vaapih264dec:0`; `main.rs` demotes only the two
+  AV1 factories. H.264 hardware decode is live. (Fixed in CLAUDE.md.)
+
+### Incidental finding for Bug A (not chased)
+
+The output window's own log now reads:
+
+```
+[output] frame #1: bitmap=1920x1080 canvas=300x150
+[output] resize: width=1280 height=673 dpr=2 -> canvas=2560x1346
+```
+
+**Frame #1 is drawn into a 300×150 canvas** — the intrinsic default from CLAUDE.md's
+canvas-sizing gotcha — and the `ResizeObserver` only resizes *after*. Reassigning
+`canvas.width/height` reallocates the backing store, so the first frames land in a buffer
+that is then thrown away and replaced by an uninitialised one. That is a concrete,
+untested mechanism for the uninitialised-looking edge bands, and it is upstream of both
+fix attempts already recorded under Bug A (neither of which addressed draw-before-resize).
 
 ---
 
@@ -659,6 +980,28 @@ cracked the choppiness was the user having *two output devices selected at once*
 construction — no logging can be argued with in the way a theory can. Look for a
 configuration where the difference isolates itself before building tooling.
 
+**6. A shared premise inherits its error to every conclusion drawn under it.** Bug A's
+investigation opened by treating the watchdog cascades as a *correlate* of the noise —
+something that co-occurred with it and might explain it. Nobody audited whether the
+cascades were themselves real, because the trigger came from an instrument built to detect
+exactly that. Once the "freezes" turned out to be a closed window the watchdog never forgot
+(see "RESOLVED 2026-08-02 (late)"), the correlation didn't just weaken — the entire framing
+of "corruption follows a respawn" became a claim about respawns that should never have
+happened. Two sessions of hypotheses were generated downstream of an unexamined premise.
+
+*Practice*: when a chain of reasoning rests on a signal from your own tooling, spend the
+cheap check on the signal before spending sessions on the chain. Here the check was two
+minutes of `ps` and `/proc/<pid>/environ` on a live app, and it also disposed of the
+DMA-BUF hypothesis (open item 2) as a side effect.
+
+**7. Read-only forensics on a live process is undervalued here.** Both of this session's
+findings came from `ps -eo pid,ppid,etimes` and `/proc/<pid>/environ` against an already-
+running app — no rebuild, no restart, no instrumentation, nothing that could perturb the
+state being examined. That matters more than usual in this project, because the most
+valuable states (a never-respawned window, a wedged pipeline) are exactly the ones a
+restart destroys. Before reaching for a new `debugLog`, ask what the running process
+already exposes.
+
 ## Warning for whoever picks this up
 
 Same caution as `docs/design/webcodecs-video-not-rendering.md`: don't leave the app
@@ -667,3 +1010,22 @@ deadlocked while testing something else audio-related — see
 trusting any external tool's view of process state, especially mid-investigation of Bug A
 above, which involves the freeze-watchdog deliberately killing and respawning
 `WebKitWebProcess`es as part of normal (if currently over-aggressive) operation.
+
+Two additions from 2026-08-02 (late):
+
+- **More than one `cuemark` can be running.** Two dev instances were live simultaneously
+  during that session, with different `CUEMARK_ENABLE_DMABUF` settings — i.e. different
+  *compositing paths* — writing to the same log file, where the second instance's start
+  truncated it while the first kept writing at its old offset. `ps -eo pid,ppid,etimes,args`
+  and `/proc/<pid>/environ` distinguish them; the `[build]` line alone does not, since both
+  were the same SHA. Confirm which instance a log line came from before drawing anything
+  from it.
+- **Process state is perishable evidence — inventory it before you change anything.** The
+  never-respawned output window that Bug A's decisive experiment needs existed on a live
+  app at the start of that session and was destroyed a few minutes later by a spurious
+  watchdog cascade, before anyone had looked at the screen. Rust edits are also hazardous
+  here for the same reason: `cargo tauri dev` watches `src-tauri/` and will restart the app
+  under you. If a running app is in a state you might want, record `ps`/`/proc` for it
+  first. To type-check without contending for `src-tauri/target`'s lock (which has killed a
+  dev server mid-rebuild before), point cargo elsewhere:
+  `CARGO_TARGET_DIR=/tmp/<somewhere> cargo check`.

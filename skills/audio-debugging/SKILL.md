@@ -588,13 +588,47 @@ Before reaching for any freeze playbook, read the watchdog's own diagnostic line
 A deadlock playbook applied to a spin (or vice versa) wastes a whole session — `gdb` on a spinning
 process shows a busy stack that looks meaningless, and `perf` on a blocked one shows nothing at all.
 
-**Known spin (2026-08-02, open)**: ~22s freeze near end of track, `state=R Δutime=103 Δstime=0`,
-clustered around the `EOS` bus message, recovered by watchdog tier3. Pure userspace compute
-(`Δstime=0`), so a tight loop rather than I/O. Suspects are all in the WebCodecs path
-(`codecWorker.ts` `pump()`/`fetchAus()` running off the end of the AU list,
-`maybeStartLoopPrefetch()` re-firing, `codecPlayer.ts` `frames.sort()` with an undrained queue) —
-none of which the freeze-watchdog work covered, since it predates that path becoming default.
-Full writeup: `docs/design/output-noise-and-track-reload-silence.md` Bug E.
+**A third reading the table above does not cover: `state=R` with the thread *permanently*
+pegged.** A spin and a saturated thread look identical in the watchdog line, and the fix is
+different again — there is no culprit loop to find, because nothing changes at the stall
+boundary. Distinguish them by slicing profiler samples to the stall window (recipe below); a
+real spin shows a CPU discontinuity at the gap edges, saturation does not.
+
+**Resolved this way, 2026-08-02 — the ~22s "near end of track spin" was neither.** The
+watchdog line (`state=R Δutime=103 Δstime=0`) correctly says "runnable, burning userspace
+CPU", and the natural inference — a tight JS loop in the WebCodecs path — was wrong on every
+count: not a spin (main thread at 100% *identically inside and outside* the rAF gap), not
+near-EOS (playing the incident file's last 68s to natural EOS was clean), and not in app code
+(`[JIT]` = 1.4% of samples; the codec Worker thread = ~1%). It is chronic main-thread
+saturation in WebKit's **software rasteriser**, forced by `WEBKIT_DISABLE_DMABUF_RENDERER=1`
+in `main.rs` — a workaround for `drawImage(video)` on VA-API DMA-BUF surfaces, a code path
+that stopped existing when WebCodecs became the default video path in `f6b94ea`. The main
+thread sits at 84% of a core with a *single* deck playing. Full evidence, the A/B
+(`CUEMARK_ENABLE_DMABUF=1`: 87% → 62%, 6 rAF stalls → 0) and the remaining open items:
+`docs/design/output-noise-and-track-reload-silence.md`, "Bug E re-diagnosis".
+
+**Three techniques from that session, reusable:**
+
+- **`scripts/probes/thread-cpu-sampler.sh` before reaching for `perf`.** The watchdog's
+  `Δutime` is process-wide; this attributes CPU to a *named thread* (main vs.
+  `WebCore: Worker` vs. `HeapHelper`/`ollector Thread` vs. `eoDecoder queue`), which is
+  usually the whole diagnosis, and it needs no `sudo`.
+- **Slice `perf` samples to the stall window.** `perf` timestamps are `CLOCK_MONOTONIC`;
+  the app log is wall-clock. Offset = `time.time() - float(open('/proc/uptime').read().split()[0])`.
+  Then `perf report --time "<s1>,<e1> <s2>,<e2>"` (space-separated ranges, in one quoted
+  arg — comma-joining them silently matches nothing), or bucket
+  `perf script -F time,tid` per 100ms. **`-F time,tid` prints tid *first*, then time.**
+- **Disassemble the hot region when symbols are stripped.** `libwebkit2gtk` exports only
+  ~2259 dynamic symbols, so `perf`/`nm -D` resolve everything to `WebProcessMain+0x28e…`.
+  But a tight cluster of hot addresses spanning a few hundred bytes is a loop body:
+  `objdump -d --start-address=… --stop-address=…` identifies what it *does* even with no
+  symbol at all (here: `psrld`/`pand`/`cvtdq2ps`/`mulps` over 4-byte-strided loads with a
+  16-entry coefficient array ⇒ a 16-tap RGBA resampling filter).
+
+⚠️ **A CPU-delta A/B is meaningless on a saturated resource.** An
+`imageSmoothingQuality` experiment during that session scored ~87% vs ~88% main-thread CPU
+and read as "no effect" — but the thread was pegged in *both* arms, so CPU could not move by
+construction. Score throughput instead (rAF stall count, `position-poll` latency).
 
 **Also note**: `App.svelte`'s rAF heartbeat now logs `[heartbeat] rAF stalled <N>ms` with a measured
 duration on recovery, so a *recovered* stall is a positive log line, not a gap you must spot.

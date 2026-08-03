@@ -1,4 +1,5 @@
 import { DeckFBO } from "./fbo";
+import { debugLog } from "../debugLog";
 
 // Full-screen quad: two triangles covering clip space
 const QUAD_VERTS = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
@@ -57,6 +58,7 @@ export class Compositor {
   readonly width: number;
   readonly height: number;
 
+
   constructor(canvas: HTMLCanvasElement) {
     const gl = canvas.getContext("webgl2", { preserveDrawingBuffer: true });
     if (!gl) throw new Error("WebGL2 not available");
@@ -66,6 +68,23 @@ export class Compositor {
     this.blitProgram = linkProgram(gl, VERT_SRC, FRAG_BLIT);
     this.quadVAO = this.buildQuad();
     this.vizFbo = new DeckFBO(gl, this.width, this.height);
+
+    // One line, once per context. Kept from the Bug A investigation because the decisive
+    // fact there was that the corruption is machine-specific — it reproduces on this 2012
+    // MacBook Pro Retina (Intel HD 4000 + NVIDIA GK107M, 3840x2400 @ dpr=2, Wayland,
+    // WebKitGTK 2.52.3) while the same code works on other systems. Without the GL
+    // implementation in the log, a report from another machine can't be compared to one from
+    // here at all. Note WebKitGTK sanitises the renderer string ("Apple GPU" on Linux) — it
+    // identifies the WebKit build's policy, not the actual hardware.
+    const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+    debugLog(
+      `[compositor] gl: version=${gl.getParameter(gl.VERSION)} ` +
+        `renderer=${gl.getParameter(gl.RENDERER)} ` +
+        `unmasked=${dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : "n/a"} ` +
+        `maxTex=${gl.getParameter(gl.MAX_TEXTURE_SIZE)} ` +
+        `drawingBuffer=${gl.drawingBufferWidth}x${gl.drawingBufferHeight} ` +
+        `canvasAttr=${canvas.width}x${canvas.height} lost=${gl.isContextLost()}`,
+    );
   }
 
   private buildQuad(): WebGLVertexArrayObject {
@@ -190,5 +209,14 @@ export class Compositor {
 
     gl.bindVertexArray(null);
     gl.disable(gl.BLEND);
+
+    // Pixel-level probes deliberately NOT added back here. During Bug A, both
+    // `gl.readPixels` on the default framebuffer and `drawImage(glCanvas)` into a scratch 2D
+    // canvas were tried; on this WebKitGTK build readPixels fails with INVALID_OPERATION
+    // (0x502) in *both* DMA-BUF arms, and a failed readPixels leaves its array zeroed —
+    // which reads as a perfectly plausible "transparent framebuffer" and briefly sent the
+    // investigation after a defect in the draw path that did not exist (the draws are
+    // clean). Any future probe here needs its failure mode checked before its output is
+    // believed; the trustworthy signal was making the canvas visible and looking at it.
   }
 }
