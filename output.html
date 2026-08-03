@@ -11,7 +11,9 @@
          colour so an undrawn region is unambiguously undrawn. */
       html, body { background: #000; overflow: hidden; }
       /* Layout size comes from resize() in output.ts per CLAUDE.md's canvas rule; these are
-         a fallback only, covering the window between first paint and first observe. */
+         a fallback only, covering the window between first paint and first observe. The
+         *drawing buffer* is fixed at the output resolution by the width/height attributes
+         below — CSS only scales it, so resizing this window never reallocates deck FBOs. */
       canvas { display: block; width: 100vw; height: 100vh; }
       #hint {
         position: fixed;
@@ -28,11 +30,26 @@
         animation-delay: 2s;
       }
       @keyframes fadeout { to { opacity: 0; } }
+      /* Visible from load until the first frame message arrives, then hidden for good
+         (output.ts). It reports a dead channel — not a static picture, which is a
+         perfectly normal state and must not raise an alarm. Deliberately small, dim and
+         cornered rather than a full-screen banner: this can be live on a projector
+         mid-performance, where a diagnostic that ruins the projection is worse than the
+         fault it reports. */
+      #nosignal {
+        position: fixed;
+        bottom: 8px;
+        right: 10px;
+        color: rgba(255, 255, 255, 0.35);
+        font: 11px 'Courier New', monospace;
+        pointer-events: none;
+      }
     </style>
   </head>
   <body>
-    <canvas id="output"></canvas>
+    <canvas id="output" width="1920" height="1080"></canvas>
     <div id="hint">F — toggle fullscreen &nbsp;·&nbsp; Esc — exit fullscreen</div>
+    <div id="nosignal">waiting for frames from the control window…</div>
     <script type="module" src="/src/output.ts"></script>
   </body>
 </html>

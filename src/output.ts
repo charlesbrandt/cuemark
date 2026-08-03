@@ -1,69 +1,123 @@
+/**
+ * output.ts — the output (projector) window.
+ *
+ * Since 2026-08-03 this window **is** the compositor. It receives per-deck frames as
+ * `ImageBitmap`s from the control window and blends them itself with WebGL, rather than
+ * receiving an already-composited snapshot. The reason is not architectural taste: on this
+ * machine all GPU→CPU readback from WebGL is broken in the Mesa `crocus` driver, so the
+ * control window physically cannot snapshot its own compositor canvas — every capture came
+ * back correctly-sized and fully transparent, with nothing raising. WebGL *display* works
+ * fine, so compositing on this side never needs to read anything back.
+ *
+ * See `lib/renderer/outputProtocol.ts` for the message contract and the probe evidence,
+ * and `docs/design/output-noise-and-track-reload-silence.md` (Bug A) for the history.
+ */
 import { invoke } from '@tauri-apps/api/core';
 import { debugLog } from './lib/debugLog';
+import { Compositor } from './lib/renderer/compositor';
+import { OUTPUT_CHANNEL, type OutputMessage } from './lib/renderer/outputProtocol';
 
-const channel = new BroadcastChannel('cuemark-output');
+const channel = new BroadcastChannel(OUTPUT_CHANNEL);
 const canvas = document.getElementById('output') as HTMLCanvasElement;
-const ctx = canvas.getContext('2d')!;
-ctx.imageSmoothingEnabled = true;
-ctx.imageSmoothingQuality = 'high';
+const noSignal = document.getElementById('nosignal') as HTMLDivElement;
 
-// JS-driven sizing via ResizeObserver, not a one-shot window.innerWidth/innerHeight
-// read + 'resize' listener — see CLAUDE.md's canvas-sizing gotcha. Right after this
-// window is force-reloaded by the freeze-watchdog (tier2/tier3 recovery), GTK can
-// still be settling the recreated window's layout when this script's top level runs;
-// a one-shot read can undersize the canvas buffer with no further 'resize' event ever
-// firing to correct it, leaving stale/uninitialized backing-store pixels visible as
-// noise at the edges. ResizeObserver reports the actual settled size whenever it
-// changes, including immediately on observe().
+// The drawing buffer is fixed at the output resolution set by the canvas width/height
+// attributes in output.html; CSS only scales it to the window. Keeping it fixed means deck
+// FBOs are allocated once and never reallocated on a window resize, and the projector gets
+// the same pixels regardless of how big this window happens to be.
+const compositor = new Compositor(canvas, 'output-compositor');
+
+// Paint once, immediately. A WebGL canvas that has never been drawn to displays
+// uninitialised surface memory on this build — that was the entire "output window renders
+// random-noise static" symptom, when the old 2D canvas was never written because every
+// incoming bitmap was transparent. An empty compositor clears to opaque black, so drawing
+// once up front guarantees this window is never showing garbage, even before any deck loads.
+compositor.composite([], 0);
+
+// JS-driven layout sizing via ResizeObserver, not a one-shot window.innerWidth/innerHeight
+// read + 'resize' listener — see CLAUDE.md's canvas-sizing gotcha. Right after this window
+// is force-reloaded by the freeze-watchdog (tier2/tier3 recovery), GTK can still be settling
+// the recreated window's layout when this script's top level runs, and a one-shot read can
+// mis-size it with no further 'resize' event ever firing to correct it. Only the CSS size is
+// touched here; the drawing buffer is deliberately fixed (see above).
 function resize(width: number, height: number) {
-  canvas.width = width * devicePixelRatio;
-  canvas.height = height * devicePixelRatio;
-  // CLAUDE.md's canvas-sizing rule: the element's *layout* size must be set from JS too,
-  // never left to scoped CSS. output.html sizes this canvas with `width:100vw;height:100vh`,
-  // which is exactly the pattern that rule forbids — WebKitGTK does not reliably apply it.
   canvas.style.width = `${width}px`;
   canvas.style.height = `${height}px`;
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = 'high';
-  debugLog(
-    `[output] resize: width=${width} height=${height} dpr=${devicePixelRatio} -> canvas=${canvas.width}x${canvas.height}`,
-  );
+  debugLog(`[output] resize: css=${width}x${height} dpr=${devicePixelRatio} buffer=${canvas.width}x${canvas.height}`);
 }
-
-// Bug A note for anyone re-instrumenting here: a geometry probe (window/body/canvasRect/
-// client/buffer sizes plus a centre-pixel getImageData) was added during that investigation
-// and removed as settled. It reported `canvasRect=1280.0x673.0@0.0,0.0` against a
-// `win=1280x673` — the canvas covers this window exactly — and a centre pixel of
-// `rgba(0,0,0,0)` while the compositor was clearing to opaque black. Neither number was
-// wrong and neither was the bug: the corruption was upstream, in the compositor's own WebGL
-// canvas in the *control* window. Re-adding probes on this side is very unlikely to help.
 new ResizeObserver((entries) => {
   const { width, height } = entries[0].contentRect;
   resize(width, height);
 }).observe(document.body);
 
+let vizSrc: string | null = null;
 let lastFrameAt = performance.now();
-let loggedFirstFrame = false;
 let frameCount = 0;
-channel.onmessage = (e: MessageEvent<{ frame: ImageBitmap }>) => {
-  const { frame } = e.data;
+let loggedFirstUpload = false;
+
+channel.onmessage = (e: MessageEvent<OutputMessage>) => {
+  const msg = e.data;
+  if (!msg) return;
+
+  if (msg.kind === 'viz') {
+    vizSrc = msg.src;
+    debugLog(`[output] visualization ${msg.src ? `set (${msg.src.length} chars)` : 'cleared'}`);
+    return;
+  }
+  if (msg.kind !== 'frame') return;
+
   lastFrameAt = performance.now();
   frameCount++;
-  if (!loggedFirstFrame || frameCount % 120 === 0) {
-    loggedFirstFrame = true;
-    debugLog(
-      `[output] frame #${frameCount}: bitmap=${frame.width}x${frame.height} canvas=${canvas.width}x${canvas.height}`,
-    );
+
+  // Allocate/free FBOs as decks come and go. Cheap and idempotent when unchanged.
+  compositor.syncDecks(msg.decks.map((d) => d.id));
+
+  let uploaded = 0;
+  for (const d of msg.decks) {
+    if (!d.bitmap) continue; // unchanged this tick — the FBO already holds its last frame
+    const fbo = compositor.getFBO(d.id);
+    if (fbo) {
+      fbo.uploadImageBitmap(d.bitmap);
+      uploaded++;
+    }
+    // These bitmaps are this process's own clones of the sender's; the sender closes its
+    // originals on its own schedule. Not closing here would leak multiple megabytes per
+    // frame into the process that also runs this window's GL.
+    d.bitmap.close();
   }
-  ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-  frame.close();
+
+  if (vizSrc && msg.vizOpacity > 0) {
+    compositor.renderVisualization(vizSrc, msg.vizUniforms, msg.time, msg.analysis);
+  }
+  compositor.composite(msg.decks, vizSrc ? msg.vizOpacity : 0);
+
+  if (frameCount === 1) {
+    noSignal.style.display = 'none';
+    debugLog(`[output] first frame: decks=${msg.decks.length} uploaded=${uploaded} buffer=${canvas.width}x${canvas.height}`);
+  } else if (frameCount % 600 === 0) {
+    debugLog(`[output] frame #${frameCount}: decks=${msg.decks.length} uploaded=${uploaded}`);
+  }
+  // "Frames are arriving" and "deck pixels are arriving" are different claims, and the
+  // first was historically mistaken for the second (Bug A's "the JS data path is provably
+  // healthy" — which was true, and irrelevant, while the screen showed garbage). A frame
+  // message with no bitmaps is normal (nothing changed this tick), so log the first one
+  // that actually carries deck pixels, separately and once.
+  if (uploaded > 0 && !loggedFirstUpload) {
+    loggedFirstUpload = true;
+    debugLog(`[output] first deck pixels uploaded at frame #${frameCount} (${uploaded} deck(s))`);
+  }
 };
 
-// Freeze-watchdog heartbeat (docs/design/freeze-watchdog.md phase 1: observe + log only,
-// no recovery yet). This window has no rAF loop of its own — frames arrive via the
-// BroadcastChannel from the main window's compositor — so "lastRafMs" here is reused to
-// mean "time since the last composited frame arrived", the closest analog of main's
-// rAF-staleness signal for detecting this window's own JS main thread going silent.
+// Ask the control window for a full re-send. Without this, a window opened mid-set — or
+// reloaded by the freeze-watchdog — would stay black until every deck happened to produce a
+// new frame, which for a paused deck never happens: the sender only ships decks that changed.
+channel.postMessage({ kind: 'hello' });
+debugLog('[output] ready — requested full re-send from control window');
+
+// Freeze-watchdog heartbeat (docs/design/freeze-watchdog.md). This window has no rAF loop of
+// its own — it renders on message arrival — so "lastRafMs" here means "time since the last
+// frame message", the closest analog of main's rAF-staleness signal for detecting this
+// window's JS main thread going silent.
 setInterval(() => {
   invoke('watchdog_heartbeat', {
     window: 'output',

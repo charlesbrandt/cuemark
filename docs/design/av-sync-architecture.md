@@ -184,7 +184,11 @@ still responding immediately to any intentional fader movement.
 **Every per-frame RAF loop must gate its expensive work on an actual-change check**, not just
 playback intent. Track the last-seen value that determines a different output (`video.currentTime`
 for frame uploads/canvas draws; a signature of id/source/opacity/visualization-opacity for the
-composite+`postFrame()` call) and skip the work when it's unchanged from the previous tick.
+`postFrame()` call) and skip the work when it's unchanged from the previous tick. Since
+2026-08-03 `postFrame()` ships per-deck `ImageBitmap`s to the output window's compositor
+rather than a snapshot of a locally-composited canvas, which makes this gate *more*
+important, not less: an unchanged deck now costs one null entry instead of a bitmap
+allocation and a cross-process copy.
 `scripts/perf-idle-test.sh` is an automated regression test for this — re-run it after touching
 the render loop (`App.svelte` `frame()`), `WaveformCanvas`, or the `DeckCard` preview.
 `scripts/latency-test.sh` covers the full deck workflow (load → waveform → playback → IPC latency

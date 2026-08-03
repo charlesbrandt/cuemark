@@ -1557,3 +1557,154 @@ rotation window. That heartbeat should drop to `debug` or be rate-limited.
 | `scripts/probes/README.md` | New "Audio-stack probes" section (README previously covered WebKit probes only) |
 | `skills/audio-debugging/SKILL.md` | Warning on the "Current sink: pipewiresink" recommendation; new "Play never starts, and the whole machine's audio hangs with it" failure mode with triage order |
 | `journal.md` | This entry |
+
+---
+
+# 2026.08.03 — Output window noise: a GPU driver bug, and the compositor moves windows
+
+## Problem
+
+The output window still rendered horizontal bands of RGB static after the previous session
+retired `WEBKIT_DISABLE_DMABUF_RENDERER=1` (which had genuinely been corrupting the
+*compositor* canvas). Bug A in `docs/design/output-noise-and-track-reload-silence.md`, open
+across four sessions, and believed to be a WebKitGTK defect.
+
+## Root cause — two of them, and neither was WebKit
+
+**1. The readback failure is a Mesa `crocus` driver bug.** Every GPU→CPU route out of a
+`webgl2` context fails here: `readPixels` on the default framebuffer *and* on a
+framebuffer-complete, `SAMPLES=0` user FBO (texture, RGBA8-texture and renderbuffer
+variants), with an explicit `readBuffer()`, through a `PIXEL_PACK_BUFFER` +
+`getBufferSubData`, and after `copyTexSubImage2D` — all `INVALID_OPERATION` with a zeroed
+buffer. Under `LIBGL_ALWAYS_SOFTWARE=1`, same build, same page, same calls, **all six pass**.
+The GPU is the Intel HD 4000 (gen7) on `crocus`; the NVIDIA card has no render node.
+
+The prior session's multisample-resolve hypothesis was wrong (`antialias:false` gives
+`SAMPLES=0` and changes nothing). GPU→GPU is fine — `copyTexSubImage2D`, draws, clears and
+blits are all clean. Only GPU→CPU fails, which is exactly why the canvas *displays*
+correctly while every snapshot comes back transparent.
+
+**2. The visible noise was not corruption — nothing was ever drawn.** `postFrame()` shipped a
+transparent bitmap; `output.ts` did `drawImage()` under `source-over`, where a fully
+transparent source **writes nothing**; and the canvas was never cleared. So no pixel of that
+canvas had ever been written and the screen showed its own uninitialised surface memory. That
+explains what never made sense: why reopening the window didn't help, and why the band shape
+changed between reproductions for no reason.
+
+## Fix — the compositor moved to the output window
+
+The constraint is precise: **never read back from WebGL.** Three things work and carry the
+design — 2D canvas capture, `drawImage`/`createImageBitmap` of a `VideoFrame` (WebCodecs
+decodes in software, so frames are already in system memory), and cross-process `ImageBitmap`
+transfer (which had been working all along; only the contents were empty).
+
+So the control window now ships each deck's current frame as an `ImageBitmap` plus the state
+needed to blend them, and the output window runs the `Compositor` itself — keeping the GLSL
+effect chain and visualization layer, and removing a per-frame 1920x1080 capture from the
+control window's hot path. The control window has no WebGL context at all any more.
+Contract: `src/lib/renderer/outputProtocol.ts`.
+
+## Lessons
+
+- **WebKit masks `RENDERER`** ("WebKit WebGL"; even `WEBGL_debug_renderer_info` says
+  "Apple GPU" on Linux), so the GPU is invisible from inside the page and a driver bug is
+  indistinguishable from a browser bug. **The `LIBGL_ALWAYS_SOFTWARE=1` A/B is the cheapest
+  way to attribute a rendering fault to a layer, and it should be run before writing any
+  upstream bug report.** One `for env in …` loop moved this from "WebKitGTK is broken" to
+  "Mesa crocus is broken" after three sessions of the wrong attribution.
+- **"Frames are arriving" is not "pixels are arriving".** The previous session concluded "the
+  JS data path is provably healthy" from correct dimensions and steady frame counts. It was
+  right, and irrelevant. Instrument the *content*, not just the flow — `output.ts` now logs
+  the first frame that actually carries deck pixels, separately from the first frame message.
+- **`drawImage` of a fully transparent source is a silent no-op.** Anything that relies on
+  `drawImage` to cover a surface must clear first, or it displays whatever was in that memory.
+- **The same class of bug was hiding in a second place.** `texImage2D(..., null)` allocates a
+  texture without defining its contents, and an empty deck is still composited at its own
+  opacity — so a freshly allocated `DeckFBO` could blit uninitialised GPU memory to the
+  projector. Found by looking for the pattern rather than the symptom; FBOs now self-clear.
+- **`UNPACK_FLIP_Y_WEBGL` is silently ignored for `ImageBitmap` sources** — no GL error,
+  unflipped pixels. Copying the existing `fbo.ts` upload pattern would have put the projector
+  upside down for the second time in this project (see `uploadVideoFrameFromCodec`'s comment).
+  Probing upload semantics before writing the upload path cost ten minutes.
+- **Pixel assertions are still possible on this machine — under software GL.** Compositing
+  semantics and orientation are WebKit-level, not driver-level, so `LIBGL_ALWAYS_SOFTWARE=1`
+  is authoritative for them even though it is normally the suspect arm on this project.
+  `scripts/probes/output_window_compositor_probe.py` verifies the real `output.html`
+  end-to-end this way, orientation included.
+
+# 2026.08.03 (later) — Output window confirmed working, then found upside down: `imageOrientation` is ignored for `VideoFrame`
+
+## Problem
+
+With the compositor moved to the output window (entry above), the projector displayed a real
+image for the first time — correct content, correct size, no noise. It was vertically flipped.
+Both DeckCard previews in the control window stayed upright throughout.
+
+## Root cause
+
+`createImageBitmap(source, { imageOrientation: 'flipY' })` is **silently ignored when `source`
+is a `VideoFrame`** on this WebKitGTK — no exception, no warning, unflipped pixels. It *is*
+honored for a canvas source. Measured both ways in one run:
+
+```
+orient/canvas-flipY     = PASS (topRow=BLUE)   <- honored
+orient/videoframe-flipY = FAIL (topRow=RED)    <- ignored
+```
+
+Identical under `LIBGL_ALWAYS_SOFTWARE=1` and on hardware, so this is WebKit-level, not the
+`crocus` driver bug that drove the architecture change.
+
+`outputBus.ts` shipped codec frames straight from the `VideoFrame` to save a copy. That is the
+default path (WebCodecs/H.264), so the flip request evaporated and nothing downstream reapplied
+it — `uploadImageBitmap()` deliberately sets no pixel-store flag, because `UNPACK_FLIP_Y_WEBGL`
+is ignored for `ImageBitmap` sources. Two independent silent failures, composed.
+
+The asymmetry was the tell: DeckCard's preview is a plain `drawImage(frame)` onto a 2D canvas,
+flip-agnostic, and it stayed correct. Wrong pixels in the projector but right pixels in the
+preview isolates the fault to the sender's bitmap construction, not the decoded frame.
+
+## Fix
+
+`bitmapFor()` routes **every** deck source — codec and legacy `<video>` alike — through the
+per-deck scratch canvas that only the legacy path used before, because a canvas is the only
+source type whose orientation this engine honors. The two branches collapse into one, and the
+`clone()`/refcount dance disappears: `drawImage()` is synchronous, so a codec frame cannot be
+closed out from under it the way an async `createImageBitmap(frame)` could. Cost is one
+full-frame copy per deck per tick — the same primitive `DeckCard.svelte` already runs per tick
+on this hardware.
+
+## Lessons
+
+- **A probe that reimplements the code under test only confirms its own assumptions.**
+  `output_window_compositor_probe.py` asserted orientation end-to-end against the real
+  `output.html` and passed — while the shipping app was upside down — because its sender
+  hand-rolled `createImageBitmap(canvas, {imageOrientation:'flipY'})` instead of calling
+  `postFrame()`. It tested the one source type that works. It now imports the real
+  `outputBus.ts` from the dev server and drives it with a codec-kind source.
+- **Verify a probe by breaking the code.** Reintroducing the direct-from-`VideoFrame` bitmap
+  flips the probe to `screenBottom=RED`; the fix restores `BLUE`. A green probe that has never
+  been shown to go red is an untested assertion. This negative control took two minutes and is
+  the only reason the strengthened probe is trustworthy.
+- **Generalising a probe result past the case actually measured is where this bug entered.**
+  The previous entry's lesson — "probing upload semantics before writing the upload path cost
+  ten minutes" — was true but overstated: the probe measured `imageOrientation` on a *canvas*
+  and `createImageBitmap(VideoFrame)` *without* orientation, then the code combined them. The
+  untested cell of a 2x2 matrix is exactly where the defect lived. Probe the combination you
+  are going to ship.
+- **Silent-ignore is this platform's signature failure mode.** Custom URI schemes, VA-API
+  DMA-BUF, `UNPACK_FLIP_Y_WEBGL` on `ImageBitmap`, and now `imageOrientation` on `VideoFrame`
+  — none throw, none log. Any WebKit API accepting an options bag should be assumed to ignore
+  it until measured on the exact source type in use.
+
+## Files touched
+
+- `src/lib/renderer/outputBus.ts` — unified `bitmapFor()` through the scratch canvas; dropped
+  `clone()`; documented both silent-ignore failures at `BITMAP_OPTS`
+- `src/lib/renderer/fbo.ts` — `uploadImageBitmap()` doc: the sender's flip only works because
+  it passes a canvas
+- `scripts/probes/imagebitmap_upload_probe.py` — added the `orient/*` matrix (canvas and
+  `VideoFrame` x with/without `imageOrientation`), read back through a 2D canvas so it is
+  authoritative on hardware too
+- `scripts/probes/output_window_compositor_probe.py` — sender now drives the real
+  `postFrame()` with a `kind:'codec'` source
+- `CLAUDE.md`, `scripts/probes/README.md` — orientation rule restated per source type

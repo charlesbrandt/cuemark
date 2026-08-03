@@ -3,8 +3,13 @@ export class DeckFBO {
   readonly fbo: WebGLFramebuffer;
   // 2D canvas intermediary — drawImage(video) is always safe; avoids direct
   // video→texImage2D which triggers assertion failures in WebKitGTK.
-  private scratch: HTMLCanvasElement;
-  private scratchCtx: CanvasRenderingContext2D;
+  //
+  // Created lazily: it is only needed by the two <video>/VideoFrame upload paths, and the
+  // output window (which owns the real compositor since 2026-08-03) uploads exclusively via
+  // uploadImageBitmap(). Allocating it eagerly cost a full output-resolution canvas — ~8MB
+  // at 1920x1080 — per deck, in the process that can least afford it.
+  private scratch: HTMLCanvasElement | null = null;
+  private scratchCtx: CanvasRenderingContext2D | null = null;
   // Cached across all decks/instances (module-level, not per-FBO): whether
   // texImage2D(gl, VideoFrame) works directly on this GPU/driver, decided once by the
   // first real codec-path frame rather than a synthetic startup probe (see
@@ -36,15 +41,34 @@ export class DeckFBO {
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+
+    // Clear to transparent black immediately. texImage2D(..., null) above *allocates* the
+    // texture but leaves its contents undefined per the GL spec — i.e. whatever was in that
+    // GPU memory. A deck that exists but has never received a frame (an empty deck, or one
+    // whose first frame hasn't decoded yet) is still composited at its own opacity, so
+    // without this the compositor blits uninitialised GPU memory straight to the projector.
+    // That is the same "displaying memory nobody wrote" failure as the output window's
+    // uninitialised 2D canvas in Bug A (docs/design/output-noise-and-track-reload-silence.md)
+    // — worth fixing everywhere it can occur, not just where it was observed. Transparent is
+    // also the semantically right value: an empty deck must contribute nothing to the blend.
+    gl.viewport(0, 0, width, height);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.bindTexture(gl.TEXTURE_2D, null);
+  }
 
-    this.scratch = document.createElement("canvas");
-    this.scratch.width = width;
-    this.scratch.height = height;
-    this.scratchCtx = this.scratch.getContext("2d")!;
-    this.scratchCtx.imageSmoothingEnabled = true;
-    this.scratchCtx.imageSmoothingQuality = "high";
+  private getScratch(): CanvasRenderingContext2D {
+    if (!this.scratchCtx) {
+      this.scratch = document.createElement("canvas");
+      this.scratch.width = this.width;
+      this.scratch.height = this.height;
+      this.scratchCtx = this.scratch.getContext("2d")!;
+      this.scratchCtx.imageSmoothingEnabled = true;
+      this.scratchCtx.imageSmoothingQuality = "high";
+    }
+    return this.scratchCtx;
   }
 
   bind() {
@@ -54,12 +78,13 @@ export class DeckFBO {
 
   uploadVideoFrame(video: HTMLVideoElement) {
     if (video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) return;
-    this.scratchCtx.drawImage(video, 0, 0, this.width, this.height);
+    const ctx = this.getScratch();
+    ctx.drawImage(video, 0, 0, this.width, this.height);
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
     // Canvas Y=0 is top; WebGL texture Y=0 is bottom — flip on upload so video is right-side up.
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.scratch);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.scratch!);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.bindTexture(gl.TEXTURE_2D, null);
   }
@@ -96,12 +121,40 @@ export class DeckFBO {
         DeckFBO.codecUploadMode = "scratch";
       }
     }
-    this.scratchCtx.drawImage(frame, 0, 0, this.width, this.height);
+    const ctx = this.getScratch();
+    ctx.drawImage(frame, 0, 0, this.width, this.height);
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
     // Same canvas-intermediary path as uploadVideoFrame() above — needs the same flip.
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.scratch);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.scratch!);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  }
+
+  /**
+   * Uploads a frame received from the control window as an `ImageBitmap` — the output
+   * window's only source of deck pixels (see `outputProtocol.ts`).
+   *
+   * ⚠️ **No `UNPACK_FLIP_Y_WEBGL` here, deliberately.** Both upload methods above set it,
+   * because a canvas/VideoFrame row 0 is the top while a GL texture row 0 is the bottom.
+   * For an **ImageBitmap source that flag is silently ignored on this WebKitGTK**: it
+   * raises no GL error and yields unflipped pixels (measured,
+   * `scripts/probes/imagebitmap_upload_probe.py`). The flip is therefore applied by the
+   * sender via `createImageBitmap(..., { imageOrientation: 'flipY' })` — which only works
+   * because `outputBus.ts` always passes a *canvas*; that option is silently ignored for a
+   * `VideoFrame` source. Setting the flag here as well would not double-flip — it would do
+   * nothing — but it would strongly imply to a reader that this path handles its own
+   * orientation, which it does not. Every bitmap arriving here is already right-side-up.
+   *
+   * texImage2D with a source re-specifies the texture at the bitmap's own dimensions, so
+   * the texture ends up at the deck's source resolution rather than the FBO's nominal
+   * size. That is intended: the blit samples it over the full quad, giving the same
+   * stretch-to-output behaviour the scratch-canvas path had, without resampling twice.
+   */
+  uploadImageBitmap(bitmap: ImageBitmap) {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, this.texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
     gl.bindTexture(gl.TEXTURE_2D, null);
   }
 

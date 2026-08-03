@@ -63,17 +63,67 @@ or the MIDI-to-audio path — several of these are subtle, previously-fixed race
 
 ### Rendering pipeline
 
+**Compositing happens in the output window, not the control window** (2026-08-03). The two
+windows are separate `WebKitWebProcess`es, and what crosses between them is *per-deck frames*,
+never a composited image:
+
 ```
-<video> element (muted)
-  └─► drawImage() ──► scratch HTMLCanvasElement (per FBO)
-        └─► texImage2D (UNPACK_FLIP_Y_WEBGL=true) ──► WebGL texture
-              └─► [FBO N] ──► alpha composite ──► preview canvas + output window
+CONTROL WINDOW (App.svelte frame())          |  OUTPUT WINDOW (output.ts)
+                                             |
+VideoDecoder ──► VideoFrame ──┐              |
+<video> ──► drawImage ──► scratch canvas ──┤ |
+                              ▼              |
+        createImageBitmap(…, imageOrientation:'flipY')
+                              │              |
+                              └─ BroadcastChannel('cuemark-output') ─►  Compositor
+                                 { decks:[{id,opacity,bitmap}], viz… }      │
+                                             |                    texImage2D ──► [FBO N]
+                                             |                              alpha composite
+                                             |                            + visualization layer
+                                             |                                    ▼
+                                             |                            visible WebGL canvas
 ```
 
 Each FBO renders at full output resolution. Compositor alpha-blends decks back-to-front by `opacity`.
-WebGL texture upload uses `UNPACK_FLIP_Y_WEBGL=true` (HTML canvas Y=0 is top; WebGL texture Y=0 is bottom).
 The crossfader is a UI/MIDI convenience that drives two selected decks' opacities inversely — not a
 structural field in the data model.
+
+**Why it is split this way**: the control window used to composite and ship a
+`createImageBitmap()` snapshot of its WebGL canvas. That is impossible on this machine — all
+GPU→CPU readback from WebGL is broken in the Mesa `crocus` driver, so every snapshot arrived
+correctly-sized and *fully transparent*, silently (see the readback warning below). WebGL
+**display** works fine, so the fix is to never read back: ship the compositor's *inputs* and
+composite on the side that displays. The contract, the probe evidence and the reasoning live in
+`src/lib/renderer/outputProtocol.ts` — **read it before changing anything about the output path.**
+
+Consequences worth knowing:
+- The control window has **no compositor and no WebGL context at all**. There is no composited
+  preview in the control UI; adding one means a real visible canvas plus its own `Compositor`,
+  never a hidden one to capture.
+- Only decks whose frame actually changed carry a bitmap; `bitmap: null` means "reuse the FBO".
+  A paused deck costs nothing per frame. The output window sends `{kind:'hello'}` on load to ask
+  for a full re-send, which is what makes a window opened mid-set (or reloaded by the
+  freeze-watchdog) show paused decks instead of black.
+- ⚠️ **Orientation on this WebKitGTK is broken in *two* independent ways, and the only
+  combination that works is canvas + `imageOrientation`.** Both failures are silent — no GL
+  error, no exception, just unflipped pixels — and both are WebKit-level, identical under
+  llvmpipe and on hardware:
+  - `UNPACK_FLIP_Y_WEBGL` is ignored for **`ImageBitmap`** sources, so `uploadImageBitmap()`
+    in `fbo.ts` deliberately sets no pixel-store flag. (The `<video>`/`VideoFrame` upload
+    paths there still use the flag and still need it.)
+  - `createImageBitmap(…, {imageOrientation:'flipY'})` is ignored for **`VideoFrame`**
+    sources. It is honored for a canvas source — which is why `outputBus.ts` routes *every*
+    deck frame, codec and legacy alike, through a scratch canvas before constructing the
+    bitmap. Shipping codec frames straight from the `VideoFrame` saves a copy and puts the
+    projector upside down (2026-08-03).
+
+  Verified by `scripts/probes/imagebitmap_upload_probe.py` (`orient/*` cases), end-to-end by
+  `scripts/probes/output_window_compositor_probe.py` — which drives the real `postFrame()`
+  with a codec-kind source rather than a hand-rolled bitmap, precisely because the earlier
+  hand-rolled version passed while the shipping app rendered upside down.
+- A newly created `DeckFBO` clears itself to transparent black. `texImage2D(…, null)` allocates
+  but leaves contents *undefined*, and an empty deck is still composited at its own opacity — so
+  without the clear the projector blits uninitialised GPU memory.
 
 **`WEBKIT_DISABLE_DMABUF_RENDERER=1` is RETIRED as the default** (2026-08-02) — GPU compositing is now
 on. It was originally set in `main.rs` to prevent VA-API DMA-BUF canvas corruption via
@@ -126,8 +176,13 @@ and the `audioSync.ts` Svelte-store-bypass pattern for continuous MIDI controls:
 
 ### Dual output
 
-- Window 1 (control): deck previews, crossfader, media browser, MIDI status
-- Window 2 (output): compositor result fullscreen on projector (display 2)
+- Window 1 (control): deck previews, crossfader, media browser, MIDI status. Ships per-deck
+  frames; does no compositing of its own.
+- Window 2 (output): **runs the compositor** and displays it fullscreen on the projector
+  (display 2). Its drawing buffer is fixed at 1920x1080 by the canvas `width`/`height`
+  attributes; CSS only scales it, so resizing never reallocates deck FBOs.
+
+See "Rendering pipeline" above and `src/lib/renderer/outputProtocol.ts` for the message contract.
 
 ### Data model
 
@@ -217,9 +272,14 @@ structural: visualizations never touch deck state at all.
 needed. `renderVisualization(fragmentSrc, uniforms, time, analysis)` renders into `vizFbo`
 exactly like `renderShader()` does for a deck. `composite(decks, visualizationOpacity)`
 blends all deck FBOs back-to-front as before, then — if `visualizationOpacity > 0` — blits
-`vizFbo` on top as a final pass using the same shared blit shader. Driven from `App.svelte`'s
-`frame()` loop, which renders the visualization once per frame (if `session.visualization`
-is set) before calling `composite()`, independent of the per-deck video-upload loop.
+`vizFbo` on top as a final pass using the same shared blit shader.
+
+Since 2026-08-03 all of this runs in the **output window** (`src/output.ts`), driven by the
+frame messages it receives rather than by `App.svelte`'s `frame()` loop. The shader *source*
+is sent only when it changes — it is far too large for a per-frame path — while `u_time`, the
+audio-analysis bands and any custom uniforms ride along with every frame. `App.svelte` still
+decides *when* a frame is due (an active visualization animates continuously, so it always
+marks the frame dirty); it just no longer renders it.
 
 Standard uniforms fed to every visualization shader: `u_time`, `u_resolution`,
 `u_bass`/`u_mid`/`u_high` (from `AudioAnalysis`, max-across-playing-decks), plus any custom
@@ -242,8 +302,10 @@ cuemark/
         types.ts                # Deck, Session, AudioAnalysis interfaces
         session.ts              # Svelte writable store + addDeck/updateDeck/setCrossfaderMapping/etc.
       renderer/
-        fbo.ts                  # DeckFBO — allocates WebGL texture + framebuffer
-        compositor.ts           # Compositor — syncDecks(), composite()
+        fbo.ts                  # DeckFBO — WebGL texture + framebuffer; uploadVideoFrame/FromCodec/ImageBitmap
+        compositor.ts           # Compositor — syncDecks(), composite(); RUNS IN THE OUTPUT WINDOW
+        outputProtocol.ts       # Control<->output window message contract + why frames, not snapshots
+        outputBus.ts            # Sender side: per-deck VideoFrame/<video> -> ImageBitmap -> BroadcastChannel
         seekBus.ts              # Module-level registry: video elements + audio clock cache; seekDeck() / getDeckTime() / setDeckAudioTime()
       audio/
         pipeline.ts             # Typed TS wrappers around all Rust audio Tauri commands (audioLoad, audioPlay, …)
@@ -431,14 +493,30 @@ Several automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb
 | `scripts/watchdog-soak-test.sh <video> [seconds]` | The design doc's full 10-minute false-positive soak (default 600s) — looped playback + a MIDI-rate burst every 60s, asserts zero watchdog triggers. Run before relying on recovery in prod, not on every change. |
 | `scripts/check-launcher-staleness.sh [path]` | Is `~/.local/bin/cuemark` behind the code? Exit 0 fresh / 1 stale / 2 not built. No toolchain or running app needed. Run before diagnosing anything against a non-dev launch. |
 | `scripts/probes/offscreencanvas_webgl_capture_probe.py` | Can pixels be read back out of a WebGL canvas on this WebKitGTK? Run **before designing anything that moves rendered content between windows or processes**, and before trusting any pixel assertion against WebGL output. Seconds, no app, no Xvfb. |
+| `scripts/probes/webgl_readback_variants_probe.py` | Route matrix for the same question — attachment formats, explicit `readBuffer`, PBO + `getBufferSubData`, `copyTexSubImage2D` — with a `LIBGL_ALWAYS_SOFTWARE=1` control arm that separates driver faults from WebKit faults. Run this before concluding anything about readback. |
+| `scripts/probes/webgl_readpixels_diag_probe.py` | Why a readback failed: reports the returned bytes *and* the GL error, `getError()` sanity, framebuffer completeness, and the implementation's preferred read format. |
+| `scripts/probes/imagebitmap_upload_probe.py` | `ImageBitmap`/`VideoFrame` upload semantics — does `createImageBitmap(VideoFrame)` carry real pixels, and which flip mechanism actually applies. Run before touching the output path's orientation handling. Needs `LIBGL_ALWAYS_SOFTWARE=1` for pixel verdicts. |
+| `scripts/probes/output_window_compositor_probe.py` | End-to-end check of the **real** `output.html`: posts a synthetic frame from a same-origin sender and reads the composited result back, including an orientation assertion. Run after touching `outputBus.ts`, `output.ts`, `outputProtocol.ts` or `fbo.ts`. Needs the Vite dev server and `LIBGL_ALWAYS_SOFTWARE=1`. |
 
-⚠️ **Pixel readback from a WebGL canvas is broken on this machine** (WebKitGTK 2.52.3):
-`createImageBitmap`, `drawImage(glCanvas)`, `toDataURL` and `readPixels` all return
-transparent/fail while the canvas **displays** correctly, and `OffscreenCanvas` has no
-`webgl2` context. None of them throw. A plain 2D canvas captures fine. Consequences:
-`postFrame()` in `outputBus.ts` ships blank frames to the output window here (works on other
-systems), and **automated screenshot/pixel checks of compositor output silently verify
-nothing**. See `docs/upstream/webgl-canvas-capture-transparent.md`.
+⚠️ **All GPU→CPU readback from WebGL is broken on this machine — it is a Mesa `crocus`
+(Intel HD 4000, gen7) driver bug, not a WebKit one.** `createImageBitmap`, `drawImage(glCanvas)`,
+`toDataURL` and *every* `readPixels` variant (default FB, complete `SAMPLES=0` user FBO, PBO,
+after `copyTexSubImage2D`) return transparent or `INVALID_OPERATION` + a zeroed buffer, while
+the canvas **displays** correctly. None of them throw. Under `LIBGL_ALWAYS_SOFTWARE=1` every
+one of them passes — that A/B is how you attribute this, since WebKit masks `RENDERER`.
+GPU→GPU is fine; only GPU→CPU fails.
+
+What still works and is the basis of any fix: a plain 2D canvas captures fine;
+`drawImage(VideoFrame)` onto a 2D canvas works (WebCodecs decodes in software, so frames are
+already in system memory); and cross-process `ImageBitmap` transfer over `BroadcastChannel`
+works. **The rule is: never read back from WebGL — ship frames that were never in GPU memory.**
+
+Consequences: the output window cannot be fed composited snapshots at all — it runs the
+compositor itself and receives per-deck frames instead (see "Rendering pipeline" and
+`src/lib/renderer/outputProtocol.ts`) — and **automated screenshot/pixel checks of compositor
+output silently verify nothing** on this machine. `LIBGL_ALWAYS_SOFTWARE=1` is not a usable workaround — it would put
+the 1920x1080 shader compositor on llvmpipe. See `docs/upstream/webgl-canvas-readback-broken.md`
+and Bug A in `docs/design/output-noise-and-track-reload-silence.md`.
 
 ## Constraints
 

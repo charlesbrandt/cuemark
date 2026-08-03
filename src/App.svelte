@@ -5,7 +5,6 @@
   import VisualizationPanel from "./components/VisualizationPanel.svelte";
   import { tapTempo } from "./lib/audio/bpm";
   import { startMidiListener } from "./lib/midi/handler";
-  import { Compositor } from "./lib/renderer/compositor";
   import { invoke } from "@tauri-apps/api/core";
   import {
     audioLoad, audioUnload, audioPlay, audioPause,
@@ -18,7 +17,7 @@
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { listen } from "@tauri-apps/api/event";
   import { registerVideoEl, unregisterVideoEl, setDeckAudioTime, getDeckTime, getVideoEl, seekDeck, getPendingSeekTarget, clearPendingSeekTarget, isScratching, registerCodecPlayer, unregisterCodecPlayer, getCodecPlayer, codecPlayerDeckIds } from "./lib/renderer/seekBus";
-  import { postFrame } from "./lib/renderer/outputBus";
+  import { postFrame, takeResendRequest, releaseDeck, type DeckFrameSource } from "./lib/renderer/outputBus";
   import DeckCard from "./components/DeckCard.svelte";
   import Crossfader from "./components/Crossfader.svelte";
   import WaveformCanvas from "./components/WaveformCanvas.svelte";
@@ -65,8 +64,12 @@
   }
   type BandAnalysis = { bass: number; mid: number; high: number };
 
-  let canvas: HTMLCanvasElement;
-  let compositor = $state<Compositor | undefined>(undefined);
+  // The control window no longer composites. Since 2026-08-03 it ships each deck's current
+  // frame to the output window, which runs the Compositor itself — snapshotting a WebGL
+  // canvas is impossible on this machine's GPU driver, so there is nothing to gain from
+  // compositing here and a whole WebGL context plus one 1920x1080 FBO per deck to lose.
+  // See src/lib/renderer/outputProtocol.ts.
+  let rendererReady = $state(false);
   // Per-deck FFT analysis received from GStreamer spectrum bus messages via Tauri events.
   const deckAnalysis = new Map<string, BandAnalysis>();
   let fftUnlisten: (() => void) | undefined;
@@ -673,7 +676,7 @@
       }).catch(() => {});
     }, 1000);
 
-    compositor = new Compositor(canvas);
+    rendererReady = true;
     let fftEventCount = 0;
     fftUnlisten = await listen<{ deckId: string; bass: number; mid: number; high: number }>(
       'audio-fft',
@@ -729,16 +732,27 @@
     }
   });
 
-  // Keep compositor FBOs and video elements in sync with the deck list.
+  // Keep video elements in sync with the deck list. (Compositor FBOs are allocated on the
+  // output window's side now, from the deck list carried in every frame message.)
   // syncVideoElements handles src changes, property sync, and play/pause.
   // rAF-throttled: rapid MIDI CC events (tempo fader at 14-bit = 200+/sec) are coalesced to
   // one syncVideoElements call per frame, preventing GStreamer from being overwhelmed with
   // rapid playbackRate changes that cause the pipeline to stall.
   let syncScheduled = false;
+  // Deck ids the output bus currently holds per-deck resources for, so they can be released
+  // when a deck is removed.
+  const shippedDeckIds = new Set<string>();
   $effect(() => {
     const decks = $session.decks; // read before early-return so Svelte always tracks it
-    if (!compositor) return;
-    compositor.syncDecks(decks.map((d) => d.id));
+    if (!rendererReady) return;
+    // Drop scratch canvases for decks that no longer exist (legacy <video> path only).
+    for (const id of shippedDeckIds) {
+      if (!decks.some((d) => d.id === id)) {
+        releaseDeck(id);
+        shippedDeckIds.delete(id);
+      }
+    }
+    for (const d of decks) shippedDeckIds.add(d.id);
     if (!syncScheduled) {
       syncScheduled = true;
       requestAnimationFrame(() => {
@@ -1133,9 +1147,17 @@
     }
     lastHeartbeatAt = nowMs;
     try {
-    if (compositor) {
+    if (rendererReady) {
       const { decks, visualization, visualizationOpacity } = get(session);
       const timeSecs = performance.now() / 1000;
+      // The output window asks for this when it opens or is reloaded. Forgetting what has
+      // already been shipped makes every deck count as changed below, so a paused deck —
+      // which will never produce a new frame on its own — reappears on the projector.
+      const resendRequested = takeResendRequest();
+      if (resendRequested) {
+        lastUploadedTime.clear();
+        lastUploadedCodecPts.clear();
+      }
       // Combine per-deck FFT data from GStreamer spectrum events: max across all playing decks.
       let bass = 0, mid = 0, high = 0;
       for (const a of deckAnalysis.values()) {
@@ -1144,19 +1166,28 @@
         high = Math.max(high, a.high);
       }
       const analysis: BandAnalysis = { bass, mid, high };
-      // Any shader deck (continuous u_time animation) or a video frame that actually
-      // advanced/seeked this tick makes the composited output stale.
-      let dirty = false;
+      // Any visualization (continuous u_time animation) or a video frame that actually
+      // advanced/seeked this tick makes the output stale.
+      // A resend must produce a message even when nothing else changed — otherwise a fresh
+      // output window with no decks loaded (or only paused, sourceless ones) never hears
+      // from us at all and sits on its "waiting for frames" state indefinitely.
+      let dirty = resendRequested;
+      // This tick's frame for each deck, in render order. A null source means "unchanged" —
+      // the output window keeps showing what that deck's FBO already holds, so a paused
+      // deck costs nothing per frame. Built for every deck, including sourceless ones, so
+      // the output window always learns the full deck list and opacity set.
+      const outputDecks: Array<{ id: string; opacity: number; source: DeckFrameSource | null }> =
+        decks.map((d) => ({ id: d.id, opacity: d.opacity, source: null }));
       for (const deck of decks) {
         if (deck.source?.type === 'video') {
           const v = videoEls.get(deck.id);
           const codecPlayer = getCodecPlayer(deck.id);
-          const fbo = compositor.getFBO(deck.id);
-          if (v && fbo && v.currentTime !== lastUploadedTime.get(deck.id)) {
+          const out = outputDecks.find((o) => o.id === deck.id)!;
+          if (v && v.currentTime !== lastUploadedTime.get(deck.id)) {
             lastUploadedTime.set(deck.id, v.currentTime);
-            fbo.uploadVideoFrame(v);
+            out.source = { kind: 'video', el: v };
             dirty = true;
-          } else if (codecPlayer && fbo) {
+          } else if (codecPlayer) {
             // Codec-path deck: no <video> element to read a currentTime from — pick the
             // frame whose pts matches the audio clock (same value the waveform consumes),
             // gated on actual pts change per CLAUDE.md's per-frame RAF rule.
@@ -1165,7 +1196,7 @@
               const frame = codecPlayer.getFrameForTime(t);
               if (frame && frame.timestamp !== lastUploadedCodecPts.get(deck.id)) {
                 lastUploadedCodecPts.set(deck.id, frame.timestamp);
-                fbo.uploadVideoFrameFromCodec(frame);
+                out.source = { kind: 'codec', frame };
                 dirty = true;
               }
             }
@@ -1355,13 +1386,12 @@
           }
         }
       }
-      // Global visualization layer — rendered separately from decks and composited above
-      // them, so picking a visualization never interrupts deck audio/video. It animates
-      // continuously (u_time), same as a per-deck shader used to, so it always marks the
-      // frame dirty.
+      // Global visualization layer — rendered by the output window's compositor, above all
+      // decks, so picking a visualization never interrupts deck audio/video. It animates
+      // continuously (u_time), so it always marks the frame dirty; only the uniforms and
+      // time ride along per frame, never the shader source (see outputProtocol.ts).
       if (visualization) {
         dirty = true;
-        compositor.renderVisualization(visualization.fragmentSrc, visualization.uniforms, timeSecs, analysis);
       }
       // Catch changes that don't come from per-frame video/visualization advancement:
       // opacity (crossfader), source swaps, deck add/remove, visualization toggle.
@@ -1372,8 +1402,14 @@
         dirty = true;
       }
       if (dirty) {
-        compositor.composite(decks, visualization ? visualizationOpacity : 0);
-        postFrame(canvas);
+        postFrame({
+          decks: outputDecks,
+          vizSrc: visualization?.fragmentSrc ?? null,
+          vizOpacity: visualization ? visualizationOpacity : 0,
+          vizUniforms: visualization?.uniforms ?? {},
+          time: timeSecs,
+          analysis,
+        });
       }
     }
     } catch (e) {
@@ -1448,22 +1484,14 @@
     </label>
   </header>
 
-  <!-- Compositor renders here; hidden from control window — visible only in Output Window.
-       NOT `display:none`: that gives the element no renderer at all, and WebKitGTK then
-       snapshots it as fully transparent — `createImageBitmap()` in postFrame() returned an
-       empty bitmap, so the output window received blank frames forever (measured 2026-08-02:
-       centrePixel=rgba(0,0,0,0) at frame #240 with video demonstrably playing). Same family
-       as this codebase's other WebKitGTK boundary failures (custom URI schemes, direct
-       video->texImage2D, VA-API DMA-BUF). Keep it laid out but off-screen and 1x1 in CSS —
-       the WebGL drawing buffer stays 1920x1080 because that is set by the width/height
-       attributes, not by CSS, so the capture is full-resolution while costing ~nothing to
-       composite in the control window. -->
-  <canvas
-    bind:this={canvas}
-    width={1920}
-    height={1080}
-    style="position:fixed; left:0; top:0; width:1px; height:1px; opacity:0.01; pointer-events:none; z-index:-1"
-  ></canvas>
+  <!-- The hidden 1x1 compositor canvas that used to live here is gone (2026-08-03). It
+       existed only to be snapshotted for the output window, and on this machine that
+       snapshot could never work: all GPU->CPU readback from WebGL is broken in the Mesa
+       `crocus` driver, so createImageBitmap() returned correctly-sized transparent frames
+       forever. The output window now composites for itself from per-deck frames — see
+       src/lib/renderer/outputProtocol.ts and docs/upstream/webgl-canvas-readback-broken.md.
+       If a composited preview is ever wanted *in* the control window, it needs its own
+       visible canvas and its own Compositor; do not reintroduce a hidden one to capture. -->
 
   <div class="main-layout">
     <div class="main-content">

@@ -221,8 +221,44 @@ Pattern (full working examples in `scripts/probes/`):
   2D canvas captures fine. So **a screenshot/pixel assertion against WebGL content proves
   nothing here** — a blank result is the platform, not your change. Verify WebGL rendering by
   *looking at the window*, not by capturing it.
-  Probe: `scripts/probes/offscreencanvas_webgl_capture_probe.py`;
-  upstream: `docs/upstream/webgl-canvas-capture-transparent.md`.
+
+  **Root-caused 2026-08-03: this is a Mesa `crocus` (Intel HD 4000, gen7) driver bug, not a
+  WebKit one** — every `readPixels` variant fails on hardware and every one passes under
+  `LIBGL_ALWAYS_SOFTWARE=1`. So it is specific to *this machine's GPU*: the same assertions
+  may work fine on other hardware, and a failure here is not evidence about WebKitGTK in
+  general. Before blaming WebKit for any rendering/readback fault, run the software arm —
+  WebKit masks `RENDERER`, so a driver bug is otherwise indistinguishable from a browser bug.
+  Probes: `scripts/probes/webgl_readback_variants_probe.py` (route matrix + software control),
+  `scripts/probes/webgl_readpixels_diag_probe.py` (why), and the original
+  `scripts/probes/offscreencanvas_webgl_capture_probe.py`;
+  upstream: `docs/upstream/webgl-canvas-readback-broken.md`.
+
+  **To verify compositor output anyway, run it under software GL.** `readPixels` and canvas
+  capture both work under `LIBGL_ALWAYS_SOFTWARE=1`, so a pixel assertion is possible — it just
+  cannot run on the hardware path. `scripts/probes/output_window_compositor_probe.py` does
+  exactly this for the output window: it loads the real `/output.html`, posts a synthetic frame
+  from a same-origin sender, and reads the composited result back, orientation included. Use it
+  as the pattern for any new compositor pixel check. Note the inversion of this project's usual
+  rule: llvmpipe results are normally the suspect ones, but for *compositing semantics and
+  orientation* — which are WebKit-level, not driver-level — the software arm is authoritative.
+
+### Two rules these probes were shipped without, and paid for (2026-08-03)
+
+- **Drive the real module, don't reimplement it in the probe page.** A `load_html` page given
+  the dev server's origin can `import` straight from it
+  (`import { postFrame } from '/src/lib/renderer/outputBus.ts'`) — Vite transforms it on
+  demand. The compositor probe originally hand-rolled its own
+  `createImageBitmap(canvas, {imageOrientation:'flipY'})` "the same way the sender does", passed
+  its orientation assertion, and the shipping app was upside down anyway: the real sender was
+  passing a `VideoFrame`, for which that option is silently ignored. A probe that reimplements
+  the code under test can only confirm its own assumptions.
+- **Verify a probe by breaking the code.** Reintroduce the defect, watch the probe go red, then
+  restore. A green assertion that has never been shown to fail is untested. Two minutes; it is
+  the only reason to trust a probe you just wrote.
+  ⚠️ Do this by editing the file and restoring from a copy — **not `git stash`**. Most of this
+  project's work sits uncommitted for long stretches, so a stash of one file reverts it to a
+  commit that may predate the entire feature (hit live 2026-08-03: it rewound `outputBus.ts`
+  past the whole output-window architecture).
 
 ## Simulating freezes and crashes (for watchdog/recovery testing)
 
@@ -298,7 +334,7 @@ post-reload state:
   against a blank image, which is worse than no check: this is precisely how three sessions
   concluded "the data path is provably healthy" while the screen showed garbage. Verify
   WebGL rendering by looking at the window. Upstream:
-  `docs/upstream/webgl-canvas-capture-transparent.md`.
+  `docs/upstream/webgl-canvas-readback-broken.md`.
   ```sh
   RESULT=$(js_sync "return document.querySelectorAll('canvas')[0].toDataURL('image/png');")
   echo "$RESULT" | python3 -c "

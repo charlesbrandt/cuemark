@@ -59,7 +59,10 @@ export class Compositor {
   readonly height: number;
 
 
-  constructor(canvas: HTMLCanvasElement) {
+  // `label` distinguishes which window's context a log line came from. Since 2026-08-03 the
+  // real compositor runs in the *output* window (see outputProtocol.ts), so "which process
+  // is this?" is the first question any GL log line here has to answer.
+  constructor(canvas: HTMLCanvasElement, label = "compositor") {
     const gl = canvas.getContext("webgl2", { preserveDrawingBuffer: true });
     if (!gl) throw new Error("WebGL2 not available");
     this.gl = gl;
@@ -74,11 +77,17 @@ export class Compositor {
     // MacBook Pro Retina (Intel HD 4000 + NVIDIA GK107M, 3840x2400 @ dpr=2, Wayland,
     // WebKitGTK 2.52.3) while the same code works on other systems. Without the GL
     // implementation in the log, a report from another machine can't be compared to one from
-    // here at all. Note WebKitGTK sanitises the renderer string ("Apple GPU" on Linux) — it
-    // identifies the WebKit build's policy, not the actual hardware.
+    // here at all.
+    //
+    // ⚠️ These strings do NOT identify the GPU. WebKit sanitises both — RENDERER is
+    // "WebKit WebGL" and even WEBGL_debug_renderer_info's unmasked value is "Apple GPU" on
+    // Linux. That masking is exactly why Bug A was misattributed to WebKitGTK for three
+    // sessions when the fault was in Mesa's `crocus` driver. To identify the actual GL
+    // stack, A/B with LIBGL_ALWAYS_SOFTWARE=1 from outside the page; see
+    // docs/upstream/webgl-canvas-readback-broken.md.
     const dbg = gl.getExtension("WEBGL_debug_renderer_info");
     debugLog(
-      `[compositor] gl: version=${gl.getParameter(gl.VERSION)} ` +
+      `[${label}] gl: version=${gl.getParameter(gl.VERSION)} ` +
         `renderer=${gl.getParameter(gl.RENDERER)} ` +
         `unmasked=${dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : "n/a"} ` +
         `maxTex=${gl.getParameter(gl.MAX_TEXTURE_SIZE)} ` +

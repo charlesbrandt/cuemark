@@ -211,7 +211,7 @@ transparent through a working capture.
 **Probed 2026-08-02, and it is worse than "one broken call".**
 `scripts/probes/offscreencanvas_webgl_capture_probe.py` reproduces this in a bare
 `Gtk.Window` with no cuemark code at all — it is an upstream WebKitGTK bug, written up in
-`docs/upstream/webgl-canvas-capture-transparent.md`. Identical results in both DMA-BUF arms:
+`docs/upstream/webgl-canvas-readback-broken.md`. Identical results in both DMA-BUF arms:
 
 ```
 onscreen-drawImage         = FAIL(transparent)
@@ -254,6 +254,134 @@ draws are clean (`errAfterDraw=0x0`). Trust the on-screen canvas, not those numb
 works on other systems. This one is a 2012 MacBook Pro Retina: Intel HD 4000 (Ivy Bridge) +
 NVIDIA GK107M, 3840x2400 panel at `dpr=2`, Wayland, WebKitGTK 2.52.3. A1 in particular looks
 specific to this WebKit/driver combination.
+
+### ROOT-CAUSED 2026-08-03 — A1 is a **Mesa `crocus` driver** bug, and the noise is not corruption at all
+
+Two findings, from `scripts/probes/webgl_readpixels_diag_probe.py` and
+`scripts/probes/webgl_readback_variants_probe.py`. Full evidence:
+`docs/upstream/webgl-canvas-readback-broken.md`.
+
+**1. The layer was wrong. It is not WebKit.** Every GPU→CPU route out of a `webgl2` context
+fails here — `readPixels` on the default framebuffer *and* on a framebuffer-complete,
+`SAMPLES=0` user FBO (texture-backed, RGBA8-texture, and renderbuffer variants alike), with
+an explicit `readBuffer()`, through a `PIXEL_PACK_BUFFER` + `getBufferSubData`, and after a
+`copyTexSubImage2D` — all `INVALID_OPERATION` (`0x502`) with a zeroed buffer. Under
+`LIBGL_ALWAYS_SOFTWARE=1`, **same build, same page, same calls, every one of them passes.**
+The GPU in use is the Intel HD 4000 (gen7) on Mesa `crocus`; the NVIDIA card has no render
+node and is not involved.
+
+This kills the hypotheses this file spent three sessions on, and one it never reached:
+
+- Not the multisample resolve. `antialias:false` gives `SAMPLES=0` and changes nothing, and
+  a user FBO is never multisampled — so the earlier reading of `0x502` as "correct behaviour
+  for a multisample FB" is wrong too.
+- Not WebKit's GPU process: `UseGPUProcessForWebGL` is `false` by default in this build.
+- Not compositing mode: reproduces under `WEBKIT_DISABLE_DMABUF_RENDERER=1` and
+  `WEBKIT_DISABLE_COMPOSITING_MODE=1` alike.
+- Not `getError()` lying: a drained context reports `NO_ERROR`, and clears, draws, FBO
+  creation and `copyTexSubImage2D` are all `0x0`. Only `readPixels` fails.
+
+**GPU→GPU works; only GPU→CPU is broken.** That is exactly why the canvas displays correctly
+while every snapshot of it comes back transparent.
+
+**2. The noise was never corruption — nothing was ever drawn.** `postFrame()` ships a
+transparent bitmap; `output.ts` did `ctx.drawImage(frame, …)` under the default `source-over`
+compositing, where a fully transparent source **writes nothing**; and `output.ts` never
+cleared the canvas. So no pixel of that canvas had ever been written, and what was on screen
+was its own uninitialised GPU-backed surface. The horizontal bands are untouched surface
+tiles — which is also why "reopen the window fresh" never helped and why the shape changed
+between reproductions for no apparent reason.
+
+Fixed in `output.ts`: `clearRect()` before every `drawImage` (and after every resize), so an
+empty transport now shows honest black instead of garbage. Plus `frameIsBlank()` — an 8x8
+downscale + `getImageData` on the incoming bitmap, checked on the first frame and once a
+second — which logs `blank=true/false` and shows a small dim corner indicator. **This is a
+correct fix for the visible symptom and a real improvement in observability, but it does not
+put video on the projector.** That needs a transport change; see below.
+
+**3. `LIBGL_ALWAYS_SOFTWARE=1` is not the workaround.** It would move the entire 1920x1080
+shader compositor onto llvmpipe on a 2012 CPU — far worse than the ~26 main-thread CPU points
+that retiring `WEBKIT_DISABLE_DMABUF_RENDERER` just recovered (Bug E).
+
+### Revised options for actually getting frames to the output window
+
+The constraint is now precise, and narrower than "capture is broken": **never read back from
+WebGL.** Anything that was in GPU memory cannot come out. Three things are known to work and
+are load-bearing here:
+
+- a plain 2D canvas captures fine (`drawImage`, `createImageBitmap`, `getImageData`);
+- **`drawImage(VideoFrame, …)` onto a 2D canvas works** — `DeckCard.svelte`'s per-deck preview
+  does exactly this and renders correctly on this machine. WebCodecs frames are decoded in
+  software (libavcodec) into system memory, so they never touch the broken path;
+- cross-process `ImageBitmap` transfer over `BroadcastChannel` works — the output window has
+  been receiving correctly-sized bitmaps every frame all along. Only their contents were empty.
+
+Given that, the earlier option list is superseded:
+
+1. **~~2D-canvas compositing for the output path~~ — viable, and cheaper than it looked.**
+   Compositing decks with `drawImage(VideoFrame)` + `globalAlpha` covers deck opacity and the
+   crossfader, i.e. the core of the output. It still costs the GLSL effect chain and the
+   visualization layer, so it remains a feature regression — but it is a small, contained
+   change and it is the fastest route to a working projector.
+2. **Composite inside the output window — CHOSEN AND BUILT 2026-08-03, see below.**
+3. **`docs/design/native-output-pipeline.md`** — GStreamer-native second output, no webview
+   in the loop. CLAUDE.md requires an explicit decision; **do not start without one.**
+4. **Report upstream and accept it on this machine.** Now well-founded: the bug is in Mesa
+   `crocus`, so this is one old GPU, and the output window genuinely does work elsewhere.
+
+### BUILT 2026-08-03 — the compositor moved to the output window
+
+Option 2, implemented. The contract and its rationale live in
+`src/lib/renderer/outputProtocol.ts`; CLAUDE.md's "Rendering pipeline" has the diagram. In
+short: the control window no longer composites or captures anything — it has **no WebGL
+context at all** — and instead ships each deck's current frame as an `ImageBitmap` plus the
+state needed to blend them. The output window runs the existing `Compositor` unchanged,
+keeping the GLSL effect chain and the visualization layer.
+
+| | |
+|---|---|
+| `src/lib/renderer/outputProtocol.ts` | New. Message contract: `frame` (per-deck bitmaps + opacities + viz uniforms/time/analysis), `viz` (shader source, on change only), `hello` (receiver asks for a full re-send) |
+| `src/lib/renderer/outputBus.ts` | Rewritten as the sender: `VideoFrame`/`<video>` → `ImageBitmap` → `BroadcastChannel` |
+| `src/output.ts` | Rewritten: owns a `Compositor`, uploads bitmaps into deck FBOs, renders viz, composites |
+| `src/lib/renderer/fbo.ts` | `uploadImageBitmap()`; scratch canvas now lazy; **FBOs clear themselves on creation** |
+| `src/App.svelte` | Compositor, its 1x1 hidden canvas and all FBO uploads removed; builds the per-deck source list instead |
+
+**Three things this surfaced that were not obvious, all probe-verified:**
+
+1. **`createImageBitmap(VideoFrame)` works on the real GPU.** WebCodecs decodes in software
+   into system memory, so decoded frames never take the broken readback path.
+   (`imagebitmap_upload_probe.py`) *Superseded in part:* it carries real pixels, but the
+   sender still routes codec frames through a scratch canvas — see item 2.
+2. **Orientation is silently ignored in two different places, and only one combination
+   works.** `UNPACK_FLIP_Y_WEBGL` is ignored for `ImageBitmap` sources (no GL error, unflipped
+   pixels), so `uploadImageBitmap()` sets no pixel-store flag and the sender decides
+   orientation via `createImageBitmap(..., {imageOrientation:'flipY'})`. **That option is in
+   turn ignored for a `VideoFrame` source** — honored only for a canvas. Shipping codec frames
+   straight from the `VideoFrame` therefore put the projector upside down for real, live, on
+   2026-08-03 (fixed same day: every source now goes through the scratch canvas). Both
+   failures are WebKit-level, identical under llvmpipe and on hardware, and neither throws.
+   This is the *third* time an orientation assumption has bitten this project — see
+   `uploadVideoFrameFromCodec`'s doc comment for the first two.
+3. **A freshly allocated `DeckFBO` contained undefined GPU memory.** `texImage2D(..., null)`
+   allocates without defining contents, and an empty or not-yet-decoded deck is still
+   composited at its own opacity — so the compositor could blit uninitialised memory to the
+   projector. This is the *same* failure mode as the uninitialised 2D canvas that produced
+   the original noise, in a second place nobody had looked. FBOs now clear to transparent
+   black on creation. **Plausibly a contributor to the original Bug A noise reports** — it
+   would have applied to the old control-side compositor identically.
+
+**Verification — CONFIRMED LIVE 2026-08-03.** User-observed with video playing: the output
+window shows the composited image, correct content, no noise. That is what makes Bug A fixed.
+
+Getting there took one more round. The first live look was upside down (see the
+`imageOrientation`/`VideoFrame` failure in item 2 above), *despite*
+`scripts/probes/output_window_compositor_probe.py` passing its orientation assertion — because
+that probe's sender hand-rolled a bitmap from a canvas instead of calling the real
+`postFrame()`, so it exercised the one source type that works. **The probe now imports
+`outputBus.ts` from the dev server and drives it with a `kind:'codec'` source, and it has been
+verified in both directions**: reintroducing the direct-from-`VideoFrame` bitmap turns it red
+(`screenBottom=RED`), the fix turns it green (`screenBottom=BLUE`). A green assertion that has
+never been shown to fail proves nothing — which is precisely how this shipped upside down.
 
 ### Fix attempts (both real, neither resolved the symptom)
 

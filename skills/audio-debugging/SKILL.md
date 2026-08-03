@@ -421,7 +421,10 @@ responsiveness watchdog deliberately self-trapped because the JS main thread was
 Tauri/wry doesn't currently detect or recover from this; the window stays frozen until killed and
 relaunched. Root cause was an unbounded backlog in `outputBus.ts`'s `postFrame()` (no backpressure —
 fixed with an in-flight guard) compounding with genuinely heavy per-frame work (WebGL composite +
-canvas capture + cross-process `postMessage` for two simultaneous decks).
+canvas capture + cross-process `postMessage` for two simultaneous decks). The in-flight guard is
+still there and still load-bearing; the work behind it changed on 2026-08-03, when compositing
+and canvas capture moved out of this process entirely (the control window no longer has a WebGL
+context) and `postFrame()` became per-deck `createImageBitmap` + `postMessage`.
 
 **Debugging WebKit's *internal* GStreamer pipeline requires a global `GST_DEBUG` threshold, not just
 named categories.** `GST_DEBUG=uridecodebin:5,decodebin:5` shows plenty for our own Rust process but
@@ -616,6 +619,18 @@ until 2026-08-02, so nobody had ever *looked* at what the compositor produced; m
 visible showed the identical corruption in the **control** window. One stale workaround, two
 bugs that looked unrelated, chased separately for weeks. See "ROOT-CAUSED 2026-08-02 (late)"
 in the same doc.
+
+⚠️ **UPDATE 2026-08-03: the *remaining* half of that bug was a GPU driver defect, not WebKit.**
+Retiring the env var fixed the compositor canvas but the output window still showed noise. Cause:
+**all GPU→CPU readback from WebGL fails on this machine's Mesa `crocus` driver** — `readPixels`
+returns `INVALID_OPERATION` + a zeroed buffer even from a complete, non-multisampled FBO, and
+every canvas snapshot returns transparent, none of it raising. Every route passes under
+`LIBGL_ALWAYS_SOFTWARE=1`; that A/B is the only way to tell, because WebKit masks `RENDERER`
+("WebKit WebGL", "Apple GPU"). **Before blaming WebKitGTK for any rendering fault, run the
+software arm.** The noise itself was not corruption at all: nothing was ever drawn to the output
+canvas (a transparent source under `source-over` writes nothing, and it was never cleared), so
+the screen showed uninitialised surface memory. The compositor now lives in the output window.
+See `docs/upstream/webgl-canvas-readback-broken.md` and Bug A's "BUILT 2026-08-03" section.
 
 **Debugging technique worth stealing**: when output is wrong and every log says the data is
 fine, *display the intermediate surface*. Give the hidden canvas a real size and a bright
@@ -1092,7 +1107,9 @@ fact rather than trying to pre-filter what's "interesting" live.
 | `src-tauri/src/midi.rs` | MIDI event loop, log throttle, 14-bit rate decoding |
 | `src-tauri/src/media_server.rs` | Local HTTP server for prod video serving (replaces `media://`) |
 | `src/App.svelte` | Video element creation (muted, crossOrigin), rAF-throttled syncVideoElements, render loop |
-| `src/lib/renderer/outputBus.ts` | Output Window frame capture/transport — has backpressure guard |
+| `src/lib/renderer/outputBus.ts` | Output Window frame transport (sender) — per-deck ImageBitmaps, has backpressure guard |
+| `src/lib/renderer/outputProtocol.ts` | Control<->output message contract, and why frames rather than snapshots |
+| `src/output.ts` | Output Window — **owns the Compositor** since 2026-08-03 |
 | `journal.md` | Session notes — decisions and symptoms from past debugging |
 
 ## VA-API hardware decode status (as of 2026-06-20)

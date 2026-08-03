@@ -27,11 +27,12 @@ The Bug A investigation (`output-noise-and-track-reload-silence.md`) found a gen
 WebKitGTK graphics defect, so this doc was explicitly reconsidered. It comes closest to the
 fourth trigger, but does not meet it:
 
-- **The defect is external, single-host and non-blocking.** Reading pixels back out of a
-  WebGL canvas returns transparent on WebKitGTK 2.52.3 on a 2012 MacBook Pro Retina —
-  reproducible in a bare `Gtk.Window` with no cuemark code
-  (`scripts/probes/offscreencanvas_webgl_capture_probe.py`,
-  `docs/upstream/webgl-canvas-capture-transparent.md`). The output window works on the
+- **The defect is external, single-host and non-blocking.** All GPU→CPU readback from a
+  WebGL context fails on a 2012 MacBook Pro Retina — reproducible in a bare `Gtk.Window`
+  with no cuemark code, and **root-caused 2026-08-03 to the Mesa `crocus` driver, not
+  WebKitGTK**: every route passes under `LIBGL_ALWAYS_SOFTWARE=1`
+  (`scripts/probes/webgl_readback_variants_probe.py`,
+  `docs/upstream/webgl-canvas-readback-broken.md`). The output window works on the
   user's other systems. Rewriting the rendering stack to route around one machine's driver
   bug is a permanent cost against a temporary, external fault.
 - **The symptom that felt structural wasn't.** The corruption — growing bands of
@@ -39,10 +40,13 @@ fourth trigger, but does not meet it:
   `WEBKIT_DISABLE_DMABUF_RENDERER=1`, a stale one-line workaround whose premise died in
   `f6b94ea`. Removing it fixed the corruption *and* ~26 points of main-thread CPU. That is
   the opposite of "mitigation can't absorb it".
-- **Crucially, only *capture* is broken — display works.** So the cheap fix is to composite
-  inside the output window and never capture at all, which needs no native pipeline. A 2D
-  compositing fallback is also proven working on this machine (at the cost of the GLSL
-  effect chain and the shader visualization layer).
+- **Crucially, only *readback* is broken — display works.** So the cheap fix was to composite
+  inside the output window and never read back at all, which needs no native pipeline. **That
+  is now built** (2026-08-03; see Bug A's "BUILT" section and
+  `src/lib/renderer/outputProtocol.ts`), which weakens the case for this doc further rather
+  than strengthening it: the output window already runs its own `Compositor` fed by per-deck
+  frames, so the webview path retains the full GLSL effect chain and visualization layer on
+  the affected machine.
 
 **What would still justify reopening**, unchanged by any of the above: wanting the projector
 output to survive the control window dying, multiple outputs, 4K@60, or NDI/capture-card

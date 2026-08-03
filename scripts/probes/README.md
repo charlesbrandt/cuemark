@@ -25,17 +25,31 @@ mirror `main.rs` so results reflect the app's real conditions.
 | `webcodecs_decode_only_probe.py` | Does `VideoDecoder` actually decode real H.264 annex-B AUs correctly? (host-encodes via GStreamer/x264, pixel-checks output, tests flush+keyframe reseek) | 60/60 frames, pixel-exact, reseek 5 ms |
 | `webcodecs_perf_probe.py` | 1080p decode throughput; `texImage2D(VideoFrame)`→WebGL viability; `drawImage` fallback cost (`PROBE_W/H/N` env to change resolution) | 153–165 fps decode; texImage2D works (no SIGTRAP), 24 ms/f on llvmpipe — re-measure on real GPU; drawImage 6.7 ms/f |
 | `encoder_crash_repro.py` | `VideoEncoder` crash triggers (`isconfig` / `configure` / `construct` arg) | `isConfigSupported` and `configure()` SIGABRT the web process; bare construction survives. Upstream draft: `docs/upstream/videoencoder-crash.md` |
-| `offscreencanvas_webgl_capture_probe.py` | Can pixels be got **out of** a WebGL canvas? Tests `drawImage`, `createImageBitmap`, `OffscreenCanvas`+`transferToImageBitmap`, `readPixels`, `toDataURL`, plus a 2D-canvas control | 2026-08-02: every WebGL route FAILS (transparent / unsupported / `0x502`), 2D control PASSES, identical in both DMA-BUF arms. Upstream draft: `docs/upstream/webgl-canvas-capture-transparent.md` |
+| `offscreencanvas_webgl_capture_probe.py` | Can pixels be got **out of** a WebGL canvas? Tests `drawImage`, `createImageBitmap`, `OffscreenCanvas`+`transferToImageBitmap`, `readPixels`, `toDataURL`, plus a 2D-canvas control | 2026-08-02: every WebGL route FAILS (transparent / unsupported / `0x502`), 2D control PASSES, identical in both DMA-BUF arms |
+| `webgl_readback_variants_probe.py` | Is *any* readback route intact? Attachment kinds (unsized RGBA / RGBA8 texture / RGBA8 renderbuffer), explicit `readBuffer`, PBO + `getBufferSubData`, `copyTexSubImage2D`-then-read — with a `LIBGL_ALWAYS_SOFTWARE=1` control arm | 2026-08-03: **all 6 FAIL on hardware, all 6 PASS on llvmpipe** → Mesa `crocus` bug, not WebKit. `docs/upstream/webgl-canvas-readback-broken.md` |
+| `webgl_readpixels_diag_probe.py` | *Why* a readback failed: returned bytes alongside the GL error, `getError()` sanity, FB completeness, `IMPLEMENTATION_COLOR_READ_FORMAT/TYPE`, and a GPU-side blit control | 2026-08-03: `getError()` is honest, FB is complete with `SAMPLES=0`, draws/clears/blits all `0x0` — only `readPixels` fails, with a zeroed buffer |
+| `imagebitmap_upload_probe.py` | Upload semantics for the output-window compositor: does `createImageBitmap(VideoFrame)` carry real pixels, and **per source type**, does the Y-flip come from `UNPACK_FLIP_Y_WEBGL` or from `imageOrientation`? | 2026-08-03: `createImageBitmap(VideoFrame)` **PASS on hardware too** (frames are in system memory); `UNPACK_FLIP_Y_WEBGL` **silently ignored for ImageBitmap**; `imageOrientation:'flipY'` PASS for a **canvas** source but **silently ignored for a `VideoFrame` source** (`orient/videoframe-flipY=FAIL`, same under llvmpipe and hardware — a WebKit bug, not a driver one). Only canvas + `imageOrientation` actually flips. |
+| `output_window_compositor_probe.py` | End-to-end: loads the **real** `/output.html`, drives the **real** `outputBus.postFrame()` from a same-origin sender with a codec (`VideoFrame`) deck source, reads the composited pixels back out, and asserts orientation | 2026-08-03: `buffer=1920x1080 screenBottom=BLUE screenTop=RED glErr=0x0` — receiver boots, composites, right way up. Negative control: reintroducing the direct-from-`VideoFrame` bitmap flips it to `screenBottom=RED`. An earlier version hand-rolled its own bitmap from a canvas and passed while the app was upside down — a probe that reimplements the code under test only confirms its own assumptions. |
 
-**Run `offscreencanvas_webgl_capture_probe.py` before designing anything that moves rendered
-content between windows or processes.** It answered in minutes what three sessions of Bug A
-could not, and it killed a proposed `OffscreenCanvas` rewrite of `compositor.ts` that this
-build cannot support. It needs no Xvfb and takes seconds:
+**Run the readback probes before designing anything that moves rendered content between
+windows or processes.** They answered in minutes what three sessions of Bug A could not: the
+first killed a proposed `OffscreenCanvas` rewrite of `compositor.ts` that this build cannot
+support, and the second two moved the fault from WebKitGTK to the GPU driver — which changes
+what a fix can even look like. They need no Xvfb and take seconds:
 
 ```sh
 python3 scripts/probes/offscreencanvas_webgl_capture_probe.py
 WEBKIT_DISABLE_DMABUF_RENDERER=1 python3 scripts/probes/offscreencanvas_webgl_capture_probe.py
+
+python3 scripts/probes/webgl_readback_variants_probe.py                      # hardware
+LIBGL_ALWAYS_SOFTWARE=1 python3 scripts/probes/webgl_readback_variants_probe.py   # control
 ```
+
+⚠️ **Always run the `LIBGL_ALWAYS_SOFTWARE=1` arm before blaming WebKit for a rendering or
+readback fault.** WebKit masks `RENDERER` (`"WebKit WebGL"`, and `"Apple GPU"` via
+`WEBGL_debug_renderer_info`), so the GPU in use is invisible from inside the page and a driver
+bug looks exactly like a browser bug. That one extra run is the difference between a filed
+WebKitGTK report and the actual cause.
 
 Prereqs (all present on this machine): `python3-gi`, `gir1.2-webkit2-4.1`, `Xvfb`,
 GStreamer with `x264enc` (`gstreamer1.0-plugins-ugly`).
