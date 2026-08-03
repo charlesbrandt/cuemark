@@ -32,9 +32,25 @@ fn main() {
     println!("cargo:rustc-env=CUEMARK_GIT_DIRTY={dirty}");
     println!("cargo:rustc-env=CUEMARK_BUILT_AT={built_at}");
 
-    // Rebuild when the commit changes, so the stamped SHA doesn't go stale after a
-    // commit/checkout that leaves the sources byte-identical. Worktree dirtiness is not
-    // tracked here — any edit that makes it dirty already triggers a rebuild on its own.
+    // Emitting ANY `rerun-if-changed` opts this script out of cargo's default behaviour of
+    // re-running it whenever a package file changes — so every input must now be declared
+    // explicitly, including the sources themselves.
+    //
+    // This line is the fix for a stamp that lied (2026-08-02). The previous version tracked
+    // only the git HEAD refs, reasoning that "worktree dirtiness is not tracked here — any
+    // edit that makes it dirty already triggers a rebuild on its own". An edit does rebuild
+    // the *crate*, but it does not re-run *this script*: cargo reused the cached build-script
+    // output, so a binary built from uncommitted changes to `watchdog.rs` was stamped
+    // `00b9129 (clean)` with a build timestamp an hour old. That is the exact failure this
+    // file exists to prevent, and it is worse than having no stamp, because CLAUDE.md tells
+    // readers to trust this line before diagnosing anything from a log.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=tauri.conf.json");
+
+    // Rebuild when the commit changes too, so the stamped SHA doesn't go stale after a
+    // commit/checkout that leaves the sources byte-identical (which the `src` watch above
+    // would not notice).
     if let Some(git_dir) = git(&["rev-parse", "--absolute-git-dir"]) {
         println!("cargo:rerun-if-changed={git_dir}/HEAD");
         if let Some(head_ref) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
