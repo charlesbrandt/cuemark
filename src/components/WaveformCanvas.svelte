@@ -2,6 +2,7 @@
   import { analyzeFile, COLOR_UPCOMING, COLOR_PLAYED } from '../lib/audio/waveform';
   import { seekDeck, getDeckTime, quantizeToGrid, scratchingDecks } from '../lib/renderer/seekBus';
   import { getDiggerFileUrl } from '../lib/digger/api';
+  import { recordAuxLoop } from '../lib/audio/pollStats';
   import type { Deck } from '../lib/state/types';
 
   let {
@@ -25,6 +26,30 @@
   // Playhead is pinned 25% from left in zoom mode so both decks align at the same X
   const ZOOM_LEAD_RATIO = 0.25;
   const HOT_COLORS = ['#00e8ff', '#ffcc00', '#ff44cc', '#44ff88'];
+
+  // Pre-rasterized overview bars, one offscreen canvas per colour scheme.
+  //
+  // drawOverview() used to walk every peak (11,583 on a 6:26 track) with a fillStyle
+  // change and a fillRect per bar, on *every* frame — 13-15ms of JS per draw at a 2496px
+  // canvas, 8-9% of main-thread wall time per playing deck, plus an unmeasurable amount of
+  // canvas paint after the JS returns. The bars are static for a given (peaks, canvas size,
+  // gain), so rasterize them once and blit per frame; the played/upcoming colour split
+  // becomes two source-rect blits either side of the playhead. A/B'd to <=1ms per draw and
+  // 0% busy (docs/design/control-window-frame-budget.md §4) — note that this bought only
+  // ~1fps, because a half-vsync rAF throttle sits behind it. It is kept for the tail: gap
+  // p90 47ms -> 34ms, max 187ms -> 47ms.
+  //
+  // Deliberately a plain `let`, not `$state`: this is a derived cache written from inside
+  // the drawing path, and making it reactive would re-enter the effect that draws it.
+  type OverviewCache = {
+    peaks: Float32Array;
+    w: number;
+    h: number;
+    gainKey: number;
+    upcoming: HTMLCanvasElement;
+    played: HTMLCanvasElement;
+  };
+  let overviewCache: OverviewCache | null = null;
 
   $effect(() => {
     if (deck.source?.type !== 'video') {
@@ -132,6 +157,12 @@
     // root cause (a Svelte store-equality gotcha), and docs/design/pcm-buffer-playback.md
     // for the full investigation.
     function loop() {
+      // Timed into [aux-loop]: shares the rAF turn with App.svelte's frame() but is not
+      // counted by frame-dur — see recordAuxLoop's doc comment. The one-device-pixel guard
+      // below makes the redraw rate depend on zoom and track length, so `drew` is reported
+      // separately from `n`: in zoom mode the playhead clears a pixel far more often.
+      const t0 = performance.now();
+      let drew = false;
       const t = getDeckTime(deck.id) ?? 0;
       const w = c.width || 1;
       const span = zoom ? zoomSeconds : (deck.source?.type === 'video' ? deck.source.duration : 1);
@@ -139,7 +170,16 @@
       if (Math.abs(t - lastDrawnTime) * pxPerSec >= 1) {
         draw(c);
         lastDrawnTime = t;
+        drew = true;
       }
+      // Canvas dimensions are in the bucket label because bar count scales with width and
+      // was an uncontrolled variable across earlier measurement runs — the same file in the
+      // same mode read 12-14fps once and 21.8-23.4fps later, and nothing in the log said why.
+      recordAuxLoop(
+        `waveform${zoom ? '/zoom' : ''}/${deck.id}@${c.width}x${c.height}`,
+        performance.now() - t0,
+        drew,
+      );
       rafId = requestAnimationFrame(loop);
     }
     rafId = requestAnimationFrame(loop);
@@ -195,7 +235,7 @@
     } else if (zoom) {
       drawZoom(ctx, W, H, mid, currentTime, duration);
     } else {
-      drawOverview(ctx, W, H, mid, currentTime, duration);
+      drawOverview(ctx, W, H, currentTime, duration);
     }
 
     // Depth gradient: darken top and bottom edges
@@ -216,23 +256,59 @@
     ctx.stroke();
   }
 
-  function drawOverview(
-    ctx: CanvasRenderingContext2D,
-    W: number, H: number, mid: number,
-    currentTime: number, duration: number
-  ) {
+  /**
+   * Build (or reuse) the two static bar layers for the overview.
+   *
+   * `deck.gain` scales both bar height and colour, so it belongs in the key — but it is a
+   * MIDI-driven continuous control, and keying on the raw float would rebuild on every
+   * 14-bit tick of a knob sweep. Quantizing to 1/100 caps a sweep at 100 rebuilds (never
+   * worse than the every-frame redraw this replaces) and is visually indistinguishable.
+   */
+  function rasterizeOverview(W: number, H: number): OverviewCache {
     const p = peaks!;
-    const playheadX = (currentTime / duration) * W;
+    const gainKey = Math.round(deck.gain * 100) / 100;
+    const cached = overviewCache;
+    if (cached && cached.peaks === p && cached.w === W && cached.h === H && cached.gainKey === gainKey) {
+      return cached;
+    }
+
+    // Reuse the canvas objects when only the gain changed; assigning width/height also
+    // clears them, which is the cheapest way to discard the previous raster.
+    const upcoming = cached?.upcoming ?? document.createElement('canvas');
+    const played = cached?.played ?? document.createElement('canvas');
+    const mid = H / 2;
     const barW = W / p.length;
 
-    for (let i = 0; i < p.length; i++) {
-      const x = i * barW;
-      const amp = p[i] * deck.gain;
-      const h = Math.max(1, amp * mid * 0.92);
-      const colorIdx = Math.min(255, Math.floor(amp * 255));
-      ctx.fillStyle = x < playheadX ? COLOR_PLAYED[colorIdx] : COLOR_UPCOMING[colorIdx];
-      ctx.fillRect(Math.floor(x), mid - h, Math.max(1, Math.ceil(barW)), h * 2);
+    for (const [layer, lut] of [[upcoming, COLOR_UPCOMING], [played, COLOR_PLAYED]] as const) {
+      layer.width = W;
+      layer.height = H;
+      const lctx = layer.getContext('2d');
+      if (!lctx) continue;
+      for (let i = 0; i < p.length; i++) {
+        const amp = p[i] * gainKey;
+        const h = Math.max(1, amp * mid * 0.92);
+        lctx.fillStyle = lut[Math.min(255, Math.floor(amp * 255))];
+        lctx.fillRect(Math.floor(i * barW), mid - h, Math.max(1, Math.ceil(barW)), h * 2);
+      }
     }
+
+    overviewCache = { peaks: p, w: W, h: H, gainKey, upcoming, played };
+    return overviewCache;
+  }
+
+  function drawOverview(
+    ctx: CanvasRenderingContext2D,
+    W: number, H: number,
+    currentTime: number, duration: number
+  ) {
+    const { upcoming, played } = rasterizeOverview(W, H);
+    const playheadX = (currentTime / duration) * W;
+
+    // Split on an integer boundary — a fractional source rect makes drawImage resample,
+    // which both costs more and softens the bars by a pixel.
+    const split = Math.max(0, Math.min(W, Math.round(playheadX)));
+    if (split > 0) ctx.drawImage(played, 0, 0, split, H, 0, 0, split, H);
+    if (split < W) ctx.drawImage(upcoming, split, 0, W - split, H, split, 0, W - split, H);
 
     drawMarkers(ctx, W, H, (t) => (t / duration) * W);
 

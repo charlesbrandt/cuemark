@@ -204,6 +204,21 @@ failure modes above from silent to obvious.
 | `HMR update` / `page reload` | Frontend hot-reload fired |
 | `Watching … for changes` | Tauri watching Rust source; will rebuild on next `.rs` save |
 
+## Measuring CPU of a running app
+
+**`ps %cpu` is a lifetime average and is useless here.** On a 2-hour-old process it reported
+7.3% while the process was genuinely at 64%. Always take a delta sample and read the *second*
+iteration:
+
+```bash
+top -b -n 2 -d 3 -p $(pgrep -x cuemark) -p $(pgrep -f 'webkit2gtk-4.1/WebKitWebProcess' | head -1) \
+  | awk '/PID|WebKit|cuemark/' | tail -3
+```
+
+Reference points measured 2026-08-03 with one deck playing, projector closed:
+`WebKitWebProcess` 36–64%, `cuemark` 18–25%. A webview far above its main-thread `busy%`
+(see CLAUDE.md's instrumentation notes) means the cost is in paint/composite, not JS.
+
 ## Performance pitfalls / common causes of freezes
 
 ### UI freeze on first track load — mutex held during GStreamer preroll
@@ -252,6 +267,49 @@ process state before assuming either:
    (evaluating '$$props.deck.bpm.toFixed')`) in seconds once the console was checked, after
    significant time spent ruling out mutex/GStreamer/native-freeze theories first. See
    `digger-integration` skill's gotcha on `bpm`/`downbeat` for that specific bug's root cause.
+
+### Transport readout frozen while audio plays fine (audio-only files)
+
+**Symptom**: a loaded track plays normally — audio, waveform playhead, position poll all
+advancing — but the deck's elapsed/remaining readout sits frozen, often showing a *plausible*
+time that belongs to the **previous** track.
+
+**Root cause class**: `DeckCard`'s `currentTime`/`videoDuration` are written only from inside
+the preview rAF loop, which has exactly two branches — a legacy `<video>` with
+`readyState >= 2`, and a codec player. An audio-only file (`.wav`/`.mp3`) satisfies neither:
+codec demux fails as designed (`[video-path] deck-N demux failed, falling back to legacy
+<video>: timed out waiting for parsebin to expose a video stream`), and the fallback `<video>`
+element never reaches `readyState 2` because there is nothing to decode. Neither branch runs,
+so both values keep whatever the last video track left in them.
+
+**Fixed 2026-08-03** — a third branch reads the master audio clock (`getDeckTime()`), plus an
+explicit reset keyed on `filePath` so nothing survives a track change. If a similar frozen
+readout reappears, check that the reset effect still fires before blaming the audio clock.
+
+**Diagnostic shortcut**: if the two numbers on screen imply a *different* duration than the
+filename label does, they are from different tracks — that arithmetic identifies the bug
+immediately (0:43 elapsed + 4:05 remaining = 4:48, against a 6:26 file).
+
+⚠️ **The `CODEC` badge in DeckCard does not clear on fallback** — a deck that failed demux and
+is running the legacy `<video>` path still shows `CODEC`. Cosmetic, still unfixed; do not use
+that badge to determine which video path a deck is actually on. Use the `[video-path]` log
+lines instead.
+
+### HMR hazard: landing a call site before its import kills the rAF loop
+
+Distinct from the stale-transform trap in CLAUDE.md — here Vite serves each write *correctly*,
+but an intermediate state is briefly wrong. Adding `foo()` to a loop body and its `import` in a
+separate Edit means HMR fires on the intermediate file and throws
+`ReferenceError: Can't find variable: foo`. Inside a rAF loop that throw happens **before** the
+tail `requestAnimationFrame(...)` call, so the loop stops permanently for that component
+instance — it only recovers because the next HMR re-runs the `$effect`.
+
+**Write the import in the same pass as the first call site**, and after any instrumentation
+edit confirm the loop is actually still ticking rather than assuming:
+```bash
+grep -a '\[aux-loop\]' ~/.local/share/com.cuemark.app/logs/cuemark.log | tail -3
+```
+A loop that died silently looks exactly like a loop with nothing to report.
 
 ### HMR cascade hang — batch all App.svelte edits into one pass
 Each HMR reload of App.svelte (the root Svelte component) tears down and rebuilds every

@@ -2,7 +2,7 @@
 
 ## Known issues
 
-### Control window drops to ~25fps while playing [partly fixed, 2026-08-03]
+### Control window drops to ~23fps while playing [root-caused, fix not built, 2026-08-03]
 
 The `audio_get_position` round trips of 300–424ms were never GStreamer: `query_position`,
 the `AudioManager` mutex and the GTK dispatch measure ~0ms/0ms/2ms, and a no-op `ipc_ping`
@@ -15,11 +15,36 @@ Largest cause fixed: `outputBus.postFrame()` built full-resolution `ImageBitmap`
 ~90ms to ~19ms and `frame-dur` from ~14ms to ~1ms. Also fixed: transport retry chains that
 multiplied instead of converging (~25 IPC/sec during a jog).
 
-**Still open** — playback costs ~23ms/frame beyond idle (25fps vs 62fps) with `frame-dur`
-~1ms, so a second consumer sits outside the render loop: software H.264 decode, DeckCard
-preview canvases, or `WaveformCanvas`. The A/B against a *working* listener gate has not
-been run yet. Full writeup, measurement method, and step-by-step pickup:
-`docs/design/control-window-frame-budget.md`.
+The A/B against a working gate has since been run and confirms the fix: **arm 1 (projector
+closed) 23fps / poll p50 13–19ms, arm 2 (open) 9–13fps / poll p50 59–86ms.** The projector
+costs **+48ms/frame**, of which only +7ms is in the rAF tick — the other +41ms is
+`createImageBitmap` resolving plus the cross-process clone, which `frame-dur` cannot see.
+
+**`WaveformCanvas`'s overview redraw was fixed 2026-08-03 (late)** — the static bars are now
+rasterized once per (peaks, canvas size, gain) into two offscreen canvases and blitted either
+side of the playhead. A/B'd in one session at a fixed 2496×144 canvas: **per-draw JS 13–15ms
+→ ≤1ms, `busy%` 8–9% → 0%, gap p90 47ms → 34ms, gap max 187ms → 47ms.**
+
+**But frame rate moved only 29.6 → 30.6fps, which is the actual news.** A third limit was
+hiding behind it: **while any deck plays, rAF is pinned to exactly half vsync (gap p50 32ms)
+with the main thread ~98% idle** — idle is 62fps. Removing 8–9% of main-thread work bought
+1fps, so the ceiling is a throttle, not saturation. Next experiments, both one-flag runs on
+existing instrumentation: (1) fire `[ipc-ping]` at the poll's rate with the position poll
+disabled — does the lock follow our IPC or the audio? (2) play with the poll disabled
+entirely and read `[raf]` alone.
+
+*Disproven along the way* (do not re-investigate): software H.264 decode, the `codecWorker`
+thread, and the DeckCard preview canvas are **not** the frame budget problem — an audio-only
+`.wav` deletes all three and is *worse*. `frame-dur` was also never the whole picture: three
+independent rAF loops run per playing deck and it measured only one. And treat the earlier
+run's absolute fps figures (22–23fps overview, the 11.3ms/2.8ms paint split) as unreliable —
+canvas width was uncontrolled; the `[aux-loop]` label now carries `@<W>x<H>` so it cannot
+recur. Full writeup, arithmetic and method: `docs/design/control-window-frame-budget.md`.
+
+Also open from the same session: arm 2 degrades monotonically within a run (13.2 → 8.8fps
+over 45s) with both `post-frame` legs flat, and its numbers predate the waveform fix so it
+should be re-measured before being investigated; and the `CODEC` badge in DeckCard does not
+clear when a deck falls back to the legacy `<video>` path.
 
 
 ### Scratch feeder starves the sink in vinyl mode [open, 2026-08-03]

@@ -502,7 +502,8 @@ the distribution, which is what made a slow baseline look like an outlier proble
 
 ```
 [poll-stats] deck-0[/scratch] n=… | total … | toRust … | inRust … (lock …, query …) | toJs …
-[raf]        n=… (~Nfps) | gap … | frame-dur …
+[raf]        n=… (~Nfps) | gap … | frame-dur … | busy …%
+[aux-loop]   preview/deck-0 | waveform[/zoom]/deck-0@<W>x<H>   n=… drew=… | dur … | busy …%
 [post-frame] n=… bitmaps=… | sync … | to-postMessage …
 [ipc-ping]   noop n=… | total … | toRust … | toJs …
 ```
@@ -516,11 +517,37 @@ How to read them (full derivation in `docs/design/control-window-frame-budget.md
 - **`[ipc-ping]` is the control arm.** If a command that does nothing is as slow as the one you
   are blaming, the callee is exonerated — no leg arithmetic required. During a scratch you get a
   second free control: `position()` returns the feeder's atomic cursor and never touches GStreamer.
-- **A position poll can never resolve faster than one main-loop turn.** `toJs` tracks the `[raf]`
-  gap almost exactly, so poll latency is a *symptom* of the frame budget, not a backend problem.
+- **A position poll can never resolve faster than one main-loop turn** — but a main-loop turn
+  is **not** an rAF turn. When the thread is saturated the two track each other and `toJs` is a
+  fair proxy for the frame period; when rAF is throttled while the thread is idle they diverge
+  hard (13ms poll against a 41ms gap, 2026-08-03). **Check `busy%` before reading `toJs` as the
+  frame budget.**
+- **`frame-dur` covers only `App.svelte`'s `frame()`.** Two more rAF loops run per playing deck
+  — `DeckCard`'s preview `draw()` and `WaveformCanvas`'s playhead `loop()` — in the same rAF
+  turn. They report into `[aux-loop]`. `busy%` (share of wall-clock time) is the field that
+  settles attribution: sum it across every loop and subtract from 100 to see what is
+  *unaccounted*, which is how the residual was shown to be outside JS entirely.
 - ⚠️ **Only compare windows with a deck playing.** Idle windows contain no polls at all, so an
   idle `62fps / frame-dur=0` line is not a control for a playing one. Reading them as comparable
   produced a wrong conclusion on the first pass.
+- ⚠️ **`busy%` measures the JS that *records* canvas drawing, not the paint that follows it.**
+  WebKit's canvas 2D builds a display list and rasterizes it after the JS call returns, in a
+  phase no JS timer can observe. Symptoms of being in this regime: `busy%` low while
+  `WebKitWebProcess` CPU is high, and fps that does not respond to removing JS work. **Never
+  conclude "this canvas is cheap" from `busy%` alone — confirm with fps.** Fewer, cheaper draw
+  *calls* is the lever; the number of primitives per draw matters more than how often you draw.
+- ⚠️ **The converse bites just as hard: a change can take `busy%` to zero and move ~1fps.**
+  Caching `WaveformCanvas`'s overview bars cut per-draw JS 13–15ms → ≤1ms and `busy%` 8–9% → 0%
+  for **+1.0fps**, because the real limit was a half-vsync rAF throttle behind it
+  (`docs/design/control-window-frame-budget.md` §4). Worth keeping for the tail — gap p90
+  −13ms, max −140ms — but **report both numbers**; either one alone tells a false story.
+- ⚠️ **Bar count scales with canvas width, so record the width.** Two runs of the same file in
+  the same mode disagreed by 2× until the `[aux-loop]` label carried `@<W>x<H>`. Never A/B a
+  canvas cost across runs whose dimensions were not captured — and prefer A/Bing in one
+  session with only the code path switched.
+- ⚠️ **`ps %cpu` is a lifetime average, not current load.** On a 2-hour-old process it read 7%
+  while the process was actually at 64%. Use `top -b -n 2 -d 3 -p <pid>` and take the *second*
+  sample.
 
 ## Skills
 

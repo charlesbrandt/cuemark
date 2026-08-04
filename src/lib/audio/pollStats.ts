@@ -54,6 +54,7 @@ const buckets = new Map<string, Legs[]>();
 const pings: { total: number; toRust: number; toJs: number }[] = [];
 const frames: { gap: number; dur: number }[] = [];
 const posts: { sync: number; total: number; bitmaps: number }[] = [];
+const auxLoops = new Map<string, { dur: number; drew: boolean }[]>();
 let lastFlushAt = 0;
 let lastPingAt = 0;
 
@@ -156,6 +157,32 @@ export function recordPostFrame(syncMs: number, totalMs: number, bitmaps: number
   maybeFlush();
 }
 
+/**
+ * Record one tick of a rAF loop *other than* `App.svelte`'s `frame()`.
+ *
+ * `frame-dur` measures only the render loop, but the control window runs three independent
+ * rAF loops per playing deck — `frame()`, `DeckCard`'s preview `draw()`, and
+ * `WaveformCanvas`'s playhead `loop()`. The latter two execute in the *same* rAF turn and
+ * are invisible to `frame-dur`, which is exactly the "gap large, dur small" signature the
+ * arm-1 residual shows (`docs/design/control-window-frame-budget.md`). Attributing that
+ * residual requires timing each loop separately rather than inferring it.
+ *
+ * @param label  bucket name, e.g. `preview/deck-0` — per-deck so a two-deck run stays legible
+ * @param durMs  synchronous duration of this tick
+ * @param drew   whether the tick actually redrew, or bailed on its change-guard. Both loops
+ *               skip work when nothing moved, so n alone cannot distinguish "cheap because
+ *               guarded" from "cheap because fast" — and only the first is load-dependent.
+ */
+export function recordAuxLoop(label: string, durMs: number, drew: boolean): void {
+  let bucket = auxLoops.get(label);
+  if (!bucket) {
+    bucket = [];
+    auxLoops.set(label, bucket);
+  }
+  bucket.push({ dur: durMs, drew });
+  maybeFlush();
+}
+
 function maybeFlush(): void {
   const now = performance.now();
   if (lastFlushAt === 0) lastFlushAt = now;
@@ -163,6 +190,20 @@ function maybeFlush(): void {
     lastFlushAt = now;
     flush();
   }
+}
+
+/**
+ * Share of wall-clock time a bucket's synchronous work occupied over the flush window.
+ *
+ * This is the number that actually settles attribution: percentiles say what one tick cost,
+ * `busy%` says how much of the frame budget the loop consumed in total. Summing `busy%`
+ * across every instrumented loop and subtracting from 100 leaves the *unaccounted* share —
+ * decode callbacks, style/layout, compositing, WebKit internals — which is the only honest
+ * way to know whether the instrumented suspects explain the residual or merely contribute.
+ */
+function busyPct(durations: number[]): string {
+  const sum = durations.reduce((a, b) => a + b, 0);
+  return `${((sum / FLUSH_INTERVAL_MS) * 100).toFixed(0)}%`;
 }
 
 function flush(): void {
@@ -183,9 +224,24 @@ function flush(): void {
       return `p50=${pct(sorted, 0.5).toFixed(0)} p90=${pct(sorted, 0.9).toFixed(0)} max=${sorted[sorted.length - 1].toFixed(0)}`;
     };
     const fps = (frames.length / (FLUSH_INTERVAL_MS / 1000)).toFixed(1);
-    debugLog(`[raf] n=${frames.length} (~${fps}fps) | gap ${s('gap')} | frame-dur ${s('dur')}`);
+    debugLog(
+      `[raf] n=${frames.length} (~${fps}fps) | gap ${s('gap')} | frame-dur ${s('dur')} | ` +
+        `busy ${busyPct(frames.map((f) => f.dur))}`,
+    );
     frames.length = 0;
   }
+
+  for (const [label, ticks] of auxLoops) {
+    if (ticks.length === 0) continue;
+    const sorted = ticks.map((t) => t.dur).sort((a, b) => a - b);
+    const drew = ticks.filter((t) => t.drew).length;
+    debugLog(
+      `[aux-loop] ${label} n=${ticks.length} drew=${drew} | dur ` +
+        `p50=${pct(sorted, 0.5).toFixed(1)} p90=${pct(sorted, 0.9).toFixed(1)} ` +
+        `max=${sorted[sorted.length - 1].toFixed(1)} | busy ${busyPct(sorted)}`,
+    );
+  }
+  auxLoops.clear();
 
   if (posts.length > 0) {
     const s = (leg: 'sync' | 'total') => {

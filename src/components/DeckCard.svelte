@@ -7,6 +7,7 @@
   import { gridSave } from "../lib/audio/pipeline";
   import { pushMarker, setTrackBpm } from "../lib/digger/api";
   import { markGridSaved } from "../lib/audio/gridSource";
+  import { recordAuxLoop } from "../lib/audio/pollStats";
   import { videoPathOverrides, videoPathDefault, setVideoPathOverride, resolveVideoPath } from "../lib/video/videoPathSettings";
   import type { Deck } from "../lib/state/types";
 
@@ -19,6 +20,21 @@
   let currentTime = $state(0);
   let videoDuration = $state(0);
   let phase = $state<number | null>(null);
+
+  // Reset the transport readout whenever the loaded file changes. Both values are written
+  // only from the preview rAF loop, and that loop legitimately has nothing to say for some
+  // sources (audio-only files) or has not run yet (mid-load) — so without an explicit reset
+  // they persist across a load and display the previous track's numbers. Keyed on filePath
+  // rather than on the source object: a re-render with an equivalent source must not clear
+  // a perfectly good clock reading.
+  let lastSourcePath: string | null = null;
+  $effect(() => {
+    const path = deck.source?.type === "video" ? deck.source.filePath : null;
+    if (path === lastSourcePath) return;
+    lastSourcePath = path;
+    currentTime = 0;
+    videoDuration = deck.source?.type === "video" ? (deck.source.duration ?? 0) : 0;
+  });
 
   $effect(() => {
     if (!previewCanvas || deck.source?.type !== "video") return;
@@ -56,6 +72,10 @@
     let lastDrawnPts = -1;
     let rafId: number;
     function draw() {
+      // Timed into [aux-loop]: this loop runs in the same rAF turn as App.svelte's frame()
+      // but is not counted by frame-dur — see recordAuxLoop's doc comment.
+      const t0 = performance.now();
+      let drew = false;
       const video = getVideoEl(deck.id);
       const codec = getCodecPlayer(deck.id);
       if (video && video.readyState >= 2) {
@@ -68,6 +88,7 @@
           if (video.videoWidth > 0 && video.videoHeight > 0) {
             try {
               ctx!.drawImage(video, 0, 0, canvas.width, canvas.height);
+              drew = true;
             } catch (e) {
               console.error(`[${deck.id}] preview drawImage failed:`, e);
             }
@@ -87,14 +108,29 @@
             lastDrawnPts = frame.timestamp;
             try {
               ctx!.drawImage(frame, 0, 0, canvas.width, canvas.height);
+              drew = true;
             } catch (e) {
               console.error(`[${deck.id}] preview drawImage (codec) failed:`, e);
             }
           }
         }
         if (deck.source?.type === "video" && deck.source.duration) videoDuration = deck.source.duration;
+      } else {
+        // Neither a usable <video> element nor a codec player. This is the audio-only case:
+        // a file with no video track (.wav/.mp3) fails codec demux ("timed out waiting for
+        // parsebin to expose a video stream"), falls back to the legacy <video> path, and
+        // that element never reaches readyState 2 because there is nothing to decode.
+        //
+        // Without this branch neither of the two above runs, so currentTime/videoDuration
+        // silently keep the *previous* track's values — a loaded audio file displayed the
+        // last video's elapsed time and duration, frozen, while audio played normally
+        // (2026-08-03). Audio is the master clock anyway, so read it directly.
+        const t = getDeckTime(deck.id);
+        if (t !== null) currentTime = t;
+        if (deck.source?.type === "video" && deck.source.duration) videoDuration = deck.source.duration;
       }
       phase = getPhase(deck.id);
+      recordAuxLoop(`preview/${deck.id}`, performance.now() - t0, drew);
       rafId = requestAnimationFrame(draw);
     }
     rafId = requestAnimationFrame(draw);
