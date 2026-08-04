@@ -2,7 +2,7 @@
 
 ## Known issues
 
-### Control window drops to ~20fps while playing [root-caused to the waveform playhead paint, fix not built, 2026-08-03]
+### Control window drops to ~20fps while playing [root-caused to DeckCard's timestamp text, fix not built, 2026-08-04]
 
 The `audio_get_position` round trips of 300–424ms were never GStreamer: `query_position`,
 the `AudioManager` mutex and the GTK dispatch measure ~0ms/0ms/2ms, and a no-op `ipc_ping`
@@ -29,7 +29,8 @@ side of the playhead. A/B'd in one session at a fixed 2496×144 canvas: **per-dr
 hiding behind it: while any deck plays, rAF locks to a vsync multiple with the main thread
 apparently ~98% idle — idle is 62fps.
 
-**ROOT-CAUSED 2026-08-03 (late): it is the waveform playhead's paint.** Four A/B arms in two
+**ROOT-CAUSED 2026-08-03 (late): the cost is what the clock's *consumers* do** (the specific
+consumer was misidentified as the waveform — see the correction below). Four A/B arms in two
 hands-free sweeps (`docs/design/control-window-frame-budget.md` §5):
 
 | arm | rAF |
@@ -41,15 +42,30 @@ hands-free sweeps (`docs/design/control-window-frame-budget.md` §5):
 | `pollNoClock` — full reply math, `setDeckAudioTime()` skipped | **62fps** |
 
 So IPC volume, the GStreamer pipeline, and the poll itself are all free; **the entire cost is
-one call publishing the clock**, which dirties a 2496×144 canvas ~6×/s. Derived cost: **~100ms
-of non-JS time per redraw** against ≤1ms of JS — WebKit rasterizing and compositing after the
-JS returns, in the phase `busy%` cannot see. `WebKitWebProcess` CPU **51.7%** while instrumented
-`busy%` read 1%.
+one call publishing the clock** — but in what the publication *drives*, not in the call. The
+cost lives after the JS returns, in the phase `busy%` cannot see: `WebKitWebProcess` CPU
+**51.7%** while instrumented `busy%` read 1%.
 
-**Fix to build: stop repainting the canvas to move the playhead** — an absolutely-positioned
-2px element driven by `transform: translateX()` never dirties it. Run one confirming arm first
-(`setDeckAudioTime` on, `WaveformCanvas.draw()` skipped) since `pollNoClock` freezes every
-`getDeckTime()` consumer at once, not just the waveform.
+**CORRECTED 2026-08-04 by the confirming arm — it is NOT the waveform canvas.** `pollNoClock`
+froze every `getDeckTime()` consumer at once, so the canvas was implied, not shown. Suppressing
+each consumer separately (§6), two runs, same file and canvas size:
+
+| arm | rAF | `WebKitWebProcess` |
+|---|---|---|
+| `baseline` | 21–22 → 15fps | 45–60% |
+| `noWaveDraw` — waveform redraw skipped | **13–15fps (no change)** | **45–49% (no change)** |
+| `noDeckText` — DeckCard's `currentTime`/`phase` writes skipped | **62.0fps** | **17.6–23.3%** |
+| `baseline2` | 21.8 → 13.0fps | 43.5–55.5% |
+
+**Fix to build: stop rewriting the deck card's timestamp 60×/s.** `formatDuration()` is `m:ss`,
+so gate the `currentTime` `$state` write on `Math.floor(t)` changing — 59 of every 60 updates
+currently dirty the card for no visible change. **Split `phase` from `currentTime` first**: the
+arm suppressed both, and φ shows two decimals so it genuinely changes per frame and needs a
+throttle instead. Do *not* start with the playhead-out-of-canvas change — `noWaveDraw` deletes
+strictly more than it could and moves nothing.
+
+The A/B harness is kept and both remaining steps need it: `src/lib/audio/perfArm.ts`, inert
+unless `VITE_PERF_SWEEP=1`; `VITE_PERF_SWEEP_TRACK=/abs/path` makes the run hands-free.
 
 *Disproven along the way* (do not re-investigate): software H.264 decode, the `codecWorker`
 thread, and the DeckCard preview canvas are **not** the frame budget problem — an audio-only

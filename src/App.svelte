@@ -30,6 +30,7 @@
   import type { Deck, Session } from "./lib/state/types";
   import { audioGetPosition, sessionRestore } from "./lib/audio/pipeline";
   import { recordPollSample, maybePingIpc, recordFrameTiming } from "./lib/audio/pollStats";
+  import { advanceSweep, sweepAutostartTrack } from "./lib/audio/perfArm";
   import { debugLog } from "./lib/debugLog";
   import { getDiggerFileUrl } from "./lib/digger/api";
 
@@ -769,6 +770,26 @@
         });
       }
     });
+
+    // Frame-budget sweep autostart (VITE_PERF_SWEEP=1 + VITE_PERF_SWEEP_TRACK=/abs/path).
+    // Loads the track exactly the way a drag-and-drop does, waits out the pipeline preroll,
+    // then presses play — the sweep itself refuses to advance until position actually moves,
+    // so an early press costs a few seconds of `arm=off`, never a bogus arm.
+    const sweepTrack = sweepAutostartTrack();
+    if (sweepTrack) {
+      const deckId = get(session).decks[0]?.id;
+      if (deckId) {
+        debugLog(`[perf-sweep] autostart: loading ${sweepTrack} into ${deckId}`);
+        updateDeck(deckId, {
+          source: { type: 'video', filePath: sweepTrack, duration: 0, loadSeq: Date.now() },
+          playing: false,
+        });
+        setTimeout(() => {
+          debugLog('[perf-sweep] autostart: play');
+          updateDeck(deckId, { playing: true });
+        }, 8000);
+      }
+    }
   });
 
   onDestroy(() => {
@@ -1196,6 +1217,17 @@
     }
   }
 
+  // Audio clock of the first deck that claims to be playing or is being scratched, for the
+  // frame-budget A/B sweep's liveness gate — null when nothing claims to be running at all.
+  // Any one such deck is enough: the sweep only needs to know that the clock it is measuring
+  // against is moving, not which deck supplies it.
+  function sweepClockSec(): number | null {
+    for (const deck of get(session).decks) {
+      if (deck.playing || isScratching(deck.id)) return getDeckTime(deck.id) ?? 0;
+    }
+    return null;
+  }
+
   // RAF render loop: upload video frames → composite; sync video to audio clock
   function frame() {
     const nowMs = performance.now();
@@ -1211,6 +1243,15 @@
       debugLog(`[heartbeat] rAF stalled ${Math.round(nowMs - lastHeartbeatAt)}ms`);
     }
     lastHeartbeatAt = nowMs;
+    // Drive the frame-budget A/B sweep, if one is enabled (VITE_PERF_SWEEP=1 — off in every
+    // ordinary run; see perfArm.ts for why the arms advance on a wall clock rather than on a
+    // keypress or an edit). Fed the clock of a deck that claims to be playing, not the flag:
+    // the sweep refuses to advance unless position is actually moving.
+    //
+    // At the top of the tick deliberately: the other two rAF loops read the arm's gates and
+    // the flush stamps it, so flipping it here means one tick is governed by exactly one arm
+    // end to end, rather than switching midway between the loops that are being compared.
+    advanceSweep(sweepClockSec());
     try {
     if (rendererReady) {
       const { decks, visualization, visualizationOpacity } = get(session);

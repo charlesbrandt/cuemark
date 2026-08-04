@@ -1877,3 +1877,82 @@ commit is empty for `src/`. Documentation only:
 - `todo.md` — known-issue entry re-root-caused, with the fix to build
 - `CLAUDE.md` — `busy%`/CPU pairing, IPC-leg-as-load-gauge, arm validation, the HMR-remount
   hazard for edit-driven measurement
+
+# 2026.08.04 — the confirming arm ran, and it exonerated the prime suspect
+
+## Problem
+
+§5 left the control window's rAF throttle attributed to "one call publishing the audio clock"
+(`setDeckAudioTime`), with the waveform canvas named as the consumer responsible — "the
+leading suspect by a wide margin". But `pollNoClock` froze *every* consumer of that clock at
+once: the waveform playhead, DeckCard's elapsed/remaining/φ text, and the preview loop. The
+doc asked for one more arm before anything was built. This is that arm.
+
+## Method
+
+Built a reusable sweep harness (`src/lib/audio/perfArm.ts`, inert unless `VITE_PERF_SWEEP=1`):
+30s per arm, `baseline → noWaveDraw → noDeckText → baseline2`, advancing off `frame()`'s own
+wall clock, with the arm stamped on every reported line and the 5s flush cut short at each
+boundary so no window straddles a switch.
+
+Two properties encode earlier failures rather than trusting memory of them:
+
+- **It advances on the audio clock, not `deck.playing`.** §5 lost a run to a wedged pipeline
+  that produced a flawless, worthless 62fps "baseline". A clock static for >2s rearms the
+  sweep.
+- **It presses play itself** (`VITE_PERF_SWEEP_TRACK`). Driving the real window needs
+  `tauri-driver` + `WebKitWebDriver` — neither installed, both needing sudo — and Wayland here
+  has no input-synthesis tool. Xvfb was rejected as a substitute: the finding is about what
+  WebKit's rasterizer costs on *this* GPU, and llvmpipe is not this GPU.
+
+## Result
+
+Same 6:26 `.wav` as §5, 2496×144 canvas, output window closed, two separate app launches.
+
+| arm | run 1 | run 2 | `WebKitWebProcess` (run 2) |
+|---|---|---|---|
+| `baseline` | 20.5–21.1fps | 21.3–22.6 → 15.1fps | 45–60% |
+| `noWaveDraw` | 21.2–21.4 → 15.1fps | **13.2–14.6fps** (6/6) | **45–49%** |
+| `noDeckText` | **62.0fps** (5/5) | **60.9–62.0fps** (6/6) | **17.6–23.3%** |
+| `baseline2` | 21.4–21.5fps | 21.8 → 13.0fps | 43.5–55.5% |
+
+`cuemark` held 22–30% across every arm. Deleting the waveform redraw moves neither frame rate
+nor webview CPU. Deleting a text update that renders `m:ss` restores full rate and drops
+webview CPU ~28 points.
+
+Validation: every arm carried `[poll-stats] total` p50 8–10ms at n≈70–310, and `noDeckText`
+still showed the waveform drawing 31×/5s — so its 62fps is a genuinely playing deck.
+
+## Root cause
+
+`DeckCard`'s elapsed/remaining spans are rewritten ~60 times a second by the preview rAF loop,
+to render a string whose resolution is **one second**. 59 of every 60 updates dirty the card
+for no visible change.
+
+## Lessons
+
+- **"Implied by an arm" is not "shown by an arm", and the gap is where the wrong fix lives.**
+  §5's evidence was sound and its conclusion still named the wrong component, because the arm
+  it ran suppressed four consumers together. The doc was right to demand one more arm before
+  building; had it not, the work would have gone into moving a playhead out of a canvas that
+  costs nothing.
+- **A per-frame write is worth auditing against the resolution of what it renders.** Nothing
+  about this code looks expensive — it is one `$state` assignment — and the waste is only
+  visible when you compare its rate (60Hz) to its output's rate of change (1Hz).
+- **Third distinct way an A/B switch produced clean, plausible, wrong output here.** This time
+  the boundary flush stamped the outgoing window with the incoming arm's name, so run 1 showed
+  `arm=noWaveDraw` with the waveform still drawing — indistinguishable from a gate that
+  silently failed. Previous two: a keyboard handler surviving HMR on a destroyed component,
+  and a wedged pipeline. The pattern is always the same: the *label* and the *behaviour* come
+  from different places, and only the label is easy to read.
+
+## Files touched
+
+- `src/lib/audio/perfArm.ts`, `src/lib/audio/perfArm.test.ts` (new) — the sweep, its liveness
+  gate, autostart, and coverage for all three
+- `src/lib/audio/pollStats.ts` — arm stamp, boundary flush, window-relative rates
+- `src/App.svelte` — `advanceSweep()` from `frame()`, sweep autostart
+- `src/components/WaveformCanvas.svelte`, `src/components/DeckCard.svelte` — the two gates
+- `docs/design/control-window-frame-budget.md` — §6, corrected status, rewritten "Where to
+  pick up" with the old one kept as superseded
+- `todo.md` — known-issue entry re-root-caused

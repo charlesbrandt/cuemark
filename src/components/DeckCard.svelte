@@ -8,6 +8,7 @@
   import { pushMarker, setTrackBpm } from "../lib/digger/api";
   import { markGridSaved } from "../lib/audio/gridSource";
   import { recordAuxLoop } from "../lib/audio/pollStats";
+  import { suppressDeckTimeText } from "../lib/audio/perfArm";
   import { videoPathOverrides, videoPathDefault, setVideoPathOverride, resolveVideoPath } from "../lib/video/videoPathSettings";
   import type { Deck } from "../lib/state/types";
 
@@ -76,6 +77,15 @@
       // but is not counted by frame-dur — see recordAuxLoop's doc comment.
       const t0 = performance.now();
       let drew = false;
+      // The `noDeckText` A/B arm (off in every ordinary run — perfArm.ts). currentTime and
+      // phase are read only by the elapsed/remaining/φ spans, so gating the writes stops a
+      // per-frame text mutation and the style/layout it forces, while leaving the preview
+      // drawImage and the audio clock itself untouched. It is the other half of the
+      // confirming experiment: §5 suppressed the clock and froze this *and* the waveform
+      // together, so neither could be priced alone. Note this arm updates ~60×/s against the
+      // waveform's ~6×/s, which is why the pair separates "a big paint, rarely" from "a
+      // small layout, constantly".
+      const publishText = !suppressDeckTimeText();
       const video = getVideoEl(deck.id);
       const codec = getCodecPlayer(deck.id);
       if (video && video.readyState >= 2) {
@@ -94,7 +104,7 @@
             }
           }
         }
-        currentTime = video.currentTime;
+        if (publishText) currentTime = video.currentTime;
         if (video.duration && isFinite(video.duration)) videoDuration = video.duration;
       } else if (codec) {
         // Codec-path deck: no <video> element to read from — pick the current frame from
@@ -102,7 +112,7 @@
         // canvas accepts a VideoFrame directly, no scratch-canvas detour needed here).
         const t = getDeckTime(deck.id);
         if (t !== null) {
-          currentTime = t;
+          if (publishText) currentTime = t;
           const frame = codec.getFrameForTime(t);
           if (frame && frame.timestamp !== lastDrawnPts) {
             lastDrawnPts = frame.timestamp;
@@ -126,10 +136,10 @@
         // last video's elapsed time and duration, frozen, while audio played normally
         // (2026-08-03). Audio is the master clock anyway, so read it directly.
         const t = getDeckTime(deck.id);
-        if (t !== null) currentTime = t;
+        if (t !== null && publishText) currentTime = t;
         if (deck.source?.type === "video" && deck.source.duration) videoDuration = deck.source.duration;
       }
-      phase = getPhase(deck.id);
+      if (publishText) phase = getPhase(deck.id);
       recordAuxLoop(`preview/${deck.id}`, performance.now() - t0, drew);
       rafId = requestAnimationFrame(draw);
     }

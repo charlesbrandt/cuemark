@@ -1,11 +1,13 @@
 # Control-window frame budget: why the position poll is slow
 
-Status: **root-caused. Two fixes landed, both A/B-confirmed. The waveform-cache fix removed
-the cost it targeted (per-draw JS 14ms → 1ms, `busy%` 8–9% → 0%) but bought only ~1fps —
-because a *third* limit was hiding behind it: while any deck plays, rAF is pinned to exactly
-half vsync (gap p50 32ms) with the main thread ~98% idle. That is now the open question; see
-"Where to pick up".** Started 2026-08-03 from a report of `audio_get_position` round trips of
-300–424ms.
+Status: **root-caused to a single line of UI, confirmed by isolating arm (§6, 2026-08-04):
+`DeckCard`'s elapsed/remaining timestamp is rewritten ~60×/s to render a string with
+one-second resolution. Suppressing it takes a playing deck from ~21fps to a flat 62fps and
+`WebKitWebProcess` from ~47% to ~18% CPU. The fix is not built.** Two earlier fixes landed and
+hold (the `postFrame` listener gate, the waveform bar cache). The waveform canvas — this doc's
+prime suspect through §4 and §5 — is **exonerated**: deleting its redraw entirely moves
+neither frame rate nor CPU. Started 2026-08-03 from a report of `audio_get_position` round
+trips of 300–424ms.
 
 **If you are picking this up fresh, read "Where to pick up" at the bottom first.**
 
@@ -414,7 +416,111 @@ margin (`drew` 28 → 0, 2496×144, and §4 already priced its paint), but a DOM
 forcing layout on a large tree has not been separately excluded. One more arm settles it: keep
 `setDeckAudioTime`, skip only `WaveformCanvas`'s `draw()`.
 
+### 6. The confirming arm ran — and the waveform canvas is innocent (2026-08-04)
+
+§5 ended by naming the waveform canvas "the leading suspect by a wide margin" and asking for
+one more arm before building anything, because `pollNoClock` froze every `getDeckTime()`
+consumer at once. **That arm has now run, and it exonerates the canvas.** The cost is
+`DeckCard`'s per-frame timestamp text.
+
+Two arms, both keeping `setDeckAudioTime()` and the whole poll intact, each suppressing
+exactly one consumer:
+
+- `noWaveDraw` — skip `WaveformCanvas`'s rAF `draw()`; the one-device-pixel guard still runs.
+- `noDeckText` — skip the `currentTime` / `phase` `$state` writes that feed the
+  elapsed / remaining / φ spans. Nothing else changes; the preview `drawImage` still runs.
+
+Sequence `baseline → noWaveDraw → noDeckText → baseline2`, 30s each, same 6:26 `.wav` §5 used
+(audio-only, legacy `<video>` path, `preview drew=0`), canvas 2496×144, output window closed.
+Run 1 and run 2 are separate app launches; run 2 was re-run after fixing the harness bug below.
+
+| arm | run 1 | run 2 | `WebKitWebProcess` (run 2) |
+|---|---|---|---|
+| `baseline` | 20.5–21.1fps | 21.3–22.6 → 15.1fps | **45–60%** |
+| `noWaveDraw` | 21.2–21.4 → 15.1fps | **13.2–14.6fps** (6/6 windows) | **45–49%** |
+| `noDeckText` | **62.0fps** (5/5) | **60.9–62.0fps** (6/6) | **17.6–23.3%** |
+| `baseline2` | 21.4–21.5fps | 21.8 → 13.0fps | **43.5–55.5%** |
+
+`cuemark` (the Rust process) sat at 22–30% throughout, unmoved by any arm — the audio pipeline
+is not involved, again.
+
+**Removing the waveform redraw entirely changes nothing**: not the frame rate, and not the
+webview's CPU, which is the measurement `busy%` structurally cannot make. Removing a text
+update that renders `m:ss` restores full rate and drops webview CPU by ~28 points. The closing
+baseline returns to ~21fps and ~47% CPU, so this is not drift.
+
+**Why the text is so expensive is not yet measured, but why it is so wasteful is obvious.**
+`formatDuration()` has one-second resolution, so the elapsed/remaining spans are rewritten
+~60 times per second to produce a string that changes **once** per second — 59 of every 60
+updates dirty the deck card for no visible change. Whether the cost is style recalc, layout,
+or repaint of the card has not been separated.
+
+⚠️ **What this arm does *not* narrow.** It suppresses `currentTime` **and** `phase` together.
+The φ display shows two decimals and genuinely changes every frame, so it cannot be fixed by
+the same "only publish when the rendered string changes" trick, and it may carry some or all
+of the cost. Splitting them is one more arm, and it should be run before assuming the cheap
+fix is the whole fix.
+
+⚠️ **An unexplained degradation, reproducible and arm-linked.** Within every arm that updates
+the text, the frame rate slides over ~30s — 22.6 → 15.1 (`baseline`), 21.8 → 13.0
+(`baseline2`) — with `gap p90` going 51 → 125–160ms while `gap p50` stays ~49ms. It is a
+growing *tail*, not a shifting median. `noDeckText` shows none of it (62.0fps flat for six
+windows), and `baseline2` starts recovered at 21.8fps before sliding again. So it resets when
+the text stops updating and recurs when it resumes, which suggests the same mechanism rather
+than a second one — but that is an inference from four windows, not a measurement. This is
+plausibly the same accumulation §4's arm 2 showed as 13.2 → 8.8fps.
+
+**Harness note: the first run's labels lagged by one window, and it looked exactly like a
+failed gate.** The boundary flush stamped the *outgoing* window with the *incoming* arm's
+name, so run 1 logged an `arm=noWaveDraw` window with the waveform still drawing — which is
+indistinguishable from a gate that silently did nothing. Fixed (`armTag()` reads the arm the
+samples were taken under, advanced only after `flush()`), and the whole sweep re-run. Run 1
+remains readable by shifting each first-window-after-a-boundary back one arm, and both runs
+agree. This is the third distinct way an A/B switch has produced clean, plausible, wrong
+output in this investigation; the pattern is always that the *label* and the *behaviour* come
+from different places.
+
+The harness itself is `src/lib/audio/perfArm.ts`, off unless `VITE_PERF_SWEEP=1`:
+
+```bash
+VITE_PERF_SWEEP=1 \
+VITE_PERF_SWEEP_TRACK=/abs/path/to/track.wav \
+cargo tauri dev
+```
+
+It loads the track and presses play by itself (`VITE_PERF_SWEEP_TRACK`), because driving the
+real window needs `tauri-driver` + `WebKitWebDriver` — neither installed, both needing sudo —
+and Wayland here has no input-synthesis tool. Measuring under Xvfb instead would answer a
+different question: the finding is about what WebKit's rasterizer costs on *this* hardware.
+The sweep refuses to advance unless the audio clock is actually moving, which is §5's
+wedged-pipeline trap encoded rather than remembered.
+
 ## Where to pick up
+
+**Stop rewriting the deck card's timestamp 60 times a second to change it once a second.**
+
+That is §6's finding, and it replaces the recommendation below, which was aimed at the
+waveform canvas and would have bought nothing. Order of work:
+
+1. **Publish `currentTime` only when the rendered string changes.** `formatDuration()` is
+   `m:ss`, so gate the `$state` write on `Math.floor(t)` changing — a ~60× reduction in text
+   mutations for zero visible difference. This is a few lines in `DeckCard.svelte`'s preview
+   loop.
+2. **Then re-measure, and split `phase` from `currentTime` first** (the ⚠️ above). If φ
+   carries a meaningful share, throttle it to ~10Hz rather than per-frame; two decimals of
+   beat phase do not need 60fps.
+3. **Then re-price the projector arm.** Every arm-2 number in §4 was taken with this cost
+   included.
+
+Do *not* start by moving the playhead out of the waveform canvas. It is still a defensible
+change for the tail (§4 bought gap p90 −13ms, max −140ms), but `noWaveDraw` deletes strictly
+more than that change ever could and moves neither fps nor webview CPU.
+
+### Superseded: move the playhead out of the canvas
+
+Kept because the reasoning was sound and the conclusion was still wrong — the doc had priced
+the waveform's paint carefully (§4, §5) and never tested whether anything *else* on the same
+clock cost more.
 
 **Stop repainting a 2496×144 canvas to move a 2px playhead.**
 
@@ -553,3 +659,13 @@ Fixes:
 - `src/output.ts` — sends the `alive` beacon
 - `src/components/WaveformCanvas.svelte` — `rasterizeOverview()` + the two-blit `drawOverview()`;
   canvas dimensions in the `[aux-loop]` bucket label
+
+A/B harness (§6) — kept, because the next two steps in "Where to pick up" both need it:
+
+- `src/lib/audio/perfArm.ts` (new) — the self-advancing sweep, its liveness gate, and the
+  autostart. Inert unless `VITE_PERF_SWEEP=1`
+- `src/lib/audio/perfArm.test.ts` (new) — sequence, rearm-on-pause, frozen-clock refusal
+- `src/lib/audio/pollStats.ts` — ` arm=` stamp on every reported line, flush at arm
+  boundaries, and window rates computed against the window's real duration
+- `src/App.svelte` — drives `advanceSweep()` from `frame()`; sweep autostart in `onMount`
+- `src/components/WaveformCanvas.svelte`, `src/components/DeckCard.svelte` — the two gates

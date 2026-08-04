@@ -3,6 +3,7 @@
   import { seekDeck, getDeckTime, quantizeToGrid, scratchingDecks } from '../lib/renderer/seekBus';
   import { getDiggerFileUrl } from '../lib/digger/api';
   import { recordAuxLoop } from '../lib/audio/pollStats';
+  import { suppressWaveformDraw } from '../lib/audio/perfArm';
   import type { Deck } from '../lib/state/types';
 
   let {
@@ -167,10 +168,19 @@
       const w = c.width || 1;
       const span = zoom ? zoomSeconds : (deck.source?.type === 'video' ? deck.source.duration : 1);
       const pxPerSec = w / Math.max(span, 0.001);
+      // suppressWaveformDraw() is the `noWaveDraw` A/B arm (off in every ordinary run —
+      // perfArm.ts). §5 of the frame-budget doc showed the whole rAF throttle sits behind
+      // setDeckAudioTime(), but suppressing that froze *every* clock consumer at once; this
+      // arm keeps the clock publishing and removes only this redraw, so the waveform can be
+      // confirmed as the cost rather than merely implied. The guard is still evaluated and
+      // lastDrawnTime still advances, so returning to baseline resumes mid-track instead of
+      // firing one catch-up redraw that would land in the next arm's window.
       if (Math.abs(t - lastDrawnTime) * pxPerSec >= 1) {
-        draw(c);
+        if (!suppressWaveformDraw()) {
+          draw(c);
+          drew = true;
+        }
         lastDrawnTime = t;
-        drew = true;
       }
       // Canvas dimensions are in the bucket label because bar count scales with width and
       // was an uncontrolled variable across earlier measurement runs — the same file in the

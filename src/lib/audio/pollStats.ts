@@ -32,6 +32,7 @@
  * `query p50≈0` alongside a slow total localizes the cost to the transport by itself.
  */
 import { debugLog } from '../debugLog';
+import { currentArm } from './perfArm';
 import { ipcPing, type PositionSample } from './pipeline';
 
 /** Individually logged, with full leg breakdown, so outliers keep their detail. */
@@ -57,6 +58,14 @@ const posts: { sync: number; total: number; bitmaps: number }[] = [];
 const auxLoops = new Map<string, { dur: number; drew: boolean }[]>();
 let lastFlushAt = 0;
 let lastPingAt = 0;
+let lastFlushArm = currentArm();
+/**
+ * Wall-clock span the pending window actually covered. Normally `FLUSH_INTERVAL_MS`, but an
+ * A/B arm boundary cuts a window short — and both `busy%` and the fps figure are rates, so
+ * dividing a truncated window by the nominal interval would understate them in exactly the
+ * lines an experiment reads most carefully.
+ */
+let flushWindowMs = FLUSH_INTERVAL_MS;
 
 function pct(sorted: number[], p: number): number {
   if (sorted.length === 0) return 0;
@@ -186,7 +195,26 @@ export function recordAuxLoop(label: string, durMs: number, drew: boolean): void
 function maybeFlush(): void {
   const now = performance.now();
   if (lastFlushAt === 0) lastFlushAt = now;
+  // An A/B arm boundary flushes immediately, whatever the interval says. A 5s window that
+  // straddles a switch mixes samples from both arms into one line and reports it under
+  // whichever arm happened to be current at flush time — silently, and looking exactly like
+  // a real intermediate result. Cutting the window short costs a little precision on the
+  // busy% denominator for that one line; not cutting it costs the arm's credibility.
+  const arm = currentArm();
+  if (arm !== lastFlushArm) {
+    flushWindowMs = now - lastFlushAt;
+    lastFlushAt = now;
+    // flush() stamps `lastFlushArm` — still the *outgoing* arm, which is whose samples these
+    // are. Advancing it first (the original mistake, caught in the first live run) labels a
+    // window of baseline data with the incoming arm's name: the log then shows `noWaveDraw`
+    // with the waveform still drawing, which is indistinguishable from a gate that failed to
+    // take effect. Exactly the class of silent misattribution this harness exists to avoid.
+    flush();
+    lastFlushArm = arm;
+    return;
+  }
   if (now - lastFlushAt >= FLUSH_INTERVAL_MS) {
+    flushWindowMs = now - lastFlushAt;
     lastFlushAt = now;
     flush();
   }
@@ -203,14 +231,25 @@ function maybeFlush(): void {
  */
 function busyPct(durations: number[]): string {
   const sum = durations.reduce((a, b) => a + b, 0);
-  return `${((sum / FLUSH_INTERVAL_MS) * 100).toFixed(0)}%`;
+  return `${((sum / flushWindowMs) * 100).toFixed(0)}%`;
+}
+
+/**
+ * ` arm=<name>` on every line an experiment reads, or nothing at all when no sweep is
+ * running — so an ordinary log stays exactly as it was, and an experimental one cannot have
+ * a window attributed to the wrong arm by whoever reads it later.
+ */
+function armTag(): string {
+  // `lastFlushArm`, not `currentArm()`: the tag must name the arm the *samples* were taken
+  // under, which at a boundary flush is the arm that just ended.
+  return lastFlushArm === 'off' ? '' : ` arm=${lastFlushArm}`;
 }
 
 function flush(): void {
   for (const [key, samples] of buckets) {
     if (samples.length === 0) continue;
     debugLog(
-      `[poll-stats] ${key} n=${samples.length} | total ${summarize(samples, 'total')} | ` +
+      `[poll-stats]${armTag()} ${key} n=${samples.length} | total ${summarize(samples, 'total')} | ` +
         `toRust ${summarize(samples, 'toRust')} | inRust ${summarize(samples, 'inRust')} ` +
         `(lock ${summarize(samples, 'lock')}, query ${summarize(samples, 'query')}) | ` +
         `toJs ${summarize(samples, 'toJs')}`,
@@ -223,9 +262,9 @@ function flush(): void {
       const sorted = frames.map((f) => f[leg]).sort((a, b) => a - b);
       return `p50=${pct(sorted, 0.5).toFixed(0)} p90=${pct(sorted, 0.9).toFixed(0)} max=${sorted[sorted.length - 1].toFixed(0)}`;
     };
-    const fps = (frames.length / (FLUSH_INTERVAL_MS / 1000)).toFixed(1);
+    const fps = (frames.length / (flushWindowMs / 1000)).toFixed(1);
     debugLog(
-      `[raf] n=${frames.length} (~${fps}fps) | gap ${s('gap')} | frame-dur ${s('dur')} | ` +
+      `[raf]${armTag()} n=${frames.length} (~${fps}fps) | gap ${s('gap')} | frame-dur ${s('dur')} | ` +
         `busy ${busyPct(frames.map((f) => f.dur))}`,
     );
     frames.length = 0;
@@ -236,7 +275,7 @@ function flush(): void {
     const sorted = ticks.map((t) => t.dur).sort((a, b) => a - b);
     const drew = ticks.filter((t) => t.drew).length;
     debugLog(
-      `[aux-loop] ${label} n=${ticks.length} drew=${drew} | dur ` +
+      `[aux-loop]${armTag()} ${label} n=${ticks.length} drew=${drew} | dur ` +
         `p50=${pct(sorted, 0.5).toFixed(1)} p90=${pct(sorted, 0.9).toFixed(1)} ` +
         `max=${sorted[sorted.length - 1].toFixed(1)} | busy ${busyPct(sorted)}`,
     );
@@ -261,7 +300,7 @@ function flush(): void {
       return `p50=${pct(sorted, 0.5).toFixed(0)} p90=${pct(sorted, 0.9).toFixed(0)} max=${sorted[sorted.length - 1].toFixed(0)}`;
     };
     debugLog(
-      `[ipc-ping] noop n=${pings.length} | total ${s('total')} | toRust ${s('toRust')} | toJs ${s('toJs')}`,
+      `[ipc-ping]${armTag()} noop n=${pings.length} | total ${s('total')} | toRust ${s('toRust')} | toJs ${s('toJs')}`,
     );
     pings.length = 0;
   }
