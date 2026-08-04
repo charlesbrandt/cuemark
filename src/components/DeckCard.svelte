@@ -8,7 +8,7 @@
   import { pushMarker, setTrackBpm } from "../lib/digger/api";
   import { markGridSaved } from "../lib/audio/gridSource";
   import { recordAuxLoop } from "../lib/audio/pollStats";
-  import { suppressDeckTimeText } from "../lib/audio/perfArm";
+  import { suppressPhaseText, suppressTimestampText } from "../lib/audio/perfArm";
   import { videoPathOverrides, videoPathDefault, setVideoPathOverride, resolveVideoPath } from "../lib/video/videoPathSettings";
   import type { Deck } from "../lib/state/types";
 
@@ -34,8 +34,57 @@
     if (path === lastSourcePath) return;
     lastSourcePath = path;
     currentTime = 0;
+    lastPublishedSec = -1;
+    lastPhasePublishedAt = 0;
     videoDuration = deck.source?.type === "video" ? (deck.source.duration ?? 0) : 0;
   });
+
+  // ── Text publication rate limits ────────────────────────────────────────────
+  // These two `$state` writes were the control window's frame budget, measured rather
+  // than guessed: suppressing them (and nothing else) took a playing deck from ~21fps to
+  // a flat 62fps and WebKitWebProcess from ~47% to ~18% CPU, while deleting the entire
+  // waveform redraw — the prime suspect for three sessions — moved neither.
+  // See docs/design/control-window-frame-budget.md §6.
+  //
+  // The waste was rate, not content: the preview rAF loop ran at ~60Hz and both spans
+  // render at far coarser resolution, so ~59 of every 60 mutations dirtied the deck card
+  // for no visible change. Publish only when the *rendered* value changes.
+
+  /** Whole seconds already published — `formatDuration()` is `m:ss`. */
+  let lastPublishedSec = -1;
+  /** `performance.now()` of the last φ publish. */
+  let lastPhasePublishedAt = 0;
+  /**
+   * φ renders two decimals and genuinely changes every frame, so unlike the timestamp it
+   * cannot be gated on the rendered string alone — it needs a rate cap.
+   *
+   * **This constant is a CPU dial, and a steep one.** §7 priced a deck-card text mutation at
+   * ~20ms of `WebKitWebProcess` CPU, so every extra Hz of φ costs roughly 2 points of a core
+   * — 10Hz measured ~21 points against the same run with φ suppressed. 5Hz is still ahead of
+   * what anyone reads off a two-decimal number while beatmatching. Raising it back toward
+   * per-frame is the single easiest way to undo this whole investigation.
+   */
+  const PHASE_PUBLISH_MS = 200;
+
+  function publishTime(t: number) {
+    const sec = Math.floor(t);
+    if (sec === lastPublishedSec) return;
+    lastPublishedSec = sec;
+    currentTime = t;
+  }
+
+  function publishPhase(now: number) {
+    if (now - lastPhasePublishedAt < PHASE_PUBLISH_MS) return;
+    lastPhasePublishedAt = now;
+    const p = getPhase(deck.id);
+    // A null↔number transition adds or removes the span itself, so it always publishes;
+    // otherwise only a change visible at two decimals does.
+    if (p === null || phase === null) {
+      if (p !== phase) phase = p;
+    } else if (Math.round(p * 100) !== Math.round(phase * 100)) {
+      phase = p;
+    }
+  }
 
   $effect(() => {
     if (!previewCanvas || deck.source?.type !== "video") return;
@@ -77,15 +126,15 @@
       // but is not counted by frame-dur — see recordAuxLoop's doc comment.
       const t0 = performance.now();
       let drew = false;
-      // The `noDeckText` A/B arm (off in every ordinary run — perfArm.ts). currentTime and
-      // phase are read only by the elapsed/remaining/φ spans, so gating the writes stops a
-      // per-frame text mutation and the style/layout it forces, while leaving the preview
-      // drawImage and the audio clock itself untouched. It is the other half of the
-      // confirming experiment: §5 suppressed the clock and froze this *and* the waveform
-      // together, so neither could be priced alone. Note this arm updates ~60×/s against the
-      // waveform's ~6×/s, which is why the pair separates "a big paint, rarely" from "a
-      // small layout, constantly".
-      const publishText = !suppressDeckTimeText();
+      // A/B gates, off in every ordinary run (perfArm.ts). currentTime and phase are read
+      // only by the elapsed/remaining/φ spans, so gating the writes removes the text
+      // mutation and the style/layout it forces, while leaving the preview drawImage and the
+      // audio clock itself untouched. Suppressing both is what identified this as the whole
+      // frame budget (§6); the rate limits above then bought the frame rate back but not the
+      // CPU (§7), so the two are now gated *separately* — φ at 10Hz against the timestamp's
+      // ~1Hz is what distinguishes a per-mutation cost from a per-rate one.
+      const publishTimeText = !suppressTimestampText();
+      const publishPhaseText = !suppressPhaseText();
       const video = getVideoEl(deck.id);
       const codec = getCodecPlayer(deck.id);
       if (video && video.readyState >= 2) {
@@ -104,7 +153,7 @@
             }
           }
         }
-        if (publishText) currentTime = video.currentTime;
+        if (publishTimeText) publishTime(video.currentTime);
         if (video.duration && isFinite(video.duration)) videoDuration = video.duration;
       } else if (codec) {
         // Codec-path deck: no <video> element to read from — pick the current frame from
@@ -112,7 +161,7 @@
         // canvas accepts a VideoFrame directly, no scratch-canvas detour needed here).
         const t = getDeckTime(deck.id);
         if (t !== null) {
-          if (publishText) currentTime = t;
+          if (publishTimeText) publishTime(t);
           const frame = codec.getFrameForTime(t);
           if (frame && frame.timestamp !== lastDrawnPts) {
             lastDrawnPts = frame.timestamp;
@@ -136,10 +185,10 @@
         // last video's elapsed time and duration, frozen, while audio played normally
         // (2026-08-03). Audio is the master clock anyway, so read it directly.
         const t = getDeckTime(deck.id);
-        if (t !== null && publishText) currentTime = t;
+        if (t !== null && publishTimeText) publishTime(t);
         if (deck.source?.type === "video" && deck.source.duration) videoDuration = deck.source.duration;
       }
-      if (publishText) phase = getPhase(deck.id);
+      if (publishPhaseText) publishPhase(t0);
       recordAuxLoop(`preview/${deck.id}`, performance.now() - t0, drew);
       rafId = requestAnimationFrame(draw);
     }
@@ -666,6 +715,19 @@
     color: #ccc;
   }
 
+  /*
+   * φ is the most expensive readout in the app: each mutation of this span costs ~20ms of
+   * WebKitWebProcess CPU (§7), so its publish rate — not its styling — is the only lever
+   * that has ever moved the number. Two plausible CSS fixes were measured and both failed,
+   * which is why this rule looks ordinary:
+   *
+   *   - `contain: layout style paint` + a fixed width (so the box can never resize and
+   *     dirty the flex line): **no effect**, 41–44% CPU either way.
+   *   - `will-change: transform` to promote the span to its own compositing layer:
+   *     **worse**, 46–55%. The extra layer costs more than the damage it avoids.
+   *
+   * Do not re-try either without reading §7 first. The cost is not this element's paint.
+   */
   .phase-display {
     font-size: 10px;
     color: #a8e6a3;

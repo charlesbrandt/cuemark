@@ -1,13 +1,16 @@
 # Control-window frame budget: why the position poll is slow
 
-Status: **root-caused to a single line of UI, confirmed by isolating arm (§6, 2026-08-04):
-`DeckCard`'s elapsed/remaining timestamp is rewritten ~60×/s to render a string with
-one-second resolution. Suppressing it takes a playing deck from ~21fps to a flat 62fps and
-`WebKitWebProcess` from ~47% to ~18% CPU. The fix is not built.** Two earlier fixes landed and
-hold (the `postFrame` listener gate, the waveform bar cache). The waveform canvas — this doc's
-prime suspect through §4 and §5 — is **exonerated**: deleting its redraw entirely moves
-neither frame rate nor CPU. Started 2026-08-03 from a report of `audio_get_position` round
-trips of 300–424ms.
+Status: **fixed and verified live (§7, 2026-08-04). A playing deck holds a flat ~61fps where
+it used to run 21fps and slide to 13.** The cause was `DeckCard` publishing its transport
+readout on every rAF tick; both writes are now rate-limited to the resolution they actually
+render at. Two earlier fixes landed and hold (the `postFrame` listener gate, the waveform bar
+cache). The waveform canvas — this doc's prime suspect through §4 and §5 — is **exonerated**:
+deleting its redraw entirely moves neither frame rate nor CPU. Started 2026-08-03 from a
+report of `audio_get_position` round trips of 300–424ms.
+
+**The residual is now understood and priced**: a deck-card text mutation costs ~20ms of
+`WebKitWebProcess` CPU on this hardware, so the φ readout is a CPU dial set by its publish
+rate. See §7 for the number, and for the two CSS fixes that were measured and failed.
 
 **If you are picking this up fresh, read "Where to pick up" at the bottom first.**
 
@@ -495,7 +498,114 @@ different question: the finding is about what WebKit's rasterizer costs on *this
 The sweep refuses to advance unless the audio clock is actually moving, which is §5's
 wedged-pipeline trap encoded rather than remembered.
 
+### 7. Built, verified live — and the residual is a DOM text mutation, not a paint (2026-08-04)
+
+§6's recommendation is implemented in `DeckCard.svelte`: both `$state` writes that feed the
+transport readout now publish only when the *rendered* value changes — `currentTime` gated on
+`Math.floor(t)` (`formatDuration()` is `m:ss`), `phase` rate-capped, since φ shows two
+decimals and genuinely changes every frame.
+
+Verified with the §6 harness on the same 6:26 `.wav`, one clean app instance per run,
+`WebKitWebProcess` sampled with `top -b -n 2 -d 2` (never `ps`). The served artifact was
+diffed against disk before trusting any window — `curl localhost:1420/src/components/DeckCard.svelte`
+— because a stale Vite transform has silently invalidated a measurement in this project before.
+
+| arm | rAF | `WebKitWebProcess` |
+|---|---|---|
+| `baseline` — §6, **before** | 21.3–22.6 → **15.1fps** | 45–60% |
+| `baseline` — **after** | **60.8–61.7fps**, gap p50 16 | 40–46% |
+| `noDeckText` (both writes off) | 62.0fps flat | **16.5–17.5%** |
+| `baseline2` (closing control) | 60.7–61.4fps | 39.5–40.5% |
+
+**The frame rate is fully recovered** — median gap is 16ms, the vsync floor, and the
+monotonic within-arm slide §6 flagged is gone from the fixed path. `frame-dur` 1ms, JS
+`busy` 4%.
+
+**But `noDeckText` still removes ~23 CPU points at the same 62fps**, which is what made the
+next arm worth running rather than declaring victory on fps alone.
+
+#### φ is the whole residual; the timestamp is free
+
+The split §6 asked for, run as its own sweep (`baseline → noPhaseText → noTimeText →
+noDeckText → baseline2`, 30s each). φ published at 10Hz, the timestamp about 1Hz:
+
+| arm | rAF | `WebKitWebProcess` |
+|---|---|---|
+| `baseline` (both live) | 60.4–61.5fps | 38–42% |
+| `noPhaseText` (φ off) | 61.8–62.0fps flat | **18.5–20.4%** |
+| `noTimeText` (timestamp off, φ live) | 61.4 → **20.8fps** | 36–39.5% |
+| `noDeckText` (both off) | 62.0fps flat | ~17% |
+
+Unambiguous: removing φ recovers the CPU, removing the timestamp recovers nothing. **φ also
+owns the frame-gap tail** — `noTimeText` slid to 20.8fps with `gap p90` blowing out while
+`p50` stayed 16ms, and both φ-suppressed arms are flat. So §4's arm-2 degradation and §6's
+"unexplained slide" are very likely this same mechanism.
+
+That prices a deck-card text mutation at **~20ms of `WebKitWebProcess` CPU** — 10 per second
+for ~21 points of a core. For scale, the waveform canvas redrawing a 2496×144 surface ~6×/s
+costs *nothing measurable*. **On this WebKitGTK a canvas content change is cheap and a DOM
+text change is expensive**, which is the opposite of the intuition that drove §4 and §5.
+
+#### Two CSS fixes, both measured, both failed
+
+Aimed at the obvious mechanism — a text change dirtying layout in its flex row:
+
+| change | result |
+|---|---|
+| `contain: layout style paint` + fixed `width` (box can never resize) | **no effect**: 41–44% |
+| `will-change: transform` (own compositing layer) | **worse**: 46–55%, and the control arm rose too |
+
+Both reverted; the rule in `DeckCard.svelte` carries a comment so they are not re-tried.
+Whatever the cost is, it is not this element's layout or its paint damage.
+
+#### The cost saturates with rate, so throttling only half-helps
+
+`PHASE_PUBLISH_MS` was then halved from 10Hz to 5Hz:
+
+| φ rate | `WebKitWebProcess` (baseline) | control (`noPhaseText`) |
+|---|---|---|
+| 10Hz | 41–44% | 19–20% |
+| **5Hz** | **39–42%** | 21.5–24.5% |
+| ~1Hz (the timestamp) | no measurable cost | — |
+
+**Halving the mutation rate bought ~2 points, not half.** The cost is nearly flat between 5
+and 10Hz and vanishes by 1Hz — it saturates rather than scaling. A per-mutation model does
+not fit; something closer to "any recurring mutation puts the page into a per-frame repaint
+regime" does. 5Hz is kept because it is free to keep and reads no worse, but **throttling is
+not the lever that finishes this**.
+
+#### What is left, and the option worth building
+
+φ costs ~17–20 points of a core to display. That is now a product question rather than a
+measurement one: a live beat-phase readout against ~20% of a CPU on this hardware, and it
+scales per playing deck.
+
+The promising fix follows directly from the finding above — **draw φ into a small canvas
+instead of a DOM span**. The evidence that this should be ~free is already in this doc: the
+waveform canvas redraws a 2496×144 surface ~6×/s for no measurable CPU, while a ~38×12px text
+node costs 20ms a mutation. It is unverified, and given how many plausible predictions this
+investigation has falsified, it should be A/B'd, not assumed.
+
+Cheaper alternatives if that disappoints: make φ a toggle (off by default, on while
+beatmatching), or drop it to ~1Hz where the timestamp already shows the cost disappears —
+though a 1Hz beat phase is close to useless.
+
 ## Where to pick up
+
+**§6's fix is built and verified (§7). The open item is φ.**
+
+1. **Try φ as a canvas readout** (§7's last subsection) and A/B it with the existing
+   `noPhaseText` arm — the harness is already set up for exactly this comparison. Target:
+   `baseline` within a couple of points of `noPhaseText`'s ~20%.
+2. **Then re-price the projector arm.** Every arm-2 number in §4 was taken before any of
+   this; its 13.2 → 8.8fps slide may well have been the same φ tail.
+
+### Superseded: the §6 recommendation (now built)
+
+Kept for the ordering it prescribed, which held up: step 1 delivered the frame rate and step
+2's split turned out to be the whole remaining cost. Its guess that φ would need "~10Hz
+rather than per-frame" was right in direction and wrong in size — 10Hz still costs ~21 CPU
+points (§7).
 
 **Stop rewriting the deck card's timestamp 60 times a second to change it once a second.**
 
@@ -660,7 +770,14 @@ Fixes:
 - `src/components/WaveformCanvas.svelte` — `rasterizeOverview()` + the two-blit `drawOverview()`;
   canvas dimensions in the `[aux-loop]` bucket label
 
-A/B harness (§6) — kept, because the next two steps in "Where to pick up" both need it:
+The fix (§7):
+
+- `src/components/DeckCard.svelte` — `publishTime()` gates the `m:ss` write on whole seconds;
+  `publishPhase()` rate-caps φ at `PHASE_PUBLISH_MS` and compares at the rendered two-decimal
+  resolution. Both reset on source change, so a new track cannot inherit the old one's gate
+  state and freeze the readout for up to a second.
+
+A/B harness (§6, resequenced in §7) — kept, because the open φ question needs it:
 
 - `src/lib/audio/perfArm.ts` (new) — the self-advancing sweep, its liveness gate, and the
   autostart. Inert unless `VITE_PERF_SWEEP=1`
@@ -668,4 +785,16 @@ A/B harness (§6) — kept, because the next two steps in "Where to pick up" bot
 - `src/lib/audio/pollStats.ts` — ` arm=` stamp on every reported line, flush at arm
   boundaries, and window rates computed against the window's real duration
 - `src/App.svelte` — drives `advanceSweep()` from `frame()`; sweep autostart in `onMount`
-- `src/components/WaveformCanvas.svelte`, `src/components/DeckCard.svelte` — the two gates
+- `src/components/WaveformCanvas.svelte`, `src/components/DeckCard.svelte` — the gates.
+  `DeckCard` now gates φ and the timestamp *separately* (`suppressPhaseText` /
+  `suppressTimestampText`); `noDeckText` implies both and is retained as the "nothing
+  updates" control. `noWaveDraw` is in `RETIRED_ARMS` — answered twice, its gate kept so
+  re-testing it is one word in `SWEEP_ARMS`.
+
+⚠️ **Running a sweep: kill every previous instance first.** Two `cuemark` processes running
+at once produced a 9.7fps window that looks exactly like a regression, and a leftover Vite
+holding port 1420 lets a *new* `cargo tauri dev` fail while an *old* app keeps serving and
+logging. Check `ps -eo pid,comm | grep -E "cuemark|WebKitWebProces"` and `ss -ltn | grep 1420`
+before believing a run. Filter the log by line offset (`tail -n +N`), not by grepping the
+whole file — arm names from previous sessions are still in it, and matching them fires
+monitors early and mixes runs.

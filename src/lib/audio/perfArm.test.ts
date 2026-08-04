@@ -49,29 +49,44 @@ describe('perfArm sweep', () => {
     expect(mod.currentArm()).toBe('off');
     expect(mod.suppressWaveformDraw()).toBe(false);
     expect(mod.suppressDeckTimeText()).toBe(false);
+    expect(mod.suppressPhaseText()).toBe(false);
+    expect(mod.suppressTimestampText()).toBe(false);
   });
 
-  it('walks baseline → noWaveDraw → noDeckText → baseline2 → done', async () => {
+  it('walks baseline → noPhaseText → noTimeText → noDeckText → baseline2 → done', async () => {
     const mod = await loadSweep(true);
     expect(mod.currentArm()).toBe('off');
 
     play(mod, now, 1000, clock);
     expect(mod.currentArm()).toBe('baseline');
 
+    // The two split arms must suppress exactly one publisher each — a gate that leaks into
+    // the other makes the arm measure the pair again, which is the ambiguity §6 was left
+    // with and the entire reason this split exists.
     play(mod, now, 30_000, clock);
-    expect(mod.currentArm()).toBe('noWaveDraw');
-    expect(mod.suppressWaveformDraw()).toBe(true);
-    expect(mod.suppressDeckTimeText()).toBe(false);
+    expect(mod.currentArm()).toBe('noPhaseText');
+    expect(mod.suppressPhaseText()).toBe(true);
+    expect(mod.suppressTimestampText()).toBe(false);
 
     play(mod, now, 30_000, clock);
+    expect(mod.currentArm()).toBe('noTimeText');
+    expect(mod.suppressPhaseText()).toBe(false);
+    expect(mod.suppressTimestampText()).toBe(true);
+
+    // The both-off control has to imply both split gates, or `baseline` vs `noDeckText` is
+    // no longer the same comparison §6 made.
+    play(mod, now, 30_000, clock);
     expect(mod.currentArm()).toBe('noDeckText');
-    expect(mod.suppressWaveformDraw()).toBe(false);
     expect(mod.suppressDeckTimeText()).toBe(true);
+    expect(mod.suppressPhaseText()).toBe(true);
+    expect(mod.suppressTimestampText()).toBe(true);
 
     // The closing baseline is the drift control: without it a run cannot distinguish a real
     // arm effect from the machine simply getting slower.
     play(mod, now, 30_000, clock);
     expect(mod.currentArm()).toBe('baseline2');
+    expect(mod.suppressPhaseText()).toBe(false);
+    expect(mod.suppressTimestampText()).toBe(false);
 
     // Past the end it parks on `done`, never silently back on a named arm — a window logged
     // as `baseline` has to mean the sweep deliberately put it there.
@@ -79,12 +94,14 @@ describe('perfArm sweep', () => {
     expect(mod.currentArm()).toBe('done');
     expect(mod.suppressWaveformDraw()).toBe(false);
     expect(mod.suppressDeckTimeText()).toBe(false);
+    expect(mod.suppressPhaseText()).toBe(false);
+    expect(mod.suppressTimestampText()).toBe(false);
   });
 
   it('rearms on pause so each press of play is a complete run', async () => {
     const mod = await loadSweep(true);
     play(mod, now, 40_000, clock);
-    expect(mod.currentArm()).toBe('noWaveDraw');
+    expect(mod.currentArm()).toBe('noPhaseText');
 
     mod.advanceSweep(null);
     expect(mod.currentArm()).toBe('off');

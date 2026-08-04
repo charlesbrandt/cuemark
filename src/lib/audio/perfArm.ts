@@ -45,14 +45,38 @@ const ARM_SECONDS = 30;
  * `baseline` first and last: the closing repeat is the drift control, and §5's sweeps are
  * only trustworthy because their baselines reproduced at the end.
  *
- * `noWaveDraw` and `noDeckText` are the two consumers `pollNoClock` froze together. They
- * differ by an order of magnitude in *rate* as well as in cost — the waveform redraws ~6×/s
- * behind its one-device-pixel guard, while the timestamp text updates on every tick the
- * clock moves — so whichever one carries the cost, the pair separates "a big paint, rarely"
- * from "a small layout, constantly".
+ * **The sequence changed after §7.** The original arms (`noWaveDraw`, `noDeckText`) answered
+ * their question: the waveform canvas costs nothing and the deck-card text was the whole
+ * frame budget. Rate-limiting both text writes then restored 62fps — but left ~23 points of
+ * `WebKitWebProcess` CPU that `noDeckText` still removes, so *something* in the two
+ * surviving publishers is expensive out of all proportion to its rate.
+ *
+ * `noPhaseText` and `noTimeText` split them, which is what §6 asked for and could not do:
+ * φ is published at 10Hz and the `m:ss` timestamp about once a second, so if the residual
+ * tracks φ it is a per-mutation cost, and if it tracks the timestamp it is something about
+ * the mutation itself rather than how often it happens.
+ *
+ * `noDeckText` is retained deliberately as the target to beat — it is the only arm that
+ * shows what the card costs when nothing updates at all, and the fix is only finished when
+ * `baseline` matches it on CPU as well as on frame rate.
  */
-export const SWEEP_ARMS = ['baseline', 'noWaveDraw', 'noDeckText', 'baseline2'] as const;
-export type PerfArm = (typeof SWEEP_ARMS)[number] | 'off' | 'done';
+export const SWEEP_ARMS = [
+  'baseline',
+  'noPhaseText',
+  'noTimeText',
+  'noDeckText',
+  'baseline2',
+] as const;
+/**
+ * Arms whose gate still exists in the UI but which are not in the current sequence.
+ * `noWaveDraw` is answered — twice, in two separate sessions — and costs 30s of every run
+ * to re-answer, but keeping its gate means re-testing it is a one-word edit to `SWEEP_ARMS`
+ * rather than a re-implementation.
+ */
+const RETIRED_ARMS = ['noWaveDraw'] as const;
+
+export type ArmName = (typeof SWEEP_ARMS)[number] | (typeof RETIRED_ARMS)[number];
+export type PerfArm = ArmName | 'off' | 'done';
 
 const enabled = import.meta.env.VITE_PERF_SWEEP === '1';
 
@@ -98,17 +122,28 @@ export function currentArm(): PerfArm {
  * True when `name` is the arm in force. Gates read this; a disabled sweep answers `false`
  * to every name, so the gated code path is the normal one.
  */
-export function armIs(name: (typeof SWEEP_ARMS)[number]): boolean {
+export function armIs(name: ArmName): boolean {
   return arm === name;
 }
 
-/** `baseline` and `baseline2` are the same arm; the suffix only distinguishes log windows. */
+/** Retired from the sequence (see `RETIRED_ARMS`); the gate stays so re-arming is trivial. */
 export function suppressWaveformDraw(): boolean {
   return armIs('noWaveDraw');
 }
 
+/** Both deck-card publishers off — the "nothing updates" control, not a candidate fix. */
 export function suppressDeckTimeText(): boolean {
   return armIs('noDeckText');
+}
+
+/** φ only. Published at 10Hz, so this arm prices a *frequent, small* text mutation. */
+export function suppressPhaseText(): boolean {
+  return armIs('noPhaseText') || armIs('noDeckText');
+}
+
+/** The `m:ss` elapsed/remaining pair only — roughly one mutation per second. */
+export function suppressTimestampText(): boolean {
+  return armIs('noTimeText') || armIs('noDeckText');
 }
 
 /**

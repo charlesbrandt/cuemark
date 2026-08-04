@@ -555,6 +555,15 @@ How to read them (full derivation in `docs/design/control-window-frame-budget.md
   the same mode disagreed by 2× until the `[aux-loop]` label carried `@<W>x<H>`. Never A/B a
   canvas cost across runs whose dimensions were not captured — and prefer A/Bing in one
   session with only the code path switched.
+- ⚠️ **A DOM text mutation is expensive here; a canvas redraw is not.** Measured 2026-08-04:
+  rewriting one small `<span>` in a deck card costs **~20ms of `WebKitWebProcess` CPU per
+  mutation**, while `WaveformCanvas` redrawing a 2496×144 surface ~6×/s costs nothing
+  measurable. Publishing a per-frame readout at 60Hz held a playing deck at ~21fps; gating
+  both writes to the resolution they actually render at restored a flat ~61fps
+  (`docs/design/control-window-frame-budget.md` §6–§7). **Never write a `$state` that feeds
+  text on every rAF tick — gate it on the rendered string changing.** Throttling helps far
+  less than it should: the cost saturates between 1Hz and 5Hz, and `contain` / `will-change`
+  do not help at all (both measured; `will-change` was worse).
 - ⚠️ **`ps %cpu` is a lifetime average, not current load.** On a 2-hour-old process it read 7%
   while the process was actually at 64%. Use `top -b -n 2 -d 3 -p <pid>` and take the *second*
   sample. **Pair it with `busy%` always** — `busy%` low + CPU high is the signature of cost in
