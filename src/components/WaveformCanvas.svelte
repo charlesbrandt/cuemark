@@ -27,6 +27,7 @@
   // Playhead is pinned 25% from left in zoom mode so both decks align at the same X
   const ZOOM_LEAD_RATIO = 0.25;
   const HOT_COLORS = ['#00e8ff', '#ffcc00', '#ff44cc', '#44ff88'];
+  const PLAYHEAD_COLOR = '#7c8cff'; // matches --accent-deck (app.css)
 
   // Pre-rasterized overview bars, one offscreen canvas per colour scheme.
   //
@@ -322,7 +323,7 @@
 
     drawMarkers(ctx, W, H, (t) => (t / duration) * W);
 
-    ctx.strokeStyle = '#e04040';
+    ctx.strokeStyle = PLAYHEAD_COLOR;
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(playheadX, 0);
@@ -395,7 +396,7 @@
     drawMarkers(ctx, W, H, (t) => ((t - timeStart) / contentSpan) * W);
 
     // Playhead pinned at fixed position
-    ctx.strokeStyle = '#e04040';
+    ctx.strokeStyle = PLAYHEAD_COLOR;
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(playheadX, 0);
@@ -556,29 +557,30 @@
        height:72px is a pre-JS fallback only; resize() overwrites it via c.style.height. */
     height: 72px;
     cursor: crosshair;
-    background: #080d18;
+    background: var(--surface2, #282b31);
   }
   .zoom-toggle {
     position: absolute;
-    top: 3px;
-    right: 4px;
-    padding: 1px 5px;
-    background: rgba(0, 0, 0, 0.65);
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    color: rgba(255, 255, 255, 0.5);
+    top: 4px;
+    right: 5px;
+    padding: 2px 6px;
+    background: rgba(23, 24, 28, 0.75);
+    border: 1px solid var(--divider, rgba(240, 241, 244, 0.1));
+    color: rgba(240, 241, 244, 0.55);
+    font-family: var(--font-heading, sans-serif);
+    font-weight: 700;
     font-size: 9px;
-    font-family: monospace;
     cursor: pointer;
-    border-radius: 2px;
+    border-radius: var(--radius-sm, 6px);
     letter-spacing: 0.05em;
     line-height: 1.6;
   }
   .zoom-toggle:hover {
-    border-color: rgba(255, 255, 255, 0.35);
+    border-color: var(--accent-deck, #7c8cff);
     color: #fff;
   }
   .zoom-toggle.active {
-    border-color: #00aadd;
-    color: #00aadd;
+    border-color: var(--accent-deck, #7c8cff);
+    color: var(--accent-deck, #7c8cff);
   }
 </style>

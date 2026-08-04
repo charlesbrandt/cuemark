@@ -263,6 +263,9 @@
         </button>
       {/if}
     </span>
+    {#if deck.source?.type === "video"}
+      <span class="deck-title" title={deck.source.filePath.split("/").pop()}>{deck.source.filePath.split("/").pop()}</span>
+    {/if}
     <button class="remove-btn" onclick={() => removeDeck(deck.id)} aria-label="Remove deck">
       ×
     </button>
@@ -344,6 +347,14 @@
       </button>
     {/if}
   </div>
+
+  {#if deck.source?.type === "video" && videoDuration > 0}
+    {@const posPct = Math.min(100, (currentTime / videoDuration) * 100)}
+    <div class="position-bar" title="{formatDuration(currentTime)} / {formatDuration(videoDuration)}">
+      <div class="position-fill" style="width: {posPct}%"></div>
+      <div class="position-playhead" style="left: {posPct}%"></div>
+    </div>
+  {/if}
 
   {#if deck.source?.type === "video" && videoDuration > 0}
     <div class="time-display">
@@ -620,60 +631,96 @@
     justify-content: center;
   }
 
-  .eq-active { color: #f5a623; }
+  .eq-active { color: var(--accent); }
+
+  .position-bar {
+    position: relative;
+    height: 4px;
+    background: var(--surface2);
+    border-radius: 2px;
+    width: 100%;
+    flex-shrink: 0;
+  }
+
+  .position-fill {
+    position: absolute;
+    left: 0;
+    top: 0;
+    height: 100%;
+    border-radius: 2px;
+    background: var(--accent);
+  }
+
+  .position-playhead {
+    position: absolute;
+    top: -3px;
+    height: 10px;
+    width: 2px;
+    background: var(--text);
+    transform: translateX(-1px);
+  }
 
   .gain-row {
     display: flex;
     align-items: center;
     gap: 6px;
     padding: 3px 4px;
-    font-size: 11px;
-    color: #aaa;
+    font-family: var(--font-heading);
+    font-size: 10px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: color-mix(in srgb, var(--text) 45%, transparent);
   }
 
   .gain-row span {
-    min-width: 28px;
+    min-width: 32px;
   }
 
   .gain-row input[type="range"] {
     flex: 1;
     height: 14px;
+    accent-color: var(--accent);
   }
 
   .gain-row strong {
-    min-width: 30px;
+    min-width: 32px;
     text-align: right;
     font-variant-numeric: tabular-nums;
-    color: #ccc;
+    text-transform: none;
+    letter-spacing: normal;
+    color: var(--text);
   }
 
   .bpm-row {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 5px;
     padding: 3px 4px;
     font-size: 11px;
+    flex-wrap: wrap;
   }
 
   .bpm-value {
     flex: 1;
-    color: #aaa;
+    color: color-mix(in srgb, var(--text) 70%, transparent);
     font-variant-numeric: tabular-nums;
     min-width: 60px;
   }
 
   .bpm-effective {
-    color: #f5a623;
+    color: var(--accent);
     font-variant-numeric: tabular-nums;
   }
 
   .bpm-btn {
-    padding: 2px 6px;
+    font-family: var(--font-heading);
+    font-weight: 600;
+    padding: 5px 8px;
     font-size: 10px;
-    background: #1a1a1a;
-    border: 1px solid #444;
-    border-radius: 3px;
-    color: #888;
+    background: var(--surface2);
+    border: 1px solid var(--divider);
+    border-radius: var(--radius-sm);
+    color: color-mix(in srgb, var(--text) 55%, transparent);
     cursor: pointer;
   }
 
@@ -683,13 +730,14 @@
   }
 
   .bpm-btn:not(:disabled):hover {
-    border-color: #666;
-    color: #ccc;
+    border-color: var(--accent);
+    color: var(--accent);
   }
 
   .bpm-btn.active {
-    border-color: #f5a623;
-    color: #f5a623;
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--on-accent);
   }
 
   .downbeat-indicator {
@@ -703,16 +751,16 @@
     padding: 1px 4px;
     font-size: 9px;
     background: none;
-    border: 1px solid #444;
-    border-radius: 3px;
-    color: #666;
+    border: 1px solid var(--divider);
+    border-radius: var(--radius-sm);
+    color: color-mix(in srgb, var(--text) 40%, transparent);
     cursor: pointer;
     line-height: 1;
   }
 
   .downbeat-clear:hover {
-    border-color: #888;
-    color: #ccc;
+    border-color: var(--accent);
+    color: var(--accent);
   }
 
   /*
@@ -739,18 +787,22 @@
   .loop-row {
     display: flex;
     align-items: center;
-    gap: 3px;
-    padding: 3px 4px;
+    gap: 2px;
+    padding: 3px;
     flex-wrap: wrap;
+    background: var(--surface2);
+    border-radius: var(--radius);
   }
 
   .loop-pt-btn {
-    padding: 2px 5px;
+    font-family: var(--font-heading);
+    font-weight: 700;
+    padding: 4px 7px;
     font-size: 9px;
-    background: #1a1a1a;
-    border: 1px solid #444;
-    border-radius: 3px;
-    color: #888;
+    background: none;
+    border: none;
+    border-radius: var(--radius-sm);
+    color: color-mix(in srgb, var(--text) 55%, transparent);
     cursor: pointer;
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
@@ -762,17 +814,19 @@
   }
 
   .loop-pt-btn:not(:disabled):hover {
-    border-color: #666;
-    color: #ccc;
+    color: var(--text);
+    background: var(--surface);
   }
 
   .bar-btn {
-    padding: 2px 5px;
+    font-family: var(--font-heading);
+    font-weight: 700;
+    padding: 4px 7px;
     font-size: 10px;
-    background: #131a13;
-    border: 1px solid #2d4a2d;
-    border-radius: 3px;
-    color: #5a9a5a;
+    background: none;
+    border: none;
+    border-radius: var(--radius-sm);
+    color: color-mix(in srgb, var(--text) 55%, transparent);
     cursor: pointer;
     min-width: 22px;
   }
@@ -783,19 +837,18 @@
   }
 
   .bar-btn:not(:disabled):hover {
-    border-color: #4caf50;
-    color: #4caf50;
+    color: var(--accent);
+    background: var(--surface);
   }
 
   .clear-btn {
     margin-left: auto;
-    border-color: #5a2020;
-    color: #a05050;
+    color: color-mix(in srgb, var(--text) 35%, transparent);
   }
 
   .clear-btn:not(:disabled):hover {
-    border-color: #e04040;
-    color: #e04040;
+    color: var(--accent-nav);
+    background: var(--surface);
   }
 
   .time-display {
@@ -804,21 +857,24 @@
     font-size: 12px;
     font-variant-numeric: tabular-nums;
     padding: 2px 4px;
-    color: #aaa;
+    color: color-mix(in srgb, var(--text) 65%, transparent);
   }
 
   .time-elapsed {
-    color: #ddd;
+    color: var(--text);
   }
 
   .time-remaining {
-    color: #888;
+    color: color-mix(in srgb, var(--text) 55%, transparent);
   }
 
   .hot-cues {
     display: flex;
-    gap: 4px;
+    gap: 2px;
     margin: 6px 0 2px;
+    padding: 3px;
+    background: var(--surface2);
+    border-radius: var(--radius);
   }
 
   .hot-cue-btn {
@@ -826,12 +882,12 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    padding: 4px 2px;
+    padding: 5px 2px;
     font-size: 11px;
-    background: #222;
-    border: 1px solid #444;
-    border-radius: 4px;
-    color: #888;
+    background: none;
+    border: none;
+    border-radius: var(--radius-sm);
+    color: color-mix(in srgb, var(--text) 55%, transparent);
     cursor: pointer;
     min-height: 36px;
     line-height: 1.2;
@@ -843,22 +899,22 @@
   }
 
   .hot-cue-btn.set {
-    background: #1a3a1a;
-    border-color: #4caf50;
-    color: #4caf50;
+    background: var(--accent);
+    color: var(--on-accent);
   }
 
   .hot-cue-btn.set:hover {
-    background: #1e4d1e;
+    filter: brightness(1.1);
   }
 
   .hot-cue-btn:not(.set):not(:disabled):hover {
-    border-color: #666;
-    color: #ccc;
+    background: var(--surface);
+    color: var(--text);
   }
 
   .hc-num {
-    font-weight: bold;
+    font-family: var(--font-heading);
+    font-weight: 800;
     font-size: 13px;
   }
 

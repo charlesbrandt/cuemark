@@ -99,11 +99,26 @@
 
 <style>
   .cf-select {
-    background: #222;
-    color: #ccc;
-    border: 1px solid #444;
-    border-radius: 3px;
-    padding: 2px 4px;
-    font-size: 0.8rem;
+    font-family: var(--font-body);
+    background-color: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--divider);
+    border-radius: var(--radius-sm);
+    padding: 6px 24px 6px 8px;
+    font-size: 12px;
+    font-weight: 700;
   }
+  .cf-select:focus { outline: none; border-color: var(--accent); }
+
+  .cf-target {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-family: var(--font-heading);
+    font-weight: 700;
+    font-size: 11px;
+    color: var(--text);
+    white-space: nowrap;
+  }
+  .cf-target input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
 </style>

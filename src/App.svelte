@@ -23,7 +23,6 @@
   import WaveformCanvas from "./components/WaveformCanvas.svelte";
   import AudioSettings from "./components/AudioSettings.svelte";
   import DiggerQueue from "./components/DiggerQueue.svelte";
-  import HistoryPanel from "./components/HistoryPanel.svelte";
   import { mainOutputDeviceIds, cueOutputDeviceId, cueGain } from "./lib/audio/audioSettings";
   import { CodecPlayer, type DemuxInfo } from "./lib/video/codecPlayer";
   import { videoPathOverrides, videoPathDefault, resolveVideoPath, setVideoPathOverride } from "./lib/video/videoPathSettings";
@@ -53,7 +52,6 @@
   let tapResetTimer: ReturnType<typeof setTimeout> | undefined;
   let showAudioSettings = $state(false);
   let showDiggerQueue = $state(true);
-  let showHistory = $state(false);
   let showVisualizationPanel = $state(false);
 
   function handleTap() {
@@ -1557,13 +1555,8 @@
 <div class="app">
   <header class="toolbar">
     <span class="logo">CUEMARK</span>
+    <div class="toolbar-divider"></div>
     <button class="add-deck" onclick={addDeck}>+ Deck</button>
-    <button class="output-btn" onclick={openOutputWindow}>Output Window</button>
-    <button
-      class="output-btn"
-      class:active={showAudioSettings}
-      onclick={() => { showAudioSettings = !showAudioSettings; }}
-    >Settings</button>
     <button
       class="output-btn"
       class:active={showDiggerQueue}
@@ -1571,14 +1564,16 @@
     >Queue</button>
     <button
       class="output-btn"
-      class:active={showHistory}
-      onclick={() => { showHistory = !showHistory; }}
-    >History</button>
-    <button
-      class="output-btn"
       class:active={showVisualizationPanel}
       onclick={() => { showVisualizationPanel = !showVisualizationPanel; }}
     >Visualization</button>
+    <button class="output-btn" onclick={openOutputWindow}>Output Window</button>
+    <button
+      class="output-btn"
+      class:active={showAudioSettings}
+      onclick={() => { showAudioSettings = !showAudioSettings; }}
+    >Settings</button>
+    <div class="toolbar-divider"></div>
     <button
       class="output-btn"
       class:active={$session.snapToBeat}
@@ -1590,6 +1585,7 @@
     {#if $session.bpm !== null}
       <button class="tap-reset" onclick={() => { setMasterBpm(null); tapTimestamps = []; }}>✕</button>
     {/if}
+    <div class="toolbar-divider"></div>
     <label class="master-vol">
       Main Volume
       <input
@@ -1602,6 +1598,23 @@
           session.update((s) => ({ ...s, masterVolume: +e.currentTarget.value }))}
       />
       <span>{$session.masterVolume.toFixed(2)}</span>
+    </label>
+    <label
+      class="master-vol"
+      class:disabled={!$cueOutputDeviceId}
+      title={$cueOutputDeviceId ? "" : "Select a headphone/cue device in Settings first"}
+    >
+      Headphone Volume
+      <input
+        type="range"
+        min="0"
+        max="1"
+        step="0.01"
+        value={$cueGain}
+        disabled={!$cueOutputDeviceId}
+        oninput={(e) => cueGain.set(+e.currentTarget.value)}
+      />
+      <span>{$cueGain.toFixed(2)}</span>
     </label>
   </header>
 
@@ -1663,12 +1676,6 @@
     {#if showDiggerQueue}
       <aside class="queue-sidebar">
         <DiggerQueue />
-      </aside>
-    {/if}
-
-    {#if showHistory}
-      <aside class="queue-sidebar">
-        <HistoryPanel />
       </aside>
     {/if}
   </div>

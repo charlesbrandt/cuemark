@@ -17,7 +17,10 @@ Built with [Tauri](https://tauri.app) (Rust + WebKit), WebGL, and GStreamer/Pipe
 
 ### Build
 
-- **Rust** ≥ 1.75 — install via [rustup](https://rustup.rs)
+- **Rust** ≥ 1.75 — install via [rustup](https://rustup.rs). rustup writes
+  `~/.cargo/env` but doesn't always wire it into a fresh shell's `~/.bashrc` —
+  if `cargo --version` fails in a new terminal, add `. "$HOME/.cargo/env"` to
+  `~/.bashrc` rather than sourcing it by hand every session.
 - **Node.js** ≥ 18 + npm
 - **Tauri CLI** — `cargo install tauri-cli`
 
@@ -83,9 +86,15 @@ screenshots of the canvas-rendered video/waveform) without a real display, via
 visual verification. See `skills/verify-ui/SKILL.md` for the full workflow.
 
 ```sh
-sudo apt-get install xvfb webkit2gtk-driver
+sudo apt-get install xvfb webkitgtk-webdriver
 cargo install tauri-driver
 ```
+
+> **Package name varies by distro release**: it's `webkitgtk-webdriver` on Ubuntu
+> 26.04 (confirmed empirically 2026-08-04 — `webkit2gtk-driver` doesn't exist there
+> and apt suggests the replacement). Older releases may still use
+> `webkit2gtk-driver`; if the install fails with "no installation candidate",
+> `apt-cache search webdriver` to find the right name for your release.
 
 ## Running
 

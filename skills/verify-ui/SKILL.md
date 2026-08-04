@@ -12,15 +12,24 @@ a screenshot or DOM-level assertion and don't want to touch the user's live sess
 
 ## One-time setup
 
-Requires `sudo` — the user runs this themselves (see `README.md`):
+Requires `sudo` — the user runs this themselves (see `README.md`). `sudo` in this
+environment needs a real interactive terminal (fails with "A terminal is required
+to authenticate" over a non-interactive shell, `!`-prefixed or otherwise) — ask the
+user to run the `apt-get` line in their own terminal; `cargo install tauri-driver`
+itself needs no sudo and can be run directly:
 ```sh
-sudo apt-get install xvfb webkit2gtk-driver
+sudo apt-get install xvfb webkitgtk-webdriver
 cargo install tauri-driver
 ```
+**Package name varies by distro release**: it's `webkitgtk-webdriver` on Ubuntu
+26.04 (confirmed empirically 2026-08-04 — `webkit2gtk-driver` doesn't exist there;
+apt's error names the replacement directly). Older releases may still use
+`webkit2gtk-driver`.
+
 Verify before starting a session:
 ```sh
 which Xvfb tauri-driver
-dpkg -L webkit2gtk-driver | grep -E '/WebKitWebDriver$'
+dpkg -L webkitgtk-webdriver | grep -E '/WebKitWebDriver$'
 ```
 If any of these are missing, stop and tell the user — don't try to work around it.
 
@@ -68,7 +77,7 @@ echo $! > /tmp/xvfb.pid
 ## 3. Start tauri-driver on that display
 
 ```sh
-WEBKIT_DRIVER=$(dpkg -L webkit2gtk-driver | grep -E '/WebKitWebDriver$')
+WEBKIT_DRIVER=$(dpkg -L webkitgtk-webdriver | grep -E '/WebKitWebDriver$')
 DISPLAY=:99 tauri-driver --port 4444 --native-driver "$WEBKIT_DRIVER" > /tmp/tauri-driver.log 2>&1 &
 echo $! > /tmp/tauri-driver.pid
 sleep 1
@@ -358,7 +367,7 @@ post-reload state:
   — never kill a process whose `DISPLAY=:0` (or `wayland-0`), that's the user's real
   desktop session, potentially their own legitimate `cargo tauri dev` instance.
 
-- **`dpkg -L webkit2gtk-driver | grep WebKitWebDriver` matches two lines**, not one — the
+- **`dpkg -L webkitgtk-webdriver | grep WebKitWebDriver` matches two lines**, not one — the
   binary (`/usr/bin/WebKitWebDriver`) and its man page (`/usr/share/man/man1/
   WebKitWebDriver.1.gz`, which also contains the string). `$WEBKIT_DRIVER` then holds both
   paths newline-joined, and `tauri-driver --native-driver "$WEBKIT_DRIVER"` fails immediately
@@ -378,9 +387,9 @@ post-reload state:
   binary directly from a terminal instead (see `run-app` skill / `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS`).
 - **Port 4444 already bound**: a previous `tauri-driver` didn't get killed —
   `fuser -k 4444/tcp` before starting a new one.
-- **`WebKitWebDriver` version mismatch**: `webkit2gtk-driver` must match the
+- **`WebKitWebDriver` version mismatch**: `webkitgtk-webdriver` must match the
   installed `libwebkit2gtk-4.1-0` version or the driver handshake fails immediately.
-  `apt-get upgrade webkit2gtk-driver` if cuemark's WebKit dependency is bumped.
+  `apt-get upgrade webkitgtk-webdriver` if cuemark's WebKit dependency is bumped.
 - **One session at a time**: `tauri-driver` does not multiplex; creating a second
   session before deleting the first will hang or error.
 - **A test script's `cleanup()` must kill the launched app binary itself, not just

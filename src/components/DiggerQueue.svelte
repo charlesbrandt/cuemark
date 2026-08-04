@@ -11,7 +11,9 @@
   } from '../lib/digger/api';
   import { markGridSaved } from '../lib/audio/gridSource';
   import { setPendingTrackMeta } from '../lib/state/history';
+  import HistoryPanel from './HistoryPanel.svelte';
 
+  let activeTab = $state<'tracks' | 'history'>('tracks');
   let queue = $state<DiggerQueueItem[]>([]);
   let searchResults = $state<DiggerTrack[]>([]);
   let searchQuery = $state('');
@@ -169,6 +171,11 @@
     <button class="icon-btn" onclick={() => { showUrlInput = !showUrlInput; }} title="Settings">⚙</button>
   </div>
 
+  <div class="seg tab-seg" role="radiogroup">
+    <button type="button" class="seg-opt" class:on={activeTab === 'tracks'} onclick={() => { activeTab = 'tracks'; }}>Tracks</button>
+    <button type="button" class="seg-opt" class:on={activeTab === 'history'} onclick={() => { activeTab = 'history'; }}>History</button>
+  </div>
+
   {#if showUrlInput}
     <div class="url-row">
       <input
@@ -186,57 +193,61 @@
     <div class="digger-error">{error}</div>
   {/if}
 
-  <div class="search-row">
-    <input
-      class="search-input"
-      type="text"
-      placeholder="Search tracks..."
-      bind:value={searchQuery}
-      oninput={onSearchInput}
-      onkeydown={(e) => { if (e.key === 'Enter') runSearch(); }}
-    />
-    <button class="small-btn" onclick={addRandom} title="Add random track">Rnd</button>
-    <button class="small-btn" onclick={addSuggested} title="Add suggested track">Nxt</button>
-  </div>
+  {#if activeTab === 'tracks'}
+    <div class="search-row">
+      <input
+        class="search-input"
+        type="text"
+        placeholder="Search tracks..."
+        bind:value={searchQuery}
+        oninput={onSearchInput}
+        onkeydown={(e) => { if (e.key === 'Enter') runSearch(); }}
+      />
+      <button class="small-btn" onclick={addRandom} title="Add random track">Rnd</button>
+      <button class="small-btn" onclick={addSuggested} title="Add suggested track">Nxt</button>
+    </div>
 
-  {#if searchQuery.length >= 2}
-    <div class="results-list">
-      {#if loading}
-        <div class="list-hint">searching…</div>
-      {:else if searchResults.length === 0}
-        <div class="list-hint">no results</div>
-      {:else}
-        {#each searchResults as track (track.id)}
-          <div class="result-row">
-            <span class="track-label">{trackLabel(track)}</span>
-            <button class="add-btn" onclick={() => addSearchResult(track)}>+</button>
-          </div>
-        {/each}
-      {/if}
-    </div>
-  {:else}
-    <div class="queue-list">
-      {#if queue.length === 0}
-        <div class="list-hint">Queue is empty — search or add random</div>
-      {:else}
-        {#each queue as item (item.id)}
-          <div class="queue-row">
-            <span class="track-label">{trackLabel(item)}</span>
-            {#if item.bpm != null}<span class="bpm-badge">{Math.round(item.bpm)}</span>{/if}
-            <div class="queue-actions">
-              {#each decks as deck (deck.id)}
-                <button
-                  class="deck-btn"
-                  onclick={() => loadToDeck(item, deck.id)}
-                  title="Load to {deck.id}"
-                >→{deck.id.replace('deck-', 'D')}</button>
-              {/each}
-              <button class="remove-btn" onclick={() => removeItem(item.id)} title="Remove from queue">✕</button>
+    {#if searchQuery.length >= 2}
+      <div class="results-list">
+        {#if loading}
+          <div class="list-hint">searching…</div>
+        {:else if searchResults.length === 0}
+          <div class="list-hint">no results</div>
+        {:else}
+          {#each searchResults as track (track.id)}
+            <div class="result-row">
+              <span class="track-label">{trackLabel(track)}</span>
+              <button class="add-btn" onclick={() => addSearchResult(track)}>+</button>
             </div>
-          </div>
-        {/each}
-      {/if}
-    </div>
+          {/each}
+        {/if}
+      </div>
+    {:else}
+      <div class="queue-list">
+        {#if queue.length === 0}
+          <div class="list-hint">Queue is empty — search or add random</div>
+        {:else}
+          {#each queue as item (item.id)}
+            <div class="queue-row">
+              <span class="track-label">{trackLabel(item)}</span>
+              {#if item.bpm != null}<span class="bpm-badge">{Math.round(item.bpm)}</span>{/if}
+              <div class="queue-actions">
+                {#each decks as deck (deck.id)}
+                  <button
+                    class="deck-btn"
+                    onclick={() => loadToDeck(item, deck.id)}
+                    title="Load to {deck.id}"
+                  >→{deck.id.replace('deck-', 'D')}</button>
+                {/each}
+                <button class="remove-btn" onclick={() => removeItem(item.id)} title="Remove from queue">✕</button>
+              </div>
+            </div>
+          {/each}
+        {/if}
+      </div>
+    {/if}
+  {:else}
+    <HistoryPanel />
   {/if}
 </div>
 
@@ -246,93 +257,101 @@
     flex-direction: column;
     height: 100%;
     min-height: 0;
-    background: #1a1a1a;
-    border-bottom: 1px solid #333;
-    padding: 6px 10px;
+    padding: 16px 16px 0;
     font-size: 12px;
-    color: #ccc;
+    color: var(--text);
   }
 
   .digger-header {
     display: flex;
     align-items: center;
-    gap: 6px;
-    margin-bottom: 6px;
+    gap: 2px;
+    margin-bottom: 12px;
     flex-shrink: 0;
   }
 
   .digger-title {
-    font-weight: bold;
-    color: #aaa;
+    font-family: var(--font-heading);
+    font-weight: 800;
+    color: var(--text);
     font-size: 11px;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
+    letter-spacing: 0.08em;
     flex: 1;
   }
 
   .icon-btn {
     background: none;
     border: none;
-    color: #777;
+    color: color-mix(in srgb, var(--text) 55%, transparent);
     cursor: pointer;
-    padding: 2px 4px;
-    font-size: 13px;
+    padding: 4px;
+    font-size: 14px;
     line-height: 1;
+    border-radius: var(--radius-sm);
   }
-  .icon-btn:hover { color: #ccc; }
+  .icon-btn:hover { color: var(--accent); }
+
+  .tab-seg {
+    margin-bottom: 12px;
+    flex-shrink: 0;
+  }
 
   .url-row {
     display: flex;
     gap: 4px;
-    margin-bottom: 6px;
+    margin-bottom: 8px;
     flex-shrink: 0;
   }
 
   .url-input {
     flex: 1;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #ccc;
-    padding: 3px 6px;
-    font-size: 11px;
-    border-radius: 3px;
+    background: var(--surface2);
+    border: 1px solid var(--divider);
+    color: var(--text);
+    padding: 6px 8px;
+    font-size: 12px;
+    border-radius: var(--radius-sm);
   }
 
   .digger-error {
-    color: #e06c75;
+    color: #ff6b6b;
     font-size: 11px;
-    margin-bottom: 4px;
+    margin-bottom: 6px;
     flex-shrink: 0;
   }
 
   .search-row {
     display: flex;
-    gap: 4px;
-    margin-bottom: 6px;
+    gap: 8px;
+    margin-bottom: 12px;
     flex-shrink: 0;
   }
 
   .search-input {
     flex: 1;
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #ccc;
-    padding: 3px 6px;
+    background: var(--surface2);
+    border: 1px solid var(--divider);
+    color: var(--text);
+    padding: 6px 8px;
     font-size: 12px;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
+    font-family: var(--font-body);
   }
-  .search-input:focus { outline: 1px solid #555; }
+  .search-input:focus { outline: none; border-color: var(--accent); }
 
   .small-btn {
-    background: #2a2a2a;
-    border: 1px solid #444;
-    color: #aaa;
-    padding: 2px 7px;
+    font-family: var(--font-heading);
+    font-weight: 600;
+    background: var(--surface2);
+    border: 1px solid var(--divider);
+    color: var(--text);
+    padding: 6px 10px;
     font-size: 11px;
     cursor: pointer;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
   }
-  .small-btn:hover { background: #333; color: #ccc; }
+  .small-btn:hover { border-color: var(--accent); color: var(--accent); }
 
   .results-list,
   .queue-list {
@@ -342,7 +361,7 @@
   }
 
   .list-hint {
-    color: #555;
+    color: color-mix(in srgb, var(--text) 40%, transparent);
     font-size: 11px;
     padding: 4px 0;
   }
@@ -351,9 +370,9 @@
   .queue-row {
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 3px 0;
-    border-bottom: 1px solid #222;
+    gap: 8px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--divider);
   }
 
   .track-label {
@@ -365,50 +384,53 @@
   }
 
   .bpm-badge {
-    color: #666;
+    color: color-mix(in srgb, var(--text) 45%, transparent);
     font-size: 10px;
     flex-shrink: 0;
     min-width: 24px;
     text-align: right;
+    font-variant-numeric: tabular-nums;
   }
 
   .queue-actions {
     display: flex;
-    gap: 3px;
+    gap: 4px;
     flex-shrink: 0;
   }
 
   .deck-btn {
-    background: #1e3a2a;
-    border: 1px solid #2a5a3a;
-    color: #5dbe8a;
-    padding: 1px 5px;
+    background: var(--accent-soft);
+    border: 1px solid transparent;
+    color: var(--accent);
+    padding: 2px 6px;
+    font-family: var(--font-heading);
+    font-weight: 700;
     font-size: 10px;
     cursor: pointer;
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     white-space: nowrap;
   }
-  .deck-btn:hover { background: #2a5040; }
+  .deck-btn:hover { filter: brightness(1.15); }
 
   .add-btn {
-    background: #1e3a2a;
-    border: 1px solid #2a5a3a;
-    color: #5dbe8a;
-    padding: 1px 6px;
-    font-size: 12px;
+    background: var(--accent-soft);
+    border: 1px solid transparent;
+    color: var(--accent);
+    padding: 2px 7px;
+    font-size: 13px;
     cursor: pointer;
-    border-radius: 2px;
+    border-radius: var(--radius-sm);
     flex-shrink: 0;
   }
-  .add-btn:hover { background: #2a5040; }
+  .add-btn:hover { filter: brightness(1.15); }
 
   .remove-btn {
     background: none;
     border: none;
-    color: #555;
+    color: color-mix(in srgb, var(--text) 35%, transparent);
     cursor: pointer;
-    padding: 1px 4px;
-    font-size: 11px;
+    padding: 2px 5px;
+    font-size: 12px;
   }
-  .remove-btn:hover { color: #e06c75; }
+  .remove-btn:hover { color: #ff6b6b; }
 </style>

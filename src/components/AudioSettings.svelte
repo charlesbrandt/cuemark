@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listAudioDevices, type AudioDevice } from "../lib/audio/pipeline";
-  import { mainOutputDeviceIds, cueOutputDeviceId, cueGain, tempoRange, scratchMode } from "../lib/audio/audioSettings";
+  import { mainOutputDeviceIds, cueOutputDeviceId, tempoRange, scratchMode } from "../lib/audio/audioSettings";
   import { session, setMidiMapping } from "../lib/state/session";
 
   let devices = $state<AudioDevice[]>([]);
@@ -85,11 +85,7 @@
           <option value={d.id}>{d.label}</option>
         {/each}
       </select>
-      {#if $cueOutputDeviceId}
-        <span class="row-label" style="margin-left:8px">Vol</span>
-        <input type="range" min="0" max="1" step="0.01" bind:value={$cueGain} />
-        <span class="gain-val">{$cueGain.toFixed(2)}</span>
-      {/if}
+      <span class="hint-inline">volume moved to the toolbar's Headphone Volume slider</span>
     </div>
   {/if}
 
@@ -146,18 +142,20 @@
   .audio-settings {
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    padding: 8px 16px;
-    background: #161616;
-    border-top: 2px solid #f5a623;
-    border-bottom: 1px solid #2a2a2a;
-    font-size: 11px;
-    color: #999;
+    gap: 8px;
+    padding: 12px 20px;
+    background: var(--surface);
+    border-top: 2px solid var(--accent-deck);
+    border-bottom: 1px solid var(--divider);
+    font-size: 12px;
+    color: var(--text);
     flex-shrink: 0;
   }
 
   .settings-title {
-    color: #f5a623;
+    font-family: var(--font-heading);
+    font-weight: 800;
+    color: var(--accent-deck);
     letter-spacing: 0.08em;
     font-size: 10px;
     text-transform: uppercase;
@@ -166,77 +164,73 @@
   .settings-row {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     flex-wrap: wrap;
   }
 
   .row-label {
-    color: #888;
+    font-family: var(--font-heading);
+    color: color-mix(in srgb, var(--text) 55%, transparent);
     flex-shrink: 0;
     min-width: 32px;
   }
 
   .side-label {
-    color: #666;
+    color: color-mix(in srgb, var(--text) 45%, transparent);
     font-size: 10px;
     flex-shrink: 0;
   }
 
   .hint {
-    color: #887755;
+    color: color-mix(in srgb, var(--accent-queue) 70%, transparent);
     font-style: italic;
   }
 
   .hint-inline {
-    color: #555;
+    color: color-mix(in srgb, var(--text) 40%, transparent);
     font-style: italic;
   }
 
   .error {
-    color: #cc5555;
+    color: #ff6b6b;
     font-style: italic;
   }
 
   .device-checks {
     display: flex;
-    gap: 8px;
+    gap: 10px;
     flex-wrap: wrap;
   }
 
   .device-check {
     display: flex;
     align-items: center;
-    gap: 3px;
-    color: #999;
+    gap: 4px;
+    color: var(--text);
     cursor: pointer;
     white-space: nowrap;
   }
 
   .device-check input[type="checkbox"] {
-    accent-color: #f5a623;
+    accent-color: var(--accent-deck);
     cursor: pointer;
   }
 
   select {
-    background: #1a1a1a;
-    border: 1px solid #2e2e2e;
-    border-radius: 3px;
-    color: #999;
-    font: inherit;
-    font-size: 11px;
-    padding: 2px 4px;
+    font-family: var(--font-body);
+    background-color: var(--surface2);
+    border: 1px solid var(--divider);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-size: 12px;
+    padding: 5px 24px 5px 8px;
     cursor: pointer;
     max-width: 220px;
   }
 
   select:focus {
     outline: none;
-    border-color: #444;
+    border-color: var(--accent-deck);
   }
 
-  .gain-val {
-    min-width: 28px;
-    color: #777;
-    font-variant-numeric: tabular-nums;
-  }
 </style>

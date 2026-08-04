@@ -41,17 +41,19 @@
   .visualization-panel {
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    padding: 8px 16px;
-    background: #161616;
+    gap: 8px;
+    padding: 12px 20px;
+    background: var(--surface);
     border-top: 2px solid #7ec8e3;
-    border-bottom: 1px solid #2a2a2a;
-    font-size: 11px;
-    color: #999;
+    border-bottom: 1px solid var(--divider);
+    font-size: 12px;
+    color: var(--text);
     flex-shrink: 0;
   }
 
   .settings-title {
+    font-family: var(--font-heading);
+    font-weight: 800;
     color: #7ec8e3;
     letter-spacing: 0.08em;
     font-size: 10px;
@@ -61,39 +63,43 @@
   .settings-row {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     flex-wrap: wrap;
   }
 
   .row-label {
-    color: #888;
+    font-family: var(--font-heading);
+    color: color-mix(in srgb, var(--text) 55%, transparent);
     flex-shrink: 0;
     min-width: 50px;
   }
 
   .viz-btn {
-    padding: 3px 8px;
+    font-family: var(--font-heading);
+    font-weight: 600;
+    padding: 5px 10px;
     font-size: 11px;
-    background: #1a1a1a;
-    border: 1px solid #444;
-    border-radius: 3px;
-    color: #888;
+    background: var(--surface2);
+    border: 1px solid var(--divider);
+    border-radius: var(--radius-sm);
+    color: color-mix(in srgb, var(--text) 55%, transparent);
     cursor: pointer;
   }
 
   .viz-btn:hover {
-    border-color: #666;
-    color: #ccc;
-  }
-
-  .viz-btn.viz-active {
     border-color: #7ec8e3;
     color: #7ec8e3;
   }
 
+  .viz-btn.viz-active {
+    background: #7ec8e3;
+    border-color: #7ec8e3;
+    color: #0b1c22;
+  }
+
   .opacity-val {
-    min-width: 30px;
-    color: #777;
+    min-width: 32px;
+    color: color-mix(in srgb, var(--text) 55%, transparent);
     font-variant-numeric: tabular-nums;
   }
 </style>
