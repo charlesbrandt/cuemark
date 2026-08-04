@@ -219,6 +219,15 @@ Reference points measured 2026-08-03 with one deck playing, projector closed:
 `WebKitWebProcess` 36–64%, `cuemark` 18–25%. A webview far above its main-thread `busy%`
 (see CLAUDE.md's instrumentation notes) means the cost is in paint/composite, not JS.
 
+**Always sample CPU per arm of a performance A/B, not once for the run.** The pairing is what
+identifies the regime, and the two numbers can move in opposite directions: 2026-08-03 late,
+`WebKitWebProcess` read **51.7% at 20fps** in one arm and **8.6% at 62fps** in another 30
+seconds later, while instrumented `busy%` sat at 1% in both. `busy%` alone said "nothing is
+happening"; CPU alone said "something is"; only together did they say *where*
+(`docs/design/control-window-frame-budget.md` §5). Note `top -b -n 2 -d 3` takes ~3s, so start
+it inside the arm's window, and record the wall-clock time of the sample so it can be matched
+to a log window afterwards — a sample that straddles an arm boundary is worthless.
+
 ## Performance pitfalls / common causes of freezes
 
 ### UI freeze on first track load — mutex held during GStreamer preroll
@@ -320,6 +329,28 @@ rapid HMR reloads in 11 seconds caused a full app hang confirmed in session 2026
 If multiple logical changes are needed, stage them all in memory and apply with one Edit/Write
 call rather than incremental edits. This applies only to App.svelte — child component HMR
 is lightweight and can be done incrementally.
+
+### HMR remounts pause the deck — so never build an A/B that needs an edit per arm
+
+The same App.svelte teardown described above also means **every code-switched measurement arm
+costs a remount, a paused deck, and often a wedged pipeline needing a track re-load** (see
+audio-debugging, "Transport retry storm"). Four arms that way is four interruptions of the
+thing being measured, by the measurement.
+
+**Build the switch so the arms advance themselves**: a wall-clock sweep driven from
+`frame()` — 30s per arm, `baseline → X → Y → baseline`, rearming whenever nothing is playing so
+each press of play is a fresh run — plus the arm name stamped on **every** `[raf]` line. One
+edit total, the operator only presses play, the return-to-baseline arm proves there was no
+drift, and no log window can be misattributed. Worked example:
+`docs/design/control-window-frame-budget.md` §5.
+
+Two switch designs that failed there first, both silently:
+- **Keyboard.** F7/F8 never reach the webview on this desktop (F6 does).
+- **`window.addEventListener` in `onMount`.** HMR does not unwind it, so handlers from
+  destroyed instances keep firing and logging arm switches *for dead components* while the live
+  arm never moves. **A log line reporting a switch is not evidence the switch took effect** —
+  only a line stamped by the loop under measurement is. Prefer `<svelte:window onkeydown={…}>`,
+  which Svelte tears down with the instance, or no listener at all.
 
 ### HMR cascade → orphaned PipeWire streams (silent audio, no hang, no error)
 

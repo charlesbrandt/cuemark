@@ -2,7 +2,7 @@
 
 ## Known issues
 
-### Control window drops to ~23fps while playing [root-caused, fix not built, 2026-08-03]
+### Control window drops to ~20fps while playing [root-caused to the waveform playhead paint, fix not built, 2026-08-03]
 
 The `audio_get_position` round trips of 300–424ms were never GStreamer: `query_position`,
 the `AudioManager` mutex and the GTK dispatch measure ~0ms/0ms/2ms, and a no-op `ipc_ping`
@@ -26,16 +26,37 @@ side of the playhead. A/B'd in one session at a fixed 2496×144 canvas: **per-dr
 → ≤1ms, `busy%` 8–9% → 0%, gap p90 47ms → 34ms, gap max 187ms → 47ms.**
 
 **But frame rate moved only 29.6 → 30.6fps, which is the actual news.** A third limit was
-hiding behind it: **while any deck plays, rAF is pinned to exactly half vsync (gap p50 32ms)
-with the main thread ~98% idle** — idle is 62fps. Removing 8–9% of main-thread work bought
-1fps, so the ceiling is a throttle, not saturation. Next experiments, both one-flag runs on
-existing instrumentation: (1) fire `[ipc-ping]` at the poll's rate with the position poll
-disabled — does the lock follow our IPC or the audio? (2) play with the poll disabled
-entirely and read `[raf]` alone.
+hiding behind it: while any deck plays, rAF locks to a vsync multiple with the main thread
+apparently ~98% idle — idle is 62fps.
+
+**ROOT-CAUSED 2026-08-03 (late): it is the waveform playhead's paint.** Four A/B arms in two
+hands-free sweeps (`docs/design/control-window-frame-budget.md` §5):
+
+| arm | rAF |
+|---|---|
+| `baseline` | 19–28fps |
+| `noPoll` — poll off, no-op IPC fired at **3× the poll's rate** | **62fps** |
+| `noPollNoPing` — poll off, zero IPC, audio playing | **62fps** |
+| `pollBare` — poll ON at 62/s, reply discarded | **62fps** |
+| `pollNoClock` — full reply math, `setDeckAudioTime()` skipped | **62fps** |
+
+So IPC volume, the GStreamer pipeline, and the poll itself are all free; **the entire cost is
+one call publishing the clock**, which dirties a 2496×144 canvas ~6×/s. Derived cost: **~100ms
+of non-JS time per redraw** against ≤1ms of JS — WebKit rasterizing and compositing after the
+JS returns, in the phase `busy%` cannot see. `WebKitWebProcess` CPU **51.7%** while instrumented
+`busy%` read 1%.
+
+**Fix to build: stop repainting the canvas to move the playhead** — an absolutely-positioned
+2px element driven by `transform: translateX()` never dirties it. Run one confirming arm first
+(`setDeckAudioTime` on, `WaveformCanvas.draw()` skipped) since `pollNoClock` freezes every
+`getDeckTime()` consumer at once, not just the waveform.
 
 *Disproven along the way* (do not re-investigate): software H.264 decode, the `codecWorker`
 thread, and the DeckCard preview canvas are **not** the frame budget problem — an audio-only
-`.wav` deletes all three and is *worse*. `frame-dur` was also never the whole picture: three
+`.wav` deletes all three and is *worse*. Nor is it **IPC volume**, the **GStreamer pipeline
+running at all**, or **WebKit's frame scheduling** — the four arms above kill all three, and
+the "main thread is 98% idle" premise that motivated them was itself an artifact of measuring
+with `busy%`. `frame-dur` was also never the whole picture: three
 independent rAF loops run per playing deck and it measured only one. And treat the earlier
 run's absolute fps figures (22–23fps overview, the 11.3ms/2.8ms paint split) as unreliable —
 canvas width was uncontrolled; the `[aux-loop]` label now carries `@<W>x<H>` so it cannot

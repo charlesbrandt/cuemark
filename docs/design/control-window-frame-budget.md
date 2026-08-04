@@ -337,7 +337,118 @@ re-measurement at a recorded canvas size: the direct path's own JS is 13–15ms 
 The paint-is-invisible mechanism is still real and still the reason `busy%` and fps disagree —
 but that specific 75% figure was computed across the same uncontrolled runs, so do not quote it.
 
+### 5. The throttle is the UI *consuming* the clock — not IPC, not GStreamer (2026-08-03, late)
+
+Both candidates the previous section proposed are dead, and the answer is one line of code.
+
+**Method change worth keeping.** The arms are switched by a wall-clock sweep driven from
+`frame()` (30s per arm, `baseline → X → Y → baseline`), with the arm name stamped on every
+`[raf]` line. Two earlier attempts failed in ways worth recording:
+
+- A keyboard switch (F6/F7/F8) — **F7 and F8 never reach the webview** on this desktop, and
+  HMR re-runs `onMount` without unwinding a raw `addEventListener`, so handlers from destroyed
+  component instances kept logging arm switches while the live arm never moved. A log line
+  that reports a *switch* is not evidence the switch took effect; only a line stamped by the
+  loop under measurement is.
+- Sweeping without validating playback. One run produced a beautiful 62fps "baseline" that was
+  entirely fake: a wedged GStreamer pipeline (visible as a `play` IPC retry storm every 203ms)
+  meant position never advanced. **Validate before believing an arm**: poll `total` p50 ≈9ms
+  and waveform `drew` > 0 mean the clock is moving; `total` p50 ≈2ms with `drew`=0 means the
+  deck is silent no matter what `deck.playing` says.
+
+Both sweeps: 6:26 `.wav`, audio-only (legacy `<video>` path, no decode, `preview drew=0`),
+output window closed, canvas 2496×144, one contiguous session each.
+
+**Sweep A — is it our IPC volume, or "audio is playing at all"?**
+
+| arm | rAF | gap p50 | JS busy | `WebKitWebProcess` | IPC round trips |
+|---|---|---|---|---|---|
+| `baseline` | 19.4–21.2fps | 47–53ms | 1% | — | poll n≈100/5s |
+| `noPoll` (ping @ rAF rate) | **62.0fps** | 16ms | 4–5% | 17.3% | ping **n=310**/5s |
+| `noPollNoPing` (no IPC) | **62.0fps** | 16ms | 1–2% | 8.6% | none |
+| `baseline` (repeat) | 19.4–20.8fps | 47–53ms | 1% | **51.7%** | poll n≈100/5s |
+
+`noPoll` fires **three times more** IPC round trips than the poll ever did, on the same
+transport, and runs at full rate. `noPollNoPing` has zero IPC with audio playing, also full
+rate. **Neither IPC volume nor a playing GStreamer pipeline throttles rAF.** The baseline
+reproduced exactly at the end of the sweep, so this is not drift.
+
+**Sweep B — bisecting the poll's reply.**
+
+| arm | rAF | gap p50 | poll `total` p50 | waveform `drew`/5s | JS busy |
+|---|---|---|---|---|---|
+| `baseline` | 22.4–28.6fps | 33–46ms | 8–9ms | 28–29 | 1% |
+| `pollBare` (reply returns immediately) | **62.0fps** | 16ms | **2–3ms** | 0 | 4–5% |
+| `pollNoClock` (full math, clock not published) | **62.0–62.2fps** | 16ms | **2–3ms** | 0 | 5% |
+| `baseline` (repeat) | 20.0–21.4fps | 47–51ms | 9–10ms | 26–27 | 1% |
+
+`pollBare` keeps the whole round trip — 62 synchronous IPC calls per second, replies delivered,
+`recordPollSample` run — and discards the result. Full frame rate. So **the poll is free**; the
+cost is entirely in what its reply publishes. For this deck the only difference between
+`pollNoClock` and `baseline` is one call, `setDeckAudioTime()` (the deck is audio-only, so the
+`v.currentTime` snap is skipped by `audioOnlyDecks` and there is no codec player).
+
+**The `toJs` leg is a load gauge, not a transport cost.** The no-op ping's own `toJs` reads
+**0ms** in `noPoll` and **8ms** in `baseline`, and the poll's `total` moves 2–3ms → 9ms across
+the same switch. Nothing about the transport changed; the JS main thread is simply late
+returning to *any* callback because it is servicing paint. Never read a slow IPC leg as
+evidence about the callee without an arm that changes only the callee.
+
+**Order-of-magnitude of the paint.** A baseline 5s window fits ~110 frames against 310 at full
+rate, so ~200 frames × 16.1ms ≈ 3.2s of wall time is missing, spread over ~28 canvas redraws:
+**~100ms of non-JS time per redraw**, against a measured JS `dur` of ≤1ms for the same redraw.
+This is an upper bound — it attributes the entire deficit to the redraws — but the ratio is not
+close enough for the attribution to be in doubt. The playhead only redraws ~5.6×/s because of
+the one-device-pixel guard (a 386s track across 2496px advances 6.5px/s); **six canvas repaints
+per second cost two thirds of the frame budget.**
+
+This is the same mechanism §4 named and is why that fix bought only +1fps: caching the bars
+removed the *JS* that records the display list, but every redraw still hands WebKit a dirty
+2496×144 canvas to rasterize and composite, and on this hardware that is the whole cost.
+`busy%` went to 0 because `busy%` cannot see it.
+
+⚠️ **What this does not yet prove.** `setDeckAudioTime` feeds *every* consumer of
+`getDeckTime()` — the waveform playhead, `DeckCard`'s timestamp text, the preview loop — and
+`pollNoClock` freezes all of them at once. The waveform canvas is the leading suspect by a wide
+margin (`drew` 28 → 0, 2496×144, and §4 already priced its paint), but a DOM text update
+forcing layout on a large tree has not been separately excluded. One more arm settles it: keep
+`setDeckAudioTime`, skip only `WaveformCanvas`'s `draw()`.
+
 ## Where to pick up
+
+**Stop repainting a 2496×144 canvas to move a 2px playhead.**
+
+That is the whole finding of §5, and it is a normal front-end fix rather than an upstream
+WebKit problem. The static waveform changes only when `(peaks, canvas size, gain, loop region)`
+change — several times a *set*. The playhead changes ~6×/s and is the only reason the canvas is
+dirty at all. Options, best first:
+
+1. **Move the playhead out of the canvas** into an absolutely-positioned 2px element driven by
+   `transform: translateX()`. A transform on a composited layer never dirties the canvas, so
+   the waveform's rasterized content survives untouched and the per-frame cost drops to a
+   compositor matrix update. This deletes the cost rather than reducing it, and it applies to
+   the loop-region overlay too.
+2. **Shrink the backing store.** 2496px wide is ~2.5× the useful resolution for a 6-minute
+   overview; the paint cost scales with area.
+3. Only if 1 and 2 disappoint: revisit whether the overview needs to be a canvas at all.
+
+Before building, run the one arm §5's ⚠️ names — `setDeckAudioTime` on, `WaveformCanvas.draw()`
+skipped — so the fix is aimed at a confirmed target rather than a strongly-implied one. Then
+re-measure with a deck **playing** and report fps *and* `busy%` *and* `WebKitWebProcess` CPU;
+this section is the case study for why any one of the three alone tells a false story.
+
+Also still open:
+
+- **Arm 2 (projector open) has not been re-measured** since either the waveform bar cache or
+  this finding. Its 13.2 → 8.8fps monotonic degradation predates both.
+- The earlier "hard 30fps ceiling / exactly half vsync" framing was file-specific. This `.wav`
+  locks at ~50ms (three vsync intervals), the mp4 at ~32ms (two). It is a vsync multiple that
+  tracks the paint cost, not a fixed ceiling.
+
+### Superseded: the original "where to pick up"
+
+Kept because the negative results are load-bearing — they are what makes §5's conclusion
+narrow rather than one guess among several.
 
 **A hard 30fps ceiling appears whenever a deck plays, and nothing in JS explains it.**
 
@@ -351,24 +462,17 @@ So the main thread is ~98% idle and rAF is still being served at half rate, snap
 vsync multiple rather than degrading smoothly. Removing 8–9% of main-thread work moved it by
 1fps, which is what a throttle looks like and not what a saturated thread looks like.
 
-Candidates, cheapest first:
+Candidates, cheapest first — **all three resolved by §5, all three wrong**:
 
-1. **IPC volume from the position poll.** It runs once per rAF frame per playing deck and is
-   the one thing that starts when playback starts. `[ipc-ping]` is the control already built
-   for this: fire it at the poll's rate with the poll *disabled* and see whether the
-   half-rate lock follows the IPC traffic or the audio. If it follows IPC, throttle or batch
-   the poll (it feeds a clock that is integrated anyway — it does not need 60Hz).
-2. **The GStreamer pipeline's effect on the GTK main loop.** Synchronous commands dispatch
-   there; a playing pipeline posts bus messages there too. Test by playing with the poll
-   disabled entirely and reading `[raf]` alone.
-3. **WebKit's own frame scheduling** under a busy main loop — the hardest to test and the
-   last resort, since it would point back at `native-output-pipeline.md`.
+1. ~~**IPC volume from the position poll.**~~ **Falsified.** Tripling the IPC rate with the
+   poll disabled (`noPoll`) runs at a full 62fps.
+2. ~~**The GStreamer pipeline's effect on the GTK main loop.**~~ **Falsified.** Audio playing
+   with zero IPC (`noPollNoPing`) also runs at 62fps.
+3. ~~**WebKit's own frame scheduling**~~ — not needed, and it would have been the wrong
+   conclusion. It is WebKit rasterizing a canvas *we* dirty six times a second.
 
-Do 1 and 2 before theorizing further; both are one-flag experiments on the existing
-instrumentation, and between them they separate "our IPC" from "audio is playing at all".
-
-Then re-run the arm-2 (projector open) numbers, which were measured with the expensive
-waveform in play and should improve for free.
+The framing itself was the trap: "the main thread is 98% idle" was measured with `busy%`,
+which by construction cannot see the phase where the cost lives. The thread was not idle.
 
 Also still open:
 
@@ -388,7 +492,7 @@ then read the paired 5s windows out of `~/.local/share/com.cuemark.app/logs/cuem
 ```
 
 Target to beat: gap p50 **32ms** at ~2% total `busy`. Idle is 16ms, so ~16ms is on the table
-and **none** of it is being spent by our own code — see "Where to pick up".
+— and §5 shows it *is* being spent by our own code, in a phase `busy%` cannot report.
 
 ### Should compositing move into GStreamer?
 
@@ -416,6 +520,13 @@ projector cannot hold 60fps on this hardware by this route.
 That is the reopen argument, but the arm-1 residual (~24ms with *no* projector at all) has to
 be measured first: if it turns out to be the same class of cost, moving compositing out will
 not deliver a 60fps control window either, and the right fix is upstream of both.
+
+**Answered by §5 (2026-08-03, late): the arm-1 residual is *ours*, and it is not compositing.**
+With the position poll's clock publication suppressed the control window holds a flat 62fps
+while audio plays — no projector involved. The control window's limit was never the compositor,
+the video path, or IPC; it is one canvas we repaint to move a playhead. That **weakens** the
+reopen case rather than strengthening it: fix the repaint first, then re-price the projector
+arm, because the arm-2 numbers were all taken with this cost included.
 
 ## Files touched
 

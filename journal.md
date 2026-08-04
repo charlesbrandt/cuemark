@@ -1802,3 +1802,78 @@ Kept permanently: `src/lib/audio/pollStats.ts` — `[poll-stats]`, `[raf]`, `[po
 - `src/output.ts` — `alive` beacon
 - `docs/design/control-window-frame-budget.md`, `docs/design/scratch-feeder-underruns.md`
   (new), `todo.md`, `CLAUDE.md`
+
+# 2026.08.03 (late) — the control window's frame throttle is our own canvas repaint
+
+## Problem
+
+The waveform bar cache landed and bought +1.0fps (29.6 → 30.6). Behind it sat a hard limit:
+while any deck plays, rAF locks to a vsync multiple — ~20fps on a `.wav`, ~30fps on an mp4 —
+with total instrumented `busy%` across all three rAF loops at ~1–2%. Idle is 62fps. Removing
+8–9% of main-thread work moving the needle by 1fps is what a throttle looks like, not a
+saturated thread, and nothing in JS explained it.
+
+## Method
+
+Four arms, switched by a wall-clock sweep driven from `frame()` (30s per arm,
+`baseline → X → Y → baseline`), with the arm name stamped on every `[raf]` line and the sweep
+rearming on pause. Two earlier switch designs failed first and are worth remembering:
+
+- **Keyboard switching.** F7/F8 never reach the webview on this desktop. Worse, a raw
+  `addEventListener` in `onMount` is not unwound by HMR, so handlers belonging to destroyed
+  component instances kept logging arm switches while the live arm never moved — a log line
+  reporting a *switch* is not evidence the switch took effect.
+- **Sweeping without validating playback.** One run produced a flawless 62fps "baseline" that
+  was entirely fake: a wedged GStreamer pipeline meant position never advanced. Tells:
+  `[poll-stats] total` p50 ≈2ms instead of ≈9ms, `drew=0`, and a `play` IPC retry storm every
+  203ms. A re-load unwedges it; a bare play does not.
+
+## Result
+
+| arm | rAF | poll `total` p50 | waveform `drew`/5s |
+|---|---|---|---|
+| `baseline` | 19–28fps | 8–9ms | 26–29 |
+| `noPoll` — poll off, no-op IPC at **3× the poll's rate** | **62fps** | — | 0 |
+| `noPollNoPing` — poll off, zero IPC, audio playing | **62fps** | — | 0 |
+| `pollBare` — poll ON at 62/s, reply discarded | **62fps** | 2–3ms | 0 |
+| `pollNoClock` — full reply math, `setDeckAudioTime()` skipped | **62fps** | 2–3ms | 0 |
+
+Baseline reproduced at the end of both sweeps, so none of this is drift.
+
+## Root cause
+
+Not IPC volume, not GStreamer, not the poll, not WebKit's scheduler: **one call publishing the
+audio clock**, which dirties a 2496×144 canvas ~6 times a second (the one-device-pixel guard —
+a 386s track across 2496px advances 6.5px/s). Derived from the frame deficit: **~100ms of
+non-JS time per redraw**, against ≤1ms of JS for the same redraw. `WebKitWebProcess` burned
+**51.7%** CPU while instrumented `busy%` read **1%**.
+
+That is also why §4's bar cache bought so little — it removed the JS that records the display
+list, but every redraw still hands WebKit a full-size dirty canvas to rasterize and composite.
+
+## Lessons
+
+- **`busy%` and CPU must be read as a pair.** `busy%` low + CPU high localizes cost to the
+  paint phase; either number alone tells a false story, in opposite directions. "The main
+  thread is 98% idle" was an artifact of the instrument, and it is what sent three sessions
+  after IPC and WebKit scheduling.
+- **An IPC leg is a load gauge, not a cost.** The *no-op* ping's `toJs` reads 0ms on an idle
+  thread and 8ms on a busy one, with nothing about the transport changed. A slow leg means the
+  main thread is late getting back to callbacks — never that the callee is slow.
+- **A control arm has to be cheap enough to run often.** `pollBare` — keep the entire round
+  trip, discard the result — split "the IPC costs" from "the reply's side effects cost" in one
+  30s window, and it was three lines.
+- **Design the A/B switch so measuring costs no further edits.** Each edit here meant an HMR
+  remount, a torn-down deck and a re-play; the self-advancing sweep removed the operator from
+  the loop entirely and made the arms comparable by construction.
+
+## Files touched
+
+No source changes — the A/B switch was temporary and removed; `git diff` against the previous
+commit is empty for `src/`. Documentation only:
+
+- `docs/design/control-window-frame-budget.md` — §5 (both sweeps, arithmetic, method notes),
+  rewritten "Where to pick up", the superseded candidate list marked falsified
+- `todo.md` — known-issue entry re-root-caused, with the fix to build
+- `CLAUDE.md` — `busy%`/CPU pairing, IPC-leg-as-load-gauge, arm validation, the HMR-remount
+  hazard for edit-driven measurement

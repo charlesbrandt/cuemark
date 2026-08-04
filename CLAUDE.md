@@ -427,6 +427,16 @@ but **the old binary keeps running until the rebuild finishes and the window res
 If managing the dev server from Claude Code: kill the background process before making Rust changes,
 then restart after. A change that was edited but never recompiled has no effect at runtime.
 
+⚠️ **An HMR update to `App.svelte` remounts it, which tears the deck down and pauses playback**
+— and repeated remounts can leave the GStreamer pipeline wedged (see the retry-storm tell under
+"Standing performance instrumentation"). This makes edit-driven A/B measurement expensive: every
+switch costs a remount, a re-play, and sometimes a track re-load. **Prefer an A/B switch that
+needs no further edits** — a wall-clock sweep driven from `frame()` that advances arms itself and
+stamps the arm on every log line, rearming on pause so each press of play is a fresh run
+(`docs/design/control-window-frame-budget.md` §5). Keyboard switching is a trap twice over: F7/F8
+never reach the webview on this desktop, and a raw `addEventListener` in `onMount` is not unwound
+by HMR, so handlers belonging to destroyed instances keep logging switches that never took effect.
+
 ⚠️ **Vite can serve a stale transform of a file that is correct on disk.** Two rapid successive
 writes to one file in a single command (e.g. a `sed -i` followed by a rewrite) can leave the
 watcher holding the intermediate state, and its mtime-based dedupe then misses the second write.
@@ -547,7 +557,18 @@ How to read them (full derivation in `docs/design/control-window-frame-budget.md
   session with only the code path switched.
 - ⚠️ **`ps %cpu` is a lifetime average, not current load.** On a 2-hour-old process it read 7%
   while the process was actually at 64%. Use `top -b -n 2 -d 3 -p <pid>` and take the *second*
-  sample.
+  sample. **Pair it with `busy%` always** — `busy%` low + CPU high is the signature of cost in
+  the paint phase, and it is the only way to see work `busy%` structurally cannot report.
+- ⚠️ **An IPC leg is a load gauge, not a cost.** `toJs` on the *no-op* ping reads 0ms on an
+  idle thread and 8ms on a busy one, and the position poll's `total` moves 2–3ms → 9ms across
+  the same switch, with nothing about the transport changed. A slow leg says "the main thread
+  is late getting back to callbacks", never "the callee is slow" — only an arm that changes
+  the callee can say that.
+- ⚠️ **Validate that an arm is really playing before believing its numbers.** A wedged
+  GStreamer pipeline produces a flawless-looking 62fps window: `deck.playing` is true, rAF is
+  full rate, and nothing errors. The tells are `[poll-stats] total` p50 ≈2ms instead of ≈9ms,
+  `[aux-loop] … drew=0`, and a `play` IPC retry storm every ~203ms in the log. Re-loading the
+  track (fresh `audio_load`) unwedges it; a bare play does not.
 
 ## Skills
 
