@@ -183,13 +183,41 @@ its mandatory avc `description` + Annex-B→avc re-mux, VP9 gets neither and its
 60.1%) — there is no VA-API on this machine so VP9 is software-decoded either way; what moved is
 *where*, from a main-thread block into a decode worker. Read the fps and CPU numbers together.
 
-**Still on legacy `<video>`: AV1, and it cannot leave.** `VideoDecoder.isConfigSupported({codec:
+✅ **The "VP9 decay" was a measurement artifact and does not exist (settled 2026-08-05
+evening).** A live 2-minute play appeared to go 58.6fps → a ~13fps plateau with `busy%` flat
+at 1–2%, which looked exactly like a paint-phase cost the sweep's metrics cannot see. A
+7-minute controlled arm refuted it: **the frame rate oscillates 9–57fps continuously**
+(n=182: min 8.7, p50 24.5, max 57.1) and recovers after every trough, so the "plateau" was a
+short window on one trough. All three candidate mechanisms are refuted by measurement — leak
+(webRSS spread 9MB across a full track, *under* the paused control's own 16MB sawtooth),
+thermal (178ms throttled in 420s, and fps **anti**-correlated with temperature: 100.0°C mean
+when fps>45 against 85.5°C when fps<20), and CPU starvation (`/proc/pressure/cpu full=0.00`;
+`webCPU` is *higher* in the fast state). ⚠️ **A window shorter than ~2 minutes cannot measure
+this machine's steady-state frame rate at all** — it samples a fraction of one oscillation
+cycle and reads as a clean monotonic trend in whichever direction it sits, which is what
+three separate "monotonic degradation" sightings were. Compare medians over multi-minute
+runs. Tooling: `scripts/decay-sample.sh` + `scripts/decay-join.py` (always run the paused
+idle control arm — it is what eliminated iowait and calibrated the leak threshold). Full
+write-up: `legacy-video-fallback-cost.md` "2026-08-05 (evening) — the decay arm ran".
+
+**Still on legacy `<video>`: AV1 — and live verification 2026-08-05 found it worse than
+documented: zero video frames, not just a low frame rate.** `VideoDecoder.isConfigSupported({codec:
 'av01.…'})` returns `true` here and then **decodes zero frames** — for a real file, in all four
 bitstream framings, with and without a `description`, and for a 320×240 stream GStreamer's own
 `av1enc` produced as a control. ⚠️ **Never trust `isConfigSupported` on this WebKitGTK; probe a
-real decode** (`scripts/probes/webcodecs_vp9_av1_probe.py`). AV1 is survivable only because the
-preview now draws once per source frame and the library's AV1 is 6fps (26 → 50–54fps); a
-high-frame-rate AV1 file would still be bad. VP8/HEVC are unprobed — same warning applies.
+real decode** (`scripts/probes/webcodecs_vp9_av1_probe.py`). This doc previously claimed AV1 was
+"survivable" at 26–54fps on the legacy `<video>` fallback — **that assumed some frames decode.**
+A live session playing a real AV1 library file (1920×1080, 6fps, on the legacy path) for ~7
+minutes logged `[aux-loop] preview/deck-N drew=0` on **every single tick, the entire time** —
+audio played and cue toggled normally, but no video frame was ever presented, in either the
+`DeckCard` preview or the output window. Immediately after, switching the same deck to a VP9
+file on the webcodecs path drew frames normally in the same session, which rules out a general
+rAF/preview-loop breakage. Root cause not yet confirmed — the Rust-side `WARNING: No decoder
+available for type 'video/x-av1…'` in the audio pipeline's `uridecodebin` is expected/harmless
+(it is deliberately skipping the video stream in the *audio-only* pipeline, see the log-pattern
+table below) and says nothing about WebKitGTK's own internal `<video>` decode, which this
+project cannot log into directly. See `legacy-video-fallback-cost.md` for the full writeup and
+open questions.
 
 See `docs/design/legacy-video-fallback-cost.md` and `webcodecs-video-path.md` "Phase 7" before
 touching `DeckCard`'s preview loop, `video_demux.rs`'s codec gate, `codecWorker.ts`'s
@@ -427,17 +455,19 @@ playback, the drift-resync path, or anything freeze-related:
 
 ## Open findings from the 2026-08-05 live set
 
-Two distinct faults were root-caused from a single ~3-hour session's log. **One is now closed,
-one is still open.** They are **independent** and can be worked in separate sessions.
+Two distinct faults were root-caused from a single ~3-hour session's log. **Both are open again
+as of a same-day live verification pass** (see below) — neither should be cited as closed.
 
-- `docs/design/legacy-video-fallback-cost.md` — ✅ **CLOSED 2026-08-05.** A1 pinned the cost to
-  the video codec feeding the `<video>` element (not DMA-BUF, not resolution, not the path);
-  A2 fixed the broken draw-frequency check; A4 moved VP9 onto the WebCodecs demux path, taking
-  the worst library file from ~26fps to ~55fps. **No outstanding work item.** The one remaining
-  exposure is AV1, which stays on the legacy element because WebCodecs decodes zero AV1 frames
-  here. Do not re-run the DMA-BUF arm (it made things worse) and do not chase *why* VP9 blocks
-  inside `drawImage` — cuemark no longer takes that path for VP9. **Verify live**: the 55fps
-  number is from an automated sweep, not from a real set.
+- `docs/design/legacy-video-fallback-cost.md` — 🔴 **REOPENED 2026-08-05 (late), by the live
+  verification the doc itself called for.** A1/A2/A4 (codec-linked cost, the draw-frequency
+  fix, moving VP9 to WebCodecs) all still stand and are not in question. What broke on
+  live verification: (1) the **55fps VP9 number does not hold** — a real ~2-minute play of the
+  same worst-library-file decayed 58.6 → ~13fps while `busy%` stayed 1–2%, the signature of a
+  paint-phase cost the automated sweep's metrics cannot see; (2) **AV1 on the legacy path
+  renders zero video frames**, not just a low frame rate — audio and cue worked, `drew=0` for
+  a full ~7-minute play, worse than the doc's prior "survivable at 26–54fps" claim. Do not
+  re-run the DMA-BUF arm (it made things worse in the earlier investigation) — neither new
+  finding points at DMA-BUF. See the doc's "2026-08-05 live verification" section.
 - `docs/design/audio-dropout-mid-playback.md` — 10.8s of silence mid-track with the pipeline in
   `Playing` and the frame rate healthy, ~21s after headphone cue was enabled on a USB controller
   carrying both the main and cue sinks. No reproducer yet. Fix the 6:1 false-positive rate in

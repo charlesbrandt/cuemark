@@ -2,24 +2,53 @@
 
 ## Known issues
 
-### AV1 files still run on the legacy `<video>` path [reduced, not eliminated, 2026-08-05]
+### AV1 renders zero video frames on the legacy `<video>` path [open, 2026-08-05]
 
-✅ **The general form of this issue is fixed.** It read "any non-H.264 file collapses the
-control window to ~6fps". `video_demux.rs` now accepts **H.264 and VP9**, and VP9 went from
-23.9–28.6fps to 54.2–56.4fps with per-call preview cost 19–22ms → 0.0ms and `busy%` 49–52 →
-9–10. The draw-frequency half was fixed separately (`legacyFrameChanged()`).
+🔴 **The only genuinely open item here.** A live ~7-minute play of a real AV1 library file
+(1920×1080, 6fps) showed `drew=0` on *every* preview tick — audio and cue worked fine, but
+literally no video frame was ever presented, in either the deck preview or the output window.
+The doc previously claimed this file class was "survivable at 26–54fps"; that assumed some
+frames decode, and none do. Switching the same deck to a VP9 file drew frames normally moments
+later in the same session, so this isn't a general preview-loop break.
 
-**What is left**: AV1 cannot join the WebCodecs path — `VideoDecoder.isConfigSupported`
-returns `true` here and then decodes **zero** frames (`EncodingError: Decode error`), proved
-against a real file, all four bitstream framings, and a GStreamer-`av1enc`-encoded control.
-So AV1 stays on the legacy `<video>` element. Tolerable today only because the preview now
-draws once per *source* frame and the library's one AV1 file is 6fps (26 → 50–54fps); **a
-high-frame-rate AV1 file would still be bad.**
+AV1 also cannot join the WebCodecs path: `VideoDecoder.isConfigSupported` returns `true` here
+and then decodes **zero** frames. ⚠️ Never gate on `isConfigSupported`; probe a real decode
+(`scripts/probes/webcodecs_vp9_av1_probe.py`) — though note that probe is about `VideoDecoder`,
+a *different* code path from the legacy `<video>` element's zero-frames finding above.
 
-No action pending. Re-run `scripts/probes/webcodecs_vp9_av1_probe.py` after any WebKitGTK
-upgrade — if AV1 decode starts working, adding it is a small change (`av1parse` already
-reports profile/level/tier). ⚠️ Never gate on `isConfigSupported` here; probe a real decode.
-Full history: `docs/design/legacy-video-fallback-cost.md`, `webcodecs-video-path.md` phase 7.
+**The library already contains three AV1 files, two of them high-frame-rate** (1920×1080@29.97
+and 1080×1080@25, not just the 6fps one everyone measured), so the "only slow files are
+affected" framing was wrong. AV1 is what YouTube serves; Digger will keep delivering it.
+
+Next: confirm whether the AV1 `<video>` element ever reaches `readyState >= 2`, then whether
+WebKitGTK's internal playbin autoplugs the registered `aom: av1dec` for a `<video>` src
+(`GST_DEBUG=avdec_av1:5,av1dec:5,playbin:3`). Retiring the legacy path outright — by
+transcoding unsupported codecs to an H.264 video-only proxy at ingest, measured at ~1.0×
+realtime for 1080p30 AV1 — is the alternative under consideration.
+
+### ~~VP9 fps decay~~ [closed 2026-08-05 (evening) — it was not a decay]
+
+✅ A 7-minute controlled arm refuted it: the frame rate **oscillates 9–57fps** and recovers
+after every trough, so the reported "58.6 → ~13fps plateau" was a 2-minute window on one
+trough. Leak refuted (webRSS spread 9MB, *under* the idle control's own 16MB sawtooth),
+thermal refuted and anti-correlated (fps is highest when the CPU is hottest; 178ms throttled
+in 420s), CPU starvation refuted (`pressure/cpu full=0.00`).
+
+⚠️ **Do not cite this decay as evidence for the native rendering rewrite** — that was its only
+support, and it does not hold. One control still outstanding: re-run after a reboot, which
+clears the 4-day uptime, 3.3GB of swap and a 90%-of-uptime system-wide I/O stall (PSI io
+`full` 72% with an idle SSD) that is the last variable standing.
+
+Tooling: `scripts/decay-sample.sh` + `scripts/decay-join.py`. **Always run the idle control
+arm** — it is what eliminated iowait and calibrated the leak threshold. Full write-up:
+`docs/design/legacy-video-fallback-cost.md`, "2026-08-05 (evening) — the decay arm ran".
+
+### `auCache` grows unbounded in the codec worker [latent, not a performance cause]
+
+`codecWorker.ts:75`'s `Map<number, Au>` has no `delete`, no `clear` and no cap — it accumulates
+every access unit for a whole playthrough, bounded only by the file's compressed video size.
+Measured **not** to be a performance factor (RSS is flat across a full track and fps doesn't
+track it), so it is hygiene, not a fix. Worth capping before a long set on large files.
 
 ### 10.8s of silence mid-track with the pipeline in PLAYING [open, no reproducer, 2026-08-05]
 

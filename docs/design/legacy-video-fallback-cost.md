@@ -1,12 +1,23 @@
 # The legacy `<video>` fallback costs 50–340 ms per preview draw
 
-Status: **A1, A2 and A4 have all run (2026-08-05). The finding is closed for VP9 and
-H.264; AV1 remains on the legacy path and cannot leave it.** H1 is refuted, H2 is half the
-answer, the per-call cost is pinned to the video codec by a single-variable arm, and the
-structural fix has shipped: VP9 now goes through the WebCodecs demux path and never touches
-a `<video>` element, which took the worst-case library file from **~26 fps to ~55 fps**.
-Read "A1 ran", "A2 ran" and "A4 ran" below before anything else in this doc; they supersede
-the ranking in "Hypotheses".
+Status: 🟡 **VP9 half re-closed 2026-08-05 (evening) — "the VP9 decay" was a measurement
+artifact and does not exist. AV1's zero-frames finding still stands and is the only open
+item.** A1, A2 and A4 all stand. The reopening below was half right: it correctly caught
+that the sweep could not see paint-phase cost, but the decay it reported is **not a decay** —
+a 7-minute controlled arm shows the frame rate oscillating 9–57 fps continuously, and the
+"58.6 → ~13 fps plateau" was a 2-minute window that caught one trough of that oscillation
+and read it as a terminal state. Leak, thermal and CPU-starvation are all refuted by
+measurement. **Read "2026-08-05 (evening) — the decay arm ran" below before any other fps
+claim in this file**, including the reopening's.
+
+Superseded status line, kept for the history: **A1, A2 and A4 have all run (2026-08-05). The
+finding is closed for VP9 and H.264; AV1 remains on the legacy path and cannot leave it.** H1
+is refuted, H2 is half the answer, the per-call cost is pinned to the video codec by a
+single-variable arm, and the structural fix has shipped: VP9 now goes through the WebCodecs
+demux path and never touches a `<video>` element, which took the worst-case library file from
+**~26 fps to ~55 fps**. Read "A1 ran", "A2 ran" and "A4 ran" below before anything else in
+this doc; they supersede the ranking in "Hypotheses". **This paragraph's fps claims are now
+superseded by "2026-08-05 live verification" below.**
 
 Original status line, for context: **root-caused to a call site, mechanism not yet confirmed.**
 Found 2026-08-05 by reading back a live set (the "Cassius 1999" session, 01:37–01:59) rather
@@ -354,6 +365,15 @@ Why VP9 specifically. Candidates, none tested:
    `control-window-frame-budget.md` §6 flagged as unexplained and §7 attributed largely to φ; it
    survives here with φ's fix in place. It is **not** caused by anything in this doc, but it does
    mean a long arm reads worse than a short one, so only compare like-for-like windows.
+
+   ⚠️ **Reinterpreted 2026-08-05 (evening): "monotonic degradation" was an artifact of arm
+   length.** The 7-minute arm shows the frame rate *oscillating* 9–57 fps with a period of
+   roughly a minute, recovering fully after every trough. A 30 s arm samples a fraction of one
+   cycle and will read as a clean monotonic trend in whichever direction it happens to sit —
+   which is exactly what these three sightings (here, §6, and the live verification) were. The
+   practical rule is stronger than "compare like-for-like windows": **a window shorter than
+   ~2 minutes cannot measure this machine's steady-state frame rate at all**, and the median
+   across a multi-minute run is the only figure worth comparing.
 2. **Even the healthy path is not at vsync.** H.264 on webcodecs, one deck, no output window,
    read **52.5 fps** in its baseline window, not the 61–62 fps `control-window-frame-budget.md` §7
    measured on an audio-only file. The preview `drawImage` of an actual video frame costs
@@ -522,6 +542,22 @@ preview now costs a rounding error.
   preview-draw rate cap were stopgaps for exactly the case A4 has now removed. The only
   file class that would still benefit is high-frame-rate AV1, which does not currently exist
   in the library — leave A3 unbuilt unless one shows up.
+
+  ❌ **Factually wrong as of 2026-08-05 (evening): high-frame-rate AV1 files are already in
+  the library and always were.** `gst-discoverer-1.0` over the media cache finds **three**
+  distinct AV1 files, only one of which is the 6fps clip everyone measured:
+
+  | cache file | AV1 stream |
+  |---|---|
+  | `bf991bae5d40c8a2-9569484.mp4` | 1920×1080 **@6** — the only one ever measured |
+  | `f87d86839efca2df-61335849.mp4` | 1920×1080 **@29.97** |
+  | `6b88001ec763a5fe-10237095.mp4` | 1080×1080 **@25** |
+
+  So "the exposure only applies to fast AV1 files, and we have none" was wrong twice over —
+  the live verification separately found even the 6fps file renders *zero* frames. **Check
+  the cache with `gst-discoverer-1.0` before making a claim about what the library
+  contains**; three of ~13 distinct cached files are AV1, and AV1 is what YouTube serves, so
+  Digger will keep delivering them.
 - **The residual on a playing VP9 deck is now the deck-card text, not video.** In the same
   run the `noDeckText` arm reads 60.4–61.3 fps against baseline's ~55. That is
   `control-window-frame-budget.md` §7's known residual, now the largest remaining item.
@@ -719,6 +755,321 @@ A/B them against a labelled run.
 
 ---
 
+## 2026-08-05 live verification — both remaining claims broke
+
+⚠️ **Half of this section is superseded.** Its VP9 half — "the ~55fps number does not hold,
+it decays to a ~13fps plateau" — was tested under a controlled arm the same evening and
+**does not survive**: there is no decay and no plateau. See "2026-08-05 (evening) — the
+decay arm ran" below. The section is kept intact because its *method* critique was correct
+and worth preserving (the sweep's metrics genuinely cannot see paint-phase cost), and
+because its **AV1 half still stands unrefuted**. Read the two together.
+
+The doc's own "Where to pick up" said *"nothing here is fixed until the user has played one
+and not seen the stall."* That session happened this same day, in the real `cargo tauri dev`
+window (build `0da1c0d`, clean), Hercules Starlight connected. Two things were checked; neither
+held up.
+
+### VP9 does not hold ~55fps in a real session
+
+The exact file A4's 55fps number came from —
+`~/.local/share/com.cuemark.app/media_cache/8dfeff2b1440d665-14817724.webm` (640×480 VP9 @25,
+"the worst library file") — was loaded onto a deck and played continuously via the webcodecs
+path (confirmed via `[video-path] deck-0 webcodecs branch: calling audioPlay`). `[raf]` over
+the following ~2.5 minutes:
+
+```
+18:07:26  58.6fps | busy 1%
+18:07:36  40.2fps | busy 2%
+18:07:51  24.4fps | busy 1%
+18:08:16  18.9fps | busy 1%
+18:08:47  14.3fps | busy 1%
+18:09:02  13.6fps | busy 1%
+18:09:52  12.5fps | busy 1%   ← plateau, stable for the last ~35s of observation
+```
+
+`frame-dur` stayed at 0–1ms and `[aux-loop] preview/deck-0` `busy%` stayed at 6–8% throughout
+— i.e. every JS-observable cost metric says nothing changed, while measured fps fell 4.5×. At
+the plateau, `WebKitWebProcess` CPU (via `top -b -n2`, the correct point-in-time method per
+`skills/run-app`) read **46.8%**, sampled twice with the same result.
+
+**This is the exact signature CLAUDE.md's own instrumentation notes warn about**: *"`busy%`
+measures the JS that records canvas drawing, not the paint that follows it... Symptoms: `busy%`
+low while `WebKitWebProcess` CPU is high, and fps that does not respond to removing JS work."*
+The automated sweep that produced 55fps measured `dur`/`busy%` — exactly the metrics that
+warning says cannot see this class of cost. It was never in a position to rule this out, and
+did not.
+
+**Ruled out, weakly**: system memory pressure. `free -h` showed `available` at 9.2Gi (healthy)
+and swap steady at 3.2Gi (not climbing across the two checks a few minutes apart) — a `top`
+snapshot taken mid-investigation showed 39% `wa` (iowait), which raised the question, but the
+steady-not-growing swap figure argues against active thrashing. Not fully eliminated —
+no continuous sampling was run — but it is the second-place suspect, not the leading one.
+
+**Not yet done**: a same-session A/B (this VP9 file vs. a forced-legacy H.264 file, or vs. the
+same VP9 file with the deck paused/reloaded) to see whether the decay is time-based (grows with
+elapsed playback — leak-shaped) or state-based (triggered once and then steady — a one-time
+transition, e.g. a buffer/cache filling up). The plateau holding steady for 35s before
+observation ended is the only hint so far, and it's compatible with either.
+
+### AV1 on the legacy path: zero video frames, not a low frame rate
+
+Deck-0 had an AV1 file auto-restored from session recovery on launch — Cassius, "Cassius 1999
+(Radio Edit)", 1920×1080, AV1 @6fps (per the codec string in the pipeline's own log), the
+exact class of file this doc previously called "survivable... because the library's AV1 is
+6fps (26 → 50–54fps)". It was played for **~7 continuous minutes** (`18:00:34`–`18:07:22`),
+audio confirmed working throughout (cue toggled on/off repeatedly via the real MIDI
+controller, logged as `[audio/deck-0] cue ON`/`cue OFF`). Over that entire span:
+
+```
+[aux-loop] preview/deck-0@1195x672 n=305 drew=0 | ...
+```
+
+**`drew=0` on every single one of ~85 logged ticks across 7 minutes.** A real 6fps decode
+would produce a nonzero `drew` within the first 5-second window (CLAUDE.md's own prior
+measurement: `drew=133/133`/`30/258` for exactly this file class). Zero for the entire play is
+not "slow," it is "never." The user confirmed this by eye: no video appeared in either the
+`DeckCard` preview or the output window, for the whole play.
+
+**Immediately after** (18:07:22), the same deck was switched to the VP9 file above, and
+`preview/deck-0` started drawing normally (`drew=102/231`, `drew=123/201`, ...) in the same
+session — which rules out a general rAF/preview-loop breakage and confines the fault to
+something specific to this AV1 file/path.
+
+**Root cause not established.** What is ruled out:
+- The Rust-side `WARNING: No decoder available for type 'video/x-av1…'` logged at load time
+  is **not** the cause — it comes from the audio pipeline's own `uridecodebin` correctly
+  declining to decode a stream it only wants audio from (CLAUDE.md's own log-pattern table:
+  *"Normal — autoplug-select is correctly skipping video decoders in the audio pipeline"*).
+  It says nothing about WebKitGTK's separate, internal `<video>`-element decode pipeline,
+  which this project has no logging visibility into at all.
+- Not a missing GStreamer element system-wide: `gst-inspect-1.0` lists `aom: av1dec` (a
+  software AV1 decoder) as registered on this machine. Whether WebKitGTK's own internal
+  media player actually autoplugs it for a `<video>` element is unconfirmed — this is the
+  next thing to check, not something this session could observe.
+- `DeckCard.svelte`'s `legacyFrameChanged()` (the frame-change gate) has an explicit
+  fallback for a stuck `totalVideoFrames` counter that logs
+  `"preview: totalVideoFrames stuck at N for >1s while the clock advanced"` via `debugLog` —
+  that line **never appeared**, but the code shows why that's not exculpatory: the
+  stuck-counter timer only arms when `video.currentTime` is independently observed to be
+  advancing (`timeChanged`). If `readyState` never reaches 2 at all (the same code path
+  documented for genuinely audio-only files), the branch that reads `totalVideoFrames` is
+  never entered and neither `currentTime` advances nor does the stuck-warning fire — which
+  is indistinguishable, from this log, from "this file has no video track." The leading
+  reading is that this AV1 `<video>` element is stuck at an early `readyState`, not that it
+  reached `readyState 2` and then froze — but that has not been directly observed (would
+  need `video.readyState`/`videoWidth`/`videoHeight` via the debug hook or devtools console,
+  neither available against this live, user-visible window without disturbing it).
+
+**This escalates the exposure CLAUDE.md already flagged.** The prior text said a
+high-frame-rate AV1 file "would still perform badly" — implying the 6fps file was fine. Live
+verification shows the 6fps file itself shows **no video at all**, so the exposure applies to
+every AV1 file cuemark can currently be handed, not just fast ones.
+
+### What to do next, in order
+
+1. Confirm whether the AV1 `<video>` element ever reaches `readyState >= 2` at all. Needs
+   `window.__cuemarkDebug` (already present — this is a `cargo tauri dev` build, so the hook
+   needs no special build flag) via a tauri-driver session, or ask the user to check
+   devtools (right-click → Inspect Element → Console →
+   `document.querySelector('video').readyState`) live.
+2. If `readyState` never advances: check whether WebKitGTK's internal playbin actually
+   autoplugs `av1dec` for a `<video>` src — this may need `GST_DEBUG=avdec_av1:5,av1dec:5,
+   playbin:3` exported before launch (propagates to `WebKitWebProcess` since it's inherited
+   from the environment) to see the internal pipeline's decoder selection.
+3. For the VP9 fps decay: re-run the same file with continuous `top -b -n1 -d1` sampling of
+   `WebKitWebProcess` across the full decay window (not two snapshots), and try a same-session
+   forced-legacy H.264 file as a comparison arm to see if the decay is specific to the
+   webcodecs/canvas-paint path or general to this session/machine state.
+4. Do not re-open A1/A2/A4's mechanism — the codec-linked cost, the draw-frequency fix, and
+   the WebCodecs demux move are not what broke. Re-open only the fps/frame-count *outcome*
+   claims built on top of them.
+
+---
+
+## 2026-08-05 (evening) — the decay arm ran
+
+**One-line verdict: the VP9 "decay" does not exist. The frame rate oscillates 9–57 fps
+continuously for as long as a deck plays; the reported "58.6 → ~13 fps plateau" was a
+2-minute window that caught one trough. Leak, thermal throttling and CPU starvation are all
+refuted, two of them by anti-correlation. The surviving anomaly is machine-level and
+ambient, not cuemark-level.**
+
+### Why an external sampler
+
+The reopening's own argument was that every JS-observable metric stayed flat while fps fell
+4.5×, so the cost had to be in a phase `busy%` and `dur` structurally cannot see. That is a
+correct reading — and it means **adding more in-app instrumentation measures the same blind
+spot again.** The three candidates each leave a distinct fingerprint *outside* the webview,
+so the arm was built to sample from outside it:
+
+| candidate | fingerprint |
+|---|---|
+| leak (ours or WebKit's) | RSS climbs monotonically with the decay |
+| thermal throttle | throttle counters tick, package temp high, MHz drops |
+| memory pressure / swap | swap grows, iowait rises, available falls |
+
+New tooling, both dependency-free (`/proc` and `/sys` only, no root, no app changes):
+
+- `scripts/decay-sample.sh` — 2 s samples of per-process RSS and **true point-in-time CPU**
+  (from `/proc/<pid>/stat` jiffy deltas, never `ps`, per CLAUDE.md's lifetime-average
+  warning), package temp, thermal-throttle counter deltas, CPU MHz, iowait, swap. Re-resolves
+  pids every sample so a watchdog reload cannot silently blind it.
+- `scripts/decay-join.py` — joins that CSV against `[raf]`/`[aux-loop]` lines on UTC
+  wall-clock, so the outcome metric and the machine state read as one table.
+
+### The idle control arm, and what it bought
+
+3.5 minutes, deck loaded but **paused**, app untouched. Run this before any play arm — the
+whole finding is a claim about change over time, and without it there is no way to tell
+play-induced drift from ambient drift.
+
+```
+fps          61.9–62.0     110 windows, zero decay
+webRSS       314 -> 305MB  sawtooth 302–318, ends BELOW start
+throttled    0 ms          across the entire run
+pkg temp     74–80 C
+iowait       46 % mean
+min avg MHz  1424          the CPU idles down; it has headroom
+```
+
+Three results for free:
+
+1. **The decay is play-induced, not ambient** — the window holds a flat 62 fps indefinitely.
+2. ✅ **iowait is eliminated as the cause.** The reopening listed memory pressure / iowait as
+   its "second-place suspect" off a single 39 % `wa` snapshot. It sits at **46 % while the app
+   holds a rock-steady 62 fps.** It is ambient on this machine.
+3. **A leak verdict now needs > 16 MB of growth** to clear the idle sawtooth — a calibrated
+   threshold rather than a guess.
+
+### The play arm
+
+Deliberately run on the **aged process from the live verification itself** — build `0da1c0d`,
+up 40 minutes, the same VP9 file (`8dfeff2b1440d665-14817724.webm`, 640×480@25) still loaded
+on deck-0 and paused since `18:14`. Resuming into that process rather than restarting is what
+makes the arm able to test accumulation at all: `auCache` and every other in-app map survives
+a pause, so a run that starts fast in a 40-minute-old process has already refuted them.
+
+Play span `18:41:29` → `18:48:28` (EOS) — **6 min 59 s continuous**, 3.5× the window the
+reopening measured. Validated as genuinely playing throughout (`drew` 62–126 per window,
+clock advancing, no `play` IPC retry storm). One deck, no output window.
+
+```
+   t     fps   busy  gap90  drew  webRSS  webCPU  temp   MHz  thrD
+   0    19.3    1%     73    95      +0            90    3093    0
+  46    54.0    3%     30   122      -1    58.9   101    3101    7
+  62    55.2    5%     29   125      -1    58.5    94    1903    0
+  94    35.6    2%     74    98      -4    58.0    97    3093    0
+ 125    14.6    1%    148    67      -3    49.2    86    3093    0
+ 158    12.5    1%    151    63      -1    45.2    86    1197    0
+ 190    26.4    1%     96    81      -2    50.2    88    3103    0
+ 222    15.7    1%    135    69      -1    50.8    83    1198    0
+ 254    26.9    2%     97    83      -1    52.6    87    3094    0
+ 319    19.0    1%    113    73      +0    49.7    87    3093    0
+ 400    24.2    1%     98    78      +1    51.4    80    1197    0
+ 416    61.9    0%     17     1      +0     3.7    81    2295    0   <- EOS, deck stopped
+```
+
+Distribution over 182 playing samples: **min 8.7, p25 21.0, p50 24.5, p75 28.8, max 57.1.**
+
+### Verdicts
+
+**There is no decay — REFUTED, and this is the load-bearing result.** The frame rate reaches
+its *maximum* (55.2 fps) at t=62, **after** a low start, and returns to 26–28 fps after every
+trough for the remaining five minutes. A monotonic decay to a stable plateau is not what this
+does. The reopening's "13.6 → 12.5 fps, plateau, stable for the last ~35 s of observation" is
+a real observation of a real trough; the error was inferring a terminal state from it. ⚠️ **A
+2-minute window cannot distinguish a decay from the falling half of an oscillation** — and
+the earlier arms were 30 s, which is shorter still.
+
+**Leak — REFUTED.** webRSS spread across a *complete* 7-minute playthrough was **9 MB**,
+*smaller* than the idle control's own 16 MB sawtooth, with no trend. The Rust side was flat
+to ±1 MB. Resuming into a 40-minute-old process started at 19 fps and rose to 55, which is
+the opposite of what accumulated state predicts.
+
+⚠️ **This also clears `auCache`, which is nonetheless a real latent bug.**
+`codecWorker.ts:75`'s `Map<number, Au>` has **no `delete`, no `clear` and no cap** — it
+accumulates every access unit for the whole playthrough, bounded only by the file's
+compressed video size. It was the leading in-app suspect going in. It is not this bug: it is
+too small to move RSS measurably and the frame rate does not track it. Worth fixing for
+hygiene (a long set on large files is unbounded growth), **not** worth citing as a
+performance cause.
+
+**Thermal throttling — REFUTED, and anti-correlated.** 178 ms throttled across the entire
+420 s run (0.04 %), essentially all of it in one early burst. The correlation runs the wrong
+way:
+
+```
+fps < 20   n=32   mean temp  85.5 C   mean webCPU 48.7%
+fps > 45   n=11   mean temp 100.0 C   mean webCPU 56.5%
+```
+
+**The frame rate is highest when the CPU is hottest.** Causation runs fps → temp (more
+frames, more work, more heat), not temp → fps. Package temp also *fell* 101 → 79 °C across
+the run while fps stayed in the low 20s. ⚠️ **Loud fans during a bad window are a
+consequence, not a diagnosis** — this machine idles at 74–80 °C, and "it sounds hot" was
+nearly mistaken for evidence.
+
+**CPU starvation — REFUTED.** `/proc/pressure/cpu` reads `full=0.00`, and `webCPU` is
+*higher* in the fast state (56.5 %) than the slow one (48.7 %). The low-fps state is one in
+which the web process does **less** work and runs **cooler**. It is not being starved; it is
+not being asked.
+
+### The surviving anomaly — and it is not cuemark's
+
+⚠️ **Correlational only. This is not established as the cause of the oscillation.**
+
+```
+/proc/pressure/io   some avg10=81.2   full avg10=72.4
+                    full total = 85.0 h of 94.4 h uptime
+vmstat              b = 5-6 blocked, wa = 50-57%
+swap                3.3 GB of 4 GB used (80%)
+sda (SSD)           in-flight = 0, counters nearly static
+```
+
+The system reports being **fully stalled on I/O ~72 % of the time, across 90 % of a
+four-day uptime, while the disk is idle.** Bare metal, not a VM (`systemd-detect-virt` →
+`none`, no hypervisor CPU flag). Whatever this is, it is **ambient** — the idle control shows
+the same 46 % iowait while holding a flat 62 fps — so it does not set the frame rate on its
+own. But a scheduler in that state under load fits *erratic oscillation* far better than
+anything in cuemark's render path does.
+
+### What this means for the native-rendering escalation
+
+**Nothing here supports `native-output-pipeline.md`.** Its reopen criterion is "webview
+rendering itself becomes the bottleneck or a new freeze class appears in compositing/WebGL
+rather than media". The single measurement that looked like that evidence was a misread
+window, and every in-app hypothesis it could have implicated is refuted. Do not cite the VP9
+decay as an argument for the rewrite.
+
+### Next — one cheap control, then stop
+
+**Reboot and re-run this exact arm.** Four days of uptime, 3.3 GB swapped out and a
+90 %-of-uptime I/O stall are all cleared by it, and it is the only remaining variable with a
+plausible link to the oscillation. If fps holds ~55 afterwards, this finding closes for VP9
+entirely.
+
+```bash
+scripts/decay-sample.sh 240 2 /tmp/idle.csv     # control: app open, deck PAUSED
+scripts/decay-sample.sh 420 2 /tmp/play.csv     # arm: press play, then do not touch the window
+scripts/decay-join.py /tmp/play.csv
+```
+
+⚠️ **Run the idle control every time.** It is what eliminated iowait and calibrated the leak
+threshold, and both would otherwise have been guesses.
+
+### Limits of this arm, stated plainly
+
+- **One run, one file, one machine state.** The oscillation is reproducible within the run
+  (many cycles) but the run itself has not been repeated.
+- **The oscillation's own cause is not established** — only that it is not leak, not
+  thermal, not CPU, and not JS.
+- **It measures the machine, not WebKit's internals.** It can say the cost is not in any
+  sampled resource; it cannot say which WebKit phase the time goes to.
+- ✅ **What it does settle** is the question that was actually blocking: whether the reported
+  decay is real (no), and whether anything in this doc justifies the rendering rewrite (no).
+
+---
+
 ## What this does *not* explain
 
 The 10.8 s audio dropout at `01:38:31`–`01:38:42` happened on the **H.264 webcodecs** path with
@@ -730,20 +1081,30 @@ underruns (`01:42:27`, `01:43:40`) *are* downstream of this doc's finding, but t
 
 ## Where to pick up
 
-**A1, A2 and A4 are all done (2026-08-05). Read "A1 ran", "A2 ran" and "A4 ran" first —
-they supersede "Hypotheses". There is no outstanding work item in this doc.**
+**A1, A2 and A4's *measurements* are done (2026-08-05) and still stand — read "A1 ran", "A2
+ran" and "A4 ran" first, they supersede "Hypotheses". The live verification they called for
+ran 2026-08-05 (late) and reopened two outcome claims; the decay arm ran the same evening and
+**closed the VP9 one as a measurement artifact**. Read "2026-08-05 (evening) — the decay arm
+ran" first. AV1 is the only genuinely open item.**
 
-What remains is watch-and-verify, not investigation:
-
-1. **Verify live.** The 55 fps VP9 number is from an automated sweep, not from a set. The
-   next real session with a VP9 track in it is the confirmation — nothing here is "fixed"
-   until the user has played one and not seen the stall.
-2. **AV1 is the one open exposure.** It stays on the legacy `<video>` path because WebCodecs
-   cannot decode it here (proved twice, including against a GStreamer-encoded control). A
-   *high-frame-rate* AV1 file would still perform badly; the library's only AV1 file is 6 fps,
-   where A2's gate already recovers 26 → 50–54 fps. Re-run
-   `scripts/probes/webcodecs_vp9_av1_probe.py` after any WebKitGTK upgrade — if AV1 decode
-   starts working, adding it is a small change (`av1parse` already reports profile/level/tier).
+1. ✅ **VP9 fps decay — CLOSED, it was not a decay.** A 7-minute controlled arm shows the
+   frame rate oscillating 9–57 fps and recovering after every trough; the "58.6 → ~13fps
+   plateau" was a 2-minute window on one trough. Leak (webRSS spread 9MB, under the idle
+   control's own 16MB sawtooth), thermal (178ms throttled in 420s, and fps *anti*-correlated
+   with temperature) and CPU starvation (`pressure/cpu full=0.00`) are all refuted. **One
+   control still outstanding: re-run after a reboot**, which clears the 4-day uptime, 3.3GB
+   of swap and the 90%-of-uptime I/O stall that is the last variable standing. Do not cite
+   this decay as evidence for the native rendering rewrite — see the arm's own section.
+2. **AV1 on the legacy path draws zero video frames, confirmed live** — not the "6fps but
+   survivable" claim this doc previously made. `drew=0` for a full ~7-minute play, audio and
+   cue working normally throughout; the same deck drew VP9 frames normally moments later in
+   the same session, ruling out a general preview-loop break. Next: confirm via
+   `window.__cuemarkDebug`/devtools whether `video.readyState` ever reaches 2 for this file;
+   if not, check whether WebKitGTK's internal playbin autoplugs the registered `aom: av1dec`
+   element for a `<video>` src at all (`GST_DEBUG=avdec_av1:5,av1dec:5,playbin:3`).
+   `scripts/probes/webcodecs_vp9_av1_probe.py`'s "decodes zero frames" finding was about
+   `VideoDecoder`, a different code path from the legacy `<video>` element — re-running it
+   does not answer this.
 3. **Do not build A3.** Its stopgaps were for the case A4 removed.
 4. **The largest remaining cost on a playing deck is now the deck-card text**, not video —
    `noDeckText` reads 60.4–61.3 fps against baseline's ~55 in the A4 run. That belongs to
@@ -767,6 +1128,9 @@ What remains is watch-and-verify, not investigation:
 | `scripts/probes/webcodecs_vp9_av1_probe.py` | A4's gate: does `VideoDecoder` here really decode VP9 / AV1? (it lies about AV1) |
 | `src-tauri/src/video_demux.rs` | the codec gate — now `CodecKind::{H264,Vp9}` + `vp9_level_code()` (A4, done 2026-08-05) |
 | `src/lib/video/codecWorker.ts` | `needsAvcRemux` — the one switch separating H.264's avc mode from VP9's pass-through (A4) |
+| `scripts/decay-sample.sh` | machine-state sampler (RSS, true CPU, thermal-throttle deltas, iowait, swap) — the arm that refuted the decay, 2026-08-05 evening |
+| `scripts/decay-join.py` | joins that CSV against `[raf]`/`[aux-loop]` on UTC wall-clock |
+| `src/lib/video/codecWorker.ts` | `auCache` (line ~75) grows unbounded — a real latent bug, but measured *not* to be a performance cause |
 | `scripts/*-test.sh` (all five) | `WebKitWebDriver` lookup, broken by a Debian package rename (fixed 2026-08-05) |
 | `src-tauri/src/main.rs` | `CUEMARK_DISABLE_DMABUF` handling and the rank demotions (~38–60) |
 

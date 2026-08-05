@@ -2129,3 +2129,52 @@ Closing `baseline2` read 55.5–56.3fps, so no drift. `drew` = 25.0/s against a 
   lookup, broken by a Debian package rename
 - `docs/design/webcodecs-video-path.md` — phase 7 + results; `docs/design/legacy-video-fallback-cost.md`
   — "A4 ran", A3 marked not-needed, doc closed; `CLAUDE.md` — the fallback section rewritten
+
+# 2026.08.05 (late) — Live verification reopens both VP9 and AV1 claims
+
+`legacy-video-fallback-cost.md` had closed itself on an automated sweep's numbers and
+explicitly said not to trust them until "the user has played one and not seen the stall."
+Launched the real `cargo tauri dev` app (build `0da1c0d`, clean) with the Hercules Starlight
+connected and did exactly that. Neither claim held.
+
+**VP9**: playing the same worst-library-file VP9 clip the 55fps number came from, continuously
+for ~2 minutes, went `58.6fps → ~13fps` in a steady decay, plateauing there. `[raf] busy%`
+stayed 1–2% and `frame-dur` ~1ms throughout — every JS-observable metric said nothing changed
+— while `WebKitWebProcess` CPU (sampled twice via `top -b -n2`) read 46.8%. This is the exact
+"cost lives in paint, invisible to busy%" signature CLAUDE.md's own instrumentation notes
+warn about; the automated sweep measured only the metrics that signature hides behind.
+System memory pressure was checked and weakly ruled out (`available` 9.2Gi, swap steady not
+climbing across two checks) but not fully — no continuous sampling was run.
+
+**AV1**: a real AV1 file (1920×1080, 6fps) auto-restored onto a deck from session recovery
+played for ~7 minutes with cue toggled repeatedly on the real controller — audio and cue both
+worked — while `[aux-loop] preview/deck-0` logged `drew=0` on every single tick, the entire
+time. The user independently reported seeing no video in either the deck preview or the
+output window. Switching the same deck to the VP9 file immediately after drew frames
+normally in the same session, ruling out a general rAF/preview-loop break. This escalates the
+doc's prior claim ("survivable at 26–54fps for a 6fps file") — the file that was supposed to
+be the survivable case renders no video at all.
+
+## What generalises
+
+- **"Verify live" is not a formality — it caught two real regressions the sweep missed
+  entirely**, in the same session the sweep had declared victory. A doc that says "closed"
+  based on an automated measurement and a doc that says "reopened" based on watching it
+  actually run can both be about the same code; only one of them is asking the question that
+  matters to a person at a controller.
+- **`busy%`/`dur` structurally cannot see paint-phase cost — this is not a hypothetical
+  caveat, it is what happened.** The VP9 decay is invisible to the exact metrics the closing
+  sweep used to declare 55fps, which is why the sweep couldn't have caught it no matter how
+  many times it ran.
+- **A frame-change gate reporting `drew=0` doesn't distinguish "nothing changed" from
+  "nothing ever will."** `legacyFrameChanged()`'s stuck-counter fallback only arms once
+  `currentTime` is observed moving, so a `<video>` element stuck before `readyState 2` looks
+  identical, from the log alone, to a legitimate audio-only file — the exact ambiguity this
+  session hit for the AV1 case.
+
+## Files touched
+
+- `docs/design/legacy-video-fallback-cost.md` — reopened status line, new "2026-08-05 live
+  verification" section with both findings and next steps, "Where to pick up" rewritten
+- `CLAUDE.md` — VP9/AV1 sections and "Open findings" list updated to reopened status
+- `todo.md` — known-issue entry rewritten from "reduced, not eliminated" to "reopened"

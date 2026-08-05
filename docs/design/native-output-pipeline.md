@@ -53,6 +53,28 @@ output to survive the control window dying, multiple outputs, 4K@60, or NDI/capt
 output. Those are product decisions on their own merits — this bug is not an argument for
 them.
 
+### Assessed again on 2026-08-05 (evening) — still shelved, and the one apparent trigger evaporated
+
+For ~a day this doc had a genuine-looking second trigger: a live session reported the VP9
+frame rate decaying 58.6 → ~13fps while every JS metric stayed flat, which reads exactly like
+trigger 2, *"webview rendering itself becomes the bottleneck"*. **It does not survive
+measurement.** A 7-minute controlled arm found no decay at all — the frame rate oscillates
+9–57fps and recovers after every trough, so the "plateau" was a 2-minute window on one trough
+— and refuted leak, thermal throttling and CPU starvation individually, two of them by
+anti-correlation. See `legacy-video-fallback-cost.md` "2026-08-05 (evening) — the decay arm
+ran".
+
+⚠️ **Do not cite the VP9 decay as an argument for this path.** It was its only support, and
+the surviving anomaly is machine-level and ambient (a system-wide I/O stall on a host with
+4 days' uptime), not a property of webview rendering. The remaining control is a reboot.
+
+**AV1 rendering zero frames on the legacy `<video>` path is also not a trigger for this doc**,
+even though it is a real open bug: it is answerable far more cheaply by transcoding
+unsupported codecs to an H.264 video-only proxy at ingest (measured ~1.0× realtime for
+1080p30 AV1 via `av1dec ! x264enc ultrafast`, ~9.5× realtime for the 6fps file). That reuses
+`media_cache.rs`'s existing shape and *deletes* the legacy path rather than adding a
+subsystem. Weigh that before a multi-week rewrite.
+
 ## The idea
 
 Remove the webview from the performance-critical output path **entirely**. Rust
