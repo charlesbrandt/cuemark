@@ -650,6 +650,7 @@
     // AudioManager is fresh with zero pipelines in that case, so `audio` comes back
     // empty and this check correctly declines).
     let isRecoveryBoot = false;
+    let globalsRestoredFromSnapshot = false;
     try {
       const recovery = await sessionRestore();
       isRecoveryBoot = !!recovery.snapshot && recovery.audio.some((a) => a.filePath);
@@ -675,6 +676,33 @@
           }
         }
         session.set(restored);
+      } else if (recovery.snapshot) {
+        // Not a recovery boot — no live pipeline to adopt, so decks stay at their fresh
+        // defaults (the ghost-restore risk above is real for per-deck state). But global,
+        // non-deck settings (master volume, bpm, crossfader position, curves, snap-to-beat,
+        // visualization) carry none of that risk — they're just numbers/toggles, safe to
+        // apply regardless of whether any deck has audio loaded. Without this, any such
+        // setting last changed via the on-screen UI (rather than a physical MIDI control,
+        // which separately persists through midi_state.json below) silently reset to its
+        // default on every full app restart, even though it was faithfully written to
+        // session-recovery.json the whole time.
+        const restored = recovery.snapshot as Session;
+        session.update((s) => ({
+          ...s,
+          masterVolume: restored.masterVolume,
+          bpm: restored.bpm,
+          masterDeckId: restored.masterDeckId,
+          crossfaderMapping: restored.crossfaderMapping,
+          midiMapping: restored.midiMapping,
+          crossfaderValue: restored.crossfaderValue,
+          crossfaderTargets: restored.crossfaderTargets,
+          audioCurve: restored.audioCurve,
+          visualCurve: restored.visualCurve,
+          snapToBeat: restored.snapToBeat,
+          visualization: restored.visualization,
+          visualizationOpacity: restored.visualizationOpacity,
+        }));
+        globalsRestoredFromSnapshot = true;
       }
     } catch (e) {
       console.error('[recovery] session_restore failed, starting fresh:', e);
@@ -688,14 +716,19 @@
       // Skipped on a recovery boot: the just-restored session snapshot already carries
       // the exact pre-freeze fader positions, which is strictly more accurate than this
       // separate per-control persist file (last-seen values, not necessarily in sync).
+      // 'crossfader'/'masterVolume' are also skipped when globalsRestoredFromSnapshot —
+      // same reasoning, just for the non-recovery-boot case (see above): the snapshot
+      // reflects every change regardless of source, while this file only updates from
+      // physical MIDI events, so it can hold a stale value if the control was last
+      // touched on-screen.
       try {
         const saved = await invoke<Record<string, number>>('midi_get_saved_state');
         const deckPatches = new Map<string, Record<string, number>>();
         for (const [key, value] of Object.entries(saved)) {
           if (key === 'crossfader') {
-            setCrossfader(value);
+            if (!globalsRestoredFromSnapshot) setCrossfader(value);
           } else if (key === 'masterVolume') {
-            setMasterVolume(value);
+            if (!globalsRestoredFromSnapshot) setMasterVolume(value);
           } else if (key === 'cueGain') {
             cueGain.set(value);
           } else {
