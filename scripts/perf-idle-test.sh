@@ -60,7 +60,14 @@ if ! grep -q '__cuemarkDebug' dist/assets/*.js 2>/dev/null; then
   echo "Rebuild with: VITE_ENABLE_DEBUG_HOOK=1 cargo tauri build --debug --no-bundle" >&2
 fi
 
-WEBKIT_DRIVER="$(dpkg -L webkit2gtk-driver | grep -E '/WebKitWebDriver$')"
+# The binary has lived in two differently-named Debian packages (webkit2gtk-driver,
+# then webkitgtk-webdriver), and `dpkg -L` on the wrong one aborts the whole script
+# under `set -e` with a bare dpkg-query error that looks nothing like the real problem.
+# Ask the PATH first; fall back to either package name.
+WEBKIT_DRIVER="$(command -v WebKitWebDriver \
+  || dpkg -L webkitgtk-webdriver 2>/dev/null | grep -E '/WebKitWebDriver$' \
+  || dpkg -L webkit2gtk-driver 2>/dev/null | grep -E '/WebKitWebDriver$')"
+[ -n "$WEBKIT_DRIVER" ] || { echo "WebKitWebDriver not found (see skills/verify-ui/SKILL.md)" >&2; exit 1; }
 
 fuser -k "$DRIVER_PORT/tcp" >/dev/null 2>&1 || true
 

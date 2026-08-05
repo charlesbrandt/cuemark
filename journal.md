@@ -1956,3 +1956,176 @@ for no visible change.
 - `docs/design/control-window-frame-budget.md` — §6, corrected status, rewritten "Where to
   pick up" with the old one kept as superseded
 - `todo.md` — known-issue entry re-root-caused
+
+# 2026.08.05 — Reading back a live set: two independent playback faults, one fully root-caused
+
+No code changed this session. A ~3-hour live set (the "Cassius 1999" session, `2026-08-05
+01:37`–`01:59`, build `5909dcb (dirty) debug`) was reported as having playback problems; the
+whole session was reconstructed from `~/.local/share/com.cuemark.app/logs/cuemark.log` and the
+findings written up as two design docs so they can be worked in separate threads.
+
+## Finding 1 — the legacy `<video>` fallback costs 50–340ms per preview draw
+
+`docs/design/legacy-video-fallback-cost.md`. Every non-H.264 file falls back to the legacy
+`<video>` element (`video_demux.rs:231` gates WebCodecs to H.264 only). On that path
+`ctx.drawImage(video, …)` in `DeckCard`'s preview loop measured **86ms median / 300ms worst per
+call**, 61–68% of the control window's wall clock.
+
+The log contained a single-variable A/B nobody designed: at `01:41:46` one deck's file was
+swapped from H.264-webcodecs to VP9-legacy with both decks playing and nothing else changed —
+**58fps → 5.6fps**, and back to 52fps the moment that deck was paused.
+
+Three facts pin it to the `drawImage` call rather than to its surroundings: non-drawing ticks
+cost 0ms while drawing ticks cost 86ms in the same window; the two text publishers were already
+rate-limited by `36c3042` and run on non-drawing ticks too; and the cost does not scale with
+pixels — a **640×480** VP9 file cost **7× more per call** than a **1920×1080** AV1 one.
+
+Downstream: rAF collapsed to 5.6–11fps, `output_queue` underruns and audible dropouts followed,
+and at `01:40:10` the heartbeat went silent long enough for the freeze-watchdog to reload the
+window mid-set — which reloaded the same file onto the same slow path and returned to 14fps.
+
+**The mechanism is not confirmed.** Leading hypothesis is a DMA-BUF GPU→CPU readback (this is
+the exact path CLAUDE.md flagged as untested when the DMA-BUF renderer was re-enabled on
+2026-08-02 — the predicted failure was corruption, the actual failure is a stall). The control
+arm that settles it is **H.264 forced onto `legacy`**, and it must run before any fix.
+
+Ruled out and worth not re-opening: pixel/resolution work; software VP9/AV1 decode (this GPU
+has no hardware decode for either, so the `vaav1dec:0` demotion in `main.rs` is a red herring);
+GStreamer `query_position` (`inRust=0`, `toRust=586ms` is a load gauge, not a cost).
+
+## Finding 2 — 10.8s of silence with the pipeline in PLAYING
+
+`docs/design/audio-dropout-mid-playback.md`. At `01:38:31` deck-0's `output_queue` ran dry and
+**no buffer reached the sink for 10.8 seconds**, with no state transition, no seek, no scratch
+and no bus error — while rAF was at 49.7fps and `busy` 13%. This is on the H.264 webcodecs path
+and is *not* explained by finding 1, which does not begin until `01:39:30`.
+
+Leading suspect is the headphone cue, switched on 21s earlier: it opens a second `pulsesink` on
+the *same* USB device as the main sink. That is the same symptom class `sink_buffer_times()`'s
+doc comment records fixing on 2026-08-02 ("with headphone cue enabled, the master output was
+silent outright") — verified then over 106s, and this is the first multi-hour set since. No
+reproducer yet; the doc's plan builds one before theorising further.
+
+## Finding 3 — the sink-gap warning has a 6:1 false-positive rate
+
+Six of seven `buffer flow resumed after a Ns gap` warnings are logged in the same millisecond as
+a `Paused → Playing` transition: they measure how long a deck sat prerolled.
+`instrument_sink_flow()` does not gate on the `playing` atomic, while its sibling
+`instrument_queue_flow()` deliberately does and documents why. **This noise is what made the one
+real dropout hard to find.**
+
+## Finding 4 — the watchdog's diagnostic sample missed the guilty process, then mislabelled the innocent one
+
+`sample_webkit_processes()` returned **only** the `WebKitNetworkProcess`; the saturated
+`WebKitWebProcess` was absent from the trigger's sample entirely (the 2026-08-03 trigger on the
+same machine listed three descendants, so the `comm.contains("WebKit")` filter is fine — the
+`/proc` descendant walk missed it). The `parked` verdict is then evaluated per-descendant, so an
+idle `NetworkProcess` printed *"all-parked — matches known deadlock signature"*. Together those
+two produced a log that reads as a textbook `WebKitNetworkProcess` deadlock — the still-open
+phase-4 finding in `webcodecs-video-path.md` — and was nothing of the kind. Recovery itself was
+unaffected; only the human-readable diagnosis was.
+
+## What generalises
+
+- **A per-item verdict printed over an incomplete sample reads as a verdict over the whole
+  system.** Assert the sample is complete before labelling it, or make the label carry its own
+  denominator.
+- **Instrumentation noise costs more than a missing signal.** Six false "gap" warnings did not
+  merely add lines; they trained the eye to skip the one real one.
+- **`busy%` found this where `frame-dur` could not.** `frame()`'s own duration was 1ms
+  throughout — the entire cost was in an aux rAF loop that `frame-dur` structurally cannot see.
+  The `[aux-loop]` bucket, added for the previous investigation, is what made a live set
+  diagnosable after the fact with no reproduction at all.
+- **The `drew` counter was the decisive field**, not any timing. `dur p50=0.0` on non-drawing
+  ticks against `p50=86.0` when `drew == n` is what separated the draw from everything sharing
+  its function body.
+- ⚠️ **A gap in the *instrumentation* was nearly a gap in the finding**: `[aux-loop]
+  preview/<deck>` carries no canvas dimensions while `waveform/<deck>@2448x144` does — against
+  CLAUDE.md's own rule. Fix before running the A/B.
+
+## Files touched
+
+- `docs/design/legacy-video-fallback-cost.md` (new) — finding 1, hypotheses, 4-item plan
+- `docs/design/audio-dropout-mid-playback.md` (new) — findings 2 and 3, 2-item plan
+- `docs/design/webcodecs-video-path.md` — phase-7 candidate (codec coverage); note that the
+  2026-08-05 trigger was not the open `NetworkProcess` deadlock
+- `docs/design/freeze-watchdog.md` — finding 4 under Risks, plus the reload-cannot-fix-load limit
+- `CLAUDE.md` — the "one path remains untested" warning replaced with what the test showed; new
+  "Open findings from the 2026-08-05 live set" section
+
+# 2026.08.05 — VP9 leaves the `<video>` element; AV1 cannot follow it
+
+## Problem
+
+`legacy-video-fallback-cost.md` work item A4. Two prior sessions had narrowed a live-set
+collapse to one sentence: at identical container, resolution, frame rate, path and canvas,
+`drawImage(<video>)` costs 22–24ms on VP9 and 8ms on H.264. The cost is codec-linked and lives
+inside WebKit's GStreamer media player, so cuemark's only lever is to stop using a `<video>`
+element for that codec. A2's frame-change gate had already rescued the 6fps AV1 file (26 →
+50–54fps) but structurally could not rescue VP9 — a 25fps source into a ~21fps loop has no
+redundant draws to remove. `video_demux.rs` gated the WebCodecs path to H.264 only.
+
+## Method
+
+Probe before code. `scripts/probes/webcodecs_vp9_av1_probe.py` (new) demuxes a **real library
+file** through the same `filesrc ! parsebin ! <parser> ! capsfilter ! appsink` chain
+`video_demux.rs` uses, builds the WebCodecs codec string with the same rules, and decodes every
+AU in a bare `WebKit2 4.1` webview.
+
+## Result
+
+- **VP9 decodes perfectly**: `vp09.00.30.08`, 120/120 AUs → I420 640×480 in 42ms, no
+  `description`, `alignment=super-frame`. Shipped.
+- **AV1 decodes nothing**: `isConfigSupported` returns `true`, then **0/120** frames with
+  `EncodingError: Decode error` — in all four bitstream framings, with and without the
+  AV1CodecConfigurationRecord as `description`. A 320×240 stream from GStreamer's own `av1enc`
+  also decodes 0/12. Refused; AV1 stays on legacy.
+
+Live A/B on the worst library file (VP9 640×480@25), two clean launches, `arm=baseline` only:
+
+| arm | `dur` p50 | `busy%` | `[raf]` fps | webkit CPU |
+|---|---|---|---|---|
+| legacy `<video>` | 19–22ms | 49–52% | **23.9–28.6** | 61.0% |
+| **webcodecs (VP9)** | **0.0ms** | **9–10%** | **54.2–56.4** | 60.1% |
+
+Closing `baseline2` read 55.5–56.3fps, so no drift. `drew` = 25.0/s against a 25fps source.
+
+## What generalises
+
+- ⚠️ **`isConfigSupported()` is not a support check on this WebKitGTK.** It said `true` for AV1
+  and the decoder produced zero frames. Gating the demuxer on it would have shipped a
+  permanently black deck for every AV1 file. **Probe a real decode, on a real file.**
+- **The control arm is what made the AV1 verdict safe to act on.** Without the
+  GStreamer-`av1enc`-encoded 320×240 stream also failing, "AV1 is broken" was indistinguishable
+  from "our AV1 file is unusual", "our level string is wrong" or "our framing is wrong" — three
+  fixable things. One cheap arm turned a maybe into a fact.
+- ⚠️ **CPU parity is not "no change".** Process CPU moved 61.0 → 60.1% while the frame rate
+  doubled. There is no VA-API here, so VP9 is software-decoded either way and the total work is
+  identical — what moved is *where*, from a main-thread block into a decode worker. Reading the
+  CPU column alone would have said the change did nothing. Reading fps alone would have hidden
+  that the machine is still doing all that work.
+- **The guard that would have failed silently was the one worth testing explicitly.**
+  `handleSeek()` and `maybeStartLoopPrefetch()` both early-returned on `!description`, which is
+  null *by design* on VP9 — seeking would have no-opped with no error and no log line. Proved
+  fixed by driving a real seek and comparing `getCodecFramePts()` to `getAudioTime()` (183.24 vs
+  183.12 forward, 19.44 vs 19.33 back), with H.264 as the regression control.
+- ⚠️ **The gate scripts had been broken for some time and nobody noticed**, because they failed
+  with a `dpkg-query: package 'webkit2gtk-driver' is not installed` line that looks like an
+  environment complaint rather than "this test did not run". All five aborted under `set -e`.
+  A harness that cannot distinguish "did not run" from "passed" is worse than no harness.
+- **A failing gate step needs its own control before it counts as a regression.** `latency-test`
+  steps 4/5 failed on the VP9 file — and failed identically with the deck forced to `legacy`,
+  which located the fault in the harness's fixed `sleep 2` racing a 7-minute file's PCM scratch
+  decode, not in the new codec path.
+
+## Files touched
+
+- `src-tauri/src/video_demux.rs` — `CodecKind::{H264,Vp9}`, `vp9parse`/`alignment=super-frame`,
+  `vp9_level_code()` Annex-A table, two new tests
+- `src/lib/video/codecWorker.ts` — `needsAvcRemux` switch, `decoderConfig()`/`chunkData()`, and
+  the two `!description` guards that would have silently disabled VP9 seek and loop prefetch
+- `scripts/probes/webcodecs_vp9_av1_probe.py` (new) + `scripts/probes/README.md`
+- `scripts/{latency,perf-idle,watchdog,rehydration,watchdog-soak}-test.sh` — `WebKitWebDriver`
+  lookup, broken by a Debian package rename
+- `docs/design/webcodecs-video-path.md` — phase 7 + results; `docs/design/legacy-video-fallback-cost.md`
+  — "A4 ran", A3 marked not-needed, doc closed; `CLAUDE.md` — the fallback section rewritten

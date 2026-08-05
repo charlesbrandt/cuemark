@@ -13,7 +13,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type EosCallback = Arc<dyn Fn() + Send + Sync>;
 
@@ -142,33 +142,112 @@ fn instrument_queue_flow(output_queue: &gst::Element, deck_id: &str, playing: &A
 /// Deliberately event-driven rather than periodic — one line per load, plus one per
 /// recovered stall — so this stays readable across a multi-hour set instead of becoming
 /// the next thing that drowns the log.
-fn instrument_sink_flow(sink: &gst::Element, deck_id: &str, label: &str) {
+///
+/// **Gated on `playing`, exactly like `instrument_queue_flow()` above and for the same
+/// reason** (added 2026-08-05, `docs/design/audio-dropout-mid-playback.md` D2). Ungated,
+/// the gap check measured *any* span between two buffers at the sink — including the one
+/// between the single preroll buffer and the first buffer after the user presses play.
+/// In the 2026-08-05 live set that produced **six false "Ns gap" warnings for every real
+/// one**, each stamped in the same millisecond as a `Paused → Playing` transition, and the
+/// noise is what nearly buried the single genuine 10.8s dropout.
+///
+/// The gate is not just "was the deck playing when this buffer arrived" — that alone still
+/// misreports a pause/resume, because the last buffer before the pause is recorded while
+/// still Playing and the bus message announcing the pause can easily lose the race to the
+/// first buffer after the resume. Instead **`last` is cleared whenever the deck is not
+/// playing**, from both sides: by this probe when a buffer arrives with the flag false,
+/// and by the bus thread's `StateChanged` handler on any transition out of `Playing`
+/// (which is why this returns its state handle). A gap is therefore only ever measured
+/// between two buffers that were *both* delivered inside one continuous `Playing` span —
+/// which is exactly the condition that makes it evidence of a fault.
+///
+/// `playing` is read with a relaxed `AtomicBool` load and **must stay that way**: this
+/// probe runs on the sink's streaming thread, and a `current_state()` query there would
+/// take `GST_OBJECT_LOCK` under it. See `instrument_queue_flow()`'s doc comment for the
+/// full argument and the deadlock history it comes from.
+///
+/// The warning reports the gap's *onset* as well as its duration. The correlation that
+/// broke the 2026-08-05 investigation open — that the stall began within 200 ms of an
+/// `output_queue underrun` — had to be back-computed by hand from the duration, and was
+/// nearly missed.
+fn instrument_sink_flow(
+    sink: &gst::Element,
+    deck_id: &str,
+    label: &str,
+    playing: &Arc<AtomicBool>,
+) -> Option<SinkFlowState> {
     let Some(pad) = sink.static_pad("sink") else {
         log::warn!("[audio/{deck_id}] {label}: no sink pad to probe for flow diagnostics");
-        return;
+        return None;
     };
+    let state: SinkFlowState = Arc::new(Mutex::new(SinkFlow::default()));
+    let probe_state = state.clone();
+    let playing = playing.clone();
     let deck_id = deck_id.to_string();
     let label = label.to_string();
-    // None until the first buffer arrives; then the arrival time of the most recent one.
-    let last_seen = Arc::new(Mutex::new(None::<Instant>));
     pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+        let is_playing = playing.load(Ordering::Relaxed);
         let now = Instant::now();
-        let mut seen = last_seen.lock().unwrap();
-        match *seen {
-            None => log::info!(
+        let mut st = probe_state.lock().unwrap();
+        if !st.first_logged {
+            // Kept ungated: "did a single sample ever reach the device" is the question
+            // this probe exists to answer (Bug B), and it is asked of a deck that has just
+            // prerolled. Gating it would delete the one line that splits that bug in half.
+            st.first_logged = true;
+            log::info!(
                 "[audio/{deck_id}] {label}: first buffer reached the sink — audio is \
                  being delivered to the device"
-            ),
-            Some(prev) if now.duration_since(prev) > Duration::from_secs(1) => log::warn!(
-                "[audio/{deck_id}] {label}: buffer flow resumed after a {:.1}s gap — the \
-                 device received no audio for that span",
-                now.duration_since(prev).as_secs_f64()
-            ),
-            Some(_) => {}
+            );
+        } else if is_playing {
+            if let Some(prev) = st.last {
+                let gap = now.duration_since(prev);
+                if gap > Duration::from_secs(1) {
+                    log::warn!(
+                        "[audio/{deck_id}] {label}: buffer flow resumed after a {:.1}s gap \
+                         (began {}) — the device received no audio for that span, and the \
+                         pipeline was Playing throughout. See instrument_sink_flow()'s doc \
+                         comment.",
+                        gap.as_secs_f64(),
+                        wall_clock_utc(SystemTime::now().checked_sub(gap)),
+                    );
+                }
+            }
         }
-        *seen = Some(now);
+        st.last = if is_playing { Some(now) } else { None };
         gst::PadProbeReturn::Ok
     });
+    Some(state)
+}
+
+/// Per-sink state for `instrument_sink_flow()`'s pad probe. `last` is deliberately
+/// `None` for any moment from which a gap cannot legitimately be measured: before the
+/// first buffer, and across every span the deck was not `Playing`.
+#[derive(Default)]
+struct SinkFlow {
+    first_logged: bool,
+    last: Option<Instant>,
+}
+
+/// Shared with the bus thread so a transition out of `Playing` can invalidate the last
+/// buffer time — see `instrument_sink_flow()`.
+type SinkFlowState = Arc<Mutex<SinkFlow>>;
+
+/// Time-of-day in UTC, matching the log formatter in `lib.rs` so a timestamp printed
+/// inside a message can be grepped against the line prefixes around it.
+fn wall_clock_utc(t: Option<SystemTime>) -> String {
+    let Some(d) = t.and_then(|t| t.duration_since(UNIX_EPOCH).ok()) else {
+        return "unknown".into();
+    };
+    time::OffsetDateTime::from_unix_timestamp(d.as_secs() as i64)
+        .ok()
+        .and_then(|dt| {
+            dt.format(&time::macros::format_description!(
+                "[hour]:[minute]:[second]"
+            ))
+            .ok()
+        })
+        .map(|hms| format!("{hms}.{:03}", d.subsec_millis()))
+        .unwrap_or_else(|| "unknown".into())
 }
 
 /// Sink ringbuffer sizing as `(buffer_time_us, latency_time_us)`. `buffer-time` is the
@@ -798,6 +877,14 @@ impl DeckAudioPipeline {
         make_eos_passthrough_valve(&valve_normal);
         let input_selector = make_el("input-selector")?;
 
+        // Written by the bus thread's StateChanged handler below, read lock-free by the
+        // output_queue underrun handler and by every main sink's flow probe, both of which
+        // run on streaming threads — see instrument_queue_flow() for why this isn't a
+        // current_state() query. Declared here rather than next to its queue hookup below
+        // because the sink probes are attached as the sinks are built, just underneath.
+        let at_playing = Arc::new(AtomicBool::new(false));
+        let mut sink_flow_states: Vec<SinkFlowState> = Vec::new();
+
         // One (volume, sink) pair per main output device. Empty devices list = single default.
         let main_devs: Vec<String> = if self.devices.is_empty() {
             vec![String::new()]
@@ -815,7 +902,12 @@ impl DeckAudioPipeline {
             if i > 0 {
                 snk.set_property("async", false);
             }
-            instrument_sink_flow(&snk, &self.deck_id, &format!("main sink {i}"));
+            sink_flow_states.extend(instrument_sink_flow(
+                &snk,
+                &self.deck_id,
+                &format!("main sink {i}"),
+                &at_playing,
+            ));
             volume_els.push(vol);
             main_sinks.push(snk);
         }
@@ -955,10 +1047,6 @@ impl DeckAudioPipeline {
         output_queue.set_property("max-size-buffers", 0u32);
         output_queue.set_property("max-size-bytes", 0u32);
         output_queue.set_property("max-size-time", OUTPUT_QUEUE_STEADY_CAP_NS);
-        // Written by the bus thread's StateChanged handler below, read lock-free by the
-        // underrun/overrun handlers on the queue's streaming thread — see
-        // instrument_queue_flow() for why this isn't a current_state() query.
-        let at_playing = Arc::new(AtomicBool::new(false));
         instrument_queue_flow(&output_queue, &self.deck_id, &at_playing);
 
         cue_valve.set_property("drop", !self.cue_enabled);
@@ -1078,6 +1166,7 @@ impl DeckAudioPipeline {
         let fft_logged = Arc::new(AtomicBool::new(false));
         let fft_logged_thread = fft_logged.clone();
         let at_playing_thread = at_playing.clone();
+        let sink_flow_thread = sink_flow_states.clone();
         let bus_thread = bus.clone();
         let deck_id_log = self.deck_id.clone();
         let eos_cb = self.eos_callback.clone();
@@ -1130,8 +1219,20 @@ impl DeckAudioPipeline {
                             // Gates the output_queue underrun/overrun diagnostics so they
                             // don't fire on the legitimately-empty queue during preroll or
                             // after EOS — see instrument_queue_flow().
-                            at_playing_thread
-                                .store(s.current() == gst::State::Playing, Ordering::Relaxed);
+                            let now_playing = s.current() == gst::State::Playing;
+                            at_playing_thread.store(now_playing, Ordering::Relaxed);
+                            if !now_playing {
+                                // Invalidate every sink's last-buffer time so the span
+                                // across this pause/preroll/EOS can never be reported as a
+                                // dropout. Doing it here as well as in the probe closes the
+                                // race where the resume's first buffer beats this message's
+                                // sibling on the way back to Playing — see
+                                // instrument_sink_flow(). Safe from this thread: the probe
+                                // holds no other lock under this one.
+                                for st in &sink_flow_thread {
+                                    st.lock().unwrap().last = None;
+                                }
+                            }
                         }
                     }
                     gst::MessageView::Element(_) => {
@@ -1875,14 +1976,47 @@ mod scratch_smoke_test {
     impl log::Log for TestLogger {
         fn enabled(&self, _: &log::Metadata) -> bool { true }
         fn log(&self, record: &log::Record) {
-            eprintln!("[{}] {}", record.level(), record.args());
+            let line = format!("[{}] {}", record.level(), record.args());
+            eprintln!("{line}");
+            // Also captured so a test can *assert* on diagnostics rather than leaving a
+            // human to eyeball --nocapture output. The sink-flow/queue-flow warnings are
+            // the entire observable behaviour of instrument_sink_flow(), so a test that
+            // does not read them back is not testing anything.
+            if let Ok(mut c) = CAPTURED.lock() {
+                c.push(line);
+            }
         }
         fn flush(&self) {}
     }
     static TEST_LOGGER: TestLogger = TestLogger;
+    static CAPTURED: Mutex<Vec<String>> = Mutex::new(Vec::new());
     fn init_test_logger() {
         let _ = log::set_logger(&TEST_LOGGER);
         log::set_max_level(log::LevelFilter::Debug);
+    }
+    fn captured_matching(needle: &str) -> Vec<String> {
+        CAPTURED.lock().unwrap().iter().filter(|l| l.contains(needle)).cloned().collect()
+    }
+    fn clear_captured() {
+        CAPTURED.lock().unwrap().clear();
+    }
+    const GAP_WARNING: &str = "buffer flow resumed after a";
+    const UNDERRUN_WARNING: &str = "output_queue underrun";
+
+    /// Every `pulsesink`/`autoaudiosink` in a built pipeline, so a test can attach its own
+    /// probes to the same pads `instrument_sink_flow()` watches.
+    fn main_sinks_of(p: &DeckAudioPipeline) -> Vec<gst::Element> {
+        let Some(inner) = p.inner.as_ref() else { return Vec::new() };
+        inner
+            .pipeline
+            .iterate_recurse()
+            .into_iter()
+            .flatten()
+            .filter(|e| {
+                let f = e.factory().map(|f| f.name().to_string()).unwrap_or_default();
+                f == "pulsesink" || f == "autoaudiosink"
+            })
+            .collect()
     }
 
     /// Effectively "never decays within a real gesture" — shuttle-mode tests want the
@@ -2340,5 +2474,251 @@ mod scratch_smoke_test {
              between the selector and here, or the wrong (normal, silent-because-locked) pad is still active"
         );
         println!("scratch_second_gesture_reverse_repro OK — reverse gesture after teardown produced audible signal at every probe point");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  docs/design/audio-dropout-mid-playback.md — D2 verification and D1 reproducer
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// Test media. Not committed (it is ~70MB) — regenerate with:
+    /// ```text
+    /// mkdir -p /var/tmp/cuemark-soak && gst-launch-1.0 -q \
+    ///   audiotestsrc num-buffers=16875 samplesperbuffer=1024 wave=pink-noise volume=0.25 \
+    ///   ! audio/x-raw,rate=48000,channels=2 ! audioconvert ! wavenc \
+    ///   ! filesink location=/var/tmp/cuemark-soak/tone6min.wav
+    /// cp /var/tmp/cuemark-soak/tone6min.wav /var/tmp/cuemark-soak/tone6min_b.wav
+    /// ```
+    /// A synthetic tone is adequate here on purpose: every hypothesis in the design doc
+    /// is about sink/device scheduling, none about decoded content.
+    const SOAK_A: &str = "/var/tmp/cuemark-soak/tone6min.wav";
+    const SOAK_B: &str = "/var/tmp/cuemark-soak/tone6min_b.wav";
+
+    fn soak_env(var: &str, default: &str) -> String {
+        std::env::var(var).unwrap_or_else(|_| default.to_string())
+    }
+
+    /// **D2 verification** (docs/design/audio-dropout-mid-playback.md).
+    ///
+    /// Reproduces the exact shape of the six false positives from the 2026-08-05 live set
+    /// — a deck that prerolls, sits there, then gets played, then paused, then played
+    /// again — and asserts that `instrument_sink_flow()` stays silent through all of it.
+    /// Then it induces a *genuine* stall (a second pad probe on the same sink pad that
+    /// sleeps 2.5s while the pipeline is Playing) and asserts the warning still fires, so
+    /// the gate cannot pass by simply having been turned off.
+    ///
+    /// Needs a real audio device and a real file, hence `#[ignore]`:
+    ///   cargo test sink_flow_gap_gating -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn sink_flow_gap_gating() {
+        init_test_logger();
+        gst::init().expect("gst init");
+        let path = soak_env("CUEMARK_TEST_AUDIO", SOAK_A);
+        assert!(std::path::Path::new(&path).exists(), "missing test media {path} — see SOAK_A's doc comment");
+
+        let mut deck = DeckAudioPipeline::new("gate-test");
+        deck.set_gain(0.02).expect("set_gain"); // audible-but-quiet; buffers flow regardless
+
+        // ── Negative arm: everything that used to produce a false "Ns gap" ────────
+        clear_captured();
+        deck.load(&path).expect("load"); // prerolls to Paused, one buffer reaches the sink
+        println!("[arm-1] prerolled; holding 6s before play (this is false positive #1's shape)");
+        std::thread::sleep(Duration::from_secs(6));
+        deck.play().expect("play");
+        std::thread::sleep(Duration::from_secs(4));
+        deck.pause().expect("pause");
+        println!("[arm-1] paused; holding 6s before resuming (false positive #2's shape)");
+        std::thread::sleep(Duration::from_secs(6));
+        deck.play().expect("play 2");
+        std::thread::sleep(Duration::from_secs(4));
+        deck.pause().expect("pause 2");
+        std::thread::sleep(Duration::from_millis(500));
+
+        let false_positives = captured_matching(GAP_WARNING);
+        for l in &false_positives {
+            println!("[arm-1] UNEXPECTED: {l}");
+        }
+        assert!(
+            captured_matching("first buffer reached the sink").len() >= 1,
+            "[arm-1] the probe never fired at all — the test proves nothing. Is there an audio device?"
+        );
+        assert!(
+            false_positives.is_empty(),
+            "[arm-1] {} preroll/pause gap warning(s) survived the D2 gate",
+            false_positives.len()
+        );
+        println!("[arm-1] OK — 16s of preroll and pause waits produced zero gap warnings");
+
+        // ── Positive arm: a real stall must still be reported ─────────────────────
+        clear_captured();
+        deck.play().expect("play 3");
+        std::thread::sleep(Duration::from_secs(2));
+        let sinks = main_sinks_of(&deck);
+        assert!(!sinks.is_empty(), "[arm-2] no sink element found to stall");
+        let stalled = Arc::new(AtomicBool::new(false));
+        let stalled_probe = stalled.clone();
+        let pad = sinks[0].static_pad("sink").expect("sink pad");
+        // Added *after* instrument_sink_flow()'s probe, so it runs second: the flow probe
+        // records this buffer's arrival, then this one holds the streaming thread for
+        // 2.5s. The next buffer is therefore a genuine >1s gap taken entirely inside
+        // PLAYING — the same shape as the live 10.8s dropout, on purpose.
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_p, _i| {
+            if !stalled_probe.swap(true, Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(2500));
+            }
+            gst::PadProbeReturn::Ok
+        });
+        std::thread::sleep(Duration::from_secs(6));
+        deck.pause().expect("final pause");
+
+        let real = captured_matching(GAP_WARNING);
+        for l in &real {
+            println!("[arm-2] {l}");
+        }
+        assert!(
+            !real.is_empty(),
+            "[arm-2] a deliberate 2.5s stall inside PLAYING was NOT reported — the D2 gate is \
+             suppressing real dropouts, which is worse than the noise it replaced"
+        );
+        assert!(
+            real[0].contains("began "),
+            "[arm-2] the warning must carry the gap's onset time, not just its duration: {}",
+            real[0]
+        );
+        println!("sink_flow_gap_gating OK — false positives gone, real stall still reported with an onset");
+    }
+
+    /// **D1 reproducer attempt** (docs/design/audio-dropout-mid-playback.md).
+    ///
+    /// Two decks on the real hardware, playing continuously, with headphone cue toggled
+    /// on and off and the master volume churned at MIDI rate — the conditions present when
+    /// the live 10.8s dropout happened. Counts post-D2 sink-flow gaps and `output_queue`
+    /// underruns per deck.
+    ///
+    /// **Arms** (`CUEMARK_SOAK_ARM`), which differ only in cue routing:
+    /// - `cue-same` — main and cue on the same USB device, cue toggled. The live config.
+    /// - `cue-off`  — cue device configured but the valve never opened. Control: the cue
+    ///   sink exists on the device but passes nothing.
+    /// - `cue-other` — cue on a *different* device (the onboard PCI codec). This is the
+    ///   arm that separates "the cue branch" from "two sinks on one USB device"; it is
+    ///   the same move that cracked the 2026-08-02 investigation.
+    /// - `no-cue`   — no cue device at all (fakesink). Floor.
+    ///
+    /// ```text
+    /// CUEMARK_SOAK_ARM=cue-same CUEMARK_SOAK_SECS=600 \
+    ///   CUEMARK_MAIN_DEVICE=alsa_output.usb-…analog-surround-40 \
+    ///   CUEMARK_CUE_DEVICE='alsa_output.usb-…analog-surround-40@RL,RR!FL,FR,RL,RR' \
+    ///   CUEMARK_OTHER_DEVICE=alsa_output.pci-0000_00_1b.0.analog-stereo \
+    ///   cargo test cue_dropout_soak -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn cue_dropout_soak() {
+        init_test_logger();
+        gst::init().expect("gst init");
+        let arm = soak_env("CUEMARK_SOAK_ARM", "cue-same");
+        let secs: u64 = soak_env("CUEMARK_SOAK_SECS", "600").parse().expect("CUEMARK_SOAK_SECS");
+        let main_dev = soak_env("CUEMARK_MAIN_DEVICE", "");
+        let cue_dev = soak_env("CUEMARK_CUE_DEVICE", "");
+        let other_dev = soak_env("CUEMARK_OTHER_DEVICE", "");
+
+        let cue_target = match arm.as_str() {
+            "cue-same" | "cue-off" => cue_dev.clone(),
+            "cue-other" => other_dev.clone(),
+            "no-cue" => String::new(),
+            other => panic!("unknown CUEMARK_SOAK_ARM {other:?}"),
+        };
+        let toggles_cue = arm == "cue-same" || arm == "cue-other";
+
+        println!("=== soak arm={arm} secs={secs} main={main_dev:?} cue={cue_target:?} toggles_cue={toggles_cue}");
+
+        // 1 = the live topology exactly (one playing deck, main + cue on one node — deck-1
+        // did not reach Playing until *after* the 2026-08-05 stall). 2 = the same node
+        // carrying four pulsesinks, which is the worst case a two-deck set produces.
+        let n_decks: usize = soak_env("CUEMARK_SOAK_DECKS", "2").parse().expect("CUEMARK_SOAK_DECKS");
+        let mut decks: Vec<DeckAudioPipeline> = Vec::new();
+        for (i, path) in [SOAK_A, SOAK_B].iter().take(n_decks).enumerate() {
+            assert!(std::path::Path::new(path).exists(), "missing test media {path}");
+            let mut d = DeckAudioPipeline::new(&format!("soak-{i}"));
+            if !main_dev.is_empty() {
+                d.devices = vec![main_dev.clone()];
+            }
+            d.cue_device = cue_target.clone();
+            d.set_gain(0.02).expect("set_gain");
+            d.set_cue_gain(0.02).expect("set_cue_gain");
+            d.load(path).expect("load");
+            decks.push(d);
+        }
+        clear_captured();
+        for d in &mut decks {
+            d.play().expect("play");
+        }
+
+        let start = Instant::now();
+        let mut tick = 0u64;
+        let mut cue_on = false;
+        let mut last_report = Instant::now();
+        while start.elapsed() < Duration::from_secs(secs) {
+            // MIDI-rate master-volume churn on both decks — H3 in the design doc. Present
+            // in every arm so it is a constant, not a variable.
+            let f = if tick % 4 == 0 { 0.0 } else { 0.5 + 0.5 * ((tick % 8) as f32 / 8.0) };
+            for d in &mut decks {
+                d.set_master_volume_factor(f);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            tick += 1;
+
+            // Cue toggles every 15s, matching the live set's on-for-93s / off pattern
+            // closely enough to exercise both the valve open and the valve close.
+            if toggles_cue && tick % 30 == 0 {
+                cue_on = !cue_on;
+                for d in &mut decks {
+                    d.set_cue_enabled(cue_on).expect("set_cue_enabled");
+                }
+                println!("[{:>5.0}s] cue {}", start.elapsed().as_secs_f64(), if cue_on { "ON" } else { "OFF" });
+            }
+
+            // Loop each deck back to the top well before EOS. Without this the 6-minute
+            // file simply ends mid-soak and the rest of the arm measures silence — the
+            // bus thread pauses the pipeline on EOS, so `playing` goes false and every
+            // metric freezes while the wall clock keeps running. (Caught exactly that way
+            // on the first attempt: position pinned at 360.0 for the last 9 minutes.)
+            for d in &mut decks {
+                if d.position().unwrap_or(0.0) > 300.0 {
+                    let _ = d.seek(2.0);
+                }
+            }
+
+            if last_report.elapsed() >= Duration::from_secs(30) {
+                last_report = Instant::now();
+                let pos: Vec<String> = decks.iter().map(|d| format!("{:.1}", d.position().unwrap_or(-1.0))).collect();
+                println!(
+                    "[{:>5.0}s] pos=[{}]  gaps={}  underruns={}",
+                    start.elapsed().as_secs_f64(),
+                    pos.join(", "),
+                    captured_matching(GAP_WARNING).len(),
+                    captured_matching(UNDERRUN_WARNING).len(),
+                );
+            }
+        }
+        for d in &mut decks {
+            let _ = d.pause();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+
+        let gaps = captured_matching(GAP_WARNING);
+        let underruns = captured_matching(UNDERRUN_WARNING);
+        println!("\n=== RESULT arm={arm} ran {}s", start.elapsed().as_secs());
+        println!("    sink-flow gaps : {}", gaps.len());
+        for g in &gaps {
+            println!("      {g}");
+        }
+        println!("    queue underruns: {}", underruns.len());
+        for u in underruns.iter().take(10) {
+            println!("      {u}");
+        }
+        // Deliberately NOT asserted: a clean run is the expected (and so far only)
+        // outcome, and a failing assertion here would read as "the harness broke" rather
+        // than "the fault reproduced". Record the counts in the design doc instead.
     }
 }

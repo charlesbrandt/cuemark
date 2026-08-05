@@ -216,10 +216,84 @@ struct WebkitSample {
     dstime: u64,
 }
 
-// Samples every WebKitWebProcess descendant, diffing utime/stime against the previous
+impl WebkitSample {
+    // `comm` in /proc is truncated to 15 chars, so the web process reads as
+    // "WebKitWebProces" and the network one as "WebKitNetworkPr". Prefix-match rather
+    // than compare, and never use the loose `contains("WebKit")` filter for this —
+    // that is what let a lone `WebKitNetworkPr` stand in for the subject of a trigger
+    // on 2026-08-05 (see docs/design/freeze-watchdog.md "Risks").
+    fn is_web_process(&self) -> bool {
+        self.comm.starts_with("WebKitWebProces")
+    }
+
+    // "Parked" == burned no CPU over the last poll interval and isn't runnable. This is
+    // the *observation*, not a verdict: an idle NetworkProcess looks exactly like this
+    // whenever nothing is being fetched. Only `WebkitSampleSet::deadlock_verdict` is
+    // allowed to turn parked-ness into a claim about a deadlock.
+    fn parked(&self) -> bool {
+        self.dutime == 0 && self.dstime == 0 && self.state != 'R'
+    }
+}
+
+// A sample that knows whether it is complete.
+//
+// The whole point of the trigger dump is to describe the `WebKitWebProcess` that owns the
+// frozen window. The descendant walk can come back without it (observed 2026-08-05: the
+// process was reparented out of the /proc ppid tree, or the sample raced the trigger), and
+// a `Vec<WebkitSample>` cannot express the difference between "the web process is fine" and
+// "we never saw the web process". This type can, and every consumer has to ask.
+struct WebkitSampleSet {
+    samples: Vec<WebkitSample>,
+}
+
+impl WebkitSampleSet {
+    fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    // True only if the descendant walk actually found the subject of the diagnostic.
+    // When this is false, NOTHING in the sample supports a conclusion about the webview.
+    fn saw_web_process(&self) -> bool {
+        self.samples.iter().any(WebkitSample::is_web_process)
+    }
+
+    fn comm_list(&self) -> String {
+        self.samples.iter().map(|s| s.comm.as_str()).collect::<Vec<_>>().join(", ")
+    }
+
+    // The one place allowed to say "deadlock signature", and it always carries its own
+    // denominator so "all-parked" over a sample of one reads as the weak evidence it is.
+    fn deadlock_verdict(&self) -> String {
+        if !self.saw_web_process() {
+            return format!(
+                "NO VERDICT — no WebKitWebProcess in this sample ({} descendant(s): {}); \
+                 the deadlock signature cannot be evaluated and nothing below is about the webview",
+                self.samples.len(),
+                self.comm_list(),
+            );
+        }
+        let web: Vec<&WebkitSample> = self.samples.iter().filter(|s| s.is_web_process()).collect();
+        let parked = web.iter().filter(|s| s.parked()).count();
+        let total = web.len();
+        if parked == total {
+            format!(
+                "{parked}/{total} WebKitWebProcess parked (near-0% CPU, not runnable) \
+                 — matches known deadlock signature"
+            )
+        } else {
+            format!(
+                "{parked}/{total} WebKitWebProcess parked — does NOT match the deadlock \
+                 signature; a web process burning CPU while the heartbeat is silent is \
+                 main-thread saturation, not a deadlock (see legacy-video-fallback-cost.md)"
+            )
+        }
+    }
+}
+
+// Samples every WebKit* descendant, diffing utime/stime against the previous
 // call's readings (`prior`, kept alive across watchdog thread ticks) so a triggered
 // diagnostic dump can report real per-second CPU deltas instead of a single snapshot.
-fn sample_webkit_processes(prior: &mut HashMap<i32, (u64, u64)>) -> Vec<WebkitSample> {
+fn sample_webkit_processes(prior: &mut HashMap<i32, (u64, u64)>) -> WebkitSampleSet {
     let own_pid = std::process::id() as i32;
     let uptime = uptime_secs().unwrap_or(0.0);
     let mut seen = HashSet::new();
@@ -245,7 +319,7 @@ fn sample_webkit_processes(prior: &mut HashMap<i32, (u64, u64)>) -> Vec<WebkitSa
         });
     }
     prior.retain(|pid, _| seen.contains(pid));
-    out
+    WebkitSampleSet { samples: out }
 }
 
 // Returns true once a fresh heartbeat has cleared `triggered` for this window — the
@@ -446,14 +520,18 @@ pub fn spawn_watchdog(state: WatchdogPersist, app: tauri::AppHandle) {
                     SILENCE_THRESHOLD.as_secs()
                 );
                 if samples.is_empty() {
-                    log::error!("[watchdog]   no WebKitWebProcess descendants found (already exited?)");
+                    log::error!("[watchdog]   no WebKit descendants found at all (already exited?)");
                 }
-                for s in &samples {
-                    let parked = s.dutime == 0 && s.dstime == 0 && s.state != 'R';
+                // Verdict first, and only ever once per trigger: the per-descendant lines
+                // below are raw observations. Printing a deadlock claim on each of them let
+                // a single idle NetworkProcess declare "all-parked" on 2026-08-05.
+                log::error!("[watchdog]   verdict: {}", samples.deadlock_verdict());
+                for s in &samples.samples {
                     log::error!(
-                        "[watchdog]   descendant pid={} comm={} state={} etimes={:.0}s Δutime={} Δstime={}{}",
+                        "[watchdog]   descendant pid={} comm={} state={} etimes={:.0}s Δutime={} Δstime={} [{}{}]",
                         s.pid, s.comm, s.state, s.etimes, s.dutime, s.dstime,
-                        if parked { " [near-0%-CPU, all-parked — matches known deadlock signature]" } else { "" },
+                        if s.parked() { "parked: near-0% CPU, not runnable" } else { "active" },
+                        if s.is_web_process() { "" } else { ", not the web process" },
                     );
                 }
             }
@@ -481,4 +559,82 @@ pub fn spawn_watchdog(state: WatchdogPersist, app: tauri::AppHandle) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(comm: &str, state: char, dutime: u64, dstime: u64) -> WebkitSample {
+        WebkitSample {
+            pid: 1234,
+            comm: comm.to_string(),
+            state,
+            etimes: 10933.0,
+            dutime,
+            dstime,
+        }
+    }
+
+    // The 2026-08-05 live-set misdiagnosis, verbatim: the descendant walk returned only an
+    // idle WebKitNetworkProcess and the old code labelled it "all-parked — matches known
+    // deadlock signature". It was steady-state main-thread saturation.
+    #[test]
+    fn lone_idle_network_process_yields_no_verdict() {
+        let set = WebkitSampleSet { samples: vec![sample("WebKitNetworkPr", 'S', 0, 0)] };
+        assert!(!set.saw_web_process());
+        let v = set.deadlock_verdict();
+        assert!(v.starts_with("NO VERDICT"), "{v}");
+        assert!(!v.contains("matches known deadlock signature"), "{v}");
+        assert!(v.contains("WebKitNetworkPr"), "{v}");
+    }
+
+    #[test]
+    fn parked_web_process_still_matches_signature_and_shows_denominator() {
+        let set = WebkitSampleSet {
+            samples: vec![
+                sample("WebKitNetworkPr", 'S', 0, 0),
+                sample("WebKitWebProces", 'S', 0, 0),
+            ],
+        };
+        assert!(set.saw_web_process());
+        let v = set.deadlock_verdict();
+        assert!(v.contains("1/1 WebKitWebProcess parked"), "{v}");
+        assert!(v.contains("matches known deadlock signature"), "{v}");
+    }
+
+    // A web process burning CPU while the heartbeat is silent is saturation, not a
+    // deadlock — the verdict must say so rather than staying quiet.
+    #[test]
+    fn busy_web_process_does_not_match_signature() {
+        let set = WebkitSampleSet {
+            samples: vec![
+                sample("WebKitNetworkPr", 'S', 0, 0),
+                sample("WebKitWebProces", 'R', 97, 4),
+            ],
+        };
+        let v = set.deadlock_verdict();
+        assert!(v.contains("0/1 WebKitWebProcess parked"), "{v}");
+        assert!(v.contains("does NOT match"), "{v}");
+    }
+
+    #[test]
+    fn partial_parking_is_reported_as_a_fraction() {
+        let set = WebkitSampleSet {
+            samples: vec![
+                sample("WebKitWebProces", 'S', 0, 0),
+                sample("WebKitWebProces", 'R', 55, 3),
+            ],
+        };
+        let v = set.deadlock_verdict();
+        assert!(v.contains("1/2 WebKitWebProcess parked"), "{v}");
+        assert!(v.contains("does NOT match"), "{v}");
+    }
+
+    #[test]
+    fn empty_sample_has_no_verdict() {
+        let set = WebkitSampleSet { samples: vec![] };
+        assert!(set.is_empty());
+        assert!(set.deadlock_verdict().starts_with("NO VERDICT"));
+    }
 }

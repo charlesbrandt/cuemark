@@ -145,11 +145,55 @@ condemned it, both same-binary A/Bs with only this variable changed:
   output-window bug; that window faithfully mirrored an already-corrupt compositor canvas. Unset, the
   canvas is clean. User-confirmed live.
 
-Set `CUEMARK_DISABLE_DMABUF=1` to restore the old behaviour. ⚠️ **One path remains untested**: the
-legacy `<video>` fallback (non-H.264 and audio-only files) has never been checked with the DMA-BUF
-renderer enabled. If VA-API canvas corruption reappears there, fix it with a codec-specific
-`GST_PLUGIN_FEATURE_RANK` demotion, not by re-killing the renderer process-wide. See
-`docs/design/output-noise-and-track-reload-silence.md`, "ROOT-CAUSED 2026-08-02 (late)".
+Set `CUEMARK_DISABLE_DMABUF=1` to restore the old behaviour. If VA-API canvas corruption ever
+appears, fix it with a codec-specific `GST_PLUGIN_FEATURE_RANK` demotion, not by re-killing the
+renderer process-wide. See `docs/design/output-noise-and-track-reload-silence.md`,
+"ROOT-CAUSED 2026-08-02 (late)".
+
+🔴 **The previously-untested path — the legacy `<video>` fallback — was exercised live on
+2026-08-05 and it is unusable.** On that path `drawImage(video)` in `DeckCard`'s preview loop
+costs **86ms median / 300ms worst per call**, 61–68% of the control window's wall clock, taking a
+playing deck from 58fps to 5.6fps and starving the GStreamer audio threads into underruns. Cost is
+per-call and independent of resolution (640×480 VP9 measured 7× *more* expensive than 1080p AV1),
+so it is not decode and not pixel work. The failure is a stall, not the predicted corruption.
+**Root-caused 2026-08-05 in two parts, both measured:**
+- **The per-call cost is a property of the video codec feeding the `<video>` element**, not of
+  the legacy path and not of DMA-BUF. A single-variable pair (same frames, same container, same
+  640×480@25, only the codec re-encoded) cost **22–24ms on VP9 against 8ms on H.264**, with
+  *more* main-thread `busy%` at *less* process CPU — so the call is parked, not working. It is
+  inside WebKit's GStreamer media player and cuemark cannot fix it; the only lever is not to use
+  a `<video>` element for that codec (extend the WebCodecs demux gate). ❌ **`CUEMARK_DISABLE_DMABUF=1`
+  makes it strictly worse** (22–32 → 54ms/call, 17.2 → 9.1fps) — do not reach for it.
+- **The draw *frequency* was separately broken and is now fixed.** `video.currentTime` advances
+  continuously here, so the preview's `currentTime !== lastDrawnTime` change-check gated nothing
+  and every legacy deck drew on 100% of rAF ticks. It now compares
+  `getVideoPlaybackQuality().totalVideoFrames` (`legacyFrameChanged()` in `DeckCard.svelte`),
+  which the probe measured advancing at exactly the source frame rate. A 6fps file went
+  `drew=133/133` → `30/258` and **26.4 → 51.6fps**. ⚠️ **`requestVideoFrameCallback` is exposed
+  here but was deliberately not used** — its firing rate cannot be verified outside the app
+  (a bare webview has no display-refresh source at all), and a preview that never draws is worse
+  than one that draws too often.
+
+**Fixed 2026-08-05 for VP9, by not taking the path at all.** `video_demux.rs` now accepts
+**H.264 and VP9** (`CodecKind`, `vp9parse` with `alignment=super-frame`, a derived
+`vp09.PP.LL.DD` string); `codecWorker.ts`'s `needsAvcRemux` is the single switch — H.264 keeps
+its mandatory avc `description` + Annex-B→avc re-mux, VP9 gets neither and its AUs go to
+`decode()` untouched. The worst library file went **23.9–28.6 → 54.2–56.4fps**, per-call
+19–22ms → 0.0ms, `busy%` 49–52 → 9–10. ⚠️ **Process CPU is flat across that change** (61.0 →
+60.1%) — there is no VA-API on this machine so VP9 is software-decoded either way; what moved is
+*where*, from a main-thread block into a decode worker. Read the fps and CPU numbers together.
+
+**Still on legacy `<video>`: AV1, and it cannot leave.** `VideoDecoder.isConfigSupported({codec:
+'av01.…'})` returns `true` here and then **decodes zero frames** — for a real file, in all four
+bitstream framings, with and without a `description`, and for a 320×240 stream GStreamer's own
+`av1enc` produced as a control. ⚠️ **Never trust `isConfigSupported` on this WebKitGTK; probe a
+real decode** (`scripts/probes/webcodecs_vp9_av1_probe.py`). AV1 is survivable only because the
+preview now draws once per source frame and the library's AV1 is 6fps (26 → 50–54fps); a
+high-frame-rate AV1 file would still be bad. VP8/HEVC are unprobed — same warning applies.
+
+See `docs/design/legacy-video-fallback-cost.md` and `webcodecs-video-path.md` "Phase 7" before
+touching `DeckCard`'s preview loop, `video_demux.rs`'s codec gate, `codecWorker.ts`'s
+`needsAvcRemux` switch, or anything about DMA-BUF.
 
 ⚠️ **The compositor canvas in `App.svelte` must not be `display:none`.** It was, from `ee91c54` until
 2026-08-02, which meant nobody could see what the compositor actually produced — the single biggest
@@ -157,8 +201,14 @@ reason Bug A went unsolved for three sessions. Keep it laid out but visually neg
 opacity, off-screen). Its WebGL drawing buffer is 1920×1080 regardless, set by the `width`/`height`
 attributes rather than CSS. To debug compositing, temporarily give it a real size and a bright border —
 that one change is what cracked the bug.
-Also demote broken VA-API decoders via `GST_PLUGIN_FEATURE_RANK` in `main.rs` — **currently only
-`vaav1dec:0,vaapiav1dec:0`; H.264 hardware decode is deliberately live** (re-tested working 2026-06-20).
+Also demote broken VA-API decoders via `GST_PLUGIN_FEATURE_RANK` in `main.rs` — currently only
+`vaav1dec:0,vaapiav1dec:0`.
+⚠️ **This demotion is a no-op today, and "H.264 hardware decode is deliberately live" (claimed
+here on 2026-06-20) is stale: this machine has no VA-API driver for any codec.** Re-verified
+2026-08-05 — no Intel `*_drv_video.so` under `/usr/lib/x86_64-linux-gnu/dri` (only d3d12,
+nouveau, r600, radeonsi, virtio_gpu), no `gstreamer1.0-vaapi`, and `gst-inspect-1.0 va` registers
+`0 features`. **Everything decodes in software**, so never explain a codec-specific cost
+difference by hardware decode without re-running those three checks.
 See `audio-debugging` skill for the full VA-API investigation, debugging tips, and env-var override
 pitfalls.
 
@@ -374,6 +424,24 @@ playback, the drift-resync path, or anything freeze-related:
   spike passed (results table in the doc).
 - `docs/design/native-output-pipeline.md` — shelved escalation path; do not start
   without an explicit decision.
+
+## Open findings from the 2026-08-05 live set
+
+Two distinct faults were root-caused from a single ~3-hour session's log. **One is now closed,
+one is still open.** They are **independent** and can be worked in separate sessions.
+
+- `docs/design/legacy-video-fallback-cost.md` — ✅ **CLOSED 2026-08-05.** A1 pinned the cost to
+  the video codec feeding the `<video>` element (not DMA-BUF, not resolution, not the path);
+  A2 fixed the broken draw-frequency check; A4 moved VP9 onto the WebCodecs demux path, taking
+  the worst library file from ~26fps to ~55fps. **No outstanding work item.** The one remaining
+  exposure is AV1, which stays on the legacy element because WebCodecs decodes zero AV1 frames
+  here. Do not re-run the DMA-BUF arm (it made things worse) and do not chase *why* VP9 blocks
+  inside `drawImage` — cuemark no longer takes that path for VP9. **Verify live**: the 55fps
+  number is from an automated sweep, not from a real set.
+- `docs/design/audio-dropout-mid-playback.md` — 10.8s of silence mid-track with the pipeline in
+  `Playing` and the frame rate healthy, ~21s after headphone cue was enabled on a USB controller
+  carrying both the main and cue sinks. No reproducer yet. Fix the 6:1 false-positive rate in
+  `instrument_sink_flow()` first or the soak will be unreadable.
 
 ## Development phases
 
@@ -607,6 +675,7 @@ Several automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb
 | `scripts/probes/webgl_readback_variants_probe.py` | Route matrix for the same question — attachment formats, explicit `readBuffer`, PBO + `getBufferSubData`, `copyTexSubImage2D` — with a `LIBGL_ALWAYS_SOFTWARE=1` control arm that separates driver faults from WebKit faults. Run this before concluding anything about readback. |
 | `scripts/probes/webgl_readpixels_diag_probe.py` | Why a readback failed: reports the returned bytes *and* the GL error, `getError()` sanity, framebuffer completeness, and the implementation's preferred read format. |
 | `scripts/probes/imagebitmap_upload_probe.py` | `ImageBitmap`/`VideoFrame` upload semantics — does `createImageBitmap(VideoFrame)` carry real pixels, and which flip mechanism actually applies. Run before touching the output path's orientation handling. Needs `LIBGL_ALWAYS_SOFTWARE=1` for pixel verdicts. |
+| `scripts/probes/video_frame_signal_probe.py` | Which frame-change signal a legacy `<video>` element actually exposes here — `currentTime` (gates nothing), `requestVideoFrameCallback` (present, rate unmeasurable headlessly), `getVideoPlaybackQuality().totalVideoFrames` (tracks the source frame rate exactly). Run before writing any "has this video advanced a frame?" check. Seconds, needs a real media file. |
 | `scripts/probes/output_window_compositor_probe.py` | End-to-end check of the **real** `output.html`: posts a synthetic frame from a same-origin sender and reads the composited result back, including an orientation assertion. Run after touching `outputBus.ts`, `output.ts`, `outputProtocol.ts` or `fbo.ts`. Needs the Vite dev server and `LIBGL_ALWAYS_SOFTWARE=1`. |
 
 ⚠️ **All GPU→CPU readback from WebGL is broken on this machine — it is a Mesa `crocus`

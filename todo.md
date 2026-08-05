@@ -2,6 +2,37 @@
 
 ## Known issues
 
+### AV1 files still run on the legacy `<video>` path [reduced, not eliminated, 2026-08-05]
+
+✅ **The general form of this issue is fixed.** It read "any non-H.264 file collapses the
+control window to ~6fps". `video_demux.rs` now accepts **H.264 and VP9**, and VP9 went from
+23.9–28.6fps to 54.2–56.4fps with per-call preview cost 19–22ms → 0.0ms and `busy%` 49–52 →
+9–10. The draw-frequency half was fixed separately (`legacyFrameChanged()`).
+
+**What is left**: AV1 cannot join the WebCodecs path — `VideoDecoder.isConfigSupported`
+returns `true` here and then decodes **zero** frames (`EncodingError: Decode error`), proved
+against a real file, all four bitstream framings, and a GStreamer-`av1enc`-encoded control.
+So AV1 stays on the legacy `<video>` element. Tolerable today only because the preview now
+draws once per *source* frame and the library's one AV1 file is 6fps (26 → 50–54fps); **a
+high-frame-rate AV1 file would still be bad.**
+
+No action pending. Re-run `scripts/probes/webcodecs_vp9_av1_probe.py` after any WebKitGTK
+upgrade — if AV1 decode starts working, adding it is a small change (`av1parse` already
+reports profile/level/tier). ⚠️ Never gate on `isConfigSupported` here; probe a real decode.
+Full history: `docs/design/legacy-video-fallback-cost.md`, `webcodecs-video-path.md` phase 7.
+
+### 10.8s of silence mid-track with the pipeline in PLAYING [open, no reproducer, 2026-08-05]
+
+Deck-0's `output_queue` ran dry and no buffer reached the sink for 10.8s, with no state
+transition, no seek, no scratch and no bus error — while rAF was healthy at 49.7fps, on the
+H.264 webcodecs path. Headphone cue had been enabled 21s earlier; main and cue are two
+`pulsesink`s on the same USB controller. Same symptom class as the 2026-08-02 `buffer-time` fix,
+which was verified over 106s; this was the first multi-hour set since.
+
+Also: `instrument_sink_flow()` does not gate on the `playing` atomic, so **six of its seven
+"buffer flow resumed after a Ns gap" warnings that session were preroll artifacts** — fix that
+first or any soak is unreadable. `docs/design/audio-dropout-mid-playback.md`.
+
 ### Control window drops to ~20fps while playing [root-caused to DeckCard's timestamp text, fix not built, 2026-08-04]
 
 The `audio_get_position` round trips of 300–424ms were never GStreamer: `query_position`,

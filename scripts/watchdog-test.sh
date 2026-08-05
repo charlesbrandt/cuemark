@@ -100,7 +100,14 @@ if ! grep -q '__cuemarkDebug' dist/assets/*.js 2>/dev/null; then
   echo "WARNING: debug hook not found in dist/ — rebuild with VITE_ENABLE_DEBUG_HOOK=1" >&2
 fi
 
-WEBKIT_DRIVER="$(dpkg -L webkit2gtk-driver | grep -E '/WebKitWebDriver$')"
+# The binary has lived in two differently-named Debian packages (webkit2gtk-driver,
+# then webkitgtk-webdriver), and `dpkg -L` on the wrong one aborts the whole script
+# under `set -e` with a bare dpkg-query error that looks nothing like the real problem.
+# Ask the PATH first; fall back to either package name.
+WEBKIT_DRIVER="$(command -v WebKitWebDriver \
+  || dpkg -L webkitgtk-webdriver 2>/dev/null | grep -E '/WebKitWebDriver$' \
+  || dpkg -L webkit2gtk-driver 2>/dev/null | grep -E '/WebKitWebDriver$')"
+[ -n "$WEBKIT_DRIVER" ] || { echo "WebKitWebDriver not found (see skills/verify-ui/SKILL.md)" >&2; exit 1; }
 
 # Start with a clean log file so `log_since` markers (byte offsets) are unambiguous —
 # a stale multi-run log makes "no TRIGGER since marker X" checks fragile across reruns.
@@ -235,7 +242,14 @@ run_freeze_scenario() {
   echo "=== Scenario: $scenario_name ==="
   local pre_audio_pos pre_wallclock mark
 
-  pre_audio_pos=$(js_sync "return window.__TAURI__.core.invoke('audio_get_position', {deckId:'deck-0'})")
+  # `audio_get_position` returns a `PositionSample` OBJECT ({pos, entryMs, lockMs,
+  # queryMs, exitMs}) since the IPC-leg instrumentation landed; it used to return a bare
+  # number. This script kept treating it as a scalar and fed the whole JSON blob to awk,
+  # which died with a syntax error *after* the scenario's real assertions had already
+  # passed — i.e. the gate exited non-zero for a reason that had nothing to do with
+  # recovery. Accept either shape (2026-08-05).
+  pre_audio_pos=$(js_sync "return window.__TAURI__.core.invoke('audio_get_position', {deckId:'deck-0'})" \
+    | jq -r 'if type=="object" then (.pos // empty) else (. // empty) end')
   pre_wallclock=$(date +%s.%N)
   echo "  pre-freeze: audioPos=$pre_audio_pos"
 
@@ -288,7 +302,7 @@ run_freeze_scenario() {
 
     adopted_ts=$(printf '%s' "$adopted_full_line" | sed -E 's/^\[([^]]*)\].*/\1/')
     adopted_epoch=$(date -u -d "$adopted_ts" +%s.%N 2>/dev/null || echo "")
-    if [ -n "$adopted_epoch" ]; then
+    if [ -n "$adopted_epoch" ] && [ -n "$pre_audio_pos" ]; then
       elapsed=$(awk "BEGIN{printf \"%.2f\", $adopted_epoch - $pre_wallclock}")
       expected_pos=$(awk "BEGIN{printf \"%.2f\", $pre_audio_pos + $elapsed}")
       echo "  post-recovery: adoptedPos=$adopted_pos elapsed=${elapsed}s (to adoption, not to log-detection) expected~=${expected_pos}"

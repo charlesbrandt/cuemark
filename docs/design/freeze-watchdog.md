@@ -381,6 +381,93 @@ never hiccups and by eye that the UI returns with decks intact.
   silence. Corollary, since it misled this investigation for two sessions: a *healthy* final
   heartbeat followed by silence is the signature of a clean shutdown, not of a freeze —
   evidence against a genuine freeze rather than for one.
+- ✅ **RESOLVED 2026-08-05 — The trigger's diagnostic sample could miss the process that is
+  actually at fault, and then confidently mislabel the one it did see** (full context in
+  `legacy-video-fallback-cost.md`). A real trigger fired during steady-state main-thread
+  saturation — the window was not deadlocked, it was running at 9fps under a 68%-busy JS
+  loop. Two separate defects showed up in the four lines the watchdog logged:
+
+  1. **`sample_webkit_processes()` returned only the `WebKitNetworkProcess`.** The
+     `WebKitWebProcess` — the saturated one, the entire subject of the trigger — was absent
+     from the sample. The 2026-08-03 trigger on the same machine listed three descendants
+     including two `WebKitWebProces`, so the filter (`comm.contains("WebKit")`,
+     `watchdog.rs:229`) is right and the process was reparented out of the `/proc` ppid
+     descendant walk, or the sample raced the trigger. **Recovery was unaffected** (tier3
+     re-enumerates), but the diagnostic that a human reads was reduced to noise. Worth an
+     explicit `no WebKitWebProcess in sample — descendant walk may have missed it` line
+     rather than silently logging a short list.
+  2. **`parked` (`watchdog.rs:452`) is evaluated per-descendant**, so an *idle*
+     `NetworkProcess` — `Δutime=0 Δstime=0 state=S`, which is simply what "nothing is being
+     fetched" looks like — printed `[near-0%-CPU, all-parked — matches known deadlock
+     signature]`. Combined with (1) it produced a log that reads as a textbook
+     `WebKitNetworkProcess` deadlock (the open phase-4 finding in `webcodecs-video-path.md`)
+     and was nothing of the kind. The label claims "all-parked" from a sample of one; it
+     should require the `WebKitWebProcess` to be present and parked, or say what it is
+     missing.
+
+  Generalisation: **a per-item verdict printed over an incomplete sample reads as a verdict
+  over the whole system.** Either assert the sample is complete before labelling it, or make
+  the label carry its own denominator.
+
+  **Fix (2026-08-05): both, because they are cheap together and defend different reads.**
+  The two defects compound — a denominator alone would have printed a confident
+  `1/1 parked` over the NetworkProcess-only sample, and a completeness assertion alone
+  would still let a genuinely-sampled pair print an unqualified "all-parked" — so neither
+  half is sufficient on its own.
+
+  1. **The sample now asserts its own completeness.** `sample_webkit_processes()` returns a
+     `WebkitSampleSet`, not a bare `Vec`. A `Vec<WebkitSample>` structurally cannot express
+     the difference between "the web process is fine" and "we never saw the web process";
+     the new type can, via `saw_web_process()`, and every consumer has to ask. Note
+     `comm` in `/proc` is truncated to 15 chars, so the discriminator is a prefix match on
+     `WebKitWebProces` — the loose `contains("WebKit")` filter (still correct for
+     *collecting* the sample) is what let `WebKitNetworkPr` stand in for the subject.
+  2. **The verdict is one line per trigger and carries its denominator.** Per-descendant
+     lines are now pure observations (`[parked: near-0% CPU, not runnable]` /
+     `[active]`, plus `, not the web process` where applicable) and make no claim about
+     deadlock. A single `verdict:` line above them is the only thing allowed to say
+     "deadlock signature", and it always prints `N/M WebKitWebProcess parked` — so
+     "all-parked" over a sample of one reads as the weak evidence it is.
+  3. **A busy web process now says so explicitly.** `0/1 WebKitWebProcess parked — does
+     NOT match the deadlock signature; a web process burning CPU while the heartbeat is
+     silent is main-thread saturation, not a deadlock`, pointing at
+     `legacy-video-fallback-cost.md`. The 2026-08-05 trigger *was* this case; the old
+     format had no way to say it.
+
+  Before (the actual 2026-08-05 live-set line — a `WebKitNetworkProcess` with nothing to
+  fetch, described as a deadlock):
+  ```
+  descendant pid=… comm=WebKitNetworkPr state=S etimes=10933s Δutime=0 Δstime=0 [near-0%-CPU, all-parked — matches known deadlock signature]
+  ```
+  After (same sample shape, reproduced live by `watchdog-test.sh`'s `kill -KILL` scenario,
+  where the web process is genuinely gone by sample time):
+  ```
+  verdict: NO VERDICT — no WebKitWebProcess in this sample (1 descendant(s): WebKitNetworkPr); the deadlock signature cannot be evaluated and nothing below is about the webview
+  descendant pid=2214341 comm=WebKitNetworkPr state=S etimes=18s Δutime=0 Δstime=0 [parked: near-0% CPU, not runnable, not the web process]
+  ```
+  The true positive is preserved — `kill -STOP` still prints
+  `1/1 WebKitWebProcess parked (near-0% CPU, not runnable) — matches known deadlock
+  signature` — and `freezeMainThread(0)` prints the new `0/1 … does NOT match` line.
+
+  **Diagnostic-only; recovery behaviour is byte-for-byte unchanged.** Nothing outside the
+  trigger's logging block was touched, so trigger *timing* cannot be affected (the 10-minute
+  soak was skipped for that reason; `watchdog-test.sh`'s 15s false-positive smoke check
+  passed). Gate re-run 2026-08-05: **23 passed, 0 failed**, all three freeze scenarios
+  recovering with audio position continuous. Five unit tests in `watchdog.rs` pin the
+  verdict logic, including the 2026-08-05 misdiagnosis verbatim as a regression test.
+
+  ⚠️ Found while re-running the gate: `watchdog-test.sh` had its own silent breakage of the
+  same family as the `webkitgtk-webdriver` package rename — `audio_get_position` returns a
+  `PositionSample` **object** since the IPC-leg instrumentation landed, and the script still
+  treated it as a bare number, feeding the whole JSON blob to `awk`. It died with a syntax
+  error *after* the first scenario's real assertions had passed, so the gate exited non-zero
+  for a reason unrelated to recovery. Fixed to accept either shape.
+
+  ⚠️ Also worth recording as a limit rather than a bug: recovery *succeeded* here
+  (heartbeat back in 12.0s) and it did not help. The window reloaded straight back into the
+  same file on the same slow path and returned to 14–17fps. **Reload cannot fix
+  steady-state load**, so a trigger that recurs on the same source is evidence of a
+  performance fault, not a freeze.
 - **Adoption bugs**: rehydration accidentally calling `audioLoad`/`audioSeek` on a
   playing pipeline would audibly glitch — the exact thing this feature must never do.
   Add a temporary assertion log in `pipeline.ts` (`audioLoad` called for a deck whose

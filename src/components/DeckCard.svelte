@@ -8,6 +8,7 @@
   import { pushMarker, setTrackBpm } from "../lib/digger/api";
   import { markGridSaved } from "../lib/audio/gridSource";
   import { recordAuxLoop } from "../lib/audio/pollStats";
+  import { debugLog } from "../lib/debugLog";
   import { suppressPhaseText, suppressTimestampText } from "../lib/audio/perfArm";
   import { videoPathOverrides, videoPathDefault, setVideoPathOverride, resolveVideoPath } from "../lib/video/videoPathSettings";
   import type { Deck } from "../lib/state/types";
@@ -120,7 +121,90 @@
     // otherwise). lastDrawnTime still catches a seek made while paused.
     let lastDrawnTime = -1;
     let lastDrawnPts = -1;
+    // Legacy-path frame-change signal — see legacyFrameChanged() below.
+    let lastDrawnFrames = -1;
+    let frameCounterStuckSince = 0;
+    let frameCounterUsable = true;
     let rafId: number;
+
+    /**
+     * Has the legacy `<video>` element presented a *new frame* since the last preview draw?
+     *
+     * This used to be `video.currentTime !== lastDrawnTime`, which is always true: on
+     * WebKitGTK `currentTime` is interpolated from the media clock and advances
+     * continuously, not in frame steps. So the check gated nothing — a **6 fps** file drew
+     * on all 70 rAF ticks of a 5 s window, and the 2026-08-05 A1 arms measured a forced-
+     * legacy H.264 file at `drew=172/172` against the codec path's ~90/265. That redundancy
+     * was the *entire* legacy-path penalty for H.264 (52.5 → 34.5 fps) and it multiplies the
+     * 22–24 ms/call VP9 cost. See docs/design/legacy-video-fallback-cost.md, A2.
+     *
+     * The signal used instead is `getVideoPlaybackQuality().totalVideoFrames` — the count of
+     * frames the media player has actually presented. `scripts/probes/video_frame_signal_probe.py`
+     * measured it advancing at **exactly** the source frame rate on this WebKitGTK (5.8/s on
+     * the 6 fps AV1 file, 24.8/s on the 25 fps VP9 one), and — importantly — it is
+     * decoder-driven, so it stays accurate even when the page's frame clock is starved,
+     * which is the regime this whole bug lives in.
+     *
+     * **Why not `requestVideoFrameCallback()`**, which is what it is for: it *is* exposed
+     * here and delivers correct metadata (`mediaTime`, `presentedFrames`, `width`/`height`),
+     * but it is driven by the page's rendering-update cycle, and the probe could never
+     * observe it firing more than once — in a bare webview rAF itself fires once in 6 s
+     * (`rafTicks=1` against `intervalTicks=453`), so its rate is unverifiable outside the
+     * app. Gating the only preview draw on a callback that might not fire risks a *frozen*
+     * preview, which is strictly worse than a redundant one. `metadata.presentedFrames` is
+     * the same number this function polls anyway, so rVFC would add nothing but that risk.
+     *
+     * Two deliberate details:
+     * - **While paused, fall back to `currentTime`.** A seek made while paused must still
+     *   repaint, and a paused deck draws a handful of times at most, so the old check is
+     *   both correct and free there. (This is what the comment on `lastDrawnTime` above has
+     *   always been about.)
+     * - **A stuck counter falls back permanently.** If the counter never moves for a second
+     *   while the clock advances (a genuinely static clip, or some source that does not feed
+     *   it), we revert to the old behaviour rather than freeze the preview: redundant draws
+     *   are a performance bug, no draws is a broken UI.
+     */
+    function legacyFrameChanged(video: HTMLVideoElement, now: number): boolean {
+      const timeChanged = video.currentTime !== lastDrawnTime;
+      let changed = timeChanged;
+
+      if (frameCounterUsable && !video.paused && typeof video.getVideoPlaybackQuality === "function") {
+        let frames = -1;
+        try {
+          frames = video.getVideoPlaybackQuality().totalVideoFrames;
+        } catch {
+          frameCounterUsable = false;
+        }
+        if (frameCounterUsable) {
+          if (frames !== lastDrawnFrames) {
+            frameCounterStuckSince = 0;
+            changed = true;
+          } else {
+            changed = false;
+            // Only arm the stuck-timer once the clock is demonstrably moving, so a
+            // paused-to-playing transition or a stall in the audio master clock is not
+            // mistaken for a dead counter.
+            if (!timeChanged) frameCounterStuckSince = 0;
+            else if (frameCounterStuckSince === 0) frameCounterStuckSince = now;
+            else if (now - frameCounterStuckSince > 1000) {
+              frameCounterUsable = false;
+              // debugLog, not console.warn: only debugLog reaches the Rust log file, and
+              // this fallback silently restores the old cost — it must be visible there.
+              debugLog(
+                `[${deck.id}] preview: totalVideoFrames stuck at ${frames} for >1s while the ` +
+                `clock advanced — falling back to the currentTime change-check`,
+              );
+              changed = true;
+            }
+          }
+          lastDrawnFrames = frames;
+        }
+      }
+
+      if (changed) lastDrawnTime = video.currentTime;
+      return changed;
+    }
+
     function draw() {
       // Timed into [aux-loop]: this loop runs in the same rAF turn as App.svelte's frame()
       // but is not counted by frame-dur — see recordAuxLoop's doc comment.
@@ -138,8 +222,7 @@
       const video = getVideoEl(deck.id);
       const codec = getCodecPlayer(deck.id);
       if (video && video.readyState >= 2) {
-        if (video.currentTime !== lastDrawnTime) {
-          lastDrawnTime = video.currentTime;
+        if (legacyFrameChanged(video, t0)) {
           // Audio-only files (e.g. .mp3) loaded into a 'video' deck have videoWidth/Height
           // of 0 — no video track. WebKitGTK throws SecurityError from drawImage() in this
           // case (rather than silently no-op'ing like Chrome), which would otherwise abort
@@ -189,7 +272,16 @@
         if (deck.source?.type === "video" && deck.source.duration) videoDuration = deck.source.duration;
       }
       if (publishPhaseText) publishPhase(t0);
-      recordAuxLoop(`preview/${deck.id}`, performance.now() - t0, drew);
+      // Canvas dimensions belong in the bucket label for the same reason WaveformCanvas
+      // carries them: `drawImage(video, 0, 0, canvas.width, canvas.height)` scales into
+      // *this* canvas, so a window resize or a panel toggle silently changes the cost
+      // being measured. Their absence here is what made the 2026-08-05 legacy-fallback
+      // numbers non-comparable across runs (legacy-video-fallback-cost.md).
+      recordAuxLoop(
+        `preview/${deck.id}@${canvas.width}x${canvas.height}`,
+        performance.now() - t0,
+        drew,
+      );
       rafId = requestAnimationFrame(draw);
     }
     rafId = requestAnimationFrame(draw);

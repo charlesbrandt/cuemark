@@ -3,10 +3,15 @@
  * deck (docs/design/webcodecs-video-path.md phase 2). Runs in a Worker (spawned by
  * codecPlayer.ts) so decode never blocks the main thread. One instance per deck.
  *
- * Always avc mode (`description` built from the first keyframe's SPS/PPS, chunks
- * re-muxed from Annex-B to length-prefixed) — annexb-without-description is confirmed
- * dead on this app's real hardware decode config, see h264.ts's doc comment and
- * docs/design/webcodecs-video-path.md "Phase 1 results". Do not attempt it here.
+ * **H.264 is always avc mode** (`description` built from the first keyframe's SPS/PPS,
+ * chunks re-muxed from Annex-B to length-prefixed) — annexb-without-description is
+ * confirmed dead on this app's real hardware decode config, see h264.ts's doc comment
+ * and docs/design/webcodecs-video-path.md "Phase 1 results". Do not attempt it here.
+ *
+ * **VP9 (phase 7) is the opposite and equally non-negotiable**: no `description`, and the
+ * AU bytes go to `decode()` untouched. `vp9parse`'s super-frame-aligned buffers already
+ * are what WebCodecs wants, and there is no parameter-set NAL concept to hoist out of
+ * them. `needsAvcRemux` is the single switch; everything else on this path is codec-blind.
  */
 import { annexBToAvc, buildAvcDescription, findSpsAndPps, parseAuFrames, splitAnnexBNals, type Au } from "./h264";
 
@@ -39,6 +44,22 @@ let auCount = 0;
 let keyframes: { auIndex: number; ptsUs: number }[] = [];
 let fpsHint = 30;
 let description: Uint8Array | null = null;
+// True only for `avc1.*`. Decides both "build a description from SPS/PPS at init" and
+// "re-mux every AU Annex-B -> length-prefixed before decode()". VP9 does neither.
+let needsAvcRemux = true;
+
+/** The decoder config for the current codec — `description` is H.264-only (see module doc). */
+function decoderConfig(): VideoDecoderConfig {
+  return description ? { codec, description } : { codec };
+}
+
+/**
+ * The bytes for one AU as `decode()` wants them. H.264 needs the Annex-B -> avc re-mux;
+ * every other codec on this path is already framed correctly by its GStreamer parser.
+ */
+function chunkData(au: Au): Uint8Array {
+  return needsAvcRemux ? annexBToAvc(au.data) : au.data;
+}
 
 let decoder: VideoDecoder | null = null;
 let nextFeedIndex = 0;
@@ -189,13 +210,14 @@ async function pump() {
       // run between awaits, but that's exactly where this checks back in) — re-check state
       // right before the call instead of trusting the entry guard at the top of pump().
       if (!decoder || decoder.state !== "configured") break;
-      const data = annexBToAvc(au.data);
+      const data = chunkData(au);
       // Some access units carry only non-VCL NALs (seen live: AUD + SEI, no slice at
       // all — docs/design/webcodecs-video-not-rendering.md) — annexBToAvc's slice-only
       // filter (type 1/5) then yields zero bytes. Feeding VideoDecoder.decode() an empty
       // chunk throws "EncodingError: Empty frame" and *closes the decoder*, permanently
       // killing this deck. There's no picture to decode here, so just skip it — advance
-      // past it like any other AU without calling decode().
+      // past it like any other AU without calling decode(). (H.264-specific in practice,
+      // but the guard is codec-blind and an empty AU is never decodable on any codec.)
       if (data.length > 0) {
         decoder.decode(new EncodedVideoChunk({
           type: au.key ? "key" : "delta",
@@ -222,7 +244,7 @@ async function feedLoopFrames() {
     if (!loopDecoder || loopDecoder.state !== "configured") break;
     // See the identical guard + comment in pump() — an AU with no VCL NALs (e.g.
     // AUD+SEI-only) must not be fed to decode() as an empty chunk.
-    const data = annexBToAvc(au.data);
+    const data = chunkData(au);
     if (data.length > 0) {
       loopDecoder.decode(new EncodedVideoChunk({
         type: au.key ? "key" : "delta",
@@ -236,13 +258,15 @@ async function feedLoopFrames() {
 }
 
 async function maybeStartLoopPrefetch() {
-  if (!loopBounds || !playing || loopPrefetchStarted || !description) return;
+  // No `!description` guard: it is null by design on the codecs that don't use one
+  // (VP9). `codec` being set is what "init has run" actually means on every path.
+  if (!loopBounds || !playing || loopPrefetchStarted || !codec) return;
   if (clockPos < loopBounds.outPos - LOOP_LOOKAHEAD_SECONDS) return;
   loopPrefetchStarted = true;
   loopIsNowPrimary = false;
   loopFramesReady = [];
   loopDecoder = makeLoopDecoder();
-  if (!configureDecoder(loopDecoder, { codec, description }, "loop decoder")) {
+  if (!configureDecoder(loopDecoder, decoderConfig(), "loop decoder")) {
     loopDecoder = null;
     loopPrefetchStarted = false;
     return;
@@ -276,10 +300,11 @@ function handleLoopWrap() {
 }
 
 function handleSeek(target: number) {
-  if (!decoder || !description) return;
+  // Same reasoning as maybeStartLoopPrefetch(): `description` is legitimately null on VP9.
+  if (!decoder) return;
   eos = false;
   decoder.reset();
-  if (!configureDecoder(decoder, { codec, description }, "seek")) return;
+  if (!configureDecoder(decoder, decoderConfig(), "seek")) return;
   nextFeedIndex = keyframeAuIndexAtOrBefore(target);
   dropBeforeUs = Math.round(target * 1_000_000);
   clockPos = target;
@@ -293,17 +318,21 @@ async function handleInit(msg: InitMsg) {
   auCount = msg.auCount;
   keyframes = msg.keyframes;
   fpsHint = msg.fpsHint;
+  needsAvcRemux = codec.startsWith("avc1");
+  description = null;
 
-  const firstAu = await ensureAuFetched(0);
-  if (!firstAu) { post({ type: "error", message: "failed to fetch first AU for init" }); return; }
-  const { sps, pps } = findSpsAndPps(splitAnnexBNals(firstAu.data));
-  if (!sps || !pps) {
-    post({ type: "error", message: "no SPS/PPS in first AU; cannot build avc description" });
-    return;
+  if (needsAvcRemux) {
+    const firstAu = await ensureAuFetched(0);
+    if (!firstAu) { post({ type: "error", message: "failed to fetch first AU for init" }); return; }
+    const { sps, pps } = findSpsAndPps(splitAnnexBNals(firstAu.data));
+    if (!sps || !pps) {
+      post({ type: "error", message: "no SPS/PPS in first AU; cannot build avc description" });
+      return;
+    }
+    description = buildAvcDescription(sps.bytes, pps.bytes);
   }
-  description = buildAvcDescription(sps.bytes, pps.bytes);
   decoder = makeDecoder();
-  if (!configureDecoder(decoder, { codec, description }, "init")) { decoder = null; return; }
+  if (!configureDecoder(decoder, decoderConfig(), "init")) { decoder = null; return; }
   pump();
 }
 

@@ -282,6 +282,14 @@ every phase; new soak test added in Phase 4. One phase per PR/branch; do not com
    automatic fallback for unsupported codecs; reassess deleting it entirely
    after a few weeks of use (not attempted this session — see "Phase 5
    results").
+6. **DONE (2026-08-02). Black-screen bug hunt.** Not planned as a phase — three
+   bugs found on the first live use after the default flip. See "Phase 6" below.
+7. **DONE (2026-08-05). Extend the demux gate past H.264 — VP9 in, AV1 out.**
+   `legacy-video-fallback-cost.md` work item A4: the legacy fallback was measured
+   unusable, so codec coverage on *this* path had to grow instead. VP9 shipped and
+   took the worst-case library file from **~26 fps to ~55 fps**; AV1 was probed and
+   **cannot** ship — `VideoDecoder` on this WebKitGTK reports `isConfigSupported:
+   true` and then decodes zero AV1 frames. See "Phase 7 results" below.
 
 ## Phase 1 results (2026-07-25)
 
@@ -1016,8 +1024,201 @@ buffer = one access unit" always contains a decodable picture. Treat "re-muxes t
 picture bytes" as a normal, skippable case in the AU→`EncodedVideoChunk` translation
 layer, not an input to hand straight to `decoder.decode()`.
 
+## Phase 7 results (2026-08-05): VP9 shipped, AV1 refused
+
+Work item A4 from `docs/design/legacy-video-fallback-cost.md`. That doc's A1 session
+established the exit sentence this phase acts on: **at identical container, resolution,
+frame rate, path and canvas, `drawImage(<video>)` costs 22–24 ms on VP9 and 8 ms on
+H.264** — the cost is codec-linked and lives inside WebKit's media player, so cuemark's
+only lever is to stop using a `<video>` element for that codec. A2 could not rescue VP9
+(a 25 fps source into a ~21 fps loop has no redundant draws to remove). This phase removes
+the `<video>` element from the VP9 path entirely.
+
+### What `VideoDecoder` actually supports here — probe first, code second
+
+`scripts/probes/webcodecs_vp9_av1_probe.py` (new) demuxes a **real library file** with the
+same `filesrc ! parsebin ! <parser> ! capsfilter ! appsink` chain `video_demux.rs` uses,
+builds the WebCodecs codec string with the same rules, and then configures + decodes every
+AU in a bare `WebKit2 4.1` webview.
+
+| codec | `isConfigSupported` | AUs fed | frames decoded | verdict |
+|---|---|---|---|---|
+| VP9 `vp09.00.30.08` (640×480@25, webm, super-frame aligned) | `true` | 120 | **120**, I420, 640×480, 42 ms | **ships** |
+| AV1 `av01.0.08M.08` (1920×1080@6, mp4) | `true` | 120 | **0** — `EncodingError: Decode error` | **refused** |
+
+⚠️ **`isConfigSupported()` lies about AV1 on this WebKitGTK.** It returns `true` and the
+`WebCodecsAV1` feature flag is enabled; every `decode()` then fails. Gating on
+`isConfigSupported` alone would have shipped a permanently black deck for every AV1 file.
+Four bitstream framings were tried (`obu-stream`/`annexb` × `tu`/`frame`/`obu`), with and
+without the AV1CodecConfigurationRecord from `av1parse`'s `codec_data` as `description` —
+all zero frames. The `alignment=obu` arm fails differently (`DataError: Key frame is
+required`), which only confirms the framing reaches the decoder and the decode itself is
+what breaks.
+
+**The control arm settles that it is not our file.** A 320×240 12-frame AV1 stream produced
+by GStreamer's own `aom av1enc` on this machine, at three different codec-string levels,
+also decodes **0 of 12**. AV1 WebCodecs decode is broken on this build, full stop. The
+legacy `<video>` element *does* play AV1 (`aom av1dec` is installed and is what
+`MediaPlayerPrivateGStreamer` uses), so AV1 stays there — and A2's frame-change gate
+already took the 6 fps AV1 library file from 26 → 50–54 fps, which is why this is a
+tolerable place to leave it.
+
+### What shipped
+
+`src-tauri/src/video_demux.rs`:
+- `PadResult::Supported` now carries a `CodecKind` (`H264` | `Vp9`), chosen from the
+  parsebin pad's caps name; `pad-added` links `h264parse`(byte-stream/AU) or
+  `vp9parse`(super-frame) accordingly. Everything downstream — the AU-pull loop, the
+  keyframe index, the binary HTTP framing — is codec-blind and unchanged.
+- ⚠️ **`alignment=super-frame`, not `frame`.** A VP9 super-frame is the container's unit
+  and yields exactly one *displayed* frame, which is the 1:1 AU↔pts↔output-frame relation
+  the keyframe index, seek and decode-ahead logic in `codecWorker.ts` all assume.
+  `alignment=frame` splits super-frames into their hidden ALTREF sub-frames as well, so AU
+  count would stop matching decoded-frame count and pts would repeat.
+- `vp09.PP.LL.DD` is built from the negotiated caps' `profile` and `bit-depth-luma` plus
+  `vp9_level_code()`, a new Annex-A table lookup. **The level has to be derived**: neither
+  `vp9parse`'s caps nor the VP9 bitstream carries one (unlike `av1parse`, which reports
+  `level=4.0` directly). Decoders here do not enforce it, but the codec string must be
+  well-formed.
+
+`src/lib/video/codecWorker.ts`: one switch, `needsAvcRemux = codec.startsWith("avc1")`.
+- H.264 keeps its mandatory avc mode (`description` from SPS/PPS + per-AU Annex-B→avc
+  re-mux). VP9 gets **neither**: `vp9parse`'s buffers go to `decode()` untouched and the
+  config has no `description`.
+- Two guards had to change: `handleSeek()` and `maybeStartLoopPrefetch()` both early-returned
+  on `!description`, which on VP9 is null *by design* — seeking and loop prefetch would have
+  silently done nothing. They now gate on the decoder / `codec` instead. This is the kind of
+  H.264 assumption that type checks cannot catch.
+
+Nothing in `App.svelte`, `codecPlayer.ts` or the media server needed changing — the path was
+already codec-agnostic above the worker.
+
+### Gate results
+
+`npm run check`: clean, 237 files, 0 errors/warnings. `cargo check`: clean.
+
+`cargo test video_demux`: 3/3, including a new `demux_file_supports_vp9` that encodes a
+320×240 webm with `vp9enc` and asserts `vp09.00.20.08` + real dimensions + a keyframe, and
+`vp9_level_codes_match_the_annex_a_table`.
+
+> Incidental finding from writing that test: left to negotiate, `vp9enc` picks a 12-bit
+> format and emits VP9 **profile 3**, and the codec string correctly came back
+> `vp09.03.20.12`. That is a free end-to-end check that the profile/bit-depth extraction is
+> not hardcoded — the test pins `format=I420` to get the profile-0 case the library has.
+
+`scripts/perf-idle-test.sh <the VP9 file>` — `video-deck-playing` **61.00 %** vs
+`webcodecs-deck-playing` **60.05 %** `WebKitWebProcess` CPU. **CPU parity is the expected
+result and is not a disappointment**: this machine has no VA-API at all, so VP9 is
+software-decoded on either path and the total work is the same. What changes is *where* it
+happens — a decode worker instead of a synchronous block inside the main thread's
+`drawImage`. Read this line together with the frame-rate table below; on its own it would
+say the change did nothing, which is precisely the failure mode
+`control-window-frame-budget.md` §4 warns about.
+
+`scripts/latency-test.sh <the VP9 file> webcodecs` — **12/14**, and the two failures are
+the harness, not this change:
+
+- Step 4 (position advancing) and step 5 (`audio_set_rate` IPC) both fail with `no audio
+  pipeline for deck 'deck-0'`. The log shows why: `audio_load` for this file only reaches
+  `Null → Ready` about **5 s after** the demux returns, because `[scratch] decoded
+  20122785 frames (419.2 s)` — the PCM scratch buffer for a 7-minute Opus track — and the
+  waveform analysis both complete first. The harness polls at a fixed `sleep 2`.
+- **Control arm: the same file on `legacy` fails the same way** (step 5 identical, plus
+  step 3's waveform going black, which the webcodecs arm passes). So this is a long-file
+  race in the harness, on both backends, not a VP9-path regression. Steps 7, 8 and 10 —
+  2× rate tracking, waveform/position agreement, and zero legacy `<video>` DOM writes for
+  the whole run — all pass on the webcodecs arm.
+- For reference the H.264 file scores 12/14 too, failing a *different* pair (MIDI-burst CPU
+  85 % and step 8). Nothing in this suite currently reads 14/14 on this machine.
+
+**Seek was verified explicitly, because the guard change is exactly the kind that no-ops
+silently.** Driven headlessly through `__cuemarkDebug.seek()` on a real VP9 deck forced to
+`webcodecs`, comparing `getCodecFramePts()` against `getAudioTime()`:
+
+| | VP9 (`vp09.00.30.08`) | H.264 control |
+|---|---|---|
+| playing | pts 4.20 | pts 4.04 |
+| seek → 180 s (past ~35 keyframes) | pts **183.24**, audio 183.12 | pts 183.56, audio 183.60 |
+| seek back → 20 s | pts **19.44**, audio 19.33 | pts 23.24, audio 23.25 |
+
+The decoded-frame clock tracks the audio clock to ~0.1 s in both directions on both codecs.
+Had the `!description` early-return been left in place, the VP9 rows would have read "pts
+unchanged" while everything else in the app looked correct — no error, no log line.
+
+⚠️ **All five gate scripts were broken before this session and silently so.** They resolved
+`WebKitWebDriver` via `dpkg -L webkit2gtk-driver`; the binary now ships in
+`webkitgtk-webdriver`, so under `set -e` every one of them aborted on a bare `dpkg-query:
+package … is not installed` line that looks nothing like the real problem. Fixed in all
+five to ask the PATH first and fall back to either package name, with an explicit
+not-found error.
+
+### The measurement: VP9 goes 26 → 55 fps
+
+Two clean launches, one arm each, `VITE_PERF_SWEEP=1 VITE_PERF_SWEEP_TRACK=<the VP9 file>`,
+one deck, window maximised, `arm=baseline` window only. Vite killed and relaunched between
+arms (it bakes `import.meta.env` at server start). Build for both:
+`cuemark 5909dcb (dirty) profile=debug built=2026-08-05 03:40:33Z`. The "before" arm is
+`VITE_VIDEO_PATH=legacy`, which is exactly what this file did before this phase — verified
+by the absence of the `[video-path] … demux failed` line (it never attempts demux) — and
+the "after" arm is the new default, verified by
+`[video_demux] …: codec=vp09.00.30.08 640x480@25.00 au_count=10479 keyframes=82` followed
+by `[codecPlayer:deck-0] first decoded frame: pts=0 640x480`.
+
+| arm | path | `drew/n` per 5 s | draws/s | preview `dur` p50 / p90 | `busy%` | **`[raf]` fps** |
+|---|---|---|---|---|---|---|
+| before | legacy `<video>` | ~100/130 | ~20 | **19–22 ms / 32–41 ms** | **49–52 %** | **23.9–28.6** |
+| **after** | **webcodecs (VP9)** | ~124/277 | **25.0** | **0.0 ms / 4–5 ms** | **9–10 %** | **54.2–56.4** |
+
+Work metric and outcome metric move **together** — per-call cost to zero, `busy%` −42
+points, frame rate +110 %. The closing `arm=baseline2` window read **55.5–56.3 fps**, so
+the run did not drift. Both arms were validated as genuinely playing before their numbers
+were read (`Paused → Playing` on the bus, `drew > 0`, no `play` IPC retry storm, no worker
+errors); the served `codecWorker.ts` was diffed against disk (`curl
+localhost:1420/src/lib/video/codecWorker.ts`) before the after arm.
+
+`drew` is **25.0/s against a 25 fps source** — A2's frame-change gate and the codec path's
+`frame.timestamp !== lastDrawnPts` check agree exactly, and the preview now costs a
+rounding error instead of half the main thread.
+
+Two things worth carrying:
+
+1. **The residual is the deck-card text, not video.** In the same run the `noDeckText` arm
+   reads **60.4–61.3 fps** against baseline's ~55. That is `control-window-frame-budget.md`
+   §7's known ~23-point residual, now the *largest* remaining item on a playing VP9 deck.
+2. **This run did not degrade over its own length**, unlike every A1 arm (which went 52.5 →
+   36.4 fps across three minutes). 55.5 fps at t=150 s against 54.6 fps at t=5 s.
+
+### What is still on the legacy `<video>` path
+
+Everything that is not H.264 or VP9 — in practice **AV1** (broken in WebCodecs here, see
+above), VP8, HEVC and anything exotic. `video_demux.rs`'s rejection message is now
+`unsupported codec for WebCodecs demux path: {name} (H.264 and VP9 only)`. VP8 and HEVC
+were never probed for real decode; `isConfigSupported` reports `true` for both, and AV1
+has just demonstrated exactly what that claim is worth — **probe a real decode before
+adding either**.
+
 ## Risks and open items
 
+- ✅ **Phase 7 candidate — RESOLVED 2026-08-05, see "Phase 7 results" above.** VP9 ships
+  through the demux gate (26 → 55 fps on the worst library file); AV1 is refused because
+  `VideoDecoder` cannot decode it on this WebKitGTK despite reporting that it can.
+- 🔴 **AV1 has no good path, only a tolerable one.** WebCodecs decodes zero AV1 frames here
+  (proved against a real file *and* against a GStreamer-encoded control), so AV1 stays on
+  the legacy `<video>` element, where `drawImage(video)` is expensive. What makes this
+  survivable rather than a live-set blocker is A2's frame-change gate
+  (`legacy-video-fallback-cost.md`), which took the 6 fps AV1 library file from 26 → 50–54
+  fps by drawing once per source frame. **A high-frame-rate AV1 file would still be bad** —
+  the gate's value is `min(rAF fps, source fps) / rAF fps`, and the library's AV1 happens
+  to be 6 fps. Re-check WebCodecs AV1 after any WebKitGTK upgrade
+  (`scripts/probes/webcodecs_vp9_av1_probe.py` answers it in a minute); if it starts
+  working, adding it to `video_demux.rs` is a two-line change plus an `av01.P.LLT.DD`
+  string built from `av1parse`'s already-reported `profile`/`level`/`tier` caps.
+- **VP8 and HEVC are unprobed.** `isConfigSupported` says `true` for both — and AV1 has
+  just shown what that is worth. Probe a real decode before adding either.
+- ⚠️ **The 2026-08-05 watchdog trigger was *not* the `NetworkProcess` deadlock below**, despite
+  logging `comm=WebKitNetworkPr … matches known deadlock signature`. It was steady-state
+  main-thread saturation from the legacy-`<video>` bug; an idle `NetworkProcess` looks the same
+  either way. Cross-check `[raf]` fps from the same window before counting an occurrence.
 - **Two open freeze/stall findings from phase 4 — (1) fixed, (2) still open**:
   (1) the shared Rust `DeckAudioPipeline` near-end-of-track stall is
   root-caused and fixed (2026-07-26) — see "Finding: silent stall..." above;

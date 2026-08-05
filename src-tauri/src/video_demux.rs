@@ -10,13 +10,34 @@
 /// and the byte-stream/AU output format are guaranteed, not dependent on parsebin's
 /// internal autoplug choices.
 ///
-/// Phase 1 supports H.264 only: the WebCodecs `avc1.PPCCLL` codec string is read
-/// directly off the SPS NAL's profile_idc/constraint_flags/level_idc bytes (present
-/// verbatim in every keyframe AU once `config-interval=-1` forces in-band SPS/PPS),
-/// which is exact — no name-to-code table for h264parse's string-valued `profile`/
-/// `level` caps fields (e.g. "high"/"4.1") needed. Any other codec returns an honest
-/// `Err` (see the design doc's explicit allowance) — the frontend already has the
-/// legacy `<video>` fallback for a deck whose source fails this path.
+/// Supported codecs (phase 7, 2026-08-05 — see `docs/design/webcodecs-video-path.md`):
+///
+/// - **H.264** (`video/x-h264` → `h264parse`, byte-stream/AU). The WebCodecs
+///   `avc1.PPCCLL` codec string is read directly off the SPS NAL's
+///   profile_idc/constraint_flags/level_idc bytes (present verbatim in every keyframe AU
+///   once `config-interval=-1` forces in-band SPS/PPS), which is exact — no name-to-code
+///   table for h264parse's string-valued `profile`/`level` caps fields (e.g. "high"/"4.1")
+///   needed. The frontend re-muxes each AU Annex-B → avc and configures with a
+///   `description` (required on this WebKitGTK, see `h264.ts`).
+/// - **VP9** (`video/x-vp9` → `vp9parse`, `alignment=super-frame`). VP9 needs no
+///   `description` and no per-AU re-muxing: the parser's super-frame-aligned buffers are
+///   exactly what `VideoDecoder.decode()` wants. The `vp09.PP.LL.DD` string comes from
+///   the negotiated caps' `profile` and `bit-depth-luma` plus a level derived from
+///   resolution × frame rate (`vp9_level_code`), since GStreamer does not report a VP9
+///   level. Verified end-to-end by `scripts/probes/webcodecs_vp9_av1_probe.py`:
+///   120/120 real AUs decode to I420 at the right size.
+///
+/// **AV1 is deliberately NOT here.** `VideoDecoder.isConfigSupported({codec:'av01.…'})`
+/// returns `true` on this WebKitGTK and then every `decode()` fails with
+/// `EncodingError: Decode error` — 0 frames out of 120, in all four bitstream framings
+/// (obu-stream/annexb × tu/frame/obu), with and without the AV1CodecConfigurationRecord
+/// as `description`, and for a 320×240 stream GStreamer's own `av1enc` produced as a
+/// control. `isConfigSupported` is lying; gating on it would ship a permanently black
+/// deck. AV1 stays on the legacy `<video>` element, which does play it.
+///
+/// Any other codec returns an honest `Err` (see the design doc's explicit allowance) —
+/// the frontend already has the legacy `<video>` fallback for a deck whose source fails
+/// this path.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -157,8 +178,53 @@ enum PadResult {
     // caps weren't fixed — see docs/design/webcodecs-video-not-rendering.md. The real
     // dimensions are read per-`gst::Sample` in the AU-pull loop instead, which carries
     // the actual negotiated caps for that buffer.
-    Supported,
+    Supported(CodecKind),
     Unsupported(String),
+}
+
+/// Which of the demux path's supported codecs this file turned out to be. Decides the
+/// parser/capsfilter pair linked in `pad-added` *and* how the WebCodecs codec string is
+/// derived after the AU-pull loop (the SPS bytes for H.264, the negotiated caps for VP9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodecKind {
+    H264,
+    Vp9,
+}
+
+/// VP9 Annex-A level table: `(level_code, max_luma_sample_rate, max_luma_picture_size)`,
+/// level_code being the two digits WebCodecs' `vp09.PP.LL.DD` wants (10 = level 1.0).
+const VP9_LEVELS: [(u32, u64, u64); 14] = [
+    (10, 829_440, 36_864),
+    (11, 2_764_800, 73_728),
+    (20, 4_608_000, 122_880),
+    (21, 9_216_000, 245_760),
+    (30, 20_736_000, 552_960),
+    (31, 36_864_000, 983_040),
+    (40, 83_558_400, 2_228_224),
+    (41, 160_432_128, 2_228_224),
+    (50, 311_951_360, 8_912_896),
+    (51, 588_251_136, 8_912_896),
+    (52, 1_176_502_272, 8_912_896),
+    (60, 1_176_502_272, 35_651_584),
+    (61, 2_353_004_544, 35_651_584),
+    (62, 4_706_009_088, 35_651_584),
+];
+
+/// Smallest VP9 level that admits `width×height` at `fps`. GStreamer's `vp9parse` does
+/// not put a level in its caps (unlike `av1parse`), and the VP9 bitstream itself does not
+/// carry one either, so it has to be derived — this is the same rule libvpx and ffmpeg
+/// use to *stamp* a level, applied in reverse. Decoders here do not enforce the level, but
+/// the WebCodecs codec string is required to be well-formed, so it must be plausible.
+fn vp9_level_code(width: i32, height: i32, fps: f64) -> u32 {
+    let pic = (width.max(1) as u64) * (height.max(1) as u64);
+    let fps = if fps > 0.0 { fps } else { 30.0 };
+    let rate = (pic as f64 * fps) as u64;
+    for (code, max_rate, max_pic) in VP9_LEVELS {
+        if pic <= max_pic && rate <= max_rate {
+            return code;
+        }
+    }
+    62
 }
 
 /// Scans byte-stream Annex-B data (one or more start-code-delimited NAL units) for an
@@ -226,44 +292,68 @@ fn demux_file(path: &str) -> Result<DemuxedVideo, String> {
             return;
         }
 
-        if name != "video/x-h264" {
-            let _ = tx.lock().unwrap().send(PadResult::Unsupported(format!(
-                "unsupported codec for WebCodecs demux path: {name} (H.264 only in phase 1)"
-            )));
-            return;
-        }
+        let kind = match name.as_str() {
+            "video/x-h264" => CodecKind::H264,
+            "video/x-vp9" => CodecKind::Vp9,
+            // AV1 is excluded deliberately, not for lack of a parser — see the module
+            // doc comment: WebCodecs decodes zero AV1 frames on this WebKitGTK while
+            // isConfigSupported() reports true.
+            _ => {
+                let _ = tx.lock().unwrap().send(PadResult::Unsupported(format!(
+                    "unsupported codec for WebCodecs demux path: {name} (H.264 and VP9 only)"
+                )));
+                return;
+            }
+        };
 
         let link_result = (|| -> Result<(), String> {
             let pipeline = pipeline_weak.upgrade().ok_or("pipeline dropped mid-negotiation")?;
-            let h264parse = make_el("h264parse")?;
-            // -1 = repeat SPS/PPS in-band before every keyframe, not just the first — our
-            // own SPS scan (below) needs to find one at whichever keyframe a seek lands on.
-            h264parse.set_property("config-interval", -1i32);
+            let (parser, filter_caps) = match kind {
+                CodecKind::H264 => {
+                    let p = make_el("h264parse")?;
+                    // -1 = repeat SPS/PPS in-band before every keyframe, not just the first
+                    // — our own SPS scan (below) needs to find one at whichever keyframe a
+                    // seek lands on.
+                    p.set_property("config-interval", -1i32);
+                    let caps = gst::Caps::builder("video/x-h264")
+                        .field("stream-format", "byte-stream")
+                        .field("alignment", "au")
+                        .build();
+                    (p, caps)
+                }
+                CodecKind::Vp9 => {
+                    let p = make_el("vp9parse")?;
+                    // `super-frame`, NOT `frame`: a VP9 super-frame is the container's
+                    // unit and yields exactly one *displayed* frame, which is the 1:1
+                    // AU↔pts↔output-frame relationship the whole keyframe-index / seek /
+                    // decode-ahead design in codecWorker.ts assumes. `alignment=frame`
+                    // splits super-frames into their hidden ALTREF sub-frames too, so AU
+                    // count would stop matching decoded-frame count and pts would repeat.
+                    let caps = gst::Caps::builder("video/x-vp9").field("alignment", "super-frame").build();
+                    (p, caps)
+                }
+            };
             let capsfilter = make_el("capsfilter")?;
-            let filter_caps = gst::Caps::builder("video/x-h264")
-                .field("stream-format", "byte-stream")
-                .field("alignment", "au")
-                .build();
             capsfilter.set_property("caps", &filter_caps);
 
             pipeline
-                .add_many([&h264parse, &capsfilter])
-                .map_err(|e| format!("add h264parse/capsfilter: {e}"))?;
-            gst::Element::link_many([&h264parse, &capsfilter])
-                .map_err(|e| format!("h264parse->capsfilter: {e}"))?;
+                .add_many([&parser, &capsfilter])
+                .map_err(|e| format!("add parser/capsfilter: {e}"))?;
+            gst::Element::link_many([&parser, &capsfilter])
+                .map_err(|e| format!("parser->capsfilter: {e}"))?;
             capsfilter
                 .link(&sink_for_pad)
                 .map_err(|e| format!("capsfilter->appsink: {e}"))?;
-            h264parse.sync_state_with_parent().map_err(|e| format!("h264parse sync_state: {e}"))?;
+            parser.sync_state_with_parent().map_err(|e| format!("parser sync_state: {e}"))?;
             capsfilter.sync_state_with_parent().map_err(|e| format!("capsfilter sync_state: {e}"))?;
 
-            let sink_pad = h264parse.static_pad("sink").ok_or("h264parse has no sink pad")?;
-            pad.link(&sink_pad).map_err(|e| format!("parsebin->h264parse: {e}"))?;
+            let sink_pad = parser.static_pad("sink").ok_or("parser has no sink pad")?;
+            pad.link(&sink_pad).map_err(|e| format!("parsebin->parser: {e}"))?;
             Ok(())
         })();
 
         let _ = tx.lock().unwrap().send(match link_result {
-            Ok(()) => PadResult::Supported,
+            Ok(()) => PadResult::Supported(kind),
             Err(e) => PadResult::Unsupported(e),
         });
     });
@@ -272,8 +362,8 @@ fn demux_file(path: &str) -> Result<DemuxedVideo, String> {
         .set_state(gst::State::Playing)
         .map_err(|e| format!("set_state(Playing): {e}"))?;
 
-    match rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(PadResult::Supported) => {}
+    let kind = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(PadResult::Supported(k)) => k,
         Ok(PadResult::Unsupported(e)) => return Err(e),
         Err(_) => return Err("timed out waiting for parsebin to expose a video stream".into()),
     };
@@ -281,6 +371,9 @@ fn demux_file(path: &str) -> Result<DemuxedVideo, String> {
     let mut coded_width = 0i32;
     let mut coded_height = 0i32;
     let mut fps_hint = 0.0f64;
+    // VP9 only — read off the same first fixed caps as width/height (see below).
+    let mut vp9_profile = 0u32;
+    let mut bit_depth = 8u32;
     let mut aus = Vec::new();
     let mut keyframes = Vec::new();
     let mut max_end_us = 0i64;
@@ -305,6 +398,11 @@ fn demux_file(path: &str) -> Result<DemuxedVideo, String> {
                             .filter(|f| f.denom() != 0)
                             .map(|f| f.numer() as f64 / f.denom() as f64)
                             .unwrap_or(0.0);
+                        // vp9parse reports `profile` as a string ("0".."3") and
+                        // `bit-depth-luma` as a uint; both are absent on the H.264 caps,
+                        // so the defaults stand there and are never used.
+                        vp9_profile = s.get::<String>("profile").ok().and_then(|p| p.parse().ok()).unwrap_or(0);
+                        bit_depth = s.get::<u32>("bit-depth-luma").unwrap_or(8);
                     }
                 }
                 let Some(buf) = sample.buffer() else { continue };
@@ -347,12 +445,22 @@ fn demux_file(path: &str) -> Result<DemuxedVideo, String> {
         ));
     }
 
-    let codec = aus
-        .iter()
-        .filter(|au| au.key)
-        .find_map(|au| find_h264_sps_profile_level(&au.data))
-        .map(|(p, c, l)| format!("avc1.{p:02x}{c:02x}{l:02x}"))
-        .ok_or_else(|| "could not locate an H.264 SPS to derive a WebCodecs codec string".to_string())?;
+    let codec = match kind {
+        CodecKind::H264 => aus
+            .iter()
+            .filter(|au| au.key)
+            .find_map(|au| find_h264_sps_profile_level(&au.data))
+            .map(|(p, c, l)| format!("avc1.{p:02x}{c:02x}{l:02x}"))
+            .ok_or_else(|| "could not locate an H.264 SPS to derive a WebCodecs codec string".to_string())?,
+        // vp09.PP.LL.DD — profile and bit depth straight from the caps, level derived
+        // (GStreamer reports none for VP9). Decimal fields, unlike avc1's hex.
+        CodecKind::Vp9 => format!(
+            "vp09.{:02}.{:02}.{:02}",
+            vp9_profile,
+            vp9_level_code(coded_width, coded_height, fps_hint),
+            bit_depth
+        ),
+    };
 
     log::info!(
         "[video_demux] {path}: codec={codec} {coded_width}x{coded_height}@{fps_hint:.2} \
@@ -447,5 +555,59 @@ mod tests {
         assert!(!video.codec.is_empty());
 
         let _ = std::fs::remove_file(mp4_path);
+    }
+
+    #[test]
+    fn vp9_level_codes_match_the_annex_a_table() {
+        // 640x480@25 = 307200 samples > level 2.1's 245760 max picture size -> 3.0.
+        assert_eq!(vp9_level_code(640, 480, 25.0), 30);
+        // 1920x1080@30 = 2073600 samples, 62.2M samples/s -> 4.0.
+        assert_eq!(vp9_level_code(1920, 1080, 30.0), 40);
+        // Same picture size at 60fps exceeds 4.0's sample rate -> 4.1.
+        assert_eq!(vp9_level_code(1920, 1080, 60.0), 41);
+        // Degenerate inputs must still yield a well-formed two-digit level.
+        assert_eq!(vp9_level_code(0, 0, 0.0), 10);
+    }
+
+    /// Phase 7 (docs/design/webcodecs-video-path.md): VP9 must come back with a
+    /// well-formed `vp09.PP.LL.DD` string, real dimensions and non-empty AUs — the same
+    /// contract the H.264 test above asserts. `vp9enc` (libvpx) rather than the media
+    /// cache so the test needs no fixture file.
+    #[test]
+    fn demux_file_supports_vp9() {
+        gst::init().expect("gstreamer init");
+        if gst::ElementFactory::find("vp9enc").is_none() {
+            eprintln!("skipping: no vp9enc (gstreamer1.0-plugins-good/vpx) on this machine");
+            return;
+        }
+        let webm_path = std::env::temp_dir().join("cuemark-video-demux-test-vp9.webm");
+        let webm_str = webm_path.to_str().unwrap();
+
+        let launch = format!(
+            // format=I420 is load-bearing: left to negotiate, vp9enc here picks a 12-bit
+            // format and emits VP9 profile 3, which the codec string then correctly
+            // reports as `vp09.03.20.12` — a fine result, but not the 8-bit profile-0
+            // case the library actually contains.
+            "videotestsrc num-buffers=25 ! video/x-raw,width=320,height=240,framerate=25/1,format=I420 \
+             ! vp9enc deadline=1 cpu-used=8 ! webmmux ! filesink location={webm_str}"
+        );
+        let pipeline = gst::parse::launch(&launch).expect("parse_launch");
+        pipeline.set_state(gst::State::Playing).expect("play");
+        let bus = pipeline.bus().unwrap();
+        bus.timed_pop_filtered(
+            gst::ClockTime::from_seconds(60),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        pipeline.set_state(gst::State::Null).expect("null");
+
+        let video = demux_file(webm_str).expect("demux_file");
+        assert_eq!(video.coded_width, 320);
+        assert_eq!(video.coded_height, 240);
+        assert!(!video.aus.is_empty());
+        assert!(!video.keyframes.is_empty());
+        // 320x240 = 76800 samples at 25fps -> level 2.0; profile 0 / 8-bit from the caps.
+        assert_eq!(video.codec, "vp09.00.20.08", "codec string: {}", video.codec);
+
+        let _ = std::fs::remove_file(webm_path);
     }
 }
