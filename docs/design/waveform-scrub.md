@@ -363,10 +363,35 @@ settles it immediately without needing the slow/fast comparison to come out clea
 | Live run 3 (2026-08-08): vinyl jog, both directions, listened | 🔴 audio starts then dies for the whole gesture — but `[scratch-tel]` shows the feeder healthy throughout, so the fault is downstream (see above) |
 | Regression: waveform click-to-seek | 🔴 removed by this work, restored 2026-08-08 with `DRAG_THRESHOLD_PX` — a relative drag reaches only one canvas width (±16s in zoom), and the deck position bar is a display-only `<div>`, so the overview click was the only way to jump anywhere in a track |
 | Live: `VINYL_SEC_PER_TICK` calibration | ✅ ±1 deltas confirmed; `1.8 / 256` |
-| Live: vinyl jog **audio** (Fault 1 fix), incl. reverse | ⏳ the open gate — run 2 was watched, not heard |
+| Live: vinyl jog **audio** (Fault 1 fix), incl. reverse | 🔴 audio starts then dies — the downstream fault, not this feature (see below) |
 | Live: vinyl jog across pauses > `SCRATCH_IDLE_MS` | ⏳ not yet run |
-| Live: waveform drag, paused (audible) | ⏳ not yet run |
+| Live: waveform drag, paused (audible) | 🔴 run 2026-08-08 evening — **the servo and the drag gesture are correct**; audio dies mid-gesture from the same downstream fault |
 | Live: waveform drag, playing (silent seek follow) | ⏳ not yet run |
+
+## Live run 4 (2026-08-08, evening) — the drag gesture itself is verified good
+
+The waveform drag was run as arm A4 of `scratch-audio-downstream-delivery.md`'s A/B,
+deliberately in place of the jog wheel so the controller was uninvolved in every respect
+including MIDI. **It reproduces the silence identically**, which is itself a result: the
+fault is not in `handler.ts`, not in MIDI delivery, and not in the jog path.
+
+Everything this feature owns measured correct through an 18.7-second gesture — `snaps=0`,
+`arrived 0%`, `late 0%`, rms −12 to −19 dBFS continuously, cursor tracking the pointer.
+The drag mapping, the servo lag, the anchor fix and the `signum` fix are all confirmed
+working live. What is broken is downstream of everything in this doc.
+
+⚠️ **Two gesture-shape notes for anyone testing this by hand**, both of which cost time:
+
+- **Use the zoomed view, slowly.** A coarse overview drag runs at 5–10× content speed,
+  which legitimately saturates `SCRATCH_TARGET_MAX_RATE` and snaps — and snapping is
+  *designed* silence. Such a gesture cannot distinguish the fault from correct behaviour.
+- **`arrived%` is designed silence too.** A hand that slows to a stop reports `arrived
+  20–46%` and fades out on purpose; that is the feature working. The diagnostic gesture is
+  one that holds `arrived 0% snaps=0` — and the fault shows up there too.
+
+The distinguishing observation, which is what took the investigation out of this feature
+for good: **the silence never recovers inside a gesture, and a new gesture is immediately
+audible again.** A designed fade recovers as soon as the hand moves again. This does not.
 
 Watch `~/.local/share/com.cuemark.app/logs/cuemark.log` during live runs for
 `appsrc push_buffer took …ms` warnings and matched `[scratch/…] feeder start … mode=position`

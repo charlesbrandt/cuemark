@@ -1,24 +1,35 @@
 # Scratch audio reaches GStreamer and never reaches the speakers — 2026-08-08
 
-Reference point for the A/B that comes next. The short version: **the PCM scratch feeder is
-producing loud, continuous, correct audio for the entire duration of a gesture the user
-hears as silent.** Everything upstream of `input_selector` is measured and healthy. The
-fault is in the shared output stage, and the most likely cause is a device-routing
-configuration that this repo already has an open bug against.
+**Status after the evening session: the A/B is run and device routing is dead as a cause.
+Every stage from the PCM buffer to the `pulsesink`'s own sink pad is now measured
+delivering non-silent audio continuously through the silence.** The fault is inside the
+sink's render stage or below it, and H5 (zero sink margin) is the leading hypothesis with
+its precondition confirmed by measurement. Next step is `GST_DEBUG` inside the sink — see
+"Where to pick up".
+
+The original short version, still true: **the PCM scratch feeder is producing loud,
+continuous, correct audio for the entire duration of a gesture the user hears as silent.**
 
 This doc exists because the same fault was chased three times in one session by inference
 and fixed three times in the wrong place. Do not add code against a guess here. The
-instruments below exist so the next step can be a measurement.
+instruments below exist so each step can be a measurement.
 
 ## Provenance
 
-One session, 2026-08-08, live on the real machine with the Hercules Starlight attached.
-Three live runs against `docs/design/waveform-scrub.md`'s vinyl-jog gate. Runs 1 and 2
-found real defects in the scratch feeder (all fixed, all confirmed fixed by the telemetry
-below). Run 3 is the one this doc is about: with those defects gone, the audio still dies.
+**Session 1, 2026-08-08 (afternoon)** — live on the real machine with the Hercules
+Starlight attached. Three live runs against `docs/design/waveform-scrub.md`'s vinyl-jog
+gate. Runs 1 and 2 found real defects in the scratch feeder (all fixed, all confirmed
+fixed by the telemetry below). Run 3 is the one this doc was opened about: with those
+defects gone, the audio still dies.
 
 Log: `~/.local/share/com.cuemark.app/logs/cuemark.log`, gestures at 16:01:12–16:01:39 and
 16:02:24–16:02:25.
+
+**Session 2, 2026-08-08 (evening)** — ran the A/B below to completion, found and fixed a
+UI bug that had been silently preventing arm A4 from ever being reached, and added the
+delivery instrument this doc had specified as the next one to build. Same machine, same
+build lineage (`c14035c`), waveform drag rather than the jog wheel so the controller is
+uninvolved in every respect including MIDI. Log: same file, `18:52`–`19:17`.
 
 ## What is established
 
@@ -58,8 +69,42 @@ confirmed by the user as "any time", with no jog involved. Nothing in the scratc
 produce that. With cue open, the Starlight receives the deck twice, summed — which is a
 sufficient explanation and needs no code.
 
-**F6 — the silence does not recover mid-gesture.** User-confirmed: once it goes, it stays
-gone until the gesture ends and a new one starts.
+**F6 — the silence does not recover mid-gesture.** User-confirmed, and re-confirmed in
+session 2 under arm A4: once it goes, it stays gone until the gesture ends, and a **new
+gesture is audible again immediately**. This is the single most diagnostic observation in
+the doc. It rules out the `arrived`-fade explanation outright — a designed fade recovers
+the moment the hand moves again *inside* the same gesture, and this does not — and it
+points at something that is re-established per gesture. Every gesture drives
+`Paused → Playing` (`pipeline.rs`, `begin_or_update_scratch`), which re-rolls `base_time`.
+
+**F7 — device routing is not the cause (session 2).** The A/B ran down to arm A4: a
+single `pulsesink`, on the onboard PCM2902C, with the Starlight carrying no audio at all
+and the cue branch on a `fakesink`. **The audio still dies mid-gesture.** H1 does not
+explain this fault. See the filled table below.
+
+**F8 — the whole graph delivers, all the way to the sink pad (session 2).** The delivery
+probes (`DeliveryProbe`, `pipeline.rs`) count buffers at `volume`'s src pad and the
+`pulsesink`'s sink pad, reported in `[scratch-tel]` once a second. Over an 18.7-second A4
+gesture the user heard die partway through:
+
+```
+19:16:44  rms −15.6 dBFS  arrived 1%   | delivery vol0=70/s(-0ms) sink0=70/s(-0ms)
+19:16:47  rms −12.9 dBFS  arrived 0%   | delivery vol0=67/s(-0ms) sink0=67/s(-0ms)
+19:16:52  rms −18.9 dBFS  arrived 21%  | delivery vol0=67/s(-0ms) sink0=67/s(-0ms)
+19:16:57  rms −16.0 dBFS  arrived 0%   | delivery vol0=67/s(-0ms) sink0=67/s(-0ms)
+19:17:01  rms −13.3 dBFS  arrived 0%   | delivery vol0=67/s(-1ms) sink0=67/s(-1ms)
+```
+
+**67 buffers/s into the sink, unbroken, for the entire gesture**, carrying −12 to −19 dBFS
+of real signal. Not one second dips. There is no delivery stall anywhere in the graph:
+GStreamer hands the device the audio and it does not come out.
+
+**F9 — the sink margin is pinned at zero, measured (session 2).** The same probe reports
+each buffer's running time minus the element's current running time. It reads **−0ms every
+second, from the first chunk** — not a decay, a structural constant. That is H5's
+precondition confirmed rather than argued: a just-in-time feeder with `do-timestamp=true`
+cannot produce slack. ⚠️ It is the *precondition*, not the mechanism — a resyncing ring
+buffer and a healthy one are indistinguishable from outside the sink.
 
 ## What is ruled out, and by what
 
@@ -72,6 +117,13 @@ gone until the gesture ends and a new one starts.
 | Gesture-start anchor mismatch (was real, now fixed) | F1 — `snaps=0`, where every gesture used to open on a silent snap |
 | `appsrc` internal queueing / the mechanism-6 stall | F2 — probes at three points, all nonzero |
 | Anything in the scrub bus, the MIDI handler, or `WaveformCanvas` | F1 — the feeder receives correct targets and acts on them |
+| The cue branch / two sinks on one physical device (H1) | F7 — arm A4: one sink, one device, cue on `fakesink`, still dies |
+| Multi-sink `tee` topology generally | F7 — A4 has a single main branch |
+| MIDI, `midir`, the jog wheel, `handler.ts` | Session 2 reproduced it with a **mouse waveform drag**; the controller carried neither audio nor input |
+| A stall in `output_queue` / `tee` / `volume` | F8 — 67 buffers/s at `volume`'s src pad throughout |
+| The sink being starved (anything upstream of it) | F8 — 67 buffers/s at the sink's own sink pad throughout |
+| The `arrived`-fade being mistaken for a fault | F6 — designed silence recovers when the hand moves again; this does not |
+| The servo's `SCRATCH_TARGET_MAX_RATE` clamp | Telemetry: the clamp engaged in 1 second of a 13.5s gesture (the closing flick). The steady portion asked for 0.05–1.6×, nowhere near 8.0 |
 
 ## The instruments, and how to read them
 
@@ -89,36 +141,102 @@ see `audio-dropout-mid-playback.md` §"Secondary finding".)
 ⚠️ **`push_buffer took …ms` only warns above 50ms**, so its silence is weak evidence.
 F1/F2 are the strong forms.
 
+**`delivery …` in the same `[scratch-tel]` line (`DeliveryProbe`, `pipeline.rs`)** — added
+2026-08-08 (evening), this doc's own prescribed next instrument. `<label>=<buffers/s>(<margin>)`
+for `volume`'s src pad (`vol<i>`) and each `pulsesink`'s sink pad (`sink<i>`):
+
+- **buffers/s** — `0/s` while the feeder is producing means a delivery stall, and the label
+  says which link. Steady 67/s through silence means delivery is not the fault at all.
+- **margin** — the buffer's own running time minus the element's current running time.
+  Positive = arrived ahead of the clock and the sink can wait for it. Negative = already
+  late on arrival. A margin walking steadily negative across a gesture *is* H5.
+
+It reports into the feeder's telemetry line deliberately: correlating delivery against the
+rms that produced it, across two separate log lines, is most of what made this fault hard
+to read.
+
+⚠️ **The counters are cumulative for the life of the pipeline** — only the per-second delta
+is meaningful, and the feeder baselines them at gesture start.
+
+⚠️ **`instrument_sink_flow()`'s gap warning cannot see this fault, and its silence proves
+nothing.** It only reports a gap when flow *resumes*, and a stall that persists to the end
+of a gesture is followed by a transition out of `Playing` that invalidates the probe's
+timestamp (the D2 invalidation in `audio-dropout-mid-playback.md`, working as designed).
+The delivery counters are deliberately ungated for exactly this reason.
+
+## The bug the A/B found on its way through — arm A4 was unreachable from the UI
+
+**`audioSetCueDevice("")` was never sent.** `App.svelte`'s cue-device `$effect` read:
+
+```js
+const deviceId = $cueOutputDeviceId;
+if (deviceId) audioSetCueDevice(deviceId).catch(console.error);   // '' is falsy
+```
+
+Selecting **`— none —`** sets the store to `""`, which is falsy, so the call was skipped
+and the backend kept whatever cue device it had last been told about. **The UI read
+"— none —", greyed out the headphone slider, and the pipeline went on building a live
+`pulsesink` on the Starlight.** Fixed 2026-08-08 (send unconditionally, change-guarded in
+the `_lastMasterVolume` idiom already in the file).
+
+Consequences worth carrying forward:
+
+- **This is a real user-facing bug independent of the investigation**: once a cue device
+  was set it could not be turned off without restarting the app. It only ever bit on
+  *disable* — a fresh boot with no cue persisted also skips the call, but the backend's own
+  default is already "no cue", so the two agreed by luck.
+- It silently turned arm A4 into arm A3 for two attempts running. **Never confirm a device
+  arm from the UI.** The authority is the log:
+  ```
+  [audio/deck-0/0]   sink: pulsesink device="…BurrBrown…USB_AUDIO_CODEC…"
+  [audio/deck-0-cue] no device set — cue output routed to fakesink
+  ```
+- The backend already had a matching no-op guard (`mod.rs`, `audio_set_cue_device`) whose
+  comment says "same bug, same fix, for the headphone cue output's `$effect` in
+  App.svelte" — the guard was added on the backend side while the frontend kept the
+  truthiness test that caused the problem.
+
 ## Hypotheses
 
-Deliberately not re-derived here — **H1–H4 in `audio-dropout-mid-playback.md` are the same
-hypothesis set** and that doc already argues them properly. H1 (the cue branch on the same
-physical USB device) is the leading one and F4 confirms the configuration is present.
+**H1 (the cue branch / shared physical device) is refuted for this fault** by F7 — arm A4
+has one sink on one device and still dies. It remains a live hypothesis for
+`audio-dropout-mid-playback.md`'s separate D1, which was never reproduced here.
 
-What this session adds to that doc is the thing it says it is blocked on:
+**H5 — zero sink margin — is the leading hypothesis, and its precondition is now
+measured.** The feeder produces exactly real time (15ms per 15ms) with `do-timestamp=true`,
+so buffers are stamped at push time and arrive with no head start: F9 reads **−0ms every
+second, from the first chunk**. `GstAudioBaseSink` writes samples into its ring buffer at
+the position their timestamp implies, so with zero slack a few milliseconds of jitter
+decide whether a buffer lands ahead of the write pointer or behind it. That is a mechanism
+which can begin failing mid-gesture and stay failed for the rest of the `Playing` span —
+and which a new gesture's fresh `base_time` resets. **It is the only hypothesis on the list
+that predicts F6's shape.**
 
-> "If it still will not reproduce, accept that this may need to be caught in the wild
-> instead… Leaving it instrumented and waiting is a legitimate plan for a one-occurrence
-> fault."
+Note this is structural to position-mode scratch: you cannot pre-buffer content whose
+position the user has not chosen yet. If H5 is confirmed, the fix is a latency/timestamp
+offset — push buffers a fixed lead ahead of the clock, or give the sink a `ts-offset` — and
+it is emphatically **not** a bigger queue and **not** anything in the feeder or servo.
 
-🟢 **There is now an on-demand reproducer.** A jog gesture on a paused deck kills the audio
-within a second or two, every time, in the configuration H1 describes. If the two faults
-share a root cause, D1 is no longer blocked on catching it in the wild. **Establishing
-whether they do share a cause is the point of the A/B below**, and it is worth more than
-either fix on its own.
+**H6 (the Paused→Playing cycle across three sinks)** is weakened but not dead: A4 still
+does the transition, on one sink. If `GST_DEBUG` shows the ring buffer resyncing, H5 and H6
+are the same finding seen from two sides.
 
-Two additions specific to the scratch path:
+The remaining candidate if `GST_DEBUG` clears the sink: **PipeWire/ALSA below GStreamer**
+(H4's territory). Nothing has yet observed the device's own behaviour during a gesture —
+`pw-top`'s `ERR` column and a `pw-record` capture of the sink monitor are both unspent.
 
-**H5 — zero sink margin.** The feeder produces exactly real time (15ms per 15ms) with
-`do-timestamp=true`, so buffers are stamped at push time and arrive with no head start. A
-sink wanting data slightly *ahead* of now can never be satisfied. Note this is structural
-to position-mode scratch: you cannot pre-buffer content whose position the user has not
-chosen yet. If H5 is the cause, the fix is a latency/timestamp offset, not a bigger queue.
+### On the shared-cause question with `audio-dropout-mid-playback.md`
 
-**H6 — the Paused→Playing cycle across three sinks.** `CLAUDE.md` documents that
-`pipewiresink` deadlocks when two or more go Paused→Playing with any delay, which is why
-this app uses `pulsesink`. Three `pulsesink`s, two on one device, doing that transition on
-every gesture is the same shape even if not the same bug.
+Session 1 opened this doc hoping the two faults shared a root cause, which would have given
+that doc's D1 an on-demand reproducer instead of a multi-hour wait. **The A/B answered it,
+and the answer is probably no.** D1's H1 configuration (two sinks on one USB device) is
+*absent* in arm A4 and this fault persists regardless — so whatever this is, it is not the
+device-contention mechanism D1 is about. The scratch reproducer does not transfer.
+
+What does transfer is the delivery instrument: `DeliveryProbe` is not scratch-specific, and
+during normal playback it would answer D1's central question ("did the sink keep receiving
+buffers during the 10.8s gap?") directly. Wiring its output into a non-scratch log line is
+cheap and would make the next wild occurrence far more readable.
 
 ## The A/B protocol
 
@@ -137,47 +255,87 @@ Per arm, record:
 - **T** — the `[scratch-tel]` lines for that gesture: `rms`, `arrived%`, `late%`
 - **U** — `output_queue underrun` delta (context only; see the warning above)
 
+### ✅ RUN 2026-08-08 (evening) — results
+
 | # | Arm | Mains | Cue | P | S | T | U |
 |---|---|---|---|---|---|---|---|
-| A0 | Baseline — as reported | default + Starlight | Starlight | clip | dies | healthy | 67/s |
-| A1 | Cue off entirely | default + Starlight | off | | | | |
-| A2 | One main only, cue off | Starlight only | off | | | | |
-| A3 | One main only, cue elsewhere | Starlight only | PCM2902C | | | | |
-| A4 | One main, no controller involved | PCM2902C only | off | | | | |
+| A0 | Baseline — as reported | default + Starlight | Starlight | **clip** | **dies** | healthy | 67/s |
+| A1 | Cue off entirely | default + Starlight | off | not run | not run | | |
+| A2 | One main only, cue off | Starlight only | off | not run | not run | | |
+| A3′ | One main, cue elsewhere *(mirrored)* | PCM2902C only | Starlight Rear | **pristine** | **dies** | healthy | 67/s |
+| A4 | One main, no controller involved | PCM2902C only | off (`fakesink`) | **pristine** | **dies** | healthy | 67/s |
 
-**How to read it:**
+A1 and A2 were skipped deliberately: A4 subsumes them (it is strictly fewer sinks than
+either), and it came back dirty, so nothing they could have shown would change the verdict.
+A3 ran mirrored — mains on the PCM2902C and cue on the Starlight rather than the reverse —
+which is the same arm shape (one main, cue on a different device) and was what the live
+config made cheapest.
 
-- **A1 clean ⇒ H1 confirmed** (the cue branch is the trigger) and it lands squarely on
-  `audio-dropout-mid-playback.md`'s D1, with a reproducer attached.
-- **A2 clean but A1 dirty ⇒ it is multi-sink, not cue specifically** — the second main sink
-  is enough. Points at the `tee`/multi-sink topology (`mixer.rs`'s shelved `MasterMix` may
-  be the real answer).
-- **A4 dirty ⇒ none of the above.** One sink, one device, no controller: the fault is in
-  `output_queue`/`tee`/`volume` or in H5, and the next step is
-  `GST_DEBUG=queue:5,pulsesink:5` on that arm plus a pad probe at `volume`'s src pad —
-  the one stage F2's probes do not yet cover.
-- **P and S disagreeing across any arm ⇒ two faults**, and the clipping half is a normal-playback
-  bug that has nothing to do with scratch.
+**What it says:**
 
-A4 is the most informative single arm if only one can be run. Run it first if time is short.
+- **P and S moved independently ⇒ two faults**, as the read rule predicted. The clipping
+  vanished the instant the mains stopped sharing a device with the cue, which is exactly
+  F5's summing explanation. **That half is a routing configuration, not a bug, and it is
+  closed.**
+- **S is unmoved by every routing variable.** Down to one sink on one device with the
+  controller carrying nothing, it still dies. **H1 is dead for this fault** (F7), and with
+  it the hope that this and `audio-dropout-mid-playback.md`'s D1 share a cause — see that
+  doc's updated "Where to pick up".
+- Combined with F8, the fault is **inside the sink's render stage or below it**.
+
+⚠️ **Two traps that cost time in session 2, both worth avoiding on any re-run:**
+
+1. **Drag the *zoomed* waveform, slowly.** A coarse overview drag runs at 5–10× content
+   speed, which legitimately produces `snaps` and high `arrived%` — both of which are
+   *designed* silence. Those gestures cannot distinguish the fault from correct behaviour.
+   The usable gesture looks like `arrived 0% snaps=0` with rms −10 to −16 dBFS.
+2. **Confirm the arm from the log, never from the UI.** See the cue-device bug below.
 
 ## Where to pick up
 
 Nothing here needs a code change to proceed. Run the A/B, fill in the table, then decide.
 
-If A4 comes back dirty and the investigation moves into the output stage, the missing
-instrument is a pad probe at `volume`'s src pad (and at each `pulsesink`'s sink pad),
-following the exact pattern already in `scratch_second_gesture_reverse_repro` — that is the
-one gap between F2's coverage and the speakers.
+**Next step: `GST_DEBUG` inside the sink, on arm A4.** Everything outside the sink is now
+measured and clean, so the only remaining place to look is where cuemark cannot log:
+
+```bash
+GST_DEBUG=audiobasesink:6,pulsesink:5 \
+GST_DEBUG_NO_COLOR=1 \
+GST_DEBUG_FILE=/tmp/gst-a4.log \
+cargo tauri dev
+```
+
+Then one ~15s slow zoomed drag on a paused deck, carried a couple of seconds *past* the
+point the sound dies — the cut is the event, and the log needs both sides of it. Grep for
+`late`, `resync`, `skew`, `dropping`. Those words appearing as the sound dies confirms H5
+and the fix is a timestamp/latency offset (a fixed lead on the pushed buffers, or a
+`ts-offset` on the sink). Their **absence** clears GStreamer and sends this to PipeWire/ALSA
+— at which point `pw-top`'s `ERR` column and a `pw-record` capture of the sink monitor
+during a gesture are the unspent instruments.
+
+⚠️ Level 6 on `audiobasesink` is per-buffer and large; `GST_DEBUG_FILE` is not optional.
 
 **Do not** re-fix anything in the feeder, the servo, the scrub bus or the MIDI handler
-against this symptom. F1 covers all of it, and it was already fixed three times there by
-mistake.
+against this symptom. F1 and F8 cover all of it end to end, and it was already fixed three
+times there by mistake.
+
+### Adjacent work this investigation surfaced but did not do
+
+- **Raise `SCRATCH_TARGET_MAX_RATE` (currently 8.0), and revisit `SCRATCH_TARGET_SNAP_SECS`
+  with it.** A fast overview drag saturates the clamp and then snaps, and snapping is
+  silent by design — so coarse drags sound broken even when nothing is wrong. Position mode
+  **cannot drift** (the target is absolute; error never accumulates the way the old
+  velocity path's did), so the cap is about pitch/aliasing at extreme speed, not position
+  integrity. Raising it is safe in the way that matters. Deliberately deferred so it does
+  not muddy the arms.
+- **Wire the delivery counters into a non-scratch log line**, for `audio-dropout-mid-playback.md`'s
+  D1 — see "On the shared-cause question" above.
 
 ### Related
 
-- `docs/design/audio-dropout-mid-playback.md` — H1–H4, the false-positive analysis, and
-  D1, which this reproducer unblocks. **Read before forming a hypothesis.**
+- `docs/design/audio-dropout-mid-playback.md` — H1–H4, the false-positive analysis, and D1.
+  ⚠️ The hoped-for shared cause did **not** survive the A/B; read "On the shared-cause
+  question" above before assuming this doc's findings transfer to that one.
 - `docs/design/waveform-scrub.md` — the feature, its three fixed faults, and the live-run
   history that produced this doc.
 - `docs/design/pcm-buffer-playback.md` — the feeder, and mechanisms 5/6/7, the previous

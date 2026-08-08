@@ -374,18 +374,32 @@ the two.
 
 ## Where to pick up
 
-🟢 **2026-08-08: D1 may no longer be blocked on a reproducer.** A separate investigation
-(`docs/design/scratch-audio-downstream-delivery.md`) found scratch audio dying on demand —
-within a second or two, every gesture — on a deck configured exactly as H1 describes:
-**three `pulsesink`s, two of them on the same physical USB device**. The PCM feeder is
-measured healthy throughout (`[scratch-tel]`, −9.6 to −18.9 dBFS for 28s) and pad probes
-clear `appsrc → input_selector`, so that fault is also in the shared output stage.
+🔴 **2026-08-08 (evening): the hoped-for shared reproducer did NOT pan out. D1 is still
+blocked on catching this in the wild.**
 
-Whether it is *this* fault is unproven and is exactly what that doc's device-routing A/B is
-designed to answer. If the two share a cause, step 3's "the scratch/PCM feeder branch
-(never engaged)" exclusion still holds — the feeder is not the suspect, the output stage
-shared by both paths is — and D1 gains a reproducer that runs in seconds instead of a
-multi-hour set. **Read that doc before spending another soak arm here.**
+Earlier the same day it looked like `docs/design/scratch-audio-downstream-delivery.md`
+might have handed D1 an on-demand reproducer: scratch audio dying within a second or two,
+every gesture, on a deck configured exactly as H1 describes (three `pulsesink`s, two on one
+USB device). That doc then **ran its device-routing A/B to completion**, and the result
+removes the connection:
+
+- Arm **A4** — a single `pulsesink`, on the onboard PCM2902C, cue on a `fakesink`, the USB
+  controller carrying no audio at all — **still dies**. H1's configuration is absent and
+  the fault is unchanged.
+- New pad probes there count **67 buffers/s reaching the sink's own sink pad, unbroken,
+  through the silence**. That fault is not a delivery stall at all; it is inside the sink's
+  render stage or below it.
+
+So the scratch fault is **not** the device-contention mechanism D1 is about, and its
+reproducer does not transfer. Everything in "Where D1 goes next" below stands unchanged.
+
+🟢 **What *does* transfer is the instrument.** `DeliveryProbe` (`pipeline.rs`) is not
+scratch-specific — it counts buffers and measures clock margin at `volume`'s src pad and
+each `pulsesink`'s sink pad. Wired into a non-scratch log line it would answer D1's central
+question directly ("did the sink keep receiving buffers during the 10.8 s gap?"), which is
+the one thing the 2026-08-05 evidence could not settle. **That is the cheapest useful thing
+to do here before the next long set**, and it makes a wild occurrence readable instead of
+ambiguous.
 
 1. ~~Ship **D2** first.~~ Done 2026-08-05. The gap warning is now trustworthy and carries an
    onset timestamp; `cargo test sink_flow_gap_gating -- --ignored` is its regression guard.
