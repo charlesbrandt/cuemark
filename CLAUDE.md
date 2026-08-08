@@ -602,6 +602,13 @@ distinguishes the dev binary from the launcher one, and old log files keep their
 so a report from last week still identifies its code. Check this line before diagnosing
 anything from a log.
 
+⚠️ **`built=` is when `build.rs` last ran, not when the binary was last linked.** Cargo reruns
+`build.rs` on its own trigger conditions, so an ordinary source edit can recompile and relink
+while the stamp stays put — observed 2026-08-08 with the stamp 8s behind the exe's mtime. The
+SHA and dirty flag are still right, which is what usually matters. To settle "is this binary
+the current source", the reliable check is `cargo build` reporting `Finished` with no
+`Compiling` line.
+
 **First-time / new machine setup** (in addition to Rust + Node toolchains):
 ```bash
 # GStreamer dev headers — runtime packages alone aren't enough
