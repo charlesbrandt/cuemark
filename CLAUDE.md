@@ -247,6 +247,18 @@ to fit a fractional BPM and beat-level grid anchor, auto-populating `deck.bpm`/`
 A saved grid (DeckCard SET BEAT button) beats the auto-fit — see `gridSource.ts`. `Session.snapToBeat`
 (SNAP toolbar toggle) routes seeks/hot-cues/loop points through `quantizeToGrid()` in `seekBus.ts`.
 
+**Direct manipulation (waveform drag, vinyl jog) drives the scratch feeder by absolute
+*position*, never by rate** — `scratch_to()` in `pipeline.rs`, the scrub bus in `seekBus.ts`.
+Both inputs are burst-delivered (USB MIDI ticks; rAF- and WebKit-coalesced pointer moves),
+which makes a velocity estimate unrecoverable: the inter-event interval it divides by is an
+artefact of delivery timing, coalescing a *rate* silently discards motion, and with no
+absolute reference the error accumulates for the whole gesture. A target has none of those
+failure modes and coalesces losslessly. Shuttle-mode jog deliberately stays on the velocity
+path (`scratch()`) — free-running between ticks is the point of that mode.
+**Read `docs/design/waveform-scrub.md` before touching** `WaveformCanvas`'s pointer
+handlers, the scrub bus, `jog_nudge`'s vinyl branch, or the feeder's servo — it also carries
+the still-open `VINYL_SEC_PER_TICK` calibration, which needs the controller.
+
 **`deck.downbeat` is a beat-level phase anchor, NOT bar-beat-1** — every consumer
 (`getPhase`, `quantizeToGrid`, `nudgePhaseToMaster`) works mod one beat, and nothing detects
 bar identity yet. It must carry the comb fit's *measured* `gridOffset`; anchoring it at `t=0`
@@ -479,8 +491,19 @@ as of a same-day live verification pass** (see below) — neither should be cite
   finding points at DMA-BUF. See the doc's "2026-08-05 live verification" section.
 - `docs/design/audio-dropout-mid-playback.md` — 10.8s of silence mid-track with the pipeline in
   `Playing` and the frame rate healthy, ~21s after headphone cue was enabled on a USB controller
-  carrying both the main and cue sinks. No reproducer yet. Fix the 6:1 false-positive rate in
-  `instrument_sink_flow()` first or the soak will be unreadable.
+  carrying both the main and cue sinks. Fix the 6:1 false-positive rate in
+  `instrument_sink_flow()` first or the soak will be unreadable. 🟢 **"No reproducer yet" is
+  out of date** — see below.
+- `docs/design/scratch-audio-downstream-delivery.md` — 🔴 **open, and the next thing to run.**
+  Scratch audio reaches GStreamer and never reaches the speakers: `[scratch-tel]` shows the PCM
+  feeder producing −9.6 to −18.9 dBFS continuously for a full 28s gesture the user hears as
+  silent, and pad probes clear `appsrc → input_selector`, so the fault is in the shared output
+  stage. Same deck runs **three `pulsesink`s, two on the same physical device** — the exact
+  configuration `audio-dropout-mid-playback.md`'s H1 describes, which makes a jog gesture an
+  **on-demand reproducer** for a fault that doc was blocked on catching in the wild. Carries a
+  5-arm device-routing A/B; **run it before writing any code against this symptom.**
+  ⚠️ Do not cite `output_queue underrun` here — it fires once per chunk by construction during
+  a scratch (66.8/s against a 66.7/s chunk rate) and adjudicates nothing.
 
 ## Development phases
 
@@ -714,6 +737,7 @@ Several automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb
 | `scripts/probes/webgl_readback_variants_probe.py` | Route matrix for the same question — attachment formats, explicit `readBuffer`, PBO + `getBufferSubData`, `copyTexSubImage2D` — with a `LIBGL_ALWAYS_SOFTWARE=1` control arm that separates driver faults from WebKit faults. Run this before concluding anything about readback. |
 | `scripts/probes/webgl_readpixels_diag_probe.py` | Why a readback failed: reports the returned bytes *and* the GL error, `getError()` sanity, framebuffer completeness, and the implementation's preferred read format. |
 | `scripts/probes/imagebitmap_upload_probe.py` | `ImageBitmap`/`VideoFrame` upload semantics — does `createImageBitmap(VideoFrame)` carry real pixels, and which flip mechanism actually applies. Run before touching the output path's orientation handling. Needs `LIBGL_ALWAYS_SOFTWARE=1` for pixel verdicts. |
+| `scripts/probes/pointer_events_probe.py` | Does this WebKitGTK deliver **Pointer Events** for real mouse input on a `<canvas>`? Pushes GDK button/motion events through the same platform→DOM path an X11 mouse takes, with a mouse-event control arm — API presence alone proves nothing here. Run before building any drag/pointer gesture. Seconds, no app, no media. |
 | `scripts/probes/video_frame_signal_probe.py` | Which frame-change signal a legacy `<video>` element actually exposes here — `currentTime` (gates nothing), `requestVideoFrameCallback` (present, rate unmeasurable headlessly), `getVideoPlaybackQuality().totalVideoFrames` (tracks the source frame rate exactly). Run before writing any "has this video advanced a frame?" check. Seconds, needs a real media file. |
 | `scripts/probes/output_window_compositor_probe.py` | End-to-end check of the **real** `output.html`: posts a synthetic frame from a same-origin sender and reads the composited result back, including an orientation assertion. Run after touching `outputBus.ts`, `output.ts`, `outputProtocol.ts` or `fbo.ts`. Needs the Vite dev server and `LIBGL_ALWAYS_SOFTWARE=1`. |
 

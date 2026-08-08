@@ -1624,3 +1624,36 @@ assumes a driving mechanism exists (here: a video track) needs to verify that
 assumption, not just the symptom — "hasn't changed in N seconds" looks
 identical whether the driver is wedged or absent, but the correct response is
 opposite (recover vs. do nothing).
+
+## Position mode added to the feeder — 2026-08-08
+
+The feeder gained a second control mode. Everything above describes **velocity mode**:
+`scratch(rate, hold_ms)` sets a signed rate and the thread free-runs at it until told
+otherwise, decaying on `hold_ms`. That is still what shuttle-mode jog uses and it is
+unchanged.
+
+**Position mode** (`scratch_to(target_secs, hold_ms)`, `ScratchFeeder::target_frames_bits`,
+NaN = velocity mode) instead takes an absolute target in content seconds and derives each
+chunk's rate from the distance left to cover. It exists because velocity is the wrong
+control variable for direct manipulation — the waveform drag and vinyl-mode jog both
+deliver input in bursts, which makes a reconstructed rate depend on delivery timing rather
+than on how far the user moved, with no absolute reference to correct against.
+
+Consequences worth knowing if you touch the feeder loop:
+
+- Silence and a frozen cursor come from **arriving at the target**
+  (`SCRATCH_TARGET_EPSILON_FRAMES`), not from `hold_ms` — which stays only as a backstop
+  against a caller that stops updating without calling `stop_scratch()`.
+- A target change beyond `SCRATCH_TARGET_SNAP_SECS` snaps the cursor and re-ramps through
+  `SCRATCH_FADE_FRAMES` rather than sweeping, so a coarse whole-track drag does not race
+  audibly through a hundred seconds of content.
+- Pitch bend is unchanged in kind: it is still purely a consequence of how fast the cursor
+  walks the buffer. Position mode changes what *sets* that speed, not how sound is made.
+- `DeckAudioPipeline::last_scratch_frame` now carries the cursor's landing position across
+  gesture boundaries, so a new gesture starting inside `stop_scratch_feeder()`'s ~300ms of
+  drain sleep and resync seeks no longer restarts from `query_position()`'s stale
+  pre-gesture answer. That was a real, frequently-hit jump: `SCRATCH_IDLE_MS` (500ms) fires
+  the teardown on any pause longer than half a second, which is what precise cueing looks
+  like. Guarded by `scratch_to_smoke`.
+
+Full rationale and the frontend side: `docs/design/waveform-scrub.md`.

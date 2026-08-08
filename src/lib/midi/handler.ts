@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { updateDeck, getDeck, setCrossfader, setMasterVolume, session } from "../state/session";
-import { seekDeck, getDeckTime, quantizeToGrid, setScratching, isScratching } from "../renderer/seekBus";
+import { seekDeck, getDeckTime, quantizeToGrid, setScratching, isScratching, beginScrub, updateScrub, endScrub } from "../renderer/seekBus";
 import { nudgePhaseToMaster } from "../audio/phaseNudge";
 import { syncRate, syncGain, syncVolume } from "../audio/audioSync";
 import { audioScratch, audioStopScratch } from "../audio/pipeline";
@@ -133,16 +133,82 @@ const SCRATCH_EMA_ALPHA = 0.4;
 // when the user is done and moves on.)
 const SCRATCH_IDLE_MS = 500;
 
+// ── Vinyl mode: position, not velocity ────────────────────────────────────────────
+//
+// Vinyl mode no longer estimates a rate from tick timing. The EMA above still serves
+// shuttle mode, where free-running between ticks is the entire point, but it was the
+// wrong control variable for vinyl — which is direct manipulation, and therefore about
+// *how far the wheel turned*, not how fast. Three things made the old path's travel
+// depend on delivery timing rather than on the user's hand:
+//
+//   1. queueScratchRate coalesces by overwrite, so a burst of ticks landing inside one
+//      frame became a single rate update and the rest of the wheel motion was dropped.
+//   2. USB MIDI delivers in bursts, collapsing (now - prev.lastT) onto SCRATCH_MIN_DT_MS
+//      and saturating the computed rate at the mode's cap.
+//   3. Nothing held an absolute reference, so every over- and undershoot accumulated for
+//      the whole gesture with no way to correct.
+//
+// Accumulating ticks into an absolute target removes all three at once: N ticks move the
+// track by exactly N ticks of travel whenever they arrive, and coalescing absolute
+// targets discards nothing. See seekBus.ts's scrub section and scratch_to() in
+// pipeline.rs. Shuttle mode is untouched below.
+
+// Content seconds of travel per encoder tick. 33⅓rpm is 1.8s per revolution, so the
+// vinyl-faithful value is 1.8 / (ticks per revolution).
+//
+// ✅ Calibrated live against the Starlight 2026-08-08, and the correctness question this
+// constant was blocked on is settled: **the encoder reports plain ±1 deltas, not
+// speed-scaled steps.** Two one-revolution gestures, ~3x apart in speed, both reported
+// `maxAbs=1 values=[1]` across every message — 248 messages over 6.06s (41/s) slow,
+// 276 over 2.11s (131/s) fast. So accumulating ticks into an absolute target is exact,
+// and the design above is correct as built. (The suspicion recorded on
+// SCRATCH_MODE_PARAMS.shuttle below was wrong; corrected there.)
+//
+// 256 ticks/revolution: bracketed by both measurements (-3.1% / +7.8%), a common encoder
+// resolution, and well inside the error of judging "exactly one revolution" by hand —
+// which is the only thing the 248-vs-276 spread measures, since the speed question is
+// already answered by maxAbs. Re-run the [jog-cal/…] procedure in
+// docs/design/waveform-scrub.md if the platter ever feels off-speed.
+const VINYL_SEC_PER_TICK = 1.8 / 256; // 0.00703
+
+// Ends a vinyl gesture once ticks stop, handing the deck back to the normal branch.
+// Longer than SCRATCH_IDLE_MS was for velocity mode's benefit is unnecessary here — the
+// feeder already goes silent the moment the cursor reaches the target — so this stays on
+// the same timer, now harmless mid-gesture because last_scratch_frame (pipeline.rs) makes
+// a restart resume exactly where the previous gesture left off.
+const vinylTarget: Record<string, number> = {};
+
+// Per-gesture raw encoder tally, logged once when the gesture ends. This is the
+// calibration instrument for VINYL_SEC_PER_TICK, and it has to live here rather than in
+// midi.rs: that logger throttles continuous controls to one line per 500ms per key (see
+// its log_throttle map), so the Rust log shows a jog wheel emitting a tidy ±1 every half
+// second no matter how fast it is really spinning — which is exactly the measurement the
+// calibration needs and exactly what is hidden.
+//
+// `absSum` is the number the procedure in docs/design/waveform-scrub.md consumes: rotate
+// one revolution slowly, then quickly, and compare. Equal ⇒ the values are deltas since
+// the last message, accumulation is exact, and VINYL_SEC_PER_TICK = 1.8 / absSum.
+// Unequal ⇒ they are speed-scaled and no single constant is correct. `maxAbs`/`values`
+// answer the same question a second way in one pass: an encoder reporting plain deltas
+// never emits anything but ±1.
+const vinylTally: Record<string, { n: number; absSum: number; net: number; maxAbs: number; values: Set<number>; t0: number }> = {};
+
 // Per-mode tuning — see scratchMode's doc comment in audioSettings.ts for the
 // shuttle-vs-vinyl distinction.
 const SCRATCH_MODE_PARAMS = {
   shuttle: {
     // Tunable sensitivity dial: still saturating to the cap on a fairly gentle spin
-    // at 0.35 (the Hercules encoder appears to report larger step values, not just
-    // ±1, as physical speed increases, so ticksPerSec grows faster than a plain
-    // "ticks counted per second" would suggest) — lowered to leave more usable range
-    // below the cap before it saturates. Retune here if it still saturates too
-    // early/late.
+    // at 0.35 — lowered to leave more usable range below the cap before it saturates.
+    // Retune here if it still saturates too early/late.
+    //
+    // ⚠️ The reason recorded here until 2026-08-08 was wrong: this comment claimed the
+    // Hercules encoder "appears to report larger step values, not just ±1, as physical
+    // speed increases". It does not. The [jog-cal/…] calibration (see VINYL_SEC_PER_TICK
+    // above) measured `maxAbs=1 values=[1]` over 524 messages across two gestures ~3x
+    // apart in speed. ticksPerSec grows exactly as fast as ticks counted per second — so
+    // if this saturates early, that is the EMA divisor collapsing onto SCRATCH_MIN_DT_MS
+    // under burst delivery, which is the documented reason velocity was abandoned for
+    // vinyl mode. Shuttle keeps it deliberately (free-running between ticks is the point).
     ratePerTickPerSec: 0.15,
     // A rate of exactly 0 would freeze the feeder thread's buffer cursor entirely,
     // so the magnitude floor keeps scratch audio always moving even when the wheel
@@ -205,12 +271,34 @@ function stopScratch(deckId: string) {
     const lateBy = performance.now() - armedAt - SCRATCH_IDLE_MS;
     debugLog(`[scratch/${deckId}] idle timer fired ${lateBy.toFixed(0)}ms late (main thread gate)`);
   }
-  setScratching(deckId, false);
   delete scratchVelocity[deckId];
   const t0 = performance.now();
-  audioStopScratch(deckId)
-    .then(() => debugLog(`[scratch/${deckId}] audioStopScratch settled after ${(performance.now() - t0).toFixed(0)}ms (IPC round-trip)`))
-    .catch(console.error);
+  const settled = () =>
+    debugLog(`[scratch/${deckId}] audioStopScratch settled after ${(performance.now() - t0).toFixed(0)}ms (IPC round-trip)`);
+
+  // Vinyl mode runs through the scrub bus, which owns the teardown (SNAP landing,
+  // setScratching, audioStopScratch) — see the vinyl branch in jog_nudge.
+  if (vinylTarget[deckId] !== undefined) {
+    delete vinylTarget[deckId];
+    const tally = vinylTally[deckId];
+    if (tally) {
+      delete vinylTally[deckId];
+      const secs = (performance.now() - tally.t0) / 1000;
+      // One line per gesture — see vinylTally for what each field is for. `1.8/absSum` is
+      // printed rather than computed by hand later because the whole calibration is
+      // "turn the wheel exactly one revolution and read this number off".
+      debugLog(
+        `[jog-cal/${deckId}] msgs=${tally.n} absSum=${tally.absSum} net=${tally.net} ` +
+        `maxAbs=${tally.maxAbs} values=[${[...tally.values].sort((a, b) => a - b).join(',')}] ` +
+        `over ${secs.toFixed(2)}s (${(tally.n / Math.max(secs, 0.001)).toFixed(0)} msg/s) | ` +
+        `if this was exactly one revolution, VINYL_SEC_PER_TICK = ${(1.8 / Math.max(tally.absSum, 1)).toFixed(5)}`
+      );
+    }
+    endScrub(deckId).then(settled);
+    return;
+  }
+  setScratching(deckId, false);
+  audioStopScratch(deckId).then(settled).catch(console.error);
 }
 
 export async function startMidiListener(): Promise<() => void> {
@@ -318,13 +406,39 @@ export async function startMidiListener(): Promise<() => void> {
         if (!d.playing) {
           // Paused: true bidirectional scratch audio — turning the wheel forward/backward
           // plays audio forward/backward at a speed matching the wheel, like a real
-          // turntable, so a beat/transient can be found by ear. Rate comes from tick
-          // velocity, tracked as an EMA of instantaneous ticks/sec — see the SCRATCH_*
-          // constants above for why (a hard rolling window was tried and discarded).
-          // Scaling/floor/cap/hold-decay all come from SCRATCH_MODE_PARAMS, so shuttle
-          // and vinyl share this exact velocity-tracking logic and only differ in how
-          // it's turned into a rate and how long the feeder free-runs on it.
-          const params = SCRATCH_MODE_PARAMS[get(scratchMode)];
+          // turntable, so a beat/transient can be found by ear.
+          const mode = get(scratchMode);
+          if (mode === "vinyl") {
+            // Accumulate ticks into an absolute position and let the feeder servo to it.
+            // Seeded from the deck's current position on the first tick of a gesture;
+            // every later tick is pure displacement, so burst delivery is irrelevant.
+            // See VINYL_SEC_PER_TICK above for why this replaced the velocity path.
+            const base = vinylTarget[deckId] ?? getDeckTime(deckId) ?? 0;
+            if (vinylTarget[deckId] === undefined) {
+              beginScrub(deckId, base, true);
+              vinylTally[deckId] = { n: 0, absSum: 0, net: 0, maxAbs: 0, values: new Set(), t0: performance.now() };
+            }
+            const tally = vinylTally[deckId];
+            tally.n++;
+            tally.absSum += Math.abs(a.value);
+            tally.net += a.value;
+            tally.maxAbs = Math.max(tally.maxAbs, Math.abs(a.value));
+            if (tally.values.size < 16) tally.values.add(a.value);
+            // Store what updateScrub actually accepted, not what we asked for: at a track
+            // boundary those differ, and keeping the raw sum would open a silent dead zone
+            // as long as the overshoot. See updateScrub's doc comment.
+            vinylTarget[deckId] = updateScrub(deckId, base + a.value * VINYL_SEC_PER_TICK);
+
+            clearTimeout(scratchIdleTimers[deckId]);
+            scratchIdleArmedAt[deckId] = performance.now();
+            scratchIdleTimers[deckId] = setTimeout(() => stopScratch(deckId), SCRATCH_IDLE_MS);
+            break;
+          }
+          // Shuttle: rate comes from tick velocity, tracked as an EMA of instantaneous
+          // ticks/sec — see the SCRATCH_* constants above for why (a hard rolling window
+          // was tried and discarded). Free-running between ticks is the point of this
+          // mode, so velocity remains the right control variable for it.
+          const params = SCRATCH_MODE_PARAMS[mode];
           const now = performance.now();
           const prev = scratchVelocity[deckId];
           // No prior tick to diff against (gesture just started): seed the EMA so the

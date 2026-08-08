@@ -745,6 +745,21 @@ pub struct DeckAudioPipeline {
     /// docs/design/pcm-buffer-playback.md). `None` if decode failed or hasn't
     /// happened yet — scratch() then declines rather than crashing playback.
     pcm_buffer: Option<Arc<PcmBuffer>>,
+    /// Where the previous scratch gesture's cursor landed, in PCM buffer frames.
+    ///
+    /// `scratch()`/`scratch_to()` prefer this over `query_position()` when starting a
+    /// fresh gesture. The reason is a real gesture-boundary jump: `stop_scratch_feeder()`
+    /// ends every gesture with a 130ms drain sleep and two flush seeks, and until that
+    /// ACCURATE resync seek actually lands, `query_position()` still reports where the
+    /// normal branch was *before* the gesture. Cueing naturally produces short gestures
+    /// separated by pauses longer than `SCRATCH_IDLE_MS`, so the next gesture routinely
+    /// started from that stale position — the track appeared to jump backward between
+    /// nudges. Reading back the cursor we ourselves wrote sidesteps the race entirely.
+    ///
+    /// Cleared by anything that legitimately moves the playhead by another route
+    /// (`seek_output_domain`, `load`, `play`), so it can never go stale in the other
+    /// direction.
+    last_scratch_frame: Option<f64>,
 }
 
 impl DeckAudioPipeline {
@@ -765,6 +780,7 @@ impl DeckAudioPipeline {
             eos_callback: None,
             app: None,
             pcm_buffer: None,
+            last_scratch_frame: None,
         }
     }
 
@@ -781,6 +797,9 @@ impl DeckAudioPipeline {
         // file — set_devices()/set_cue_device() call load() again on every device switch.
         let needs_pcm_decode = self.pcm_buffer.is_none() || self.file_path.as_deref() != Some(file_path);
         self.file_path = Some(file_path.to_string());
+        // Any remembered scratch landing frame belongs to the outgoing pipeline (and
+        // possibly to a different file) — see `last_scratch_frame`.
+        self.last_scratch_frame = None;
 
         if let Some(ref mut inner) = self.inner {
             Self::take_and_join_feeder(inner);
@@ -1401,6 +1420,8 @@ impl DeckAudioPipeline {
 
     pub fn play(&mut self) -> Result<(), String> {
         self.playing = true;
+        // Normal playback owns the playhead from here — see `last_scratch_frame`.
+        self.last_scratch_frame = None;
         // Any post-scratch resync already happened synchronously in
         // stop_scratch_feeder() (it has to: switching input-selector's pad leaves the
         // sink needing a fresh preroll buffer on the newly-active branch, which only a
@@ -1455,6 +1476,9 @@ impl DeckAudioPipeline {
     /// where the caller already holds a value in that domain rather than content time
     /// (see `seek`'s doc comment for why the two differ at any rate != 1.0).
     fn seek_output_domain(&mut self, secs: f64) -> Result<(), String> {
+        // The playhead just moved by a route that has nothing to do with the scratch
+        // cursor, so the remembered landing frame is now wrong — see `last_scratch_frame`.
+        self.last_scratch_frame = None;
         let inner = self.inner.as_ref().ok_or_else(|| "no pipeline loaded".to_string())?;
         // An explicit seek means the user chose a new position — don't restart from 0 on next play().
         inner.at_eos.store(false, Ordering::Relaxed);
@@ -1546,18 +1570,58 @@ impl DeckAudioPipeline {
     /// call before decaying toward silence/hold if no further `scratch()` call
     /// refreshes it — see the field comment on `ScratchFeeder::hold_ms`.
     pub fn scratch(&mut self, rate: f64, hold_ms: u64) -> Result<(), String> {
+        // NaN target = velocity mode (see ScratchFeeder::target_frames_bits). Written
+        // unconditionally so a gesture that started in position mode can be handed over
+        // to velocity mode without restarting the feeder.
+        self.begin_or_update_scratch(rate, f64::NAN, hold_ms)
+    }
+
+    /// Position-mode scratch: drive the feeder toward an absolute content position
+    /// instead of at a rate. Same audible result as `scratch()` — the feeder still walks
+    /// the PCM buffer and pitch still bends with speed — but the caller supplies *where
+    /// to be* rather than *how fast to go*, so it cannot drift and repeated updates are
+    /// safe to coalesce down to the most recent one.
+    ///
+    /// This is the mode for anything driven by direct manipulation: a waveform drag
+    /// (which has an absolute position by construction) and vinyl-mode jog (which gets
+    /// one by accumulating encoder ticks). See `target_frames_bits` for why velocity is
+    /// the wrong control variable for those inputs.
+    ///
+    /// `target_secs` is **content time**, the same domain as the waveform, cue points and
+    /// the PCM buffer itself — not the tempo-scaled seek domain `seek()` takes.
+    pub fn scratch_to(&mut self, target_secs: f64, hold_ms: u64) -> Result<(), String> {
+        let rate = self.pcm_buffer.as_ref().map(|p| p.rate as f64).unwrap_or(48_000.0);
+        self.begin_or_update_scratch(0.0, target_secs.max(0.0) * rate, hold_ms)
+    }
+
+    /// Shared body of `scratch()`/`scratch_to()`: starts the feeder and switches the
+    /// topology on the first call of a gesture, and is a cheap atomic store on every
+    /// call after that.
+    fn begin_or_update_scratch(
+        &mut self,
+        rate: f64,
+        target_frames: f64,
+        hold_ms: u64,
+    ) -> Result<(), String> {
         let pcm = self.pcm_buffer.clone().ok_or_else(|| {
             format!("[{}] no PCM buffer decoded — scratch unavailable for this file", self.deck_id)
         })?;
+        let last_scratch_frame = self.last_scratch_frame;
         let inner = self.inner.as_mut().ok_or_else(|| "no pipeline loaded".to_string())?;
         inner.at_eos.store(false, Ordering::Relaxed);
 
         if let Some(feeder) = &inner.scratch_feeder {
             feeder.rate_bits.store(rate.to_bits(), Ordering::Relaxed);
+            feeder.target_frames_bits.store(target_frames.to_bits(), Ordering::Relaxed);
             *feeder.last_update.lock().unwrap() = Instant::now();
             return Ok(());
         }
 
+        // Prefer where the last gesture's cursor actually landed over asking GStreamer:
+        // the previous stop_scratch_feeder()'s resync seek may still be in flight, in
+        // which case query_position() reports the pre-gesture position and the new
+        // gesture starts with a visible jump. See `last_scratch_frame`.
+        //
         // query_position() is in the seek/output domain (see seek()'s doc comment) —
         // scale by self.rate (the tempo currently in effect) to recover true content
         // time before indexing into the PCM buffer, which is authored at real content
@@ -1566,13 +1630,32 @@ impl DeckAudioPipeline {
         // non-1.0 rate begins the feeder from the wrong point in the file, off by the
         // same tempo ratio as the seek-domain bug in seek() (see
         // docs/design/rate-position-drift.md).
-        let start_secs = inner
-            .pipeline
-            .query_position::<gst::ClockTime>()
-            .map(|t| (t.nseconds() as f64 / 1_000_000_000.0).max(0.0))
-            .unwrap_or(0.0)
-            * self.rate;
-        let start_frame = start_secs * pcm.rate as f64;
+        //
+        // ⚠️ **Position mode ignores both and starts at the caller's own target.** The
+        // caller anchored the gesture on `getDeckTime()`, which is the clock the waveform
+        // is drawn from — so it is the position the user is looking at and grabbing. Any
+        // disagreement with GStreamer's idea of the playhead becomes a jump on the first
+        // chunk, and if it exceeds SCRATCH_TARGET_SNAP_SECS the servo *snaps* and reports
+        // `arrived`, opening every gesture on silence. Measured live 2026-08-08: a jog
+        // gesture whose accumulator moved 5.126s left the cursor 7.484s further on,
+        // because query_position() said frame 0 while the frontend anchor said 2.358s.
+        // In position mode there is nothing to recover — the caller states where to be.
+        let start_frame = if !target_frames.is_nan() {
+            target_frames
+        } else {
+            match last_scratch_frame {
+                Some(frame) => frame,
+                None => {
+                    let start_secs = inner
+                        .pipeline
+                        .query_position::<gst::ClockTime>()
+                        .map(|t| (t.nseconds() as f64 / 1_000_000_000.0).max(0.0))
+                        .unwrap_or(0.0)
+                        * self.rate;
+                    start_secs * pcm.rate as f64
+                }
+            }
+        };
 
         inner.input_selector.set_property("active-pad", &inner.sel_scratch_pad);
         inner.valve_normal_el.set_property("drop", true);
@@ -1606,6 +1689,7 @@ impl DeckAudioPipeline {
             pcm,
             start_frame,
             rate,
+            target_frames,
             hold_ms,
         ));
         Ok(())
@@ -1628,6 +1712,10 @@ impl DeckAudioPipeline {
         let Some(inner) = self.inner.as_mut() else { return };
         let t_entry = Instant::now();
         let Some(final_frame) = Self::take_and_join_feeder(inner) else { return };
+        // Remember where the gesture ended before doing anything else — the resync below
+        // takes ~300ms of sleep and seeks, and a gesture starting inside that window must
+        // not fall back to query_position()'s stale answer. See `last_scratch_frame`.
+        self.last_scratch_frame = Some(final_frame);
 
         // Narrow output_queue back to the steady cap — the normal branch is
         // about to become active again and wants tight tempo-change latency,
@@ -1796,7 +1884,22 @@ impl Drop for DeckAudioPipeline {
 struct ScratchFeeder {
     /// Signed rate (PCM-buffer frames advanced per output frame), updated live by
     /// every scratch() call during an ongoing gesture — no seek needed to change it.
+    /// Ignored while `target_frames_bits` holds a real target (see below).
     rate_bits: Arc<AtomicU64>,
+    /// Absolute target position in PCM-buffer frames for **position mode**, or NaN for
+    /// **velocity mode** (the original free-running behaviour, still used by shuttle
+    /// scratch). Written by `scratch_to()`; `scratch()` writes NaN, so a caller can
+    /// switch a live gesture between the two without restarting the feeder.
+    ///
+    /// Position mode exists because velocity is the wrong control variable for anything
+    /// driven by direct manipulation. The rate a gesture *should* produce is a function
+    /// of how far the input moved, but a velocity estimate can only recover that by
+    /// dividing by inter-event timing — and both of this app's direct-manipulation
+    /// inputs deliver events in bursts (USB MIDI jog ticks; rAF-coalesced pointer
+    /// moves), which makes that divisor meaningless and lets error accumulate for the
+    /// whole gesture with nothing to correct it against. A target is absolute: it
+    /// cannot drift, and coalescing several updates into the latest one loses nothing.
+    target_frames_bits: Arc<AtomicU64>,
     /// Set by take_and_join_feeder() to tell the thread to fade out and exit.
     stop_requested: Arc<AtomicBool>,
     /// Buffer-frame cursor, updated by the feeder thread every chunk so
@@ -1825,6 +1928,87 @@ const SCRATCH_CHUNK_MS: u64 = 15;
 /// anyway as insurance.
 const SCRATCH_FADE_FRAMES: usize = 240;
 
+/// Position mode: how close (in PCM frames) the cursor must be to the target to count as
+/// "arrived". Below this the feeder stops advancing and fades to silence, so a stationary
+/// finger/wheel produces silence rather than a stalled-cursor buzz — the same thing
+/// `hold_ms` does for velocity mode, but keyed on the target instead of on elapsed time.
+///
+/// ⚠️ **Not "closer than the cursor can resolve" (half a frame), which is what this was
+/// until 2026-08-08.** With `SCRATCH_SERVO_LAG_CHUNKS` the cursor approaches the target
+/// asymptotically, so a half-frame epsilon keeps the gesture technically-moving — and
+/// therefore audible — for a long exponential tail after the hand stops. A quarter of a
+/// millisecond is inaudible as a position error and reaches silence in ~200ms of decay,
+/// which sounds like a record coming to rest rather than like a stuck cursor.
+const SCRATCH_TARGET_EPSILON_FRAMES: f64 = 12.0;
+
+/// Position mode: how long the servo takes to close the distance to the target, in
+/// 15ms chunks — the single most important number in this mode.
+///
+/// It was effectively 1 until 2026-08-08 (`rate = err / chunk_frames`), and that is what
+/// made live scratch audio nearly silent. Covering the whole error inside one chunk means
+/// the cursor moves for 15ms and then reports `arrived` — silence — until the next update
+/// lands. Position updates arrive every ~25–40ms (rAF-coalesced pointer moves; USB MIDI
+/// jog bursts), so the output was a train of ~15ms blips separated by silence, each one
+/// additionally gain-ramped up and down through `SCRATCH_FADE_FRAMES`. The user report was
+/// simply "scrubbing does not play back any audio", and the measurement agrees: at a
+/// hand speed of 0.2x the duty cycle is under half, at a third of normal pitch.
+///
+/// Spreading the error over several chunks makes it a first-order lag instead, which is
+/// the right filter for this input: for a *ramp* — a hand moving at a steady speed, which
+/// is what a scrub is — a first-order lag settles to the **same slope** as its input. So
+/// the cursor ends up walking the buffer at exactly the hand's speed, continuously, with
+/// only a constant position lag behind the target (`hand_speed × lag`, e.g. 12ms of
+/// content at 0.2x — inaudible). Continuous motion at the true speed is both the audible
+/// fix and the pitch-correct one.
+///
+/// 4 chunks (~60ms) is short enough that the lag never reads as latency and long enough
+/// that no realistic update cadence can outrun it.
+const SCRATCH_SERVO_LAG_CHUNKS: f64 = 4.0;
+
+/// Position mode: ceiling on servo speed, in buffer frames per output frame. Keeps a
+/// large target change from becoming a screech; the cursor instead sweeps toward it over
+/// several chunks, which is what dragging a record fast actually sounds like.
+const SCRATCH_TARGET_MAX_RATE: f64 = 8.0;
+
+/// Position mode: target changes larger than this stop being a scrub and become a jump —
+/// the cursor snaps and re-ramps through `SCRATCH_FADE_FRAMES` instead of sweeping. At
+/// `SCRATCH_TARGET_MAX_RATE` a sweep covers ~0.12s of content per 15ms chunk, so without
+/// a snap a coarse drag across a whole-track overview (easily 100s in one gesture) would
+/// spend many seconds racing through content nobody asked to hear.
+const SCRATCH_TARGET_SNAP_SECS: f64 = 0.5;
+
+/// What the position-mode servo decided for one chunk. Split out of the feeder loop so it
+/// can be unit-tested without GStreamer: the properties that matter here are *statistical
+/// over a whole gesture* (what fraction of chunks are silent, what mean speed the cursor
+/// ends up walking at), which is exactly what a live listening test reports as "no audio"
+/// and exactly what a single-step assertion cannot see.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ServoStep {
+    /// Buffer frames to advance per output frame this chunk.
+    rate: f64,
+    /// Nothing left to cover — the feeder fades to silence (see `SCRATCH_TARGET_EPSILON_FRAMES`).
+    arrived: bool,
+    /// Target was too far to sweep: `cursor` was moved to it outright and the gain
+    /// re-ramped, rather than racing through the intervening content.
+    snapped: bool,
+}
+
+/// One chunk of the position-mode servo: given where the cursor is and where the caller
+/// wants it, decide this chunk's rate. See `SCRATCH_SERVO_LAG_CHUNKS` for why the error is
+/// spread over several chunks rather than closed inside one.
+fn servo_step(target: f64, cursor: f64, chunk_frames: f64, snap_frames: f64) -> ServoStep {
+    let err = target - cursor;
+    if err.abs() > snap_frames {
+        return ServoStep { rate: 0.0, arrived: true, snapped: true };
+    }
+    if err.abs() < SCRATCH_TARGET_EPSILON_FRAMES {
+        return ServoStep { rate: 0.0, arrived: true, snapped: false };
+    }
+    let rate = (err / (chunk_frames * SCRATCH_SERVO_LAG_CHUNKS))
+        .clamp(-SCRATCH_TARGET_MAX_RATE, SCRATCH_TARGET_MAX_RATE);
+    ServoStep { rate, arrived: false, snapped: false }
+}
+
 /// Starts the feeder thread for one scratch gesture: walks `pcm` forward or backward
 /// from `start_frame` at the (live-updatable) rate in `rate_bits`, linearly
 /// interpolating between adjacent buffer samples for sub-sample step sizes, and pushes
@@ -1845,14 +2029,17 @@ fn spawn_scratch_feeder(
     pcm: Arc<PcmBuffer>,
     start_frame: f64,
     initial_rate: f64,
+    initial_target: f64,
     hold_ms: u64,
 ) -> ScratchFeeder {
     let rate_bits = Arc::new(AtomicU64::new(initial_rate.to_bits()));
+    let target_frames_bits = Arc::new(AtomicU64::new(initial_target.to_bits()));
     let stop_requested = Arc::new(AtomicBool::new(false));
     let cursor_frames_bits = Arc::new(AtomicU64::new(start_frame.to_bits()));
     let last_update = Arc::new(Mutex::new(Instant::now()));
 
     let rate_bits_t = rate_bits.clone();
+    let target_t = target_frames_bits.clone();
     let stop_t = stop_requested.clone();
     let cursor_t = cursor_frames_bits.clone();
     let last_update_t = last_update.clone();
@@ -1861,30 +2048,119 @@ fn spawn_scratch_feeder(
         let chunk_frames = ((pcm.rate as u64 * SCRATCH_CHUNK_MS) / 1000).max(1) as usize;
         let max_frame = pcm.frames().saturating_sub(1) as f64;
         let mut cursor = start_frame.clamp(0.0, max_frame);
-        let mut last_sign = initial_rate.signum();
+        // 0.0 means "no direction established yet", so the first chunk that commands real
+        // motion sets it and takes the fade-in exactly once, whichever way it goes.
+        // Reading initial_rate here is only right in velocity mode: scratch_to() passes
+        // rate 0.0, and Rust's `0.0_f64.signum()` is *1.0*, not 0.0 — so every reverse
+        // gesture used to open by "reversing" from a forward direction it never had.
+        let mut last_sign = if initial_target.is_nan() { initial_rate.signum() } else { 0.0 };
         let mut fade_pos: usize = 0; // frames into an in-progress fade-in/reversal ramp
         let mut hold_gain: f32 = 1.0; // ramps toward 0 while idle beyond hold_ms, else toward 1
         let mut next_wake = Instant::now();
+        let snap_frames = SCRATCH_TARGET_SNAP_SECS * pcm.rate as f64;
 
-        log::info!("[scratch/{deck_id}] feeder start frame={start_frame:.0} rate={initial_rate:.3} hold_ms={hold_ms}");
+        log::info!(
+            "[scratch/{deck_id}] feeder start frame={start_frame:.0} rate={initial_rate:.3} \
+             mode={} hold_ms={hold_ms}",
+            if initial_target.is_nan() { "velocity" } else { "position" }
+        );
+
+        // Per-second feeder telemetry. Added 2026-08-08 after a live report of "a few
+        // scratchy pops and then nothing" that no existing signal could adjudicate: the
+        // feeder logs only start/stop, `push_buffer` warns only above 50ms, and the
+        // `output_queue underrun` counter fires once per chunk by construction here (a
+        // just-in-time feeder empties the queue every buffer — 66.8/s measured against a
+        // 66.7/s chunk rate, so it is structurally uninformative during a scratch).
+        //
+        // `rms` is the field that settles it, and it is why this exists: it is measured on
+        // the bytes actually handed to appsrc, after every gain stage. Audible RMS with
+        // nothing coming out of the speakers puts the fault downstream in GStreamer;
+        // collapsing RMS puts it in the servo or the gain logic. Everything else here is
+        // context for whichever way that reads — `arrived%` and `snaps` say whether the
+        // servo thinks it has nothing to do, `ramps` counts fade restarts (the pop
+        // suspect), and `late%` says whether the thread is failing to hold its 15ms cadence.
+        let mut tel_chunks: u64 = 0;
+        let mut tel_arrived: u64 = 0;
+        let mut tel_snaps: u64 = 0;
+        let mut tel_ramps: u64 = 0;
+        let mut tel_late: u64 = 0;
+        let mut tel_sumsq: f64 = 0.0;
+        let mut tel_samples: u64 = 0;
+        let mut tel_rate_sum: f64 = 0.0;
+        let mut tel_rate_max: f64 = 0.0;
+        let mut tel_cursor_start = cursor;
+        let mut tel_since = Instant::now();
 
         loop {
             let stopping = stop_t.load(Ordering::Relaxed);
             let rate = f64::from_bits(rate_bits_t.load(Ordering::Relaxed));
+            let target = f64::from_bits(target_t.load(Ordering::Relaxed));
+
+            // Position mode (NaN target = velocity mode, the original behaviour): derive
+            // this chunk's rate from the distance still to cover, spread over
+            // SCRATCH_SERVO_LAG_CHUNKS so the cursor keeps moving between updates instead
+            // of lurching once and going quiet. Pitch bend comes out of this for free —
+            // it is still just how fast the cursor walks the buffer, exactly as in
+            // velocity mode. `arrived` means there is nothing left to cover, which is the
+            // position-mode equivalent of velocity mode's hold_ms idle.
+            let mut arrived = false;
+            let commanded_rate = if target.is_nan() {
+                rate
+            } else {
+                let step = servo_step(
+                    target.clamp(0.0, max_frame),
+                    cursor,
+                    chunk_frames as f64,
+                    snap_frames,
+                );
+                if step.snapped {
+                    // Too far to sweep — jump, and re-ramp so the splice doesn't click.
+                    cursor = target.clamp(0.0, max_frame);
+                    fade_pos = 0;
+                    tel_snaps += 1;
+                }
+                arrived = step.arrived;
+                step.rate
+            };
+            tel_chunks += 1;
+            if arrived { tel_arrived += 1; }
+            tel_rate_sum += commanded_rate.abs();
+            tel_rate_max = tel_rate_max.max(commanded_rate.abs());
+            let fade_pos_before = fade_pos;
 
             if !stopping {
-                let sign = rate.signum();
+                // NOT `commanded_rate.signum()`: Rust returns *1.0* for `0.0_f64`, so a
+                // stationary chunk read as "moving forward" and every stationary chunk
+                // during a reverse gesture flipped last_sign, zeroed fade_pos, and forced
+                // a 5ms gain ramp — then another one when motion resumed. Two spurious
+                // ramps per pause, i.e. an audible click each time the hand hesitated or
+                // crossed zero. This is the "scratchy pops" half of the 2026-08-08 live
+                // report; the silence half was the servo (SCRATCH_SERVO_LAG_CHUNKS).
+                let sign = if commanded_rate > 0.0 {
+                    1.0
+                } else if commanded_rate < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                };
                 if sign != 0.0 && sign != last_sign {
                     fade_pos = 0;
                     last_sign = sign;
                 }
             }
+            if fade_pos == 0 && fade_pos_before != 0 { tel_ramps += 1; }
 
-            // Checked once per chunk (15ms granularity is plenty for a hold decision) —
-            // idle means no scratch() call has refreshed last_update within hold_ms.
+            // Checked once per chunk (15ms granularity is plenty for a hold decision).
+            // Velocity mode: idle means no scratch() call refreshed last_update within
+            // hold_ms. Position mode: idle means the cursor reached the target — a
+            // stationary finger or hand should sound like a stationary hand on a record,
+            // i.e. silence, not a stalled cursor buzzing on one sample. hold_ms still
+            // applies as a backstop for a caller that stops updating without ever
+            // calling stop_scratch().
             let idle = !stopping
-                && last_update_t.lock().unwrap().elapsed().as_millis() as u64 > hold_ms;
-            let effective_rate = if idle { 0.0 } else { rate };
+                && (arrived
+                    || last_update_t.lock().unwrap().elapsed().as_millis() as u64 > hold_ms);
+            let effective_rate = if idle { 0.0 } else { commanded_rate };
             let target_hold_gain: f32 = if idle { 0.0 } else { 1.0 };
             let hold_step = 1.0 / SCRATCH_FADE_FRAMES as f32;
 
@@ -1913,11 +2189,13 @@ fn spawn_scratch_feeder(
 
                 out[i * 2] = l * gain;
                 out[i * 2 + 1] = r * gain;
+                tel_sumsq += (l * gain) as f64 * (l * gain) as f64;
 
                 if !stopping {
                     cursor = (cursor + effective_rate).clamp(0.0, max_frame);
                 }
             }
+            tel_samples += chunk_frames as u64;
 
             cursor_t.store(cursor.to_bits(), Ordering::Relaxed);
 
@@ -1954,12 +2232,180 @@ fn spawn_scratch_feeder(
             if next_wake > now {
                 std::thread::sleep(next_wake - now);
             } else {
+                // Missed the cadence — the chunk took longer than SCRATCH_CHUNK_MS to
+                // build and push, so this feeder is producing slower than real time and
+                // the sink will run dry no matter how healthy the samples are.
                 next_wake = now;
+                tel_late += 1;
+            }
+
+            let elapsed = tel_since.elapsed();
+            if elapsed >= Duration::from_secs(1) {
+                let secs = elapsed.as_secs_f64();
+                let rms = if tel_samples > 0 {
+                    (tel_sumsq / tel_samples as f64).sqrt()
+                } else {
+                    0.0
+                };
+                let dbfs = if rms > 0.0 { 20.0 * rms.log10() } else { -f64::INFINITY };
+                log::info!(
+                    "[scratch-tel/{deck_id}] chunks={tel_chunks} ({:.0}/s, late {:.0}%) | \
+                     rms={rms:.5} ({dbfs:.1} dBFS) | arrived {:.0}% snaps={tel_snaps} \
+                     ramps={tel_ramps} | rate mean={:.3} max={:.3} | cursor {:.3}s -> {:.3}s \
+                     ({:+.3}s in {secs:.2}s = {:.2}x)",
+                    tel_chunks as f64 / secs,
+                    100.0 * tel_late as f64 / tel_chunks.max(1) as f64,
+                    100.0 * tel_arrived as f64 / tel_chunks.max(1) as f64,
+                    tel_rate_sum / tel_chunks.max(1) as f64,
+                    tel_rate_max,
+                    tel_cursor_start / pcm.rate as f64,
+                    cursor / pcm.rate as f64,
+                    (cursor - tel_cursor_start) / pcm.rate as f64,
+                    (cursor - tel_cursor_start) / pcm.rate as f64 / secs,
+                );
+                tel_chunks = 0;
+                tel_arrived = 0;
+                tel_snaps = 0;
+                tel_ramps = 0;
+                tel_late = 0;
+                tel_sumsq = 0.0;
+                tel_samples = 0;
+                tel_rate_sum = 0.0;
+                tel_rate_max = 0.0;
+                tel_cursor_start = cursor;
+                tel_since = Instant::now();
             }
         }
     });
 
-    ScratchFeeder { rate_bits, stop_requested, cursor_frames_bits, last_update, handle: Some(handle) }
+    ScratchFeeder {
+        rate_bits,
+        target_frames_bits,
+        stop_requested,
+        cursor_frames_bits,
+        last_update,
+        handle: Some(handle),
+    }
+}
+
+/// Position-mode servo, tested as arithmetic rather than as audio. These run in a plain
+/// `cargo test` — no GStreamer, no PCM file, no hardware — because the thing that was
+/// broken live is a *statistical* property of the servo over a whole gesture (how much of
+/// the time it is producing sound, and at what speed), which the existing `scratch_to`
+/// smoke test cannot see: that test asserts the cursor arrives, and it did arrive. It
+/// arrived in one chunk and then sat silent, which is precisely the bug.
+#[cfg(test)]
+mod servo_test {
+    use super::*;
+
+    const RATE: f64 = 48_000.0;
+    /// 15ms at 48kHz — one feeder chunk.
+    const CHUNK: f64 = 720.0;
+    const SNAP: f64 = SCRATCH_TARGET_SNAP_SECS * RATE;
+
+    /// Replays a gesture the way the feeder does: the caller moves the target every
+    /// `update_every_ms`, the servo runs every `SCRATCH_CHUNK_MS`. Returns the fraction of
+    /// chunks that produced no sound and the mean speed the cursor actually walked at.
+    fn replay(hand_speed: f64, update_every_ms: f64, secs: f64) -> (f64, f64) {
+        let mut cursor = 0.0f64;
+        let mut target = 0.0f64;
+        let chunks = (secs * 1000.0 / SCRATCH_CHUNK_MS as f64) as usize;
+        let mut silent = 0usize;
+        let mut next_update_ms = 0.0f64;
+        for c in 0..chunks {
+            let now_ms = c as f64 * SCRATCH_CHUNK_MS as f64;
+            // Bursty by construction: the target only moves when an update lands, which
+            // is the whole reason velocity was unrecoverable from this input.
+            while next_update_ms <= now_ms {
+                target += hand_speed * RATE * (update_every_ms / 1000.0);
+                next_update_ms += update_every_ms;
+            }
+            let step = servo_step(target, cursor, CHUNK, SNAP);
+            if step.arrived {
+                silent += 1;
+            } else {
+                cursor += step.rate * CHUNK;
+            }
+        }
+        (silent as f64 / chunks as f64, cursor / (secs * RATE))
+    }
+
+    /// The live failure, as a number. A hand moving at 0.2x — the speed measured from the
+    /// 2026-08-08 log's jog gesture (1.31s of content in 6.6s) — must produce essentially
+    /// continuous audio, not a train of blips.
+    #[test]
+    fn slow_scrub_is_not_mostly_silent() {
+        let (silent_fraction, _) = replay(0.2, 30.0, 3.0);
+        assert!(
+            silent_fraction < 0.05,
+            "servo went silent for {:.0}% of a steady 0.2x scrub — this is the \
+             'scrubbing plays no audio' bug (rate = err/chunk_frames closed the whole \
+             error inside one chunk and then reported arrived)",
+            silent_fraction * 100.0
+        );
+    }
+
+    /// A first-order lag tracks a ramp at the *input's* slope. That is what makes the
+    /// scrub pitch-correct: the cursor walks the buffer at the hand's speed, not at some
+    /// speed manufactured by the update cadence.
+    #[test]
+    fn cursor_speed_matches_hand_speed() {
+        for &hand in &[0.05, 0.2, 1.0, 2.0] {
+            for &update_ms in &[16.0, 30.0, 45.0] {
+                let (_, measured) = replay(hand, update_ms, 4.0);
+                let err = (measured - hand).abs() / hand;
+                assert!(
+                    err < 0.05,
+                    "hand {hand}x with updates every {update_ms}ms produced cursor speed \
+                     {measured:.4}x ({:.1}% off)",
+                    err * 100.0
+                );
+            }
+        }
+    }
+
+    /// Reverse is not a special case anywhere in the servo, and this pins that down —
+    /// the live report singled reverse out, so a regression that quietly made one
+    /// direction silent must fail here rather than wait for another listening session.
+    #[test]
+    fn reverse_behaves_identically_to_forward() {
+        let (fwd_silent, fwd_speed) = replay(0.2, 30.0, 3.0);
+        let (rev_silent, rev_speed) = replay(-0.2, 30.0, 3.0);
+        assert_eq!(fwd_silent, rev_silent, "silent-chunk fraction differs by direction");
+        assert!(
+            (fwd_speed + rev_speed).abs() < 1e-9,
+            "reverse speed {rev_speed:.4} is not the mirror of forward {fwd_speed:.4}"
+        );
+    }
+
+    /// A stopped hand still has to reach silence promptly — the lag makes the approach
+    /// asymptotic, so `SCRATCH_TARGET_EPSILON_FRAMES` is what ends it. Under a
+    /// half-frame epsilon this tail ran on for the better part of a second.
+    #[test]
+    fn stopped_hand_reaches_silence() {
+        // Steady-state lag from a 1.0x hand, the worst realistic case to decay from.
+        let mut cursor = 0.0f64;
+        let target = 1.0 * RATE * (SCRATCH_SERVO_LAG_CHUNKS * SCRATCH_CHUNK_MS as f64 / 1000.0);
+        let mut chunks_to_silence = None;
+        for c in 0..200 {
+            let step = servo_step(target, cursor, CHUNK, SNAP);
+            if step.arrived {
+                chunks_to_silence = Some(c);
+                break;
+            }
+            cursor += step.rate * CHUNK;
+        }
+        let chunks = chunks_to_silence.expect("servo never reached silence after the hand stopped");
+        let ms = chunks as f64 * SCRATCH_CHUNK_MS as f64;
+        assert!(ms < 400.0, "took {ms}ms to fall silent after the hand stopped");
+    }
+
+    /// A coarse overview drag must not race audibly through the content it skipped.
+    #[test]
+    fn far_target_snaps_silently() {
+        let step = servo_step(60.0 * RATE, 0.0, CHUNK, SNAP);
+        assert!(step.snapped && step.arrived && step.rate == 0.0, "{step:?}");
+    }
 }
 
 #[cfg(test)]
@@ -2285,6 +2731,80 @@ mod scratch_smoke_test {
         );
         println!("vinyl_hold_smoke OK: advanced {advanced:.3}s in a 200ms gap (hold_ms={VINYL_HOLD_MS})");
 
+        pipeline.pause().expect("final pause");
+    }
+
+    /// Position-mode (`scratch_to`) regression guard, covering the two properties the
+    /// waveform drag and vinyl jog both depend on:
+    ///
+    ///   1. **Convergence and hold.** The cursor reaches a commanded target and then
+    ///      stays there. Velocity mode cannot do this — with no absolute reference it
+    ///      keeps free-running (or decays on a timer) rather than stopping *somewhere
+    ///      specific*, which is what made travel depend on event timing.
+    ///   2. **Gesture-boundary continuity.** A second gesture started immediately after
+    ///      the first resumes from where the first landed, rather than from
+    ///      `query_position()`'s pre-gesture answer — the `last_scratch_frame` path. The
+    ///      100ms gap here is deliberately inside `stop_scratch_feeder()`'s own ~300ms of
+    ///      drain sleep and resync seeks, which is exactly the window that used to make
+    ///      the track jump backward between short cueing nudges.
+    #[test]
+    #[ignore]
+    fn scratch_to_smoke() {
+        gst::init().expect("gst init");
+        let path = "/home/account/Downloads/audio.wav";
+        const HOLD_MS: u64 = 1000;
+
+        let mut pipeline = DeckAudioPipeline::new("test-deck-scratch-to");
+        pipeline.load(path).expect("load");
+        pipeline.play().expect("play");
+        std::thread::sleep(Duration::from_millis(300));
+        pipeline.pause().expect("pause");
+
+        let start = pipeline.position().unwrap();
+        let target = start + 0.20;
+
+        // Converge. Well inside SCRATCH_TARGET_SNAP_SECS, so this sweeps rather than
+        // snapping — i.e. it exercises the servo, not the jump path.
+        pipeline.scratch_to(target, HOLD_MS).expect("scratch_to");
+        std::thread::sleep(Duration::from_millis(250));
+        let arrived = pipeline.position().unwrap();
+        assert!(
+            (arrived - target).abs() < 0.02,
+            "cursor should have converged on {target:.3}s, but sits at {arrived:.3}s"
+        );
+
+        // ...and hold. No further scratch_to() calls: in position mode silence and a
+        // frozen cursor come from having arrived, not from hold_ms (1s here, so it
+        // cannot be what stops the cursor within this window).
+        std::thread::sleep(Duration::from_millis(300));
+        let held = pipeline.position().unwrap();
+        assert!(
+            (held - arrived).abs() < 0.01,
+            "cursor should hold at the target once arrived, but drifted {:.3}s",
+            held - arrived
+        );
+
+        pipeline.stop_scratch().expect("stop_scratch");
+
+        // Second gesture inside the resync window — must resume from the first's landing
+        // frame, not from wherever the normal branch still thinks it is.
+        std::thread::sleep(Duration::from_millis(100));
+        let target2 = target + 0.10;
+        pipeline.scratch_to(target2, HOLD_MS).expect("scratch_to 2");
+        std::thread::sleep(Duration::from_millis(250));
+        let arrived2 = pipeline.position().unwrap();
+        assert!(
+            (arrived2 - target2).abs() < 0.02,
+            "second gesture should have converged on {target2:.3}s, but sits at {arrived2:.3}s \
+             (a large negative error here means it restarted from a stale query_position)"
+        );
+
+        println!(
+            "scratch_to_smoke OK: converged {start:.3}s -> {arrived:.3}s (target {target:.3}s), \
+             held, then {arrived2:.3}s (target {target2:.3}s) across a gesture boundary"
+        );
+
+        pipeline.stop_scratch().expect("final stop_scratch");
         pipeline.pause().expect("final pause");
     }
 

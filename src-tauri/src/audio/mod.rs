@@ -295,6 +295,16 @@ pub fn audio_scratch(state: State<'_, AudioState>, deck_id: String, rate: f64, h
     state.lock().unwrap().pipeline_mut(&deck_id)?.scratch(rate, hold_ms)
 }
 
+/// Position-mode scratch: drive the scratch feeder toward an absolute content position
+/// rather than at a rate. Used by the waveform drag and by vinyl-mode jog — see
+/// `DeckAudioPipeline::scratch_to`. Deliberately *not* detached: like `audio_scratch`
+/// this is a per-frame hot path during a gesture, and after the first call it is only an
+/// atomic store behind the manager lock.
+#[tauri::command]
+pub fn audio_scratch_to(state: State<'_, AudioState>, deck_id: String, target_secs: f64, hold_ms: u64) -> Result<(), String> {
+    state.lock().unwrap().pipeline_mut(&deck_id)?.scratch_to(target_secs, hold_ms)
+}
+
 #[tauri::command]
 pub fn audio_stop_scratch(state: State<'_, AudioState>, deck_id: String) -> Result<(), String> {
     // Detached — same reason as audio_pause above.

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { analyzeFile, COLOR_UPCOMING, COLOR_PLAYED } from '../lib/audio/waveform';
-  import { seekDeck, getDeckTime, quantizeToGrid, scratchingDecks } from '../lib/renderer/seekBus';
+  import { seekDeck, getDeckTime, quantizeToGrid, scratchingDecks, beginScrub, updateScrub, endScrub, cancelScrub } from '../lib/renderer/seekBus';
   import { getDiggerFileUrl } from '../lib/digger/api';
   import { recordAuxLoop } from '../lib/audio/pollStats';
   import { suppressWaveformDraw } from '../lib/audio/perfArm';
@@ -498,23 +498,104 @@
     }
   }
 
-  function handleClick(e: MouseEvent) {
-    if (!canvas || deck.source?.type !== 'video') return;
+  // ── Drag to scrub ───────────────────────────────────────────────────────────────
+  //
+  // Press-anchored and relative: pressing records where you grabbed and moves nothing,
+  // so a stray click can never jump the track (this replaced a click-to-seek that
+  // could). Motion from there is converted to content time and handed to the scrub bus,
+  // which drives the PCM scratch feeder for turntable-style audio on a paused deck —
+  // the point of the feature being to find a transient by ear while setting a cue.
+  //
+  // The direction rule is "whatever moves follows your finger", which lands on opposite
+  // signs in the two views because they animate opposite halves of the same picture. In
+  // zoom the playhead is pinned at ZOOM_LEAD_RATIO and the waveform scrolls under it, so
+  // dragging right must pull the track *backward* for the grabbed peak to stay under the
+  // pointer — you are holding the record. In overview the waveform is fixed and the
+  // playhead is the only thing that moves, so it simply tracks the pointer.
+  //
+  // ⚠️ **A press that never moves is still a needle-drop seek**, and removing that was a
+  // real regression (reported live 2026-08-08: "it is now impossible to jump to a
+  // different position in a track"). The relative drag cannot substitute for it, because
+  // its reach is one canvas width of whatever view is drawn: in the zoom view that is
+  // ±16s, so jumping a minute would need a 6,600px drag across a 1,765px canvas. The deck's
+  // position bar is a display-only <div>, so the overview click was the *only* way to jump
+  // anywhere in a track. A click and a drag stay distinguishable by DRAG_THRESHOLD_PX, so
+  // the "a stray click can no longer jump the track" argument that justified deleting it
+  // is served without giving up the gesture.
+  const DRAG_THRESHOLD_PX = 4;
+  let dragging = $state(false);
+  let dragStartX = 0;
+  let dragStartTime = 0;
+  let dragAudible = false;
+  let dragMoved = false;
+
+  /** Content seconds per CSS pixel, matching whichever view is currently drawn. */
+  function secondsPerPixel(rect: DOMRect): number {
+    if (deck.source?.type !== 'video') return 0;
+    // Must match drawZoom's contentSpan scaling, or the waveform slides at a different
+    // rate than the pointer and the grabbed peak drifts out from under it.
+    const span = zoom
+      ? zoomSeconds * Math.max(0.01, deck.playbackRate)
+      : deck.source.duration || 0;
+    return rect.width > 0 ? span / rect.width : 0;
+  }
+
+  function handlePointerDown(e: PointerEvent) {
+    if (!canvas || deck.source?.type !== 'video' || e.button !== 0) return;
+    e.preventDefault();
+    dragging = true;
+    dragStartX = e.clientX;
+    dragMoved = false;
+    dragStartTime = getDeckTime(deck.id) ?? 0;
+    // Audible scrub needs the paused scratch topology (input-selector switch + frozen
+    // uridecodebin), so a playing deck scrubs silently via seeks and keeps playing.
+    dragAudible = !deck.playing;
+    beginScrub(deck.id, dragStartTime, dragAudible);
+    // Listen on window, not the canvas: the pointer routinely leaves a 72px-tall canvas
+    // mid-gesture, and setPointerCapture is not otherwise exercised on this WebKitGTK.
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+    window.addEventListener('pointercancel', handlePointerUp);
+  }
+
+  function handlePointerMove(e: PointerEvent) {
+    if (!dragging || !canvas) return;
+    const dx = e.clientX - dragStartX;
+    // Below the threshold this is still a candidate click, so send nothing at all — the
+    // deck must not creep while the user is only deciding whether to drag.
+    if (!dragMoved && Math.abs(dx) < DRAG_THRESHOLD_PX) return;
+    dragMoved = true;
+    const rect = canvas.getBoundingClientRect();
+    updateScrub(deck.id, dragStartTime + (zoom ? -dx : dx) * secondsPerPixel(rect));
+  }
+
+  function handlePointerUp(e?: PointerEvent) {
+    if (!dragging) return;
+    dragging = false;
+    window.removeEventListener('pointermove', handlePointerMove);
+    window.removeEventListener('pointerup', handlePointerUp);
+    window.removeEventListener('pointercancel', handlePointerUp);
+    if (dragMoved) { endScrub(deck.id); return; }
+    // Click, not drag: needle-drop to the absolute position under the pointer, exactly as
+    // the pre-2026-08-08 onclick handler did (same math, same quantizeToGrid/SNAP
+    // treatment). cancelScrub rather than endScrub because beginScrub sent no IPC and no
+    // update followed it — there is no feeder to stop and nothing to land on.
+    cancelScrub(deck.id);
+    if (!canvas || deck.source?.type !== 'video' || !e) return;
     const rect = canvas.getBoundingClientRect();
     const ratio = (e.clientX - rect.left) / rect.width;
     const duration = deck.source.duration || 0;
-
-    if (zoom) {
-      const currentTime = getDeckTime(deck.id) ?? 0;
-      // Must match drawZoom's contentSpan scaling or clicks land off from what's drawn.
-      const contentSpan = zoomSeconds * Math.max(0.01, deck.playbackRate);
-      const timeStart = currentTime - contentSpan * ZOOM_LEAD_RATIO;
-      const t = timeStart + ratio * contentSpan;
-      seekDeck(deck.id, Math.max(0, Math.min(duration, quantizeToGrid(deck.id, t))));
-    } else {
-      seekDeck(deck.id, Math.max(0, Math.min(duration, quantizeToGrid(deck.id, ratio * duration))));
-    }
+    const t = zoom
+      ? dragStartTime - zoomSeconds * Math.max(0.01, deck.playbackRate) * ZOOM_LEAD_RATIO
+        + ratio * zoomSeconds * Math.max(0.01, deck.playbackRate)
+      : ratio * duration;
+    seekDeck(deck.id, Math.max(0, Math.min(duration, quantizeToGrid(deck.id, t))));
   }
+
+  // A gesture in flight when the deck is torn down (track swap, deck removal) would
+  // otherwise leave its window listeners and its scrub target behind — and a stale
+  // target outranks the audio clock in getDeckTime(), pinning the playhead for good.
+  $effect(() => () => { if (dragging) handlePointerUp(); });
 
   function handleWheel(e: WheelEvent) {
     if (!zoom) return;
@@ -529,7 +610,8 @@
     use:autoSize={deck.source?.type === 'video' ? deck.source.filePath : null}
     bind:this={canvas}
     class="waveform-canvas"
-    onclick={handleClick}
+    class:dragging
+    onpointerdown={handlePointerDown}
     onwheel={handleWheel}
   ></canvas>
   <button
@@ -557,8 +639,14 @@
        flex children, causing the canvas to render at 300px default width.
        height:72px is a pre-JS fallback only; resize() overwrites it via c.style.height. */
     height: 72px;
-    cursor: crosshair;
+    cursor: grab;
+    /* Without this a touch/pen drag is claimed by the browser as a pan gesture and the
+       pointermove stream stops partway through the scrub. */
+    touch-action: none;
     background: var(--surface2, #282b31);
+  }
+  .waveform-canvas.dragging {
+    cursor: grabbing;
   }
   .zoom-toggle {
     position: absolute;

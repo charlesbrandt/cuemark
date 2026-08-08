@@ -251,6 +251,44 @@ Pattern (full working examples in `scripts/probes/`):
   rule: llvmpipe results are normally the suspect ones, but for *compositing semantics and
   orientation* — which are WebKit-level, not driver-level — the software arm is authoritative.
 
+### Input APIs: presence is not behaviour — inject real platform events (2026-08-08)
+
+`typeof PointerEvent === 'function'` answers a different question than "will a drag
+gesture work". This build's whole catalogue of hazards is APIs that are *present* and
+silently do nothing (`UNPACK_FLIP_Y_WEBGL` for `ImageBitmap`, `imageOrientation` for
+`VideoFrame`, `isConfigSupported` returning true for AV1 before decoding zero frames), and
+`dispatchEvent(new PointerEvent(...))` does not close the gap either — it proves your
+listeners are wired, nothing about whether the platform ever produces the event.
+
+Push **GDK events into the WebView** instead, which is the same platform→DOM path an X11
+mouse takes (`scripts/probes/pointer_events_probe.py`, which cleared Pointer Events for the
+waveform drag-scrub gesture):
+
+```python
+ev = Gdk.Event.new(Gdk.EventType.BUTTON_PRESS)
+ev.button.window = view.get_window()
+ev.button.x, ev.button.y = float(x), float(y)
+ev.button.button = 1
+ev.button.set_device(Gdk.Display.get_default().get_default_seat().get_pointer())
+ev.set_screen(Gdk.Screen.get_default())
+Gtk.main_do_event(ev)          # → WebKit → DOM
+```
+
+Notes that transfer to any input probe here:
+
+- **`xdotool` is not installed on this machine.** GDK injection is the available route; do
+  not plan around synthesizing X input externally.
+- **Carry a control arm at a different API level.** That probe counts `mouse*` alongside
+  `pointer*`, so "the platform delivered nothing" and "the platform delivered mouse but not
+  pointer" are distinguishable — and the second is the answer that would force a rewrite.
+  A probe that only counts the API you hope works cannot tell those apart.
+- **WebKit coalesces motion events** — three injected moves arrived as two. Design gestures
+  so a dropped intermediate position is harmless (absolute targets supersede; accumulated
+  deltas silently under-travel). This is the same property that makes rAF coalescing safe
+  for the scrub bus, see `docs/design/waveform-scrub.md`.
+- Give WebKit's event queue time to drain (a few hundred ms) before asking the page what it
+  saw; results are not available synchronously after `Gtk.main_do_event`.
+
 ### Two rules these probes were shipped without, and paid for (2026-08-03)
 
 - **Drive the real module, don't reimplement it in the probe page.** A `load_html` page given

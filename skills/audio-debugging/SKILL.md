@@ -843,6 +843,35 @@ a plausible-looking "5 HMR reloads ≈ 5x duplicate seeks" coincidence turned ou
 herring once a Rust-side `audio_seek` call counter proved the real ratio (238 IPC calls for 92
 logged events) was fully explained by the log throttle, not by stacked event listeners.
 
+## Burst delivery: never derive a rate from inter-event timing (2026-08-08)
+
+The same fact that makes the log throttle misleading has a second, worse consequence. USB
+MIDI does not deliver ticks evenly — several land in one JS macrotask, then a gap. So the
+inter-event interval is an artefact of *delivery*, not of how fast the user moved, and any
+control that divides by it is measuring the wrong thing.
+
+Vinyl-mode jog was built that way and it made the position jump around erratically. Three
+compounding failures, all traceable to the same root:
+
+1. `queueScratchRate`-style rAF coalescing **overwrites**, so a burst collapses to one
+   update and the rest of the wheel motion is discarded outright. Coalescing a *rate* is
+   lossy; coalescing a *position* is not.
+2. The divisor collapses onto its floor (`SCRATCH_MIN_DT_MS`), saturating the computed rate
+   at the mode cap. An EMA smooths this but cannot remove it — a hard rolling window was
+   tried first and was worse, and both attempts are documented at length in `handler.ts`.
+3. With no absolute reference, every over- and undershoot accumulates for the whole gesture.
+
+**The fix is structural, not a tuning problem**: for anything driven by direct
+manipulation, accumulate events into an **absolute target position** and servo to it
+(`scratch_to()` in `pipeline.rs`, the scrub bus in `seekBus.ts`). N ticks then move the
+track by exactly N ticks of travel whenever they arrive. Velocity remains correct for
+controls that are *supposed* to free-run between events — shuttle-mode jog deliberately
+keeps it.
+
+Reach for this whenever a continuous control feels erratic rather than merely mis-scaled:
+mis-scaled is a constant, erratic is usually timing dependence. Full write-up and the
+still-open `VINYL_SEC_PER_TICK` calibration: `docs/design/waveform-scrub.md`.
+
 ---
 
 ## CPU profiling a live "chokes up" freeze — `pidstat` + `perf`

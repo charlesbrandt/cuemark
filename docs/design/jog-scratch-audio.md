@@ -237,3 +237,21 @@ Also worth knowing: `midi.rs` throttles **log printing** for continuous controls
 per 500ms per key (`log_throttle`, `midi.rs` ~line 288-317) but does **not** throttle the
 actual `MidiAction` dispatch to the frontend — don't mistake sparse jog-wheel log lines
 for a low real event rate when debugging.
+
+## Superseded for vinyl mode — 2026-08-08
+
+The velocity-derived rate this doc designed (open question #3, "how to derive
+rate-from-velocity cleanly — window size, min/max clamps") turned out to be the wrong
+question for vinyl mode. Both the rolling window tried first and the EMA that replaced it
+were attempts to reconstruct a rate from burst-delivered USB MIDI ticks, and neither can
+succeed: the inter-tick interval they divide by is an artefact of delivery timing, the
+rAF coalescer discards ticks outright because coalescing a *rate* is lossy, and nothing
+holds an absolute reference to correct the accumulated error against.
+
+Vinyl mode now accumulates ticks into an **absolute target position** and the feeder
+servos to it (`scratch_to()` in `pipeline.rs`). Shuttle mode keeps everything described
+here — free-running at an estimated rate between ticks is exactly what that mode is for,
+and the EMA remains the right tool for it.
+
+See `docs/design/waveform-scrub.md`, which also covers the waveform drag gesture built on
+the same primitive.

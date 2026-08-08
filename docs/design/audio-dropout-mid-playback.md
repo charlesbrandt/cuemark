@@ -374,6 +374,19 @@ the two.
 
 ## Where to pick up
 
+🟢 **2026-08-08: D1 may no longer be blocked on a reproducer.** A separate investigation
+(`docs/design/scratch-audio-downstream-delivery.md`) found scratch audio dying on demand —
+within a second or two, every gesture — on a deck configured exactly as H1 describes:
+**three `pulsesink`s, two of them on the same physical USB device**. The PCM feeder is
+measured healthy throughout (`[scratch-tel]`, −9.6 to −18.9 dBFS for 28s) and pad probes
+clear `appsrc → input_selector`, so that fault is also in the shared output stage.
+
+Whether it is *this* fault is unproven and is exactly what that doc's device-routing A/B is
+designed to answer. If the two share a cause, step 3's "the scratch/PCM feeder branch
+(never engaged)" exclusion still holds — the feeder is not the suspect, the output stage
+shared by both paths is — and D1 gains a reproducer that runs in seconds instead of a
+multi-hour set. **Read that doc before spending another soak arm here.**
+
 1. ~~Ship **D2** first.~~ Done 2026-08-05. The gap warning is now trustworthy and carries an
    onset timestamp; `cargo test sink_flow_gap_gating -- --ignored` is its regression guard.
 2. **Start from "2026-08-05 reproducer attempt" → "Where D1 goes next"**, not from a blank
