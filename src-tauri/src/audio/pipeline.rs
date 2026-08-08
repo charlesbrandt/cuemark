@@ -12,7 +12,7 @@
 /// selected so the pipeline loads successfully regardless of headphone availability.
 
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type EosCallback = Arc<dyn Fn() + Send + Sync>;
@@ -231,6 +231,75 @@ struct SinkFlow {
 /// Shared with the bus thread so a transition out of `Playing` can invalidate the last
 /// buffer time — see `instrument_sink_flow()`.
 type SinkFlowState = Arc<Mutex<SinkFlow>>;
+
+/// Buffer delivery counters for `volume` → `pulsesink`, the one span between the scratch
+/// feeder and the speakers that nothing else measures.
+///
+/// Added 2026-08-08 for `docs/design/scratch-audio-downstream-delivery.md`. That
+/// investigation established the feeder is healthy (`[scratch-tel]` rms, F1) and that
+/// `appsrc → input_selector` delivers everything (F2's pad probes), then ran the
+/// device-routing A/B down to arm A4 — a single `pulsesink` on a single device, nothing
+/// on the controller — where the audio still dies mid-gesture and stays dead until the
+/// next gesture. That kills every routing hypothesis and leaves two candidates this
+/// probe separates in one reading:
+///
+/// - **`count` stops advancing** ⇒ the stall is in `output_queue`/`tee`/`volume`; the
+///   sink is starved and the question becomes what stopped upstream of it.
+/// - **`count` keeps advancing while nothing is audible** ⇒ buffers are reaching the
+///   device and not being rendered, which is H5 (zero sink margin): the feeder produces
+///   exactly real time with `do-timestamp=true`, so buffers carry no head start, and a
+///   gesture that re-rolls `base_time` on its `Paused → Playing` can leave every
+///   subsequent buffer late for the rest of that span.
+///
+/// `margin_us` is what adjudicates the second case: a buffer's own running time minus
+/// the element's current running time. Positive means it arrived ahead of the clock and
+/// the sink can wait for it; negative means it is already late on arrival, and a
+/// steadily-more-negative margin across a gesture *is* H5, measured rather than argued.
+///
+/// ⚠️ Deliberately **not** gated on `at_playing` like `instrument_sink_flow()`. That gate
+/// is why the existing sink-flow warning cannot see this fault at all: it only reports a
+/// gap when flow *resumes*, and a stall that persists to the end of the gesture is
+/// followed by a transition out of `Playing` that invalidates the timestamp — so the
+/// warning is structurally unreachable here. These are plain counters read by the feeder
+/// telemetry once a second, which sidesteps that entirely.
+struct DeliveryProbe {
+    label: String,
+    /// Buffers seen at this pad since the pipeline was built. Read as a per-second delta.
+    count: AtomicU64,
+    /// Most recent buffer's running time minus the element's current running time, in
+    /// microseconds. `i64::MIN` = never set (no PTS, or no clock yet).
+    margin_us: AtomicI64,
+}
+
+/// All delivery probes for one pipeline, shared with the scratch feeder so a gesture's
+/// telemetry line can carry delivery counts alongside the rms that produced them —
+/// correlating them by hand across two log lines is what made this fault hard to read.
+type DeliveryProbes = Arc<Vec<Arc<DeliveryProbe>>>;
+
+fn instrument_delivery(element: &gst::Element, pad_name: &str, label: &str) -> Option<Arc<DeliveryProbe>> {
+    let pad = element.static_pad(pad_name)?;
+    let probe = Arc::new(DeliveryProbe {
+        label: label.to_string(),
+        count: AtomicU64::new(0),
+        margin_us: AtomicI64::new(i64::MIN),
+    });
+    let probe_ref = probe.clone();
+    // Weak, so the probe closure can never keep the element alive across a rebuild.
+    let elem_weak = element.downgrade();
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+        probe_ref.count.fetch_add(1, Ordering::Relaxed);
+        if let Some(gst::PadProbeData::Buffer(buf)) = &info.data {
+            if let (Some(pts), Some(elem)) = (buf.pts(), elem_weak.upgrade()) {
+                if let Some(now) = elem.current_running_time() {
+                    let margin_ns = pts.nseconds() as i64 - now.nseconds() as i64;
+                    probe_ref.margin_us.store(margin_ns / 1000, Ordering::Relaxed);
+                }
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+    Some(probe)
+}
 
 /// Time-of-day in UTC, matching the log formatter in `lib.rs` so a timestamp printed
 /// inside a message can be grepped against the line prefixes around it.
@@ -715,6 +784,9 @@ struct PipelineInner {
     /// above `make_el` for why `scratch()` widens its cap for the gesture's
     /// duration.
     output_queue_el: gst::Element,
+    /// Buffer counters on the `volume`/`pulsesink` pads, handed to each scratch feeder so
+    /// its per-second telemetry can report delivery next to rms. See `DeliveryProbe`.
+    delivery_probes: DeliveryProbes,
 }
 
 pub struct DeckAudioPipeline {
@@ -912,6 +984,7 @@ impl DeckAudioPipeline {
         };
         let mut volume_els: Vec<gst::Element> = Vec::with_capacity(main_devs.len());
         let mut main_sinks: Vec<gst::Element> = Vec::with_capacity(main_devs.len());
+        let mut delivery_probes: Vec<Arc<DeliveryProbe>> = Vec::new();
         for (i, dev) in main_devs.iter().enumerate() {
             let vol = make_el("volume")?;
             let snk = make_sink(dev, &format!("{}/{}", self.deck_id, i))?;
@@ -927,6 +1000,12 @@ impl DeckAudioPipeline {
                 &format!("main sink {i}"),
                 &at_playing,
             ));
+            // Bracket the last stage: what leaves `volume` against what the sink accepts.
+            // Both, not just the sink — a count that matches at `volume` and not at the
+            // sink narrows the fault to one link, and a count that advances at both while
+            // the room is silent moves the whole question past delivery. See DeliveryProbe.
+            delivery_probes.extend(instrument_delivery(&vol, "src", &format!("vol{i}")));
+            delivery_probes.extend(instrument_delivery(&snk, "sink", &format!("sink{i}")));
             volume_els.push(vol);
             main_sinks.push(snk);
         }
@@ -1351,6 +1430,7 @@ impl DeckAudioPipeline {
             uridecodebin_el: src.clone(),
             scratch_feeder: None,
             output_queue_el: output_queue,
+            delivery_probes: Arc::new(delivery_probes),
         });
         Ok(duration)
     }
@@ -1691,6 +1771,7 @@ impl DeckAudioPipeline {
             rate,
             target_frames,
             hold_ms,
+            inner.delivery_probes.clone(),
         ));
         Ok(())
     }
@@ -2031,6 +2112,7 @@ fn spawn_scratch_feeder(
     initial_rate: f64,
     initial_target: f64,
     hold_ms: u64,
+    delivery: DeliveryProbes,
 ) -> ScratchFeeder {
     let rate_bits = Arc::new(AtomicU64::new(initial_rate.to_bits()));
     let target_frames_bits = Arc::new(AtomicU64::new(initial_target.to_bits()));
@@ -2090,6 +2172,11 @@ fn spawn_scratch_feeder(
         let mut tel_rate_max: f64 = 0.0;
         let mut tel_cursor_start = cursor;
         let mut tel_since = Instant::now();
+        // Baseline for the delivery counters, which are cumulative for the life of the
+        // pipeline — only the per-second delta is meaningful, and the gesture starts
+        // partway into whatever the file branch already delivered.
+        let mut tel_delivery_last: Vec<u64> =
+            delivery.iter().map(|p| p.count.load(Ordering::Relaxed)).collect();
 
         loop {
             let stopping = stop_t.load(Ordering::Relaxed);
@@ -2248,11 +2335,31 @@ fn spawn_scratch_feeder(
                     0.0
                 };
                 let dbfs = if rms > 0.0 { 20.0 * rms.log10() } else { -f64::INFINITY };
+                // `<label>=<buffers/s>(<margin>)` per probed pad. Silence with these still
+                // ticking means the buffers arrive and are not rendered; silence with them
+                // at 0/s means the stall is upstream of that pad. See `DeliveryProbe`.
+                let delivery_report = delivery
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let now = p.count.load(Ordering::Relaxed);
+                        let delta = now.saturating_sub(tel_delivery_last[i]);
+                        tel_delivery_last[i] = now;
+                        let margin = p.margin_us.load(Ordering::Relaxed);
+                        let margin_str = if margin == i64::MIN {
+                            "no ts".to_string()
+                        } else {
+                            format!("{:+.0}ms", margin as f64 / 1000.0)
+                        };
+                        format!("{}={:.0}/s({})", p.label, delta as f64 / secs, margin_str)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 log::info!(
                     "[scratch-tel/{deck_id}] chunks={tel_chunks} ({:.0}/s, late {:.0}%) | \
                      rms={rms:.5} ({dbfs:.1} dBFS) | arrived {:.0}% snaps={tel_snaps} \
                      ramps={tel_ramps} | rate mean={:.3} max={:.3} | cursor {:.3}s -> {:.3}s \
-                     ({:+.3}s in {secs:.2}s = {:.2}x)",
+                     ({:+.3}s in {secs:.2}s = {:.2}x) | delivery {delivery_report}",
                     tel_chunks as f64 / secs,
                     100.0 * tel_late as f64 / tel_chunks.max(1) as f64,
                     100.0 * tel_arrived as f64 / tel_chunks.max(1) as f64,
