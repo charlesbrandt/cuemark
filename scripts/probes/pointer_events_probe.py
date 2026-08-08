@@ -28,6 +28,21 @@ A useful pass is `gdk.pointerdown/pointermove/pointerup` all non-zero **and** th
 if mousedown arrives and pointerdown does not, Pointer Events are not wired to mouse input
 here and the drag must be rebuilt on mouse events.
 
+Third question, added 2026-08-08 for the scrub-delivery instrument
+(`src/lib/audio/scrubStats.ts`): **is `event.timeStamp` on the same clock as
+`performance.now()`?** `performance.now() - e.timeStamp` at handler entry is the one leg
+that can distinguish "the pointer produced no events" from "events were produced and sat
+queued behind a busy main thread" — the exact ambiguity blocking
+`docs/design/scratch-audio-downstream-delivery.md`'s remaining fault. The spec says
+`DOMHighResTimeStamp` relative to the time origin; whether *this* port's platform → DOM
+path honours that is a different question, and this project does not assume.
+
+    ts.synthetic  `dispatchEvent(new PointerEvent(…))` — establishes what scale WebKit
+                  stamps DOM events with when it has no platform event to derive from.
+    ts.gdk        the real path, with **real monotonic event times** injected into
+                  `GdkEvent.time` (not `CURRENT_TIME`, which is 0 and would make a
+                  zero-derived stamp look like a clock mismatch).
+
 Usage:
     APPORT_DISABLE=1 xvfb-run -a python3 scripts/probes/pointer_events_probe.py
 
@@ -44,6 +59,11 @@ from gi.repository import Gtk, Gdk, WebKit2, GLib  # noqa: E402
 
 # Canvas geometry inside the page; the GDK stage aims at the middle of it.
 CANVAS_X, CANVAS_Y, CANVAS_W, CANVAS_H = 20, 20, 400, 72
+
+# How far into the past the `stale` stage backdates one event's `GdkEvent.time`. Large
+# enough to be unmistakable against the ~44ms constant origin skew measured here, and in
+# the same range as the 500-874ms delivery stalls the instrument is being built to explain.
+STALE_BACKDATE_MS = 250
 
 PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
 <style>
@@ -65,20 +85,33 @@ const out = {
   gdk: { pointerdown: 0, pointermove: 0, pointerup: 0,
          mousedown: 0, mousemove: 0, mouseup: 0,
          moveXs: [], downX: null, upX: null },
+  // (timeStamp, performance.now()) pairs captured at handler entry, per stage. The delta
+  // is what the scrub instrument wants to use as an event-queueing delay, so both halves
+  // are reported raw rather than pre-subtracted — a wrong clock is far easier to
+  // recognise from the magnitudes than from a difference.
+  ts: { timeOrigin: performance.timeOrigin, synthetic: [], gdk: [], stale: [] },
+  // Backdated-event stage: one motion event whose GdkEvent.time is deliberately in the
+  // past. Decides whether timeStamp is derived from the platform event's own time (so it
+  // can express queueing delay) or simply stamped at dispatch (so it never can).
+  stale: { pointermove: 0, mousemove: 0 },
 };
 
 // Stage flag: the same listeners serve both stages, so they must know which is running
 // or the synthetic counts and the GDK counts would be indistinguishable.
 let stage = 'synthetic';
 function bump(name, e) {
+  const now = performance.now();
   const b = out[stage];
   if (b[name] !== undefined) b[name]++;
+  if (out.ts[stage].length < 12) {
+    out.ts[stage].push({ ev: name, ts: e.timeStamp, now: now });
+  }
   if (stage === 'synthetic') {
     if (name === 'pointerdown') { out.synthetic.clientX = e.clientX; out.synthetic.button = e.button; }
   } else {
     if (name === 'pointerdown') { out.gdk.downX = e.clientX; out.api.pointerType = e.pointerType; }
     if (name === 'pointerup') out.gdk.upX = e.clientX;
-    if (name === 'pointermove' && out.gdk.moveXs.length < 12) out.gdk.moveXs.push(Math.round(e.clientX));
+    if (stage === 'gdk' && name === 'pointermove' && out.gdk.moveXs.length < 12) out.gdk.moveXs.push(Math.round(e.clientX));
   }
 }
 
@@ -107,6 +140,7 @@ runSynthetic();
 stage = 'gdk';
 
 // Driver hooks: Python flips stages and collects via document.title.
+window.__stage = (s) => { stage = s; };
 window.__report = () => { document.title = "RESULT:" + JSON.stringify(out); };
 document.title = "READY";
 </script></body></html>"""
@@ -126,7 +160,23 @@ def main():
     loop = GLib.MainLoop()
     state = {"phase": "loading"}
 
-    def inject(evtype, x, y, button=0, pressed=False):
+    injected_times = []
+    stale_backdated_to = None
+
+    def event_time_ms():
+        """A realistic `GdkEvent.time`: milliseconds off a monotonic clock, 32-bit.
+
+        `Gdk.CURRENT_TIME` (0) was used here originally, which is fine for testing
+        *delivery* but poisons the timeStamp question — a DOM stamp derived from 0 is
+        indistinguishable from one taken off a different clock. Real X11 motion events
+        carry a real server timestamp, so injecting one is also the more faithful
+        simulation.
+        """
+        t = (GLib.get_monotonic_time() // 1000) & 0xFFFFFFFF
+        injected_times.append(t)
+        return t
+
+    def inject(evtype, x, y, button=0, pressed=False, time_ms=None):
         """Push one GDK event at the WebView exactly as X11 input would."""
         gdkwin = view.get_window()
         if gdkwin is None:
@@ -139,7 +189,7 @@ def main():
             ev.motion.x, ev.motion.y = float(x), float(y)
             ev.motion.x_root, ev.motion.y_root = float(x), float(y)
             ev.motion.state = Gdk.ModifierType.BUTTON1_MASK if pressed else 0
-            ev.motion.time = Gdk.CURRENT_TIME
+            ev.motion.time = event_time_ms() if time_ms is None else time_ms
             ev.motion.set_device(pointer)
         else:
             ev.button.window = gdkwin
@@ -147,7 +197,7 @@ def main():
             ev.button.x_root, ev.button.y_root = float(x), float(y)
             ev.button.button = button
             ev.button.state = Gdk.ModifierType.BUTTON1_MASK if pressed else 0
-            ev.button.time = Gdk.CURRENT_TIME
+            ev.button.time = event_time_ms() if time_ms is None else time_ms
             ev.button.set_device(pointer)
         ev.set_screen(Gdk.Screen.get_default())
         Gtk.main_do_event(ev)
@@ -162,6 +212,26 @@ def main():
         for dx in (15, 45, 90):
             inject(Gdk.EventType.MOTION_NOTIFY, x0 + dx, cy, pressed=True)
         inject(Gdk.EventType.BUTTON_RELEASE, x0 + 90, cy, button=1, pressed=True)
+        GLib.timeout_add(300, stale_stage)
+        return False
+
+    def stale_stage():
+        view.run_javascript("window.__stage('stale')", None, None, None)
+        GLib.timeout_add(200, drive_stale)
+        return False
+
+    def drive_stale():
+        """One motion event backdated by STALE_BACKDATE_MS in GdkEvent.time.
+
+        If the DOM stamp moves back with it, `timeStamp` carries the platform event's own
+        time and `performance.now() - e.timeStamp` measures how long the event waited.
+        If the stamp ignores it, WebKit stamps at dispatch and that leg is structurally
+        incapable of showing a queueing delay, however busy the main thread gets.
+        """
+        nonlocal stale_backdated_to
+        stale_backdated_to = ((GLib.get_monotonic_time() // 1000) - STALE_BACKDATE_MS) & 0xFFFFFFFF
+        inject(Gdk.EventType.MOTION_NOTIFY, CANVAS_X + 200, CANVAS_Y + 30,
+               pressed=False, time_ms=stale_backdated_to)
         # Let WebKit's own event queue drain before asking the page what it saw.
         GLib.timeout_add(600, collect)
         return False
@@ -193,6 +263,59 @@ def main():
 
     print(json.dumps(result, indent=2))
     api, syn, gdk = result["api"], result["synthetic"], result["gdk"]
+
+    # ── event.timeStamp usability ────────────────────────────────────────────────────
+    # Printed before the primary verdict because that one returns early on failure, and a
+    # delivery failure does not make this question uninteresting.
+    print("\n--- event.timeStamp vs performance.now() ---")
+    ts = result.get("ts", {})
+    print(f"injected GdkEvent.time values: {injected_times}")
+    for stage_name in ("synthetic", "gdk", "stale"):
+        samples = ts.get(stage_name) or []
+        if not samples:
+            print(f"{stage_name}: no samples")
+            continue
+        deltas = [s["now"] - s["ts"] for s in samples]
+        print(
+            f"{stage_name}: ts={[round(s['ts'], 1) for s in samples]}\n"
+            f"{' ' * (len(stage_name) + 2)}now-ts={[round(d, 1) for d in deltas]}"
+        )
+        # Three failure shapes, all seen in the wild on some port or other:
+        #   epoch-scale ts  → a wall clock, not the document time origin
+        #   ts == 0         → the port does not stamp platform events at all
+        #   |delta| huge    → some other monotonic origin (process start, X server boot)
+        worst = max(abs(d) for d in deltas)
+        if any(s["ts"] > 1e11 for s in samples):
+            print(f"  ✗ epoch-scale timeStamp — NOT on performance.now()'s origin")
+        elif all(s["ts"] == 0 for s in samples):
+            print(f"  ✗ timeStamp is always 0 — this port does not stamp these events")
+        elif worst > 5000:
+            print(f"  ✗ delta up to {worst:.0f}ms — a different clock origin, not a queueing delay")
+        elif stage_name == "gdk":
+            print(f"  ✓ same scale; offset {min(deltas):+.0f}..{max(deltas):+.0f}ms "
+                  f"(a constant skew, not a delay — calibrate it away)")
+        else:
+            print(f"  ✓ same origin, deltas ≤ {worst:.1f}ms")
+
+    # The decisive arm: does a backdated platform event produce a backdated DOM stamp?
+    gdk_s, stale_s = ts.get("gdk") or [], ts.get("stale") or []
+    if gdk_s and stale_s:
+        base = min(s["now"] - s["ts"] for s in gdk_s)
+        stale_delta = stale_s[0]["now"] - stale_s[0]["ts"]
+        shift = stale_delta - base
+        print(f"\nbackdated by {STALE_BACKDATE_MS}ms → now-ts shifted {shift:+.0f}ms "
+              f"(baseline {base:+.0f} → {stale_delta:+.0f})")
+        if shift > STALE_BACKDATE_MS * 0.6:
+            print("  ✓ PLATFORM-DERIVED: timeStamp carries the event's own time, so "
+                  "(now - timeStamp) - min(now - timeStamp) IS an event-queueing delay.")
+        else:
+            print("  ✗ DISPATCH-STAMPED: timeStamp ignores the platform event time, so it "
+                  "can never express queueing. The scrub instrument must fall back to "
+                  "inter-event gaps measured in JS, and cannot attribute a gap to the "
+                  "event pipeline vs. the input device.")
+    elif not stale_s:
+        print(f"\nbackdated event produced no DOM event at all — inconclusive; the "
+              f"instrument should not rely on timeStamp.")
 
     print("\n--- verdict ---")
     if not api["PointerEvent"]:
