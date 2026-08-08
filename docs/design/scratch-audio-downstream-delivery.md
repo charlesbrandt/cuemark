@@ -369,22 +369,42 @@ config made cheapest.
 
 **Do not** touch the feeder, the servo, the scrub bus or the MIDI handler. F1, F8 and F10
 cover that whole span end to end, and it was already fixed three times there by mistake.
-The change belongs on the main `pulsesink`s, in `build_main_sink()`.
+The change belongs on the main `pulsesink`s.
 
-**Recommended: raise `discont-wait` (and `alignment-threshold`) so the sink never stops
-masking.** F10's strongest practical detail is that *the masking worked* — for the entire
+**Implemented 2026-08-08 (night), unverified live at time of writing** —
+`scratch_sink_alignment()` in `pipeline.rs`, applied by `begin_or_update_scratch()` before
+its `Paused→Playing` transition and restored by `stop_scratch_feeder()`:
+`alignment-threshold` 40ms → **2s**, `discont-wait` 1s → **1h**.
+
+**Scoped to the gesture, not set on the sink permanently.** Outside a scratch these
+defaults are load-bearing — a real decoder gap during normal playback *should* resync
+rather than be masked into contiguous-but-late audio that drifts away from video. During a
+gesture there is nothing to drift from: the normal branch is valved off and
+`uridecodebin`'s state is locked, so the feeder is the deck's only audio and it is
+self-paced to wall clock. It rides the existing widen-at-start/restore-at-end idiom that
+`output_queue`'s cap already uses, and the restore sits ahead of every early return in
+`stop_scratch_feeder()` — a leaked widening has no symptom until some unrelated live
+session drifts, which is what `scratch_widens_sink_alignment_then_restores` guards.
+
+⚠️ The property write is guarded by `find_property()`. `make_sink()` falls back to
+`autoaudiosink` when `pulsesink` is missing, that is a `GstBin` with neither property, and
+`set_property` on an absent property **panics** — unguarded, a missing-plugin install would
+crash on the first jog gesture.
+
+**Why this rather than something cleverer:** F10's strongest practical detail is that *the
+masking worked* — for the entire
 second the sink aligned to the previous sample, the output was correct. The defect is that
 the correction is time-limited by a default tuned for decoded media streams with
-meaningful timestamps, which is not what a scratch feeder is. Setting `discont-wait=0`
-disables the wait but makes *every* over-threshold buffer an instant discont, which is the
-opposite of what we want; the lever is a large `discont-wait` plus an
-`alignment-threshold` wide enough that a hard gesture does not trip it at all.
+meaningful timestamps, which is not what a scratch feeder is.
+
+⚠️ **`discont-wait=0` is the trap here, not the fix.** It reads like "never wait to
+resync" and does the opposite of what is wanted — it removes the grace period, making
+*every* over-threshold buffer an instant discont. Both values must go **up**.
 
 Trade-off to state honestly: unbounded alignment means the scratch output drifts steadily
 later than the pipeline clock over a long gesture. During a scratch that costs nothing —
-the normal branch is valved off, so there is nothing on that deck to be in sync with, and
-every gesture re-rolls `base_time`. It would matter if a scratch ever had to stay aligned
-to video; today it does not.
+see the scoping note above — and every gesture re-rolls `base_time`. It would matter if a
+scratch ever had to stay aligned to video; today it does not.
 
 **Rejected: a fixed timestamp lead on the pushed buffers.** This is what the doc predicted
 before F10 and it is the wrong trade. Giving buffers a head start means stamping them to
@@ -393,15 +413,26 @@ work. A quarter-second of latency on a scratch is grossly audible — the gestur
 detached from the sound, which is the entire point of the feature. `ts-offset` on the sink
 has the same cost and additionally applies to normal playback through the same element.
 
-**Verification.** This is a one-gesture A/B and both arms are already characterised:
+**Verification — not yet done.** Both arms are already characterised, and the control arm
+is an env var so switching costs no edit and no HMR remount:
 
-- Put it behind an env var in the `CUEMARK_*` idiom already used by
-  `sink_slave_method()`, so arms switch without an edit or an HMR remount.
-- Re-run with `GST_DEBUG=audiobasesink:6 GST_DEBUG_FILE=…` and drive the gesture **hard**
-  — `rate mean` >2, `max` at the 8.0 clamp — which is the condition F10 showed is required
-  to reproduce. A gentle drag passes either way and proves nothing (gesture 1).
-- Pass = zero `Unexpected discontinuity` WARNs and audio for the whole gesture. The WARN
-  count is the assertion; do not rely on listening alone.
+```bash
+GST_DEBUG=audiobasesink:6 GST_DEBUG_NO_COLOR=1 GST_DEBUG_FILE=/tmp/gst-fix.log \
+cargo tauri dev
+# control arm — stock GStreamer values, should still reproduce:
+CUEMARK_SCRATCH_ALIGN_MS=40 CUEMARK_SCRATCH_DISCONT_WAIT_MS=1000 …
+```
+
+- **Drive the gesture hard** — `rate mean` >2, `max` at the 8.0 clamp. That is the
+  condition F10 showed is required. A gentle drag passes either way and proves nothing;
+  that is precisely what gesture 1 was.
+- **Pass = zero `Unexpected discontinuity` WARNs** and audio for the whole gesture. The
+  WARN count is the assertion; do not rely on listening alone. `grep -c` it.
+- Confirm the arm from the log, never the UI — `[audio/deck-0] scratch: sink
+  alignment-threshold=…ms discont-wait=…ms` is printed at every gesture start, and an
+  active env override additionally logs `OVERRIDE ACTIVE`.
+- If WARNs persist at 2s/1h, the threshold is not the whole story and the next question is
+  what is making a *single* buffer land >2s out — do not simply raise it further.
 
 ⚠️ Level 6 on `audiobasesink` is per-buffer and large; `GST_DEBUG_FILE` is not optional.
 

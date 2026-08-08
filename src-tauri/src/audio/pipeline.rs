@@ -439,6 +439,101 @@ fn sink_buffer_times() -> (i64, i64) {
     )
 }
 
+/// Sink timestamp-alignment tolerance to apply **for the duration of a scratch gesture
+/// only**, as `(alignment_threshold_ns, discont_wait_ns)`. Restored to GStreamer's
+/// defaults when the gesture ends.
+///
+/// **Why this exists — root-caused 2026-08-08, see
+/// docs/design/scratch-audio-downstream-delivery.md F10.** The scratch feeder pushes
+/// just-in-time with `do-timestamp=true`, so its buffers carry no head start and run
+/// progressively later than the sink's ringbuffer write pointer as a gesture is driven
+/// harder. `GstAudioBaseSink` absorbs that by aligning each buffer to the previous one —
+/// and the output is **correct** while it does. But the correction is time-limited: once
+/// misalignment exceeds `alignment-threshold` (40ms) continuously for `discont-wait`
+/// (1s), the sink gives up, sets `align = 0`, and places the buffer at its raw
+/// timestamp-derived offset — measured live at **253ms in the past**, behind the
+/// ringbuffer's read pointer. Every buffer after that is written into segments already
+/// played out, so the deck goes silent for the rest of the `Playing` span and only a new
+/// gesture (fresh `base_time`) recovers it.
+///
+/// Widening both is therefore not a workaround for a stall — it keeps the sink doing the
+/// thing that was already producing correct audio. Delivery was never interrupted:
+/// `DeliveryProbe` measured an unbroken 67 buffers/s into the sink's own pad, and
+/// `audiobasesink:6` shows `wrote 720 of 720` on every buffer, throughout the silence.
+///
+/// **Why it is scoped to the gesture and not set on the sink permanently.** Outside a
+/// scratch these defaults are load-bearing: a real decoder gap during normal playback
+/// *should* resync rather than be masked, or the audio plays contiguously late and drifts
+/// away from video. During a gesture there is nothing to drift from — the normal branch is
+/// valved off and `uridecodebin`'s state is locked (see `valve_normal_el`), so the deck's
+/// only audio is the feeder's, and the feeder is self-paced to wall clock.
+///
+/// **Rejected alternative: a fixed timestamp lead on the pushed buffers.** To work it must
+/// be ≥ the worst-case lateness (~250ms observed), and a quarter-second of latency between
+/// hand and sound defeats the point of scratching. `ts-offset` on the sink costs the same
+/// and additionally applies to normal playback through the same element.
+///
+/// ```text
+/// # control arm — GStreamer's stock values, reproduces the fault on a hard gesture
+/// CUEMARK_SCRATCH_ALIGN_MS=40 CUEMARK_SCRATCH_DISCONT_WAIT_MS=1000 cargo tauri dev
+/// ```
+fn scratch_sink_alignment() -> (u64, u64) {
+    fn from_env(var: &str, default_ms: u64) -> u64 {
+        let Ok(raw) = std::env::var(var) else { return default_ms * 1_000_000 };
+        match raw.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 => {
+                // WARN for the same reason sink_buffer_times() does: an override means the
+                // running app is not testing the compiled-in default, and that divergence
+                // is otherwise invisible in the log.
+                log::warn!(
+                    "[audio] {var}={ms}ms OVERRIDE ACTIVE — compiled-in default ({default_ms}ms) \
+                     is NOT in effect; unset it to test the default"
+                );
+                ms * 1_000_000
+            }
+            _ => {
+                log::warn!(
+                    "[audio] ignoring {var}={raw:?} — expected a positive whole number of \
+                     milliseconds; using default {default_ms}ms"
+                );
+                default_ms * 1_000_000
+            }
+        }
+    }
+    (
+        // 2s/1h against GStreamer's 40ms/1s. The threshold is sized well clear of the
+        // ~253ms of lateness a hard gesture actually accumulated, and the wait is sized so
+        // it cannot expire inside any plausible gesture — together they mean the sink
+        // masks for the whole gesture rather than masking and then giving up, which is
+        // the specific failure F10 measured.
+        from_env("CUEMARK_SCRATCH_ALIGN_MS", 2_000),
+        from_env("CUEMARK_SCRATCH_DISCONT_WAIT_MS", 3_600_000),
+    )
+}
+
+/// GStreamer's stock `(alignment-threshold, discont-wait)`, restored at gesture end.
+/// Hardcoded rather than read back before overriding: `make_sink()` never sets these, so
+/// the pre-gesture value is always the default, and reading it back would silently
+/// persist a previous gesture's override if a restore were ever missed.
+const SINK_ALIGN_DEFAULTS_NS: (u64, u64) = (40_000_000, 1_000_000_000);
+
+/// Apply `(alignment-threshold, discont-wait)` to whichever main sinks actually have them.
+///
+/// ⚠️ **The property check is not defensive padding.** `make_sink()` falls back to
+/// `autoaudiosink` when `pulsesink` is missing, and that is a `GstBin`, not a
+/// `GstAudioBaseSink` — it has neither property, and `set_property` on a property a
+/// GObject does not have **panics** rather than erroring. That fallback path would
+/// otherwise turn a missing-plugin install into a crash on the first jog gesture.
+fn set_sink_alignment(sinks: &[gst::Element], align_ns: u64, discont_wait_ns: u64) {
+    for snk in sinks {
+        if snk.find_property("alignment-threshold").is_none() {
+            continue;
+        }
+        snk.set_property("alignment-threshold", align_ns);
+        snk.set_property("discont-wait", discont_wait_ns);
+    }
+}
+
 fn make_el(factory: &str) -> Result<gst::Element, String> {
     gst::ElementFactory::make(factory)
         .build()
@@ -784,6 +879,9 @@ struct PipelineInner {
     /// above `make_el` for why `scratch()` widens its cap for the gesture's
     /// duration.
     output_queue_el: gst::Element,
+    /// The main output sinks, kept so a scratch gesture can widen their timestamp-alignment
+    /// tolerance for its duration and restore it afterwards — see `scratch_sink_alignment()`.
+    main_sink_els: Vec<gst::Element>,
     /// Buffer counters on the `volume`/`pulsesink` pads, handed to each scratch feeder so
     /// its per-second telemetry can report delivery next to rms. See `DeliveryProbe`.
     delivery_probes: DeliveryProbes,
@@ -1430,6 +1528,7 @@ impl DeckAudioPipeline {
             uridecodebin_el: src.clone(),
             scratch_feeder: None,
             output_queue_el: output_queue,
+            main_sink_els: main_sinks,
             delivery_probes: Arc::new(delivery_probes),
         });
         Ok(duration)
@@ -1758,6 +1857,22 @@ impl DeckAudioPipeline {
         // and the normal branch needs tight latency again.
         inner.output_queue_el.set_property("max-size-time", SCRATCH_STARTUP_QUEUE_CAP_NS);
 
+        // Widen the sinks' timestamp-alignment tolerance for the gesture, before the
+        // Paused→Playing transition below — see scratch_sink_alignment() for the full
+        // mechanism. Must be set before PLAYING: the sink reads these on its streaming
+        // thread from the first buffer, and the failure it prevents begins accumulating
+        // immediately (the gesture that first exposed it opened 93ms late).
+        let (align_ns, discont_wait_ns) = scratch_sink_alignment();
+        set_sink_alignment(&inner.main_sink_els, align_ns, discont_wait_ns);
+        log::info!(
+            "[audio/{}] scratch: sink alignment-threshold={}ms discont-wait={}ms (defaults {}ms/{}ms)",
+            self.deck_id,
+            align_ns / 1_000_000,
+            discont_wait_ns / 1_000_000,
+            SINK_ALIGN_DEFAULTS_NS.0 / 1_000_000,
+            SINK_ALIGN_DEFAULTS_NS.1 / 1_000_000,
+        );
+
         inner
             .pipeline
             .set_state(gst::State::Playing)
@@ -1803,6 +1918,19 @@ impl DeckAudioPipeline {
         // not the widened scratch-startup allowance (see scratch()'s comment
         // on why this narrows here, at gesture end, rather than on a timer).
         inner.output_queue_el.set_property("max-size-time", OUTPUT_QUEUE_STEADY_CAP_NS);
+
+        // Restore stock alignment tolerance — the normal branch is about to feed these
+        // sinks again, and there a real timestamp discontinuity should resync rather than
+        // be masked into contiguous-but-late audio. See scratch_sink_alignment().
+        //
+        // Deliberately before the early `return` below: that path (no PCM buffer) skips
+        // only the resync seek, and leaving the sinks widened because a buffer was absent
+        // would be a silent, sticky change to normal playback.
+        set_sink_alignment(
+            &inner.main_sink_els,
+            SINK_ALIGN_DEFAULTS_NS.0,
+            SINK_ALIGN_DEFAULTS_NS.1,
+        );
 
         let Some(pcm) = &self.pcm_buffer else { return };
         let pos = (final_frame / pcm.rate as f64).max(0.0);
@@ -2912,6 +3040,61 @@ mod scratch_smoke_test {
         );
 
         pipeline.stop_scratch().expect("final stop_scratch");
+        pipeline.pause().expect("final pause");
+    }
+
+    /// The sinks' timestamp-alignment tolerance is widened for the duration of a scratch
+    /// gesture and restored when it ends — see `scratch_sink_alignment()` and
+    /// docs/design/scratch-audio-downstream-delivery.md F10.
+    ///
+    /// Asserting the *restore* is the point of this test. The widened value cannot break
+    /// anything during a gesture, but leaking it into normal playback silently changes how
+    /// the sink handles a genuine decoder discontinuity — a regression with no symptom
+    /// until some unrelated live session drifts audio away from video. `stop_scratch_feeder()`
+    /// has several early returns, and this is what keeps the restore ahead of all of them.
+    #[test]
+    #[ignore]
+    fn scratch_widens_sink_alignment_then_restores() {
+        gst::init().expect("gst init");
+        let mut pipeline = DeckAudioPipeline::new("test-deck-align");
+        pipeline.load("/home/account/Downloads/audio.wav").expect("load");
+        pipeline.play().expect("play");
+        std::thread::sleep(Duration::from_millis(300));
+        pipeline.pause().expect("pause");
+
+        let sinks: Vec<gst::Element> = main_sinks_of(&pipeline)
+            .into_iter()
+            .filter(|s| s.find_property("alignment-threshold").is_some())
+            .collect();
+        assert!(!sinks.is_empty(), "no GstAudioBaseSink to assert on");
+
+        let read = |s: &gst::Element| -> (u64, u64) {
+            (s.property("alignment-threshold"), s.property("discont-wait"))
+        };
+
+        for s in &sinks {
+            assert_eq!(
+                read(s),
+                SINK_ALIGN_DEFAULTS_NS,
+                "sink should start at GStreamer's stock values — SINK_ALIGN_DEFAULTS_NS \
+                 is hardcoded on the assumption that make_sink() never touches these"
+            );
+        }
+
+        let start = pipeline.position().unwrap();
+        pipeline.scratch_to(start + 0.20, 1000).expect("scratch_to");
+        std::thread::sleep(Duration::from_millis(150));
+
+        let expected = scratch_sink_alignment();
+        for s in &sinks {
+            assert_eq!(read(s), expected, "widened for the gesture");
+        }
+
+        pipeline.stop_scratch().expect("stop_scratch");
+        for s in &sinks {
+            assert_eq!(read(s), SINK_ALIGN_DEFAULTS_NS, "restored at gesture end");
+        }
+
         pipeline.pause().expect("final pause");
     }
 
