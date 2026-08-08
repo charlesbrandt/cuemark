@@ -758,7 +758,7 @@
     gap: 6px;
     padding: 3px 4px;
     font-family: var(--font-heading);
-    font-size: 10px;
+    font-size: calc(10px * var(--font-scale));
     letter-spacing: 0.05em;
     text-transform: uppercase;
     color: color-mix(in srgb, var(--text) 45%, transparent);
@@ -788,7 +788,7 @@
     align-items: center;
     gap: 5px;
     padding: 3px 4px;
-    font-size: 11px;
+    font-size: calc(11px * var(--font-scale));
     flex-wrap: wrap;
   }
 
@@ -808,7 +808,7 @@
     font-family: var(--font-heading);
     font-weight: 600;
     padding: 5px 8px;
-    font-size: 10px;
+    font-size: calc(10px * var(--font-scale));
     background: var(--surface2);
     border: 1px solid var(--divider);
     border-radius: var(--radius-sm);
@@ -833,7 +833,7 @@
   }
 
   .downbeat-indicator {
-    font-size: 10px;
+    font-size: calc(10px * var(--font-scale));
     color: #7ec8e3;
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
@@ -841,7 +841,7 @@
 
   .downbeat-clear {
     padding: 1px 4px;
-    font-size: 9px;
+    font-size: calc(9px * var(--font-scale));
     background: none;
     border: 1px solid var(--divider);
     border-radius: var(--radius-sm);
@@ -869,7 +869,7 @@
    * Do not re-try either without reading §7 first. The cost is not this element's paint.
    */
   .phase-display {
-    font-size: 10px;
+    font-size: calc(10px * var(--font-scale));
     color: #a8e6a3;
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
@@ -890,7 +890,7 @@
     font-family: var(--font-heading);
     font-weight: 700;
     padding: 4px 7px;
-    font-size: 9px;
+    font-size: calc(9px * var(--font-scale));
     background: none;
     border: none;
     border-radius: var(--radius-sm);
@@ -914,7 +914,7 @@
     font-family: var(--font-heading);
     font-weight: 700;
     padding: 4px 7px;
-    font-size: 10px;
+    font-size: calc(10px * var(--font-scale));
     background: none;
     border: none;
     border-radius: var(--radius-sm);
@@ -946,7 +946,7 @@
   .time-display {
     display: flex;
     justify-content: space-between;
-    font-size: 12px;
+    font-size: calc(12px * var(--font-scale));
     font-variant-numeric: tabular-nums;
     padding: 2px 4px;
     color: color-mix(in srgb, var(--text) 65%, transparent);
@@ -975,7 +975,7 @@
     flex-direction: column;
     align-items: center;
     padding: 5px 2px;
-    font-size: 11px;
+    font-size: calc(11px * var(--font-scale));
     background: none;
     border: none;
     border-radius: var(--radius-sm);
@@ -1007,11 +1007,11 @@
   .hc-num {
     font-family: var(--font-heading);
     font-weight: 800;
-    font-size: 13px;
+    font-size: calc(13px * var(--font-scale));
   }
 
   .hc-time {
-    font-size: 9px;
+    font-size: calc(9px * var(--font-scale));
     opacity: 0.85;
   }
 </style>

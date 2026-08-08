@@ -46,7 +46,7 @@
     background: var(--surface);
     border-top: 2px solid #7ec8e3;
     border-bottom: 1px solid var(--divider);
-    font-size: 12px;
+    font-size: calc(12px * var(--font-scale));
     color: var(--text);
     flex-shrink: 0;
   }
@@ -56,7 +56,7 @@
     font-weight: 800;
     color: #7ec8e3;
     letter-spacing: 0.08em;
-    font-size: 10px;
+    font-size: calc(10px * var(--font-scale));
     text-transform: uppercase;
   }
 
@@ -78,7 +78,7 @@
     font-family: var(--font-heading);
     font-weight: 600;
     padding: 5px 10px;
-    font-size: 11px;
+    font-size: calc(11px * var(--font-scale));
     background: var(--surface2);
     border: 1px solid var(--divider);
     border-radius: var(--radius-sm);

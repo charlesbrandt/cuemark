@@ -105,7 +105,7 @@
     border: 1px solid var(--divider);
     border-radius: var(--radius-sm);
     padding: 6px 24px 6px 8px;
-    font-size: 12px;
+    font-size: calc(12px * var(--font-scale));
     font-weight: 700;
   }
   .cf-select:focus { outline: none; border-color: var(--accent); }
@@ -116,7 +116,7 @@
     gap: 5px;
     font-family: var(--font-heading);
     font-weight: 700;
-    font-size: 11px;
+    font-size: calc(11px * var(--font-scale));
     color: var(--text);
     white-space: nowrap;
   }

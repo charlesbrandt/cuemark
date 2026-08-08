@@ -4,6 +4,7 @@
   import { getDiggerFileUrl } from '../lib/digger/api';
   import { recordAuxLoop } from '../lib/audio/pollStats';
   import { suppressWaveformDraw } from '../lib/audio/perfArm';
+  import { fontScale } from '../lib/settings/displaySettings';
   import type { Deck } from '../lib/state/types';
 
   let {
@@ -215,7 +216,7 @@
     if (!hasSource) {
       const dpr = window.devicePixelRatio || 1;
       ctx.fillStyle = '#2a2a2a';
-      ctx.font = `${Math.round(11 * dpr)}px monospace`;
+      ctx.font = `${Math.round(11 * dpr * $fontScale)}px monospace`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText('— no source —', W / 2, mid);
@@ -229,7 +230,7 @@
     if (!duration) {
       const dpr = window.devicePixelRatio || 1;
       ctx.fillStyle = '#333';
-      ctx.font = `${Math.round(11 * dpr)}px monospace`;
+      ctx.font = `${Math.round(11 * dpr * $fontScale)}px monospace`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText('loading…', W / 2, mid);
@@ -239,7 +240,7 @@
     if (!peaks) {
       const dpr = window.devicePixelRatio || 1;
       ctx.fillStyle = '#333';
-      ctx.font = `${Math.round(11 * dpr)}px monospace`;
+      ctx.font = `${Math.round(11 * dpr * $fontScale)}px monospace`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(loading ? 'analyzing…' : '—', W / 2, mid);
@@ -569,7 +570,7 @@
     color: rgba(240, 241, 244, 0.55);
     font-family: var(--font-heading, sans-serif);
     font-weight: 700;
-    font-size: 9px;
+    font-size: calc(9px * var(--font-scale));
     cursor: pointer;
     border-radius: var(--radius-sm, 6px);
     letter-spacing: 0.05em;

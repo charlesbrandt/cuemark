@@ -24,6 +24,7 @@
   import AudioSettings from "./components/AudioSettings.svelte";
   import DiggerQueue from "./components/DiggerQueue.svelte";
   import { mainOutputDeviceIds, cueOutputDeviceId, cueGain } from "./lib/audio/audioSettings";
+  import { fontScale } from "./lib/settings/displaySettings";
   import { CodecPlayer, type DemuxInfo } from "./lib/video/codecPlayer";
   import { videoPathOverrides, videoPathDefault, resolveVideoPath, setVideoPathOverride } from "./lib/video/videoPathSettings";
   import type { Deck, Session } from "./lib/state/types";
@@ -53,6 +54,12 @@
   let showAudioSettings = $state(false);
   let showDiggerQueue = $state(true);
   let showVisualizationPanel = $state(false);
+
+  // --font-scale (app.css :root) is inherited into every component's scoped styles,
+  // so setting it once here on documentElement is all that's needed to scale all UI text.
+  $effect(() => {
+    document.documentElement.style.setProperty("--font-scale", String($fontScale));
+  });
 
   function handleTap() {
     const now = Date.now();
@@ -1674,16 +1681,23 @@
         {#each $session.decks as deck (deck.id)}
           <div class="waveform-row">
             <span class="waveform-label">{deck.id}</span>
-            <!-- downbeat defaults to track start (0) on every auto-fit load — extrapolating
-                 the grid from t=0 rather than the comb-fit's arbitrary beat phase (also
-                 clears a stale downbeat carried over from the previous track). This is
-                 intentionally a guess: SET BEAT in DeckCard is the manual override, and
-                 only a manual SET BEAT persists locally / pushes to Digger. -->
-            <WaveformCanvas {deck} onAnalyzed={({ bpm }) => {
+            <!-- downbeat comes from the comb fit's measured grid phase (gridOffset), NOT
+                 from t=0. Between 2026-07-25 and 2026-08-08 this deliberately used 0 on the
+                 grounds that the fitted phase was "arbitrary" — it is not. gridOffset is the
+                 measured position of a beat (bpm.test.ts asserts it within 20-25ms of truth);
+                 t=0 is the arbitrary one, off by a uniformly-random fraction of a beat on
+                 every track. Since getPhase() measures phase relative to this anchor, two
+                 decks anchored at their own t=0 could sit up to half a beat apart while NUDGE
+                 reported them perfectly in phase — beat-level sync could not work at all.
+                 gridOffset marks *a* beat, not bar-beat-1; SET BEAT remains the manual
+                 override for bar identity, and only a manual SET BEAT persists locally /
+                 pushes to Digger. null (grid fit failed, integer detectBpm fallback) still
+                 clears any stale downbeat carried over from the previous track. -->
+            <WaveformCanvas {deck} onAnalyzed={({ bpm, gridOffset }) => {
               // A saved grid (sidecar or Digger) always wins over the auto-fit — see the
               // race-ordering comment at the gridGetSaved() call site above.
               if (deck.source?.type === 'video' && !hasSavedGrid(deck.id, deck.source.filePath)) {
-                updateDeck(deck.id, { bpm, downbeat: 0 });
+                updateDeck(deck.id, { bpm, downbeat: gridOffset });
               }
             }} />
           </div>

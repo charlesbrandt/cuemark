@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { listAudioDevices, type AudioDevice } from "../lib/audio/pipeline";
   import { mainOutputDeviceIds, cueOutputDeviceId, tempoRange, scratchMode } from "../lib/audio/audioSettings";
+  import { fontScale } from "../lib/settings/displaySettings";
   import { session, setMidiMapping } from "../lib/state/session";
 
   let devices = $state<AudioDevice[]>([]);
@@ -116,6 +117,20 @@
   </div>
 
   <div class="settings-row">
+    <span class="row-label">Display</span>
+    <input
+      type="range"
+      min="0.8"
+      max="1.5"
+      step="0.05"
+      bind:value={$fontScale}
+    />
+    <span class="font-scale-value">{Math.round($fontScale * 100)}%</span>
+    <button type="button" class="font-scale-reset" onclick={() => fontScale.set(1.0)}>Reset</button>
+    <span class="hint-inline">UI text size</span>
+  </div>
+
+  <div class="settings-row">
     <span class="row-label">MIDI</span>
     <span class="side-label">L</span>
     <select
@@ -147,7 +162,7 @@
     background: var(--surface);
     border-top: 2px solid var(--accent-deck);
     border-bottom: 1px solid var(--divider);
-    font-size: 12px;
+    font-size: calc(12px * var(--font-scale));
     color: var(--text);
     flex-shrink: 0;
   }
@@ -157,7 +172,7 @@
     font-weight: 800;
     color: var(--accent-deck);
     letter-spacing: 0.08em;
-    font-size: 10px;
+    font-size: calc(10px * var(--font-scale));
     text-transform: uppercase;
   }
 
@@ -177,7 +192,7 @@
 
   .side-label {
     color: color-mix(in srgb, var(--text) 45%, transparent);
-    font-size: 10px;
+    font-size: calc(10px * var(--font-scale));
     flex-shrink: 0;
   }
 
@@ -222,7 +237,7 @@
     border: 1px solid var(--divider);
     border-radius: var(--radius-sm);
     color: var(--text);
-    font-size: 12px;
+    font-size: calc(12px * var(--font-scale));
     padding: 5px 24px 5px 8px;
     cursor: pointer;
     max-width: 220px;
@@ -231,6 +246,27 @@
   select:focus {
     outline: none;
     border-color: var(--accent-deck);
+  }
+
+  .font-scale-value {
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+    min-width: 34px;
+  }
+
+  .font-scale-reset {
+    font-family: var(--font-body);
+    font-size: calc(11px * var(--font-scale));
+    background: var(--surface2);
+    border: 1px solid var(--divider);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    padding: 3px 8px;
+    cursor: pointer;
+  }
+  .font-scale-reset:hover {
+    border-color: var(--accent-deck);
+    color: var(--accent-deck);
   }
 
 </style>

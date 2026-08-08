@@ -258,7 +258,7 @@
     height: 100%;
     min-height: 0;
     padding: 16px 16px 0;
-    font-size: 12px;
+    font-size: calc(12px * var(--font-scale));
     color: var(--text);
   }
 
@@ -274,7 +274,7 @@
     font-family: var(--font-heading);
     font-weight: 800;
     color: var(--text);
-    font-size: 11px;
+    font-size: calc(11px * var(--font-scale));
     text-transform: uppercase;
     letter-spacing: 0.08em;
     flex: 1;
@@ -286,7 +286,7 @@
     color: color-mix(in srgb, var(--text) 55%, transparent);
     cursor: pointer;
     padding: 4px;
-    font-size: 14px;
+    font-size: calc(14px * var(--font-scale));
     line-height: 1;
     border-radius: var(--radius-sm);
   }
@@ -310,13 +310,13 @@
     border: 1px solid var(--divider);
     color: var(--text);
     padding: 6px 8px;
-    font-size: 12px;
+    font-size: calc(12px * var(--font-scale));
     border-radius: var(--radius-sm);
   }
 
   .digger-error {
     color: #ff6b6b;
-    font-size: 11px;
+    font-size: calc(11px * var(--font-scale));
     margin-bottom: 6px;
     flex-shrink: 0;
   }
@@ -334,7 +334,7 @@
     border: 1px solid var(--divider);
     color: var(--text);
     padding: 6px 8px;
-    font-size: 12px;
+    font-size: calc(12px * var(--font-scale));
     border-radius: var(--radius-sm);
     font-family: var(--font-body);
   }
@@ -347,7 +347,7 @@
     border: 1px solid var(--divider);
     color: var(--text);
     padding: 6px 10px;
-    font-size: 11px;
+    font-size: calc(11px * var(--font-scale));
     cursor: pointer;
     border-radius: var(--radius-sm);
   }
@@ -362,7 +362,7 @@
 
   .list-hint {
     color: color-mix(in srgb, var(--text) 40%, transparent);
-    font-size: 11px;
+    font-size: calc(11px * var(--font-scale));
     padding: 4px 0;
   }
 
@@ -380,12 +380,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 12px;
+    font-size: calc(12px * var(--font-scale));
   }
 
   .bpm-badge {
     color: color-mix(in srgb, var(--text) 45%, transparent);
-    font-size: 10px;
+    font-size: calc(10px * var(--font-scale));
     flex-shrink: 0;
     min-width: 24px;
     text-align: right;
@@ -405,7 +405,7 @@
     padding: 2px 6px;
     font-family: var(--font-heading);
     font-weight: 700;
-    font-size: 10px;
+    font-size: calc(10px * var(--font-scale));
     cursor: pointer;
     border-radius: var(--radius-sm);
     white-space: nowrap;
@@ -417,7 +417,7 @@
     border: 1px solid transparent;
     color: var(--accent);
     padding: 2px 7px;
-    font-size: 13px;
+    font-size: calc(13px * var(--font-scale));
     cursor: pointer;
     border-radius: var(--radius-sm);
     flex-shrink: 0;
@@ -430,7 +430,7 @@
     color: color-mix(in srgb, var(--text) 35%, transparent);
     cursor: pointer;
     padding: 2px 5px;
-    font-size: 12px;
+    font-size: calc(12px * var(--font-scale));
   }
   .remove-btn:hover { color: #ff6b6b; }
 </style>

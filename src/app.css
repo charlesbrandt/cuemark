@@ -34,13 +34,18 @@
 
   --accent: var(--accent-deck);
   --accent-soft: var(--accent-soft-deck);
+
+  /* Global proportional UI text scale; set at runtime by App.svelte from the
+     persisted fontScale setting. Every font-size in the app is calc()'d against
+     this so a single slider scales all text together. */
+  --font-scale: 1;
 }
 
 body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font-body);
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
   height: 100vh;
   overflow: hidden;
 }
@@ -93,7 +98,7 @@ body {
 .logo {
   font-family: var(--font-heading);
   font-weight: 800;
-  font-size: 15px;
+  font-size: calc(15px * var(--font-scale));
   letter-spacing: 0.06em;
   color: var(--accent);
   margin-right: 4px;
@@ -110,7 +115,7 @@ body {
 .btn {
   font-family: var(--font-heading);
   font-weight: 600;
-  font-size: 12px;
+  font-size: calc(12px * var(--font-scale));
   letter-spacing: 0.02em;
   padding: 7px 12px;
   background: var(--surface2);
@@ -127,7 +132,7 @@ body {
 .tap-btn {
   font-family: var(--font-heading);
   font-weight: 600;
-  font-size: 12px;
+  font-size: calc(12px * var(--font-scale));
   letter-spacing: 0.02em;
   padding: 7px 12px;
   background: var(--surface2);
@@ -153,7 +158,7 @@ body {
   border: none;
   color: color-mix(in srgb, var(--text) 45%, transparent);
   cursor: pointer;
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
   line-height: 1;
   padding: 0 2px;
 }
@@ -162,7 +167,7 @@ body {
 .bpm {
   font-family: var(--font-heading);
   font-weight: 800;
-  font-size: 15px;
+  font-size: calc(15px * var(--font-scale));
   font-variant-numeric: tabular-nums;
   color: var(--text);
   white-space: nowrap;
@@ -174,7 +179,7 @@ body {
   gap: 8px;
   color: color-mix(in srgb, var(--text) 60%, transparent);
   font-family: var(--font-heading);
-  font-size: 10px;
+  font-size: calc(10px * var(--font-scale));
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -226,7 +231,7 @@ body {
 .deck-id {
   font-family: var(--font-heading);
   font-weight: 700;
-  font-size: 11px;
+  font-size: calc(11px * var(--font-scale));
   letter-spacing: 0.08em;
   color: color-mix(in srgb, var(--text) 55%, transparent);
   text-transform: uppercase;
@@ -236,7 +241,7 @@ body {
   min-width: 0;
   font-family: var(--font-heading);
   font-weight: 800;
-  font-size: 14px;
+  font-size: calc(14px * var(--font-scale));
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -249,7 +254,7 @@ body {
   border: none;
   color: color-mix(in srgb, var(--text) 30%, transparent);
   cursor: pointer;
-  font-size: 18px;
+  font-size: calc(18px * var(--font-scale));
   line-height: 1;
   padding: 0 2px;
   border-radius: var(--radius-sm);
@@ -265,7 +270,7 @@ body {
 .video-path-btn {
   padding: 2px 6px;
   font-family: var(--font-heading);
-  font-size: 9px;
+  font-size: calc(9px * var(--font-scale));
   font-weight: 700;
   letter-spacing: 0.05em;
   background: var(--surface2);
@@ -296,7 +301,7 @@ body {
   align-items: center;
   justify-content: center;
   font-family: var(--font-heading);
-  font-size: 10px;
+  font-size: calc(10px * var(--font-scale));
   font-weight: 700;
   letter-spacing: 0.08em;
   color: var(--accent-deck);
@@ -341,12 +346,12 @@ body {
 }
 .preview-placeholder {
   color: color-mix(in srgb, var(--text) 45%, transparent);
-  font-size: 12px;
+  font-size: calc(12px * var(--font-scale));
 }
 .preview-placeholder.empty { color: color-mix(in srgb, var(--text) 20%, transparent); }
 .source-label {
   color: color-mix(in srgb, var(--text) 60%, transparent);
-  font-size: 11px;
+  font-size: calc(11px * var(--font-scale));
   text-align: center;
   word-break: break-all;
   overflow: hidden;
@@ -354,7 +359,7 @@ body {
   white-space: nowrap;
   max-width: 100%;
 }
-.duration { font-size: 10px; color: color-mix(in srgb, var(--text) 35%, transparent); }
+.duration { font-size: calc(10px * var(--font-scale)); color: color-mix(in srgb, var(--text) 35%, transparent); }
 .load-btn {
   padding: 4px 10px;
   font-family: var(--font-heading);
@@ -364,7 +369,7 @@ body {
   color: color-mix(in srgb, var(--text) 55%, transparent);
   cursor: pointer;
   border-radius: var(--radius-sm);
-  font-size: 11px;
+  font-size: calc(11px * var(--font-scale));
 }
 .load-btn:hover { border-color: var(--accent); color: var(--accent); }
 
@@ -379,7 +384,7 @@ body {
   border: 1px solid var(--accent);
   color: var(--on-accent);
   cursor: pointer;
-  font-size: 15px;
+  font-size: calc(15px * var(--font-scale));
   font-weight: 800;
   border-radius: var(--radius-sm);
   font-family: var(--font-heading);
@@ -411,7 +416,7 @@ body {
   gap: 3px;
   color: color-mix(in srgb, var(--text) 45%, transparent);
   font-family: var(--font-heading);
-  font-size: 10px;
+  font-size: calc(10px * var(--font-scale));
   letter-spacing: 0.05em;
   text-transform: uppercase;
 }
@@ -435,7 +440,7 @@ body {
   gap: 3px;
   color: color-mix(in srgb, var(--text) 45%, transparent);
   font-family: var(--font-heading);
-  font-size: 9px;
+  font-size: calc(9px * var(--font-scale));
   letter-spacing: 0.04em;
 }
 .eq-row label > span {
@@ -446,7 +451,7 @@ body {
 .eq-row input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer; }
 .eq-reset {
   padding: 4px 7px;
-  font-size: 13px;
+  font-size: calc(13px * var(--font-scale));
   background: var(--surface2);
   border: 1px solid var(--divider);
   border-radius: var(--radius-sm);
@@ -472,7 +477,7 @@ body {
 }
 .cf-label {
   font-family: var(--font-heading);
-  font-size: 11px;
+  font-size: calc(11px * var(--font-scale));
   font-weight: 700;
   letter-spacing: 0.04em;
   color: color-mix(in srgb, var(--text) 55%, transparent);
@@ -493,7 +498,7 @@ body {
   flex: 1;
   text-align: center;
   font-family: var(--font-heading);
-  font-size: 11px;
+  font-size: calc(11px * var(--font-scale));
   font-weight: 700;
   padding: 5px 6px;
   border: none;

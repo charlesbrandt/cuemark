@@ -76,13 +76,13 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    font-size: 12px;
+    font-size: calc(12px * var(--font-scale));
     color: var(--text);
   }
 
   .list-hint {
     color: color-mix(in srgb, var(--text) 40%, transparent);
-    font-size: 11px;
+    font-size: calc(11px * var(--font-scale));
     padding: 4px 0;
   }
 
@@ -97,7 +97,7 @@
   .history-deck {
     color: color-mix(in srgb, var(--text) 45%, transparent);
     font-family: var(--font-heading);
-    font-size: 10px;
+    font-size: calc(10px * var(--font-scale));
     font-weight: 700;
     flex-shrink: 0;
     min-width: 16px;
@@ -114,12 +114,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 12px;
+    font-size: calc(12px * var(--font-scale));
   }
 
   .history-meta {
     color: color-mix(in srgb, var(--text) 40%, transparent);
-    font-size: 10px;
+    font-size: calc(10px * var(--font-scale));
   }
 
   .requeue-btn {
@@ -129,7 +129,7 @@
     padding: 2px 7px;
     font-family: var(--font-heading);
     font-weight: 700;
-    font-size: 10px;
+    font-size: calc(10px * var(--font-scale));
     cursor: pointer;
     border-radius: var(--radius-sm);
     flex-shrink: 0;
