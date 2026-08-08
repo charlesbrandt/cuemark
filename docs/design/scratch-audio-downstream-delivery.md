@@ -1,11 +1,11 @@
 # Scratch audio reaches GStreamer and never reaches the speakers — 2026-08-08
 
-**Status after the evening session: the A/B is run and device routing is dead as a cause.
-Every stage from the PCM buffer to the `pulsesink`'s own sink pad is now measured
-delivering non-silent audio continuously through the silence.** The fault is inside the
-sink's render stage or below it, and H5 (zero sink margin) is the leading hypothesis with
-its precondition confirmed by measurement. Next step is `GST_DEBUG` inside the sink — see
-"Where to pick up".
+**🟢 ROOT-CAUSED 2026-08-08 (night). H5 is confirmed with a mechanism, by `GST_DEBUG`
+inside the sink, against a within-run control arm.** `GstAudioBaseSink` gives up masking
+the feeder's accumulated lateness after `discont-wait` (1s) and resyncs its ringbuffer
+write pointer ~253ms *backwards*, behind the read pointer; every subsequent buffer lands
+in already-played segments. See F10. The fix is a sink tolerance/timestamp change and
+nothing else — see "The fix".
 
 The original short version, still true: **the PCM scratch feeder is producing loud,
 continuous, correct audio for the entire duration of a gesture the user hears as silent.**
@@ -104,7 +104,74 @@ each buffer's running time minus the element's current running time. It reads **
 second, from the first chunk** — not a decay, a structural constant. That is H5's
 precondition confirmed rather than argued: a just-in-time feeder with `do-timestamp=true`
 cannot produce slack. ⚠️ It is the *precondition*, not the mechanism — a resyncing ring
-buffer and a healthy one are indistinguishable from outside the sink.
+buffer and a healthy one are indistinguishable from outside the sink. (F10 got inside the
+sink and found the resync. The −93ms this probe read at gesture 2's open is the head start
+on the lateness that F10's resync then punished.)
+
+**F10 — the sink resyncs its ringbuffer backwards mid-gesture, and that is the fault
+(session 3, 2026-08-08 night).** Arm A4 confirmed from the log (one `pulsesink` on the
+BurrBrown/TI USB codec, cue on `fakesink`). Two waveform drags in one run, and **they
+disagreed** — the first stayed audible for its full 17s, the second died. That accident
+is the best control arm in this investigation: same build, same routing, same session,
+one variable (how hard the gesture was driven).
+
+`GST_DEBUG=audiobasesink:6,pulsesink:5` over both gestures contains **exactly two WARNs in
+17,006 lines**, and both are inside the gesture that died:
+
+```
+0:02:48.295 WARN audiobasesink gst_audio_base_sink_get_alignment:<pulsesink0>
+            Unexpected discontinuity in audio timestamps of -0:00:00.253062500, resyncing
+```
+
+The render trace on either side of it:
+
+```
+rendering at 2154577   (align +12067)     ← sink masking 251ms of lateness, sounds correct
+rendering at 2155297   (align +12141)     ← mask still growing
+    WARN  -0:00:00.253062500, resyncing   ← discont-wait expires, align := 0
+rendering at 2143870                      ← write pointer drops back 11427 samples
+rendering at 2144591 / 2145311 / 2146031  ← continues from there, small aligns, never returns
+```
+
+The buffer *timestamps* never went backwards — they advance ~15ms per buffer throughout.
+What moved is the sink's write pointer.
+
+**The arithmetic closes on GStreamer's two defaults**, both read off this machine's
+`gst-inspect-1.0 pulsesink`:
+
+| | default | in the log |
+|---|---|---|
+| `alignment-threshold` | 40ms | `1920` samples @48kHz — the threshold in `ABS (12067) < 1920` |
+| `discont-wait` | 1.000s | WARN fires 1.355s after the gesture's `Paused→Playing` |
+
+So the sequence is: the gesture opens ~93ms late (F9's margin caught exactly this),
+misalignment crosses 40ms about 0.35s in, `get_alignment()` records a discont *candidate*
+and **keeps correcting it by aligning to the previous sample** — which is why the audio is
+fine at first — and one full `discont-wait` later it stops, sets `align = 0`, and places
+the buffer at its raw timestamp-derived offset 253ms in the past. That is behind the
+ringbuffer's read pointer, so those samples and all after them are written into segments
+already played out. Silence, for the rest of the `Playing` span.
+
+⚠️ **The `align with prev sample, ABS (12067) < 1920` DEBUG line is misleading and cost
+time to read.** 12067 is not less than 1920. That branch prints whenever the sink
+*decides* to align, including while a discont candidate is pending — the printed
+comparison is not the test that was performed. Read it as "aligned anyway", not "was
+within threshold".
+
+**What F10 explains that nothing else did:**
+
+- **F6, exactly.** The silence cannot recover inside the gesture because the write pointer
+  stays retarded for the whole `Playing` span; a new gesture re-rolls `base_time` and
+  starts clean, so it is instantly audible.
+- **F8's paradox.** 67 buffers/s really do reach the sink pad, and the sink really does
+  `wrote 720 of 720` on every one. Delivery was never the question — placement was.
+- **Why it is rate-dependent.** The user's own read on the two gestures ("maybe I kept the
+  rate low enough") is what the telemetry says: gesture 1 ran `rate mean` 0.17–0.64 and
+  never sustained >40ms of misalignment for a full second; gesture 2 ran `rate mean`
+  2.2–3.2 with `max` saturating the 8.0 clamp, and did.
+- **Why the sink's own behaviour is the lever.** For the entire second it aligned, the
+  output was correct. Masking is the *right* behaviour for this feeder. The fault is that
+  it is time-limited.
 
 ## What is ruled out, and by what
 
@@ -124,6 +191,8 @@ buffer and a healthy one are indistinguishable from outside the sink.
 | The sink being starved (anything upstream of it) | F8 — 67 buffers/s at the sink's own sink pad throughout |
 | The `arrived`-fade being mistaken for a fault | F6 — designed silence recovers when the hand moves again; this does not |
 | The servo's `SCRATCH_TARGET_MAX_RATE` clamp | Telemetry: the clamp engaged in 1 second of a 13.5s gesture (the closing flick). The steady portion asked for 0.05–1.6×, nowhere near 8.0 |
+| A stall or drop *inside* the sink | F10 — the sink renders every buffer, `wrote 720 of 720` throughout. It writes them to the wrong place |
+| PipeWire / ALSA below GStreamer (H4) | F10 — the fault is fully explained one layer above, in `GstAudioBaseSink`'s alignment logic, with both of its thresholds matching the observed timing. `pw-top`/`pw-record` remain unspent and are no longer needed |
 
 ## The instruments, and how to read them
 
@@ -202,8 +271,13 @@ Consequences worth carrying forward:
 has one sink on one device and still dies. It remains a live hypothesis for
 `audio-dropout-mid-playback.md`'s separate D1, which was never reproduced here.
 
-**H5 — zero sink margin — is the leading hypothesis, and its precondition is now
-measured.** The feeder produces exactly real time (15ms per 15ms) with `do-timestamp=true`,
+**H5 — zero sink margin — is CONFIRMED (F10), with a more specific mechanism than it was
+originally stated with.** Zero margin is the precondition; the failure itself is
+`GstAudioBaseSink` timing out its alignment correction after `discont-wait` and resyncing
+the ringbuffer write pointer backwards past the read pointer. The original statement of
+the hypothesis follows, unchanged, because it was right:
+
+The feeder produces exactly real time (15ms per 15ms) with `do-timestamp=true`,
 so buffers are stamped at push time and arrive with no head start: F9 reads **−0ms every
 second, from the first chunk**. `GstAudioBaseSink` writes samples into its ring buffer at
 the position their timestamp implies, so with zero slack a few milliseconds of jitter
@@ -217,13 +291,13 @@ position the user has not chosen yet. If H5 is confirmed, the fix is a latency/t
 offset — push buffers a fixed lead ahead of the clock, or give the sink a `ts-offset` — and
 it is emphatically **not** a bigger queue and **not** anything in the feeder or servo.
 
-**H6 (the Paused→Playing cycle across three sinks)** is weakened but not dead: A4 still
-does the transition, on one sink. If `GST_DEBUG` shows the ring buffer resyncing, H5 and H6
-are the same finding seen from two sides.
+**H6 (the Paused→Playing cycle across three sinks)** resolves into H5, as anticipated:
+`GST_DEBUG` did show the ringbuffer resyncing, so they are one finding seen from two
+sides. The `Paused→Playing` transition is not itself harmful — it is what makes each new
+gesture audible again, by re-rolling `base_time` and clearing the retarded write pointer.
 
-The remaining candidate if `GST_DEBUG` clears the sink: **PipeWire/ALSA below GStreamer**
-(H4's territory). Nothing has yet observed the device's own behaviour during a gesture —
-`pw-top`'s `ERR` column and a `pw-record` capture of the sink monitor are both unspent.
+**H4 (PipeWire/ALSA below GStreamer) is no longer needed** and its instruments stay
+unspent — see the ruled-out table.
 
 ### On the shared-cause question with `audio-dropout-mid-playback.md`
 
@@ -291,33 +365,53 @@ config made cheapest.
    The usable gesture looks like `arrived 0% snaps=0` with rms −10 to −16 dBFS.
 2. **Confirm the arm from the log, never from the UI.** See the cue-device bug below.
 
-## Where to pick up
+## The fix
 
-Nothing here needs a code change to proceed. Run the A/B, fill in the table, then decide.
+**Do not** touch the feeder, the servo, the scrub bus or the MIDI handler. F1, F8 and F10
+cover that whole span end to end, and it was already fixed three times there by mistake.
+The change belongs on the main `pulsesink`s, in `build_main_sink()`.
 
-**Next step: `GST_DEBUG` inside the sink, on arm A4.** Everything outside the sink is now
-measured and clean, so the only remaining place to look is where cuemark cannot log:
+**Recommended: raise `discont-wait` (and `alignment-threshold`) so the sink never stops
+masking.** F10's strongest practical detail is that *the masking worked* — for the entire
+second the sink aligned to the previous sample, the output was correct. The defect is that
+the correction is time-limited by a default tuned for decoded media streams with
+meaningful timestamps, which is not what a scratch feeder is. Setting `discont-wait=0`
+disables the wait but makes *every* over-threshold buffer an instant discont, which is the
+opposite of what we want; the lever is a large `discont-wait` plus an
+`alignment-threshold` wide enough that a hard gesture does not trip it at all.
 
-```bash
-GST_DEBUG=audiobasesink:6,pulsesink:5 \
-GST_DEBUG_NO_COLOR=1 \
-GST_DEBUG_FILE=/tmp/gst-a4.log \
-cargo tauri dev
-```
+Trade-off to state honestly: unbounded alignment means the scratch output drifts steadily
+later than the pipeline clock over a long gesture. During a scratch that costs nothing —
+the normal branch is valved off, so there is nothing on that deck to be in sync with, and
+every gesture re-rolls `base_time`. It would matter if a scratch ever had to stay aligned
+to video; today it does not.
 
-Then one ~15s slow zoomed drag on a paused deck, carried a couple of seconds *past* the
-point the sound dies — the cut is the event, and the log needs both sides of it. Grep for
-`late`, `resync`, `skew`, `dropping`. Those words appearing as the sound dies confirms H5
-and the fix is a timestamp/latency offset (a fixed lead on the pushed buffers, or a
-`ts-offset` on the sink). Their **absence** clears GStreamer and sends this to PipeWire/ALSA
-— at which point `pw-top`'s `ERR` column and a `pw-record` capture of the sink monitor
-during a gesture are the unspent instruments.
+**Rejected: a fixed timestamp lead on the pushed buffers.** This is what the doc predicted
+before F10 and it is the wrong trade. Giving buffers a head start means stamping them to
+play N ms in the future, and N has to be ≥ the worst-case lateness (~250ms observed) to
+work. A quarter-second of latency on a scratch is grossly audible — the gesture would feel
+detached from the sound, which is the entire point of the feature. `ts-offset` on the sink
+has the same cost and additionally applies to normal playback through the same element.
+
+**Verification.** This is a one-gesture A/B and both arms are already characterised:
+
+- Put it behind an env var in the `CUEMARK_*` idiom already used by
+  `sink_slave_method()`, so arms switch without an edit or an HMR remount.
+- Re-run with `GST_DEBUG=audiobasesink:6 GST_DEBUG_FILE=…` and drive the gesture **hard**
+  — `rate mean` >2, `max` at the 8.0 clamp — which is the condition F10 showed is required
+  to reproduce. A gentle drag passes either way and proves nothing (gesture 1).
+- Pass = zero `Unexpected discontinuity` WARNs and audio for the whole gesture. The WARN
+  count is the assertion; do not rely on listening alone.
 
 ⚠️ Level 6 on `audiobasesink` is per-buffer and large; `GST_DEBUG_FILE` is not optional.
 
-**Do not** re-fix anything in the feeder, the servo, the scrub bus or the MIDI handler
-against this symptom. F1 and F8 cover all of it end to end, and it was already fixed three
-times there by mistake.
+### Session 3 method note, worth reusing
+
+The control arm was an accident: the user ran one gentle gesture and one hard one, and
+only the hard one failed. **Two gestures of deliberately different intensity in a single
+run is now the standard protocol for this fault** — it costs nothing, and a within-run
+control removes build, routing, device and session state as variables in one stroke. The
+earlier A/B spent five arms establishing less.
 
 ### Adjacent work this investigation surfaced but did not do
 
