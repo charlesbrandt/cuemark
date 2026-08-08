@@ -247,6 +247,15 @@ to fit a fractional BPM and beat-level grid anchor, auto-populating `deck.bpm`/`
 A saved grid (DeckCard SET BEAT button) beats the auto-fit — see `gridSource.ts`. `Session.snapToBeat`
 (SNAP toolbar toggle) routes seeks/hot-cues/loop points through `quantizeToGrid()` in `seekBus.ts`.
 
+**`deck.downbeat` is a beat-level phase anchor, NOT bar-beat-1** — every consumer
+(`getPhase`, `quantizeToGrid`, `nudgePhaseToMaster`) works mod one beat, and nothing detects
+bar identity yet. It must carry the comb fit's *measured* `gridOffset`; anchoring it at `t=0`
+instead silently breaks beat sync outright (each deck's reported phase is then off by a random
+fraction of a beat, so NUDGE reports alignment two decks don't have). That regression shipped
+2026-07-25 and was fixed 2026-08-08. **Read `docs/design/beatmatching.md` before touching**
+the grid anchor, the Digger grid-trust path, Sync/Lock/NUDGE, or downbeat detection — it also
+holds the roadmap (Digger provenance-aware trust, quantized play, phase-lock PLL, bar detection).
+
 **Canvas sizing rule — always use JS, never rely on scoped CSS width**: WebKitGTK does not reliably
 apply CSS width to a `<canvas>` inside a flex child (falls back to the 300px intrinsic default).
 Every canvas must size its pixel buffer via a `ResizeObserver` + `c.style.width/height` set in a
