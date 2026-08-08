@@ -322,10 +322,19 @@
     audioSetMainDevices($mainOutputDeviceIds).catch(console.error);
   });
 
-  // Sync headphone output device to Rust audio pipeline
+  // Sync headphone output device to Rust audio pipeline.
+  // '' (the "— none —" option) must be sent like any other value: it is what tears the
+  // cue pulsesink down and swaps in the fakesink. Guarding on truthiness left the backend
+  // holding the previous device forever — the UI read "— none —" while the pipeline still
+  // had a live cue sink on it (found 2026-08-08, mid-A/B: it silently turned arm A4 into
+  // A3). Change-guarded because set_cue_device() rebuilds the pipeline unconditionally.
+  let _lastCueDevice: string | undefined;
   $effect(() => {
     const deviceId = $cueOutputDeviceId;
-    if (deviceId) audioSetCueDevice(deviceId).catch(console.error);
+    if (deviceId !== _lastCueDevice) {
+      _lastCueDevice = deviceId;
+      audioSetCueDevice(deviceId).catch(console.error);
+    }
   });
 
   // Sync headphone cue gain to Rust audio pipeline
