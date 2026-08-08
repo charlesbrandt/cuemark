@@ -2251,6 +2251,122 @@ const SCRATCH_TARGET_MAX_RATE: f64 = 8.0;
 /// spend many seconds racing through content nobody asked to hear.
 const SCRATCH_TARGET_SNAP_SECS: f64 = 0.5;
 
+/// Position mode: how long the cursor keeps moving after target updates stop, in 15ms
+/// chunks, tapering linearly to a standstill across the window.
+///
+/// **Why any coasting at all** (measured 2026-08-08 night 2, `scratch-audio-downstream-delivery.md`
+/// "RUN … the stall is absence of input"): a slowly-moving hand does not produce a steady
+/// stream of pointer events. At 16s over a 1224px canvas the gentle drag was moving 13–27
+/// px/s and the DOM delivered **5–12 events/s** — ~2.3px per event, with gaps to 1180ms —
+/// while every other leg of the delivery path measured clean (`rafWait` 13ms, `ipc` 11ms,
+/// `evQueue` 4ms on the event that ended the longest gap: freshly stamped, not late). The
+/// events were never produced. Between them the servo converged inside
+/// `SCRATCH_TARGET_EPSILON_FRAMES` and faded, so `arrived%` tracked hand speed inversely
+/// and exactly: 15–45% muted below 0.35x, **0% for eleven straight seconds** above 0.96x.
+/// The user's report was "the gentle one dropped out frequently; the hard drag created sound
+/// consistently".
+///
+/// A platter has mass: when your hand stops feeding it motion it does not stop dead. That is
+/// both the audible fix and the honest physical model, and it is why the window tapers rather
+/// than ending abruptly.
+///
+/// **Sizing.** Position error is bounded by `SCRATCH_COAST_MAX_FRAMES`, not by this window, so
+/// this is chosen purely for how long a silence it bridges. Silence begins once the servo
+/// closes the last jump to within `SCRATCH_TARGET_EPSILON_FRAMES` — from a tight-burst update
+/// (~228 frames at 0.28x) that takes ~150ms, which is why gaps as short as the measured 228ms
+/// already produced 15% muted chunks. 20 chunks (300ms) plus that convergence tail covers
+/// gaps to roughly 450ms, i.e. the frequent ones.
+///
+/// It is deliberately **not** long enough to bridge the measured 1180ms outlier. Covering that
+/// would make this a flywheel, and a hand that crosses no pixel for 1.2s at 13–27px/s has
+/// genuinely stopped — a held record is silent, which is correct.
+const SCRATCH_COAST_CHUNKS: f64 = 20.0;
+
+/// Hard cap on how far a coast may carry the cursor past the last real target, in PCM frames
+/// (~50ms of content at 48kHz).
+///
+/// Coasting is dead reckoning, so it necessarily overshoots when the hand slows — the next
+/// absolute target corrects it, and the correction is what the cap bounds. It also makes the
+/// mechanism self-limiting exactly where it is not needed: a fast hand fills the cap in a
+/// couple of chunks, and a fast hand was never the problem (`arrived 0%` above 0.96x).
+const SCRATCH_COAST_MAX_FRAMES: f64 = 2400.0;
+
+/// Smoothing on the hand-speed estimate, applied **per observed target change** rather than
+/// per chunk (a per-chunk EMA would decay toward zero through the very gaps it has to
+/// extrapolate across, biasing the estimate low precisely when it is used).
+const SCRATCH_SPEED_EMA_ALPHA: f64 = 0.35;
+
+/// Tracks how fast the caller's target is moving, so the servo can keep the cursor walking
+/// through a gap in target updates instead of converging and falling silent.
+///
+/// ⚠️ **This estimates a velocity from an inter-event interval, which the rest of this design
+/// deliberately refuses to do** (`docs/design/waveform-scrub.md`, "Why velocity was the wrong
+/// control variable"). The distinction that makes it safe here: velocity is not the control
+/// variable. Position still is — every real target re-anchors the cursor absolutely, so an
+/// error in this estimate cannot accumulate across a gesture, and its only effect is a
+/// bounded extrapolation (`SCRATCH_COAST_CHUNKS`, `SCRATCH_COAST_MAX_FRAMES`) that the next
+/// target corrects. The old velocity path had neither bound nor correction.
+#[derive(Debug, Clone, Copy)]
+struct HandTracker {
+    last_target: f64,
+    /// Buffer frames per output frame — same units as `ServoStep::rate`, signed.
+    speed: f64,
+    /// Chunks since the target last changed.
+    idle_chunks: f64,
+    /// How far the coast has carried the aim point past `last_target`.
+    coast_offset: f64,
+}
+
+impl HandTracker {
+    fn new(target: f64) -> Self {
+        Self { last_target: target, speed: 0.0, idle_chunks: 0.0, coast_offset: 0.0 }
+    }
+
+    /// Forget the gesture's history — after a snap, where any speed estimate is stale by
+    /// construction (the user jumped rather than dragged).
+    fn reset(&mut self, target: f64) {
+        *self = Self::new(target);
+    }
+
+    /// Observe this chunk's target and return the point the servo should aim at: the target
+    /// itself while updates are arriving, or a tapering extrapolation of it while they are
+    /// not.
+    fn step(&mut self, target: f64, chunk_frames: f64) -> f64 {
+        let delta = target - self.last_target;
+        if delta != 0.0 {
+            // Divided by the elapsed chunks, not by 1: at a 200ms update cadence the target
+            // jumps once every ~13 chunks, and dividing a 13-chunk displacement by one chunk
+            // would read as 13x the real hand speed.
+            let observed = delta / (chunk_frames * self.idle_chunks.max(1.0));
+            self.speed += SCRATCH_SPEED_EMA_ALPHA * (observed - self.speed);
+            self.last_target = target;
+            self.idle_chunks = 0.0;
+            // The hand's own position is authoritative again; drop the extrapolation.
+            self.coast_offset = 0.0;
+            return target;
+        }
+
+        self.idle_chunks += 1.0;
+        if self.idle_chunks <= SCRATCH_COAST_CHUNKS {
+            let taper = 1.0 - self.idle_chunks / SCRATCH_COAST_CHUNKS;
+            self.coast_offset += self.speed * chunk_frames * taper;
+            let cap = SCRATCH_COAST_MAX_FRAMES;
+            self.coast_offset = self.coast_offset.clamp(-cap, cap);
+        }
+        // Past the window the offset is held, not unwound: unwinding would walk the cursor
+        // backwards to the last real target, which is audible motion in the wrong direction
+        // at exactly the moment the deck should be coming to rest. The residual is bounded by
+        // the cap and superseded by the next target, or by the gesture's final one.
+        target + self.coast_offset
+    }
+
+    /// True while the aim point is ahead of the last real target — i.e. this chunk is sounding
+    /// only because of the coast. Reported as `coast%` in `[scratch-tel]`.
+    fn coasting(&self) -> bool {
+        self.coast_offset != 0.0
+    }
+}
+
 /// What the position-mode servo decided for one chunk. Split out of the feeder loop so it
 /// can be unit-tested without GStreamer: the properties that matter here are *statistical
 /// over a whole gesture* (what fraction of chunks are silent, what mean speed the cursor
@@ -2331,6 +2447,8 @@ fn spawn_scratch_feeder(
         // rate 0.0, and Rust's `0.0_f64.signum()` is *1.0*, not 0.0 — so every reverse
         // gesture used to open by "reversing" from a forward direction it never had.
         let mut last_sign = if initial_target.is_nan() { initial_rate.signum() } else { 0.0 };
+        // Position mode only; in velocity mode the target is NaN and this is never stepped.
+        let mut hand = HandTracker::new(initial_target);
         let mut fade_pos: usize = 0; // frames into an in-progress fade-in/reversal ramp
         let mut hold_gain: f32 = 1.0; // ramps toward 0 while idle beyond hold_ms, else toward 1
         let mut next_wake = Instant::now();
@@ -2358,6 +2476,9 @@ fn spawn_scratch_feeder(
         // suspect), and `late%` says whether the thread is failing to hold its 15ms cadence.
         let mut tel_chunks: u64 = 0;
         let mut tel_arrived: u64 = 0;
+        // Chunks that sounded only because of the coast. The direct readout for the fix: as
+        // `coast%` picks up, `arrived%` should collapse on gentle gestures.
+        let mut tel_coast: u64 = 0;
         let mut tel_snaps: u64 = 0;
         let mut tel_ramps: u64 = 0;
         let mut tel_late: u64 = 0;
@@ -2386,24 +2507,33 @@ fn spawn_scratch_feeder(
             // velocity mode. `arrived` means there is nothing left to cover, which is the
             // position-mode equivalent of velocity mode's hold_ms idle.
             let mut arrived = false;
+            let mut coasting = false;
             let commanded_rate = if target.is_nan() {
                 rate
             } else {
-                let step = servo_step(
-                    target.clamp(0.0, max_frame),
-                    cursor,
-                    chunk_frames as f64,
-                    snap_frames,
-                );
+                // Aim at the hand, or — while no update has arrived — at where the hand would
+                // be if it kept going, tapering to a standstill. See SCRATCH_COAST_CHUNKS:
+                // a slow hand delivers 5-12 events/s, and without this the servo converges
+                // between them and mutes for a third to a half of a gentle gesture.
+                let aim = hand
+                    .step(target.clamp(0.0, max_frame), chunk_frames as f64)
+                    .clamp(0.0, max_frame);
+                coasting = hand.coasting();
+                let step = servo_step(aim, cursor, chunk_frames as f64, snap_frames);
                 if step.snapped {
                     // Too far to sweep — jump, and re-ramp so the splice doesn't click.
                     cursor = target.clamp(0.0, max_frame);
                     fade_pos = 0;
                     tel_snaps += 1;
+                    // A jump says nothing about hand speed, and coasting on a stale estimate
+                    // after one would walk the cursor away from where the user just landed.
+                    hand.reset(cursor);
+                    coasting = false;
                 }
                 arrived = step.arrived;
                 step.rate
             };
+            if coasting && !arrived { tel_coast += 1; }
             tel_chunks += 1;
             if arrived { tel_arrived += 1; }
             tel_rate_sum += commanded_rate.abs();
@@ -2570,13 +2700,15 @@ fn spawn_scratch_feeder(
                 };
                 log::info!(
                     "[scratch-tel/{deck_id}] chunks={tel_chunks} ({:.0}/s, late {:.0}%) | \
-                     rms={rms:.5} ({dbfs:.1} dBFS) | arrived {:.0}% snaps={tel_snaps} \
-                     ramps={tel_ramps} | rate mean={:.3} max={:.3} | {targets_report} | \
+                     rms={rms:.5} ({dbfs:.1} dBFS) | arrived {:.0}% coast {:.0}% \
+                     snaps={tel_snaps} ramps={tel_ramps} | rate mean={:.3} max={:.3} | \
+                     {targets_report} | \
                      cursor {:.3}s -> {:.3}s \
                      ({:+.3}s in {secs:.2}s = {:.2}x) | delivery {delivery_report}",
                     tel_chunks as f64 / secs,
                     100.0 * tel_late as f64 / tel_chunks.max(1) as f64,
                     100.0 * tel_arrived as f64 / tel_chunks.max(1) as f64,
+                    100.0 * tel_coast as f64 / tel_chunks.max(1) as f64,
                     tel_rate_sum / tel_chunks.max(1) as f64,
                     tel_rate_max,
                     tel_cursor_start / pcm.rate as f64,
@@ -2586,6 +2718,7 @@ fn spawn_scratch_feeder(
                 );
                 tel_chunks = 0;
                 tel_arrived = 0;
+                tel_coast = 0;
                 tel_snaps = 0;
                 tel_ramps = 0;
                 tel_late = 0;
@@ -2625,31 +2758,76 @@ mod servo_test {
     const CHUNK: f64 = 720.0;
     const SNAP: f64 = SCRATCH_TARGET_SNAP_SECS * RATE;
 
-    /// Replays a gesture the way the feeder does: the caller moves the target every
-    /// `update_every_ms`, the servo runs every `SCRATCH_CHUNK_MS`. Returns the fraction of
+    /// Replays a gesture the way the feeder does, coast included: the hand moves
+    /// *continuously* at `hand_speed`, the caller samples its position into the target only at
+    /// the listed times, and the servo runs every `SCRATCH_CHUNK_MS`. Returns the fraction of
     /// chunks that produced no sound and the mean speed the cursor actually walked at.
-    fn replay(hand_speed: f64, update_every_ms: f64, secs: f64) -> (f64, f64) {
+    ///
+    /// Sampling a continuously-moving hand is the measured reality rather than a convenience:
+    /// a slow drag delivers 5–12 events/s at ~2.3px each with gaps to 1180ms, and the target
+    /// only exists at those instants.
+    fn replay_sampled(hand_speed: f64, updates_ms: &[f64], secs: f64) -> (f64, f64) {
         let mut cursor = 0.0f64;
         let mut target = 0.0f64;
+        let mut hand = HandTracker::new(0.0);
         let chunks = (secs * 1000.0 / SCRATCH_CHUNK_MS as f64) as usize;
         let mut silent = 0usize;
-        let mut next_update_ms = 0.0f64;
+        let mut counted = 0usize;
+        let mut moving = false;
+        let mut next = 0usize;
         for c in 0..chunks {
             let now_ms = c as f64 * SCRATCH_CHUNK_MS as f64;
-            // Bursty by construction: the target only moves when an update lands, which
-            // is the whole reason velocity was unrecoverable from this input.
-            while next_update_ms <= now_ms {
-                target += hand_speed * RATE * (update_every_ms / 1000.0);
-                next_update_ms += update_every_ms;
+            while next < updates_ms.len() && updates_ms[next] <= now_ms {
+                let sampled = hand_speed * RATE * (updates_ms[next] / 1000.0);
+                if sampled != target {
+                    moving = true;
+                }
+                target = sampled;
+                next += 1;
             }
-            let step = servo_step(target, cursor, CHUNK, SNAP);
-            if step.arrived {
-                silent += 1;
-            } else {
+            let step = servo_step(hand.step(target, CHUNK), cursor, CHUNK, SNAP);
+            // Counted only once the target has actually moved. Before that the cursor sits on
+            // it with zero error and reports `arrived` — correctly, there is nothing to play
+            // yet — and counting those chunks made a uniform 300ms schedule read as "7.5%
+            // silent" no matter what the servo did. That number was the harness measuring its
+            // own first update period, and it moved not at all across a coast on/off A/B,
+            // which is what exposed it.
+            if moving {
+                counted += 1;
+                if step.arrived {
+                    silent += 1;
+                }
+            }
+            if !step.arrived {
                 cursor += step.rate * CHUNK;
             }
         }
-        (silent as f64 / chunks as f64, cursor / (secs * RATE))
+        (silent as f64 / counted.max(1) as f64, cursor / (secs * RATE))
+    }
+
+    /// Uniform update cadence — the original harness, now expressed as a schedule.
+    fn replay(hand_speed: f64, update_every_ms: f64, secs: f64) -> (f64, f64) {
+        let updates: Vec<f64> = (0..)
+            .map(|i| i as f64 * update_every_ms)
+            .take_while(|t| *t <= secs * 1000.0)
+            .collect();
+        replay_sampled(hand_speed, &updates, secs)
+    }
+
+    /// Bursts of `burst` updates `tight_ms` apart, one burst every `period_ms` — the measured
+    /// shape of slow pointer delivery, and the shape that mutes the servo: a burst ends with a
+    /// small jump, which the servo closes quickly, and then nothing arrives for the rest of
+    /// the period.
+    fn bursty(period_ms: f64, burst: usize, tight_ms: f64, secs: f64) -> Vec<f64> {
+        let mut v = Vec::new();
+        let mut t = 0.0;
+        while t < secs * 1000.0 {
+            for k in 0..burst {
+                v.push(t + k as f64 * tight_ms);
+            }
+            t += period_ms;
+        }
+        v
     }
 
     /// The live failure, as a number. A hand moving at 0.2x — the speed measured from the
@@ -2721,6 +2899,130 @@ mod servo_test {
         let ms = chunks as f64 * SCRATCH_CHUNK_MS as f64;
         assert!(ms < 400.0, "took {ms}ms to fall silent after the hand stopped");
     }
+
+    /// The live failure of 2026-08-08 night 2, as a number: a gentle drag delivers its
+    /// updates in bursts with a few hundred ms of nothing between them **while the hand keeps
+    /// moving**, and the servo used to converge in those holes and mute. Measured live at
+    /// 15–45% of chunks muted below 0.35x; the user heard it as "the gentle one dropped out
+    /// frequently".
+    ///
+    /// **Measured, not assumed: 19.7% muted without `HandTracker`, 0.0% with it.** The A/B was
+    /// run by setting `SCRATCH_COAST_CHUNKS` to 0 — worth repeating if this ever needs
+    /// re-tuning, because the first schedule tried here (a 300ms period) came out at 1.5% and
+    /// would have passed on the broken code, exactly as `scratch_to_smoke` did for Fault 1.
+    ///
+    /// What the A/B also showed, which is the real mechanism: **burstiness mutes the servo, not
+    /// sparseness.** A uniform 300ms cadence never converges (each jump is large, and closing
+    /// it takes about as long as the period) and measures 0% silent either way. A burst ends
+    /// with a *small* jump the servo closes in ~150ms, and then nothing arrives for the rest of
+    /// the period — which is precisely the shape the live log shows: `gap p50=18ms` with
+    /// `gapMax` of 376–1180ms.
+    #[test]
+    fn sparse_slow_hand_stays_audible() {
+        // 3 updates 17ms apart every 400ms: a 366ms hole after each burst, and the live
+        // gentle gesture recorded a 376ms gap in the second that measured 40% muted.
+        let updates = bursty(400.0, 3, 17.0, 4.0);
+        let (silent_fraction, _) = replay_sampled(0.28, &updates, 4.0);
+        assert!(
+            silent_fraction < 0.05,
+            "servo muted {:.0}% of a 0.28x drag delivering 10 updates/s in bursts — this is \
+             the 'gentle drag drops out' bug (the servo converges inside the gaps and fades)",
+            silent_fraction * 100.0
+        );
+    }
+
+    /// The coast must not become a flywheel. A hand that stops for over a second has really
+    /// stopped — a held record is silent — so the deck has to come to rest, and promptly.
+    /// Paired with the test above deliberately: one asserts sound where there should be sound,
+    /// the other silence where there should be silence, and a wrong window fails one of them.
+    #[test]
+    fn long_input_gap_still_comes_to_rest() {
+        let hand = 0.28;
+        // Dense updates for 1s, then the hand stops feeding targets for 1.5s.
+        let updates: Vec<f64> = (0..59).map(|i| i as f64 * 17.0).collect();
+        let last_update_ms = *updates.last().unwrap();
+        let mut cursor = 0.0f64;
+        let mut target = 0.0f64;
+        let mut tracker = HandTracker::new(0.0);
+        let mut next = 0usize;
+        let mut silence_at_ms = None;
+        for c in 0..(2500 / SCRATCH_CHUNK_MS as usize) {
+            let now_ms = c as f64 * SCRATCH_CHUNK_MS as f64;
+            while next < updates.len() && updates[next] <= now_ms {
+                target = hand * RATE * (updates[next] / 1000.0);
+                next += 1;
+            }
+            let step = servo_step(tracker.step(target, CHUNK), cursor, CHUNK, SNAP);
+            if step.arrived {
+                if now_ms > last_update_ms && silence_at_ms.is_none() {
+                    silence_at_ms = Some(now_ms - last_update_ms);
+                }
+            } else {
+                cursor += step.rate * CHUNK;
+            }
+        }
+        let ms = silence_at_ms.expect("never fell silent — the coast has become a flywheel");
+        assert!(
+            (250.0..800.0).contains(&ms),
+            "fell silent {ms}ms after the hand stopped; wanted 250-800ms (under 250 means the \
+             coast is not bridging real gaps, over 800 means it keeps playing content the hand \
+             never asked for)"
+        );
+    }
+
+    /// Dead reckoning must not systematically run ahead of the hand. If it did, a long gesture
+    /// would end somewhere the user never dragged to — and pitch would read high throughout.
+    #[test]
+    fn coast_does_not_outrun_the_hand() {
+        for &hand in &[0.1, 0.28, 0.6] {
+            let updates = bursty(400.0, 3, 17.0, 4.0);
+            let (_, measured) = replay_sampled(hand, &updates, 4.0);
+            let err = (measured - hand).abs() / hand;
+            assert!(
+                err < 0.15,
+                "hand {hand}x with bursty delivery produced cursor speed {measured:.4}x \
+                 ({:.1}% off)",
+                err * 100.0
+            );
+        }
+    }
+
+    /// The distance cap is the bound that makes coasting safe to do at all — it is what keeps
+    /// a wrong speed estimate from walking the cursor away from the user's finger. A fast hand
+    /// fills it in a couple of chunks, which is also why the mechanism is self-limiting at the
+    /// speeds that never needed it.
+    #[test]
+    fn coast_is_bounded_by_the_distance_cap() {
+        let mut tracker = HandTracker::new(0.0);
+        // Two updates establish a 4x speed estimate, then updates stop for a long time.
+        tracker.step(0.0, CHUNK);
+        tracker.step(4.0 * CHUNK, CHUNK);
+        let target = 4.0 * CHUNK;
+        for _ in 0..200 {
+            let aim = tracker.step(target, CHUNK);
+            assert!(
+                (aim - target).abs() <= SCRATCH_COAST_MAX_FRAMES + 1e-6,
+                "coast carried the aim {:.0} frames past the target, cap is \
+                 {SCRATCH_COAST_MAX_FRAMES}",
+                aim - target
+            );
+        }
+    }
+
+    /// A snap means the user jumped rather than dragged, so any speed estimate is stale by
+    /// construction — coasting on it would walk the cursor away from where they just landed.
+    #[test]
+    fn snap_clears_the_coast() {
+        let mut tracker = HandTracker::new(0.0);
+        tracker.step(0.0, CHUNK);
+        tracker.step(1.0 * CHUNK, CHUNK);
+        tracker.step(1.0 * CHUNK, CHUNK); // one idle chunk: coast engages
+        assert!(tracker.coasting(), "coast never engaged, so this test proves nothing");
+        tracker.reset(90.0 * RATE);
+        assert!(!tracker.coasting());
+        assert_eq!(tracker.step(90.0 * RATE, CHUNK), 90.0 * RATE);
+    }
+
 
     /// A coarse overview drag must not race audibly through the content it skipped.
     #[test]
