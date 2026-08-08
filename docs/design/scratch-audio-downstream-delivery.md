@@ -1,11 +1,17 @@
 # Scratch audio reaches GStreamer and never reaches the speakers — 2026-08-08
 
-**🟢 ROOT-CAUSED 2026-08-08 (night). H5 is confirmed with a mechanism, by `GST_DEBUG`
-inside the sink, against a within-run control arm.** `GstAudioBaseSink` gives up masking
-the feeder's accumulated lateness after `discont-wait` (1s) and resyncs its ringbuffer
-write pointer ~253ms *backwards*, behind the read pointer; every subsequent buffer lands
-in already-played segments. See F10. The fix is a sink tolerance/timestamp change and
-nothing else — see "The fix".
+**🟢 CLOSED 2026-08-08 (night) — root-caused, fixed, and verified live.**
+`GstAudioBaseSink` gave up masking the feeder's accumulated lateness after `discont-wait`
+(1s) and resynced its ringbuffer write pointer ~253ms *backwards*, behind the read
+pointer, so every subsequent buffer landed in already-played segments (F10). Widening
+`alignment-threshold`/`discont-wait` for the duration of a gesture fixes it: a 16s smooth
+gesture ran at a **sustained −55ms of lateness** — continuously past the old 40ms
+threshold, i.e. the death condition itself — with **zero** discontinuity WARNs, and the
+user confirms continuous audio with no dropouts.
+
+**Two separate faults remain, neither of them this one, both in the feeder's servo and
+envelope rather than downstream.** See "The remaining fault" below. Do not reopen this doc
+for them.
 
 The original short version, still true: **the PCM scratch feeder is producing loud,
 continuous, correct audio for the entire duration of a gesture the user hears as silent.**
@@ -371,10 +377,10 @@ config made cheapest.
 cover that whole span end to end, and it was already fixed three times there by mistake.
 The change belongs on the main `pulsesink`s.
 
-**Implemented 2026-08-08 (night), unverified live at time of writing** —
-`scratch_sink_alignment()` in `pipeline.rs`, applied by `begin_or_update_scratch()` before
-its `Paused→Playing` transition and restored by `stop_scratch_feeder()`:
-`alignment-threshold` 40ms → **2s**, `discont-wait` 1s → **1h**.
+**Implemented and verified live 2026-08-08 (night)** — `scratch_sink_alignment()` in
+`pipeline.rs`, applied by `begin_or_update_scratch()` before its `Paused→Playing`
+transition and restored by `stop_scratch_feeder()`: `alignment-threshold` 40ms → **2s**,
+`discont-wait` 1s → **1h**.
 
 **Scoped to the gesture, not set on the sink permanently.** Outside a scratch these
 defaults are load-bearing — a real decoder gap during normal playback *should* resync
@@ -413,8 +419,21 @@ work. A quarter-second of latency on a scratch is grossly audible — the gestur
 detached from the sound, which is the entire point of the feature. `ts-offset` on the sink
 has the same cost and additionally applies to normal playback through the same element.
 
-**Verification — not yet done.** Both arms are already characterised, and the control arm
-is an env var so switching costs no edit and no HMR remount:
+**Verification — ✅ passed 2026-08-08 (night).** A 16s smooth gesture
+(`arrived 0% snaps=0 ramps=0`, rms −10 to −18 dBFS, 67 chunks/s, `late 0%`) logged **zero**
+`Unexpected discontinuity` WARNs, and the user confirms continuous audio, no dropouts.
+
+**The strongest evidence is the delivery margin, not the WARN count.** That gesture ran at
+`delivery vol0=67/s(-74ms … -48ms)`, a **stable ~−55ms** for its full 16 seconds, against
+−0 to −6ms in every earlier run. −55ms is continuously past the old 40ms
+`alignment-threshold` — under stock settings that is exactly F10's death condition, one
+`discont-wait` from a backward resync. It ran for sixteen seconds and the sink absorbed
+all of it. The margin oscillates around −55 without growing, so it is a stable offset, not
+a runaway. ⚠️ **Do not "fix" this margin** — it is the fix working. A just-in-time
+position-mode feeder cannot produce slack (F9), so the sink absorbing steady lateness is
+the intended end state.
+
+The reproduction procedure, for any re-run:
 
 ```bash
 GST_DEBUG=audiobasesink:6 GST_DEBUG_NO_COLOR=1 GST_DEBUG_FILE=/tmp/gst-fix.log \
@@ -435,6 +454,75 @@ CUEMARK_SCRATCH_ALIGN_MS=40 CUEMARK_SCRATCH_DISCONT_WAIT_MS=1000 …
   what is making a *single* buffer land >2s out — do not simply raise it further.
 
 ⚠️ Level 6 on `audiobasesink` is per-buffer and large; `GST_DEBUG_FILE` is not optional.
+
+### ✅ Verified 2026-08-08 (night) — and the remaining symptom is a different fault
+
+Arm confirmed from the log (`alignment-threshold=2000ms discont-wait=3600000ms`, no
+`OVERRIDE ACTIVE`). One 12s gesture, driven hard.
+
+**The F10 mechanism is gone.** No backward resync anywhere in the run. The five WARNs
+present are +50ms, +0.7ms, +0.3ms, +2.1ms and +1.5ms, and the sink re-aligns within a
+single buffer after each (`ABS (22)`, `ABS (57)` immediately following). Nothing lands
+behind the read pointer and stays there. **The user's report changed shape accordingly:
+"choppy/stuttering, sound coming and going" instead of F6's "dies and stays dead."**
+
+⚠️ **"Zero WARNs" was the wrong pass criterion and is retracted.** Those WARNs fire at
+|align| = 2423 samples — far *under* the 96000-sample (2s) threshold — so they are not the
+threshold branch at all. `gst_audio_base_sink_get_alignment()` also refuses to align when
+aligning would write **behind the ringbuffer's read segment**, and that check is
+threshold-independent. Four of the five are a ~2ms catch-up transient at gesture start,
+where the write position lands ~411ms behind where playback already was (`452518` →
+`432765`) and takes a few buffers to climb back over the read pointer. Zero is therefore
+unreachable by construction. **The correct gate is "no *sustained* backward resync"** —
+i.e. no WARN whose following buffers continue from the retarded position instead of
+re-aligning. That is what passed.
+
+⚠️ **The verification gesture was over-driven, and the instruction is what did it.**
+"Drive it hard" produced `snaps=9/11/14` per second and `arrived 41–48%`, which is the
+regime the A/B protocol's trap #1 says cannot adjudicate anything. The original repro was
+hard but *smooth*: `rate mean` 2.2–3.2 at `snaps=0, arrived 0%`. **Say "fast and smooth,
+one direction, no flicks or reversals" — never just "hard."**
+
+### The remaining fault: `arrived ⇒ silence` chatters under burst-delivered input
+
+Not the sink, not delivery, not this doc's original subject. Recorded here because the
+gesture that exposed it is the same one, and because it is what a user now hears.
+
+`arrived%` is the share of 15ms chunks the servo commanded to **silence**
+(`target_hold_gain = 0.0`, 5ms ramp each way via `SCRATCH_FADE_FRAMES = 240`). At 41–48%,
+nearly half the gesture is muted in ~15ms fragments — audibly chatter, not a dropout.
+Two paths reach it, both in `servo_step()`:
+
+- `err.abs() > snap_frames` (`SCRATCH_TARGET_SNAP_SECS` = 0.5s) → snap, silence.
+- `err.abs() < SCRATCH_TARGET_EPSILON_FRAMES` → target reached, silence.
+
+The second dominates a smooth fast drag, and it is a **design mismatch with burst
+delivery**: pointer moves arrive rAF- and WebKit-coalesced, the servo converges within
+`SCRATCH_SERVO_LAG_CHUNKS`, then mutes until the next event lands. A record under a moving
+hand coasts between updates; this cursor stops dead and mutes. **The target should be a
+waypoint, not a place to park** — mute on a genuine hold timeout (no new target for N ms),
+and coast at the last commanded rate through the inter-event gap.
+
+**The same root produces a second, milder symptom on gestures that never mute at all.**
+The verified-clean 16s gesture was reported as "a bit erratic sounding, but continuous",
+and the telemetry shows why: within a single second, `rate mean=1.06` against `max=4.55`;
+`rate mean=0.72` against `max=2.42`. Instantaneous speed swings 3–6× above its own
+one-second average, every second, at `snaps=0` — so this is not snapping, it is the servo
+lurching at each coalesced batch and coasting to near-zero between batches. Audibly, speed
+wobble.
+
+**Both symptoms are one fix.** Converge-and-park lurches when it converges and goes silent
+when it parks; hard gestures hear the silence, smooth ones hear the lurch. Smoothing the
+target across the inter-event gap — rather than treating each burst as a fresh destination
+to reach as fast as `SCRATCH_TARGET_MAX_RATE` allows — addresses both. ⚠️ Note this means
+**raising `SCRATCH_TARGET_MAX_RATE` (the deferred "Adjacent work" item below) would make
+the wobble worse, not better** — it raises the ceiling on exactly the lurch being measured
+here. Reassess that item after this fix, not before.
+
+Adjacent and separate: **there is no anti-aliasing when decimating.** The lerp in the
+feeder is a reasonable interpolator for `rate < 1` but does nothing against aliasing at
+`rate > 1`; at the 8.0 clamp everything above ~3kHz folds back. That is a harshness/timbre
+fault, **not** a silence one — do not reach for it to explain a dropout.
 
 ### Session 3 method note, worth reusing
 
