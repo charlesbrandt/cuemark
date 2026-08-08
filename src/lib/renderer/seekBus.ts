@@ -1,5 +1,15 @@
 import { get, writable } from 'svelte/store';
 import { audioSeek, audioScratchTo, audioStopScratch } from '../audio/pipeline';
+import {
+  beginScrubGesture,
+  endScrubGesture,
+  noteScrubDispatch,
+  noteScrubDispatchResult,
+  noteScrubFlushRan,
+  noteScrubFlushScheduled,
+  noteScrubThrottleSkip,
+  noteScrubWentSilent,
+} from '../audio/scrubStats';
 import { session } from '../state/session';
 
 // Which decks are mid-scratch-gesture right now. Scratch runs entirely while
@@ -103,6 +113,9 @@ export function unregisterVideoEl(deckId: string) {
   scrubSilent.delete(deckId);
   pendingScrub.delete(deckId);
   lastSilentSeekMs.delete(deckId);
+  // No-op unless a gesture was in flight, which is the case worth covering: a deck torn
+  // down mid-drag would otherwise leave its samples behind for the next gesture to inherit.
+  endScrubGesture(deckId);
 }
 
 export function seekDeck(deckId: string, time: number) {
@@ -196,6 +209,9 @@ const lastSilentSeekMs = new Map<string, number>();
  */
 export function beginScrub(deckId: string, anchorSecs: number, audible: boolean): void {
   scrubTargets.set(deckId, anchorSecs);
+  // Delivery instrumentation: buffered in memory and emitted at endScrub/cancelScrub, so it
+  // adds no IPC to the path it is timing. See scrubStats.ts for how to read the legs.
+  beginScrubGesture(deckId, audible);
   if (audible) {
     scrubSilent.delete(deckId);
     // Wakes WaveformCanvas's redraw loop and App.svelte's position poll, both of which
@@ -226,32 +242,45 @@ export function updateScrub(deckId: string, targetSecs: number): number {
   pendingScrub.set(deckId, clamped);
   if (scrubFlushPending) return clamped;
   scrubFlushPending = true;
+  noteScrubFlushScheduled();
   requestAnimationFrame(() => {
-    // First statement, and outside the loop: a throw from any one deck's dispatch below
-    // must not leave this latched. It is a module-level flag, so a single missed reset
-    // wedges *every* deck's scrub for the life of the page — updateScrub() would keep
-    // returning at the `if (scrubFlushPending)` guard above, the feeder would stop
-    // receiving targets, and the gesture would fall silent with no error anywhere.
+    // Before the try/finally bookkeeping below: this closes the rafWait leg, and how long
+    // this callback waited is exactly what a stalled rAF has to be able to report.
+    noteScrubFlushRan();
+    // Ahead of the loop (only the instrument line above precedes it, and that is pure
+    // arithmetic that cannot throw): a throw from any one deck's dispatch below must not
+    // leave this latched. It is a module-level flag, so a single missed reset wedges *every*
+    // deck's scrub for the life of the page — updateScrub() would keep returning at the
+    // `if (scrubFlushPending)` guard above, the feeder would stop receiving targets, and the
+    // gesture would fall silent with no error anywhere.
     scrubFlushPending = false;
     for (const [id, target] of pendingScrub) {
       if (scrubSilent.has(id)) {
         const now = performance.now();
         if (now - (lastSilentSeekMs.get(id) ?? -Infinity) >= SILENT_SCRUB_SEEK_MS) {
           lastSilentSeekMs.set(id, now);
+          noteScrubDispatch(id); // no promise to time on this path; ipc reads as `—`
           seekDeck(id, target);
+        } else {
+          noteScrubThrottleSkip(id);
         }
         // Dropping an intermediate seek is safe here and nowhere else in this file: the
         // target is absolute, so the next one supersedes it. endScrub() always issues the
         // final position unthrottled, so the deck cannot come to rest short of it.
       } else {
-        audioScratchTo(id, target, SCRUB_HOLD_MS).catch((err) => {
-          // Chiefly "no PCM buffer decoded" — a file whose decode failed or hasn't
-          // finished. Degrade to a silent seek scrub for the rest of the gesture rather
-          // than dropping the user's input on the floor.
-          console.warn(`[scrub/${id}] falling back to silent seek scrub:`, err);
-          scrubSilent.add(id);
-          seekDeck(id, target);
-        });
+        const token = noteScrubDispatch(id);
+        audioScratchTo(id, target, SCRUB_HOLD_MS)
+          .then(() => noteScrubDispatchResult(id, token, true))
+          .catch((err) => {
+            noteScrubDispatchResult(id, token, false);
+            // Chiefly "no PCM buffer decoded" — a file whose decode failed or hasn't
+            // finished. Degrade to a silent seek scrub for the rest of the gesture rather
+            // than dropping the user's input on the floor.
+            console.warn(`[scrub/${id}] falling back to silent seek scrub:`, err);
+            noteScrubWentSilent(id);
+            scrubSilent.add(id);
+            seekDeck(id, target);
+          });
       }
     }
     pendingScrub.clear();
@@ -269,6 +298,10 @@ export function endScrub(deckId: string): Promise<void> {
   if (target === undefined) return Promise.resolve();
   const wasSilent = scrubSilent.has(deckId);
   const final = quantizeToGrid(deckId, target);
+  // Emits the whole gesture's buffered delivery timing in one burst. Deliberately here
+  // rather than during the gesture — see scrubStats.ts's "nothing is logged during the
+  // gesture". Before the stop IPC below, so the log lines cannot be delayed behind it.
+  endScrubGesture(deckId);
 
   // Publish before clearing the target, so getDeckTime() hands straight over to the
   // audio clock at the final position instead of momentarily reading a stale one and
@@ -303,6 +336,9 @@ export function endScrub(deckId: string): Promise<void> {
  */
 export function cancelScrub(deckId: string): void {
   if (!scrubTargets.has(deckId)) return;
+  // A press that never moved recorded no samples, so this emits nothing — but it must still
+  // run, or the gesture state would leak into the next one and inflate its input gaps.
+  endScrubGesture(deckId);
   const wasSilent = scrubSilent.has(deckId);
   scrubTargets.delete(deckId);
   scrubSilent.delete(deckId);

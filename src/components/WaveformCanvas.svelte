@@ -3,6 +3,7 @@
   import { seekDeck, getDeckTime, quantizeToGrid, scratchingDecks, beginScrub, updateScrub, endScrub, cancelScrub } from '../lib/renderer/seekBus';
   import { getDiggerFileUrl } from '../lib/digger/api';
   import { recordAuxLoop } from '../lib/audio/pollStats';
+  import { noteScrubInput } from '../lib/audio/scrubStats';
   import { suppressWaveformDraw } from '../lib/audio/perfArm';
   import { fontScale } from '../lib/settings/displaySettings';
   import type { Deck } from '../lib/state/types';
@@ -528,6 +529,17 @@
   let dragStartTime = 0;
   let dragAudible = false;
   let dragMoved = false;
+  /**
+   * Canvas geometry captured once at pointerdown and reused for the whole gesture.
+   *
+   * `getBoundingClientRect()` was called per `pointermove`, which forces a synchronous
+   * layout flush on a main thread that is simultaneously running `frame()`, an rAF-rate
+   * position poll and this canvas's own redraw — i.e. inside the exact handler whose
+   * delivery latency `scrubStats.ts` is measuring. The canvas cannot move or resize during
+   * a press in any real gesture (only a window resize could, and that ends the drag by
+   * moving the pointer), so re-reading it every event bought nothing.
+   */
+  let dragRect: DOMRect | null = null;
 
   /** Content seconds per CSS pixel, matching whichever view is currently drawn. */
   function secondsPerPixel(rect: DOMRect): number {
@@ -545,6 +557,7 @@
     e.preventDefault();
     dragging = true;
     dragStartX = e.clientX;
+    dragRect = canvas.getBoundingClientRect();
     dragMoved = false;
     dragStartTime = getDeckTime(deck.id) ?? 0;
     // Audible scrub needs the paused scratch topology (input-selector switch + frozen
@@ -560,13 +573,18 @@
 
   function handlePointerMove(e: PointerEvent) {
     if (!dragging || !canvas) return;
+    // Timed first, before the threshold guard and before any layout read: this is the
+    // arrival of the input event itself, and `e.timeStamp` is platform-derived on this
+    // WebKitGTK (verified by pointer_events_probe.py's `stale` stage), so the pair is what
+    // lets a delivery stall be attributed to the event pipeline rather than to the hand.
+    noteScrubInput(deck.id, e.timeStamp);
+    if (!dragRect) return;
     const dx = e.clientX - dragStartX;
     // Below the threshold this is still a candidate click, so send nothing at all — the
     // deck must not creep while the user is only deciding whether to drag.
     if (!dragMoved && Math.abs(dx) < DRAG_THRESHOLD_PX) return;
     dragMoved = true;
-    const rect = canvas.getBoundingClientRect();
-    updateScrub(deck.id, dragStartTime + (zoom ? -dx : dx) * secondsPerPixel(rect));
+    updateScrub(deck.id, dragStartTime + (zoom ? -dx : dx) * secondsPerPixel(dragRect));
   }
 
   function handlePointerUp(e?: PointerEvent) {
@@ -581,9 +599,8 @@
     // treatment). cancelScrub rather than endScrub because beginScrub sent no IPC and no
     // update followed it — there is no feeder to stop and nothing to land on.
     cancelScrub(deck.id);
-    if (!canvas || deck.source?.type !== 'video' || !e) return;
-    const rect = canvas.getBoundingClientRect();
-    const ratio = (e.clientX - rect.left) / rect.width;
+    if (!canvas || deck.source?.type !== 'video' || !e || !dragRect) return;
+    const ratio = (e.clientX - dragRect.left) / dragRect.width;
     const duration = deck.source.duration || 0;
     const t = zoom
       ? dragStartTime - zoomSeconds * Math.max(0.01, deck.playbackRate) * ZOOM_LEAD_RATIO

@@ -5,6 +5,7 @@ import { nudgePhaseToMaster } from "../audio/phaseNudge";
 import { syncRate, syncGain, syncVolume } from "../audio/audioSync";
 import { audioScratch, audioStopScratch } from "../audio/pipeline";
 import { cueGain, tempoRange, scratchMode } from "../audio/audioSettings";
+import { noteScrubInput } from "../audio/scrubStats";
 import { debugLog } from "../debugLog";
 import { get } from "svelte/store";
 
@@ -418,6 +419,12 @@ export async function startMidiListener(): Promise<() => void> {
               beginScrub(deckId, base, true);
               vinylTally[deckId] = { n: 0, absSum: 0, net: 0, maxAbs: 0, values: new Set(), t0: performance.now() };
             }
+            // Delivery instrumentation (scrubStats.ts). `null` because a MIDI tick arrives
+            // over Tauri IPC and carries no platform event time — so this path reports
+            // inter-event gaps but cannot separate "the wheel sent nothing" from "the tick
+            // waited in a queue", which the pointer path can. Any gap here is therefore an
+            // upper bound on delivery latency, not an attribution.
+            noteScrubInput(deckId, null);
             const tally = vinylTally[deckId];
             tally.n++;
             tally.absSum += Math.abs(a.value);
