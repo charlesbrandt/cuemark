@@ -1792,7 +1792,20 @@ impl DeckAudioPipeline {
         if let Some(feeder) = &inner.scratch_feeder {
             feeder.rate_bits.store(rate.to_bits(), Ordering::Relaxed);
             feeder.target_frames_bits.store(target_frames.to_bits(), Ordering::Relaxed);
-            *feeder.last_update.lock().unwrap() = Instant::now();
+            // Gap since the previous update, measured here rather than in the feeder
+            // thread: this is the arrival time of the input event itself, whereas the
+            // feeder only ever sees the *latest* value at 15ms chunk boundaries and so
+            // cannot distinguish "no update" from "several coalesced into one".
+            {
+                let mut last = feeder.last_update.lock().unwrap();
+                let now = Instant::now();
+                feeder
+                    .target_gaps_ms
+                    .lock()
+                    .unwrap()
+                    .record(now.duration_since(*last).as_millis().min(u32::MAX as u128) as u32);
+                *last = now;
+            }
             return Ok(());
         }
 
@@ -2122,7 +2135,59 @@ struct ScratchFeeder {
     /// most once per scratch() call (≤ rAF rate, ~60Hz) and read once per 15ms chunk —
     /// no meaningful contention.
     last_update: Arc<Mutex<Instant>>,
+    /// Inter-arrival gaps between position-mode target updates, in milliseconds, drained
+    /// once a second by the feeder's telemetry.
+    ///
+    /// **Why this is measured rather than assumed.** `SCRATCH_SERVO_LAG_CHUNKS`'s whole
+    /// justification rests on a claimed update cadence of "~25–40ms" — at which a 4-chunk
+    /// (60ms) lag can never be outrun and the cursor never parks. The live evidence
+    /// contradicts that: a hard gesture reports `arrived` on 41–48% of chunks (the cursor
+    /// *did* catch up and mute, repeatedly) and a smooth one swings instantaneous rate
+    /// 3–6× above its one-second mean (a lurch, i.e. a large error appearing at once).
+    /// Both imply gaps far longer than 60ms. The cadence has never actually been
+    /// instrumented, and the two candidate fixes — lengthen the lag, or coast through the
+    /// gap at a decaying rate — are chosen by what this distribution turns out to be.
+    ///
+    /// Bounded to `TARGET_GAP_SAMPLE_CAP` so a wedged telemetry drain cannot grow it
+    /// without limit; overflow is counted, not silently dropped.
+    target_gaps_ms: Arc<Mutex<TargetGapStats>>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Cap on retained per-second gap samples. One second of the fastest plausible update
+/// cadence (rAF, ~60Hz) is 60 samples; 512 is far above that and still trivially small.
+const TARGET_GAP_SAMPLE_CAP: usize = 512;
+
+#[derive(Default)]
+struct TargetGapStats {
+    gaps_ms: Vec<u32>,
+    /// Updates that arrived while `gaps_ms` was at cap. Non-zero here means the
+    /// percentiles below are computed on a truncated sample — read them accordingly.
+    dropped: u32,
+}
+
+impl TargetGapStats {
+    fn record(&mut self, gap_ms: u32) {
+        if self.gaps_ms.len() < TARGET_GAP_SAMPLE_CAP {
+            self.gaps_ms.push(gap_ms);
+        } else {
+            self.dropped += 1;
+        }
+    }
+
+    /// `(count, p50, p90, max, dropped)`, and clears. Percentiles use nearest-rank on the
+    /// sorted sample — the distribution's *shape* is the question here (is there a tail of
+    /// long gaps?), which a mean would hide entirely.
+    fn drain(&mut self) -> (usize, u32, u32, u32, u32) {
+        let dropped = std::mem::take(&mut self.dropped);
+        let mut g = std::mem::take(&mut self.gaps_ms);
+        if g.is_empty() {
+            return (0, 0, 0, 0, dropped);
+        }
+        g.sort_unstable();
+        let at = |q: f64| g[(((g.len() as f64 - 1.0) * q).round() as usize).min(g.len() - 1)];
+        (g.len(), at(0.5), at(0.9), g[g.len() - 1], dropped)
+    }
 }
 
 /// Wall-clock duration of each pushed appsrc buffer. Small enough for responsive rate
@@ -2247,12 +2312,14 @@ fn spawn_scratch_feeder(
     let stop_requested = Arc::new(AtomicBool::new(false));
     let cursor_frames_bits = Arc::new(AtomicU64::new(start_frame.to_bits()));
     let last_update = Arc::new(Mutex::new(Instant::now()));
+    let target_gaps = Arc::new(Mutex::new(TargetGapStats::default()));
 
     let rate_bits_t = rate_bits.clone();
     let target_t = target_frames_bits.clone();
     let stop_t = stop_requested.clone();
     let cursor_t = cursor_frames_bits.clone();
     let last_update_t = last_update.clone();
+    let target_gaps_t = target_gaps.clone();
 
     let handle = std::thread::spawn(move || {
         let chunk_frames = ((pcm.rate as u64 * SCRATCH_CHUNK_MS) / 1000).max(1) as usize;
@@ -2483,10 +2550,29 @@ fn spawn_scratch_feeder(
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
+                // Target-update cadence: the number SCRATCH_SERVO_LAG_CHUNKS is tuned
+                // against, measured rather than assumed. p90/max are the fields that
+                // matter — a long tail is what lets the cursor catch up and park.
+                let (tgt_n, tgt_p50, tgt_p90, tgt_max, tgt_dropped) =
+                    target_gaps_t.lock().unwrap().drain();
+                let targets_report = if tgt_n == 0 {
+                    "targets none".to_string()
+                } else {
+                    format!(
+                        "targets {:.0}/s gap p50={tgt_p50} p90={tgt_p90} max={tgt_max}ms{}",
+                        tgt_n as f64 / secs,
+                        if tgt_dropped > 0 {
+                            format!(" (+{tgt_dropped} over cap)")
+                        } else {
+                            String::new()
+                        }
+                    )
+                };
                 log::info!(
                     "[scratch-tel/{deck_id}] chunks={tel_chunks} ({:.0}/s, late {:.0}%) | \
                      rms={rms:.5} ({dbfs:.1} dBFS) | arrived {:.0}% snaps={tel_snaps} \
-                     ramps={tel_ramps} | rate mean={:.3} max={:.3} | cursor {:.3}s -> {:.3}s \
+                     ramps={tel_ramps} | rate mean={:.3} max={:.3} | {targets_report} | \
+                     cursor {:.3}s -> {:.3}s \
                      ({:+.3}s in {secs:.2}s = {:.2}x) | delivery {delivery_report}",
                     tel_chunks as f64 / secs,
                     100.0 * tel_late as f64 / tel_chunks.max(1) as f64,
@@ -2519,6 +2605,7 @@ fn spawn_scratch_feeder(
         stop_requested,
         cursor_frames_bits,
         last_update,
+        target_gaps_ms: target_gaps,
         handle: Some(handle),
     }
 }
@@ -2640,6 +2727,46 @@ mod servo_test {
     fn far_target_snaps_silently() {
         let step = servo_step(60.0 * RATE, 0.0, CHUNK, SNAP);
         assert!(step.snapped && step.arrived && step.rate == 0.0, "{step:?}");
+    }
+
+    /// The gap instrument is about to decide between two different fixes, so it has to be
+    /// right about the tail specifically — a p90 that silently reported the median would
+    /// make a bursty cadence look uniform and point at the wrong one.
+    #[test]
+    fn target_gap_stats_report_the_tail() {
+        let mut s = TargetGapStats::default();
+        // Nine tight updates and one long stall. Nearest-rank p90 of ten samples is the
+        // 9th smallest, so a lone 10% outlier belongs to `max` and NOT to p90 — worth
+        // pinning, because reading p90 as "the worst case" would call a bursty cadence
+        // uniform. Both fields are reported for exactly this reason.
+        for _ in 0..9 {
+            s.record(16);
+        }
+        s.record(300);
+        let (n, p50, p90, max, dropped) = s.drain();
+        assert_eq!((n, p50, max, dropped), (10, 16, 300, 0));
+        assert_eq!(p90, 16, "a lone 10% outlier is max, not p90");
+
+        // A sustained 20% tail is what p90 is there to catch.
+        let mut tail = TargetGapStats::default();
+        for _ in 0..8 {
+            tail.record(16);
+        }
+        tail.record(300);
+        tail.record(300);
+        let (_, tp50, tp90, tmax, _) = tail.drain();
+        assert_eq!((tp50, tp90, tmax), (16, 300, 300));
+
+        // Draining clears, so per-second windows cannot bleed into each other.
+        assert_eq!(s.drain(), (0, 0, 0, 0, 0));
+
+        // Overflow is counted, never silently discarded.
+        let mut s2 = TargetGapStats::default();
+        for _ in 0..(TARGET_GAP_SAMPLE_CAP + 7) {
+            s2.record(20);
+        }
+        let (n2, _, _, _, dropped2) = s2.drain();
+        assert_eq!((n2, dropped2), (TARGET_GAP_SAMPLE_CAP, 7));
     }
 }
 
