@@ -489,19 +489,94 @@ Not the sink, not delivery, not this doc's original subject. Recorded here becau
 gesture that exposed it is the same one, and because it is what a user now hears.
 
 `arrived%` is the share of 15ms chunks the servo commanded to **silence**
-(`target_hold_gain = 0.0`, 5ms ramp each way via `SCRATCH_FADE_FRAMES = 240`). At 41–48%,
+(`target_hold_gain = 0.0`, 5ms ramp each way via `SCRATCH_FADE_FRAMES = 240`). At 41–51%,
 nearly half the gesture is muted in ~15ms fragments — audibly chatter, not a dropout.
 Two paths reach it, both in `servo_step()`:
 
 - `err.abs() > snap_frames` (`SCRATCH_TARGET_SNAP_SECS` = 0.5s) → snap, silence.
 - `err.abs() < SCRATCH_TARGET_EPSILON_FRAMES` → target reached, silence.
 
-The second dominates a smooth fast drag, and it is a **design mismatch with burst
-delivery**: pointer moves arrive rAF- and WebKit-coalesced, the servo converges within
-`SCRATCH_SERVO_LAG_CHUNKS`, then mutes until the next event lands. A record under a moving
-hand coasts between updates; this cursor stops dead and mutes. **The target should be a
-waypoint, not a place to park** — mute on a genuine hold timeout (no new target for N ms),
-and coast at the last commanded rate through the inter-event gap.
+#### ✅ Cadence measured 2026-08-08, and it moved the fault upstream of the servo
+
+`SCRATCH_SERVO_LAG_CHUNKS`'s doc comment justified its 4-chunk (60ms) value against a
+claimed update cadence of "~25–40ms". That number had never been measured.
+`target_gaps_ms` (commit `2777791`) now reports it, and across three live gestures:
+
+| | claimed | measured |
+|---|---|---|
+| update rate | ~60/s implied | **11–45/s** |
+| gap p50 | 25–40ms | 17–**105**ms |
+| gap p90 | — | **33–163ms** |
+| gap max | — | **65–874ms** |
+
+🔴 **But the typical cadence is NOT the cause, and assuming it was cost a full
+implement-and-revert cycle.** The `servo_test::replay` harness says a steady 0.2× hand
+with updates every 160ms — well past the 60ms lag — produces **0% silent chunks** on the
+*current* code. Periodic re-injection keeps the error above `SCRATCH_TARGET_EPSILON_FRAMES`
+indefinitely; the cursor never converges, so it never parks. The lag being "outrun" is not
+a real failure mode.
+
+**What actually mutes it is a multi-hundred-millisecond stall in target delivery.** Read
+the worst live second again:
+
+```
+arrived 51%  targets 11/s  gap p50=18  p90=46  max=874ms
+```
+
+p50 of 18ms is *fast*. That second is a burst of tight updates followed by **one 874ms
+stall**. With the current lag the cursor converges to within epsilon about 250ms into a
+stall and mutes for the remainder. Modelled against that shape (burst of 8 at 20ms, then
+one stall, 0.2× hand):
+
+| stall | silent, current code |
+|---|---|
+| 300ms | 0.0% |
+| 500ms | 24.8% |
+| 874ms | 49.0% |
+
+which reproduces the observed 41–51% closely. It also explains why **slow gestures are
+choppier**: a slow hand emits 11–16 updates/s against 40–45, so stalls are both longer and
+more frequent.
+
+#### ❌ Adaptive lag: implemented, measured, reverted
+
+Sizing the lag to the observed gap (fast-attack/slow-release envelope → `servo_lag_chunks()`)
+was built and then **thrown away, because the model says it buys nothing**:
+
+| stall | current | +idle timer | adaptive lag + idle timer |
+|---|---|---|---|
+| 500ms | 24.8% | 29.3% | **29.3%** |
+| 874ms | 49.0% | 53.5% | **53.5%** |
+
+Two independent reasons, both worth keeping so this is not re-attempted:
+
+1. **The envelope can only react after the stall it needed to predict.** It updates when
+   the *next* target arrives, so the stall currently in progress is never bridged.
+2. **An adaptive lag needs a time-based idle timer to exist at all** — at a 300ms lag the
+   servo's own approach takes ~2s to cross the epsilon, so a stopped hand keeps playing for
+   two seconds, which is worse than the chatter. Adding that timer then dominates every
+   stall longer than it, erasing the lag's contribution and making the 500ms case *worse*
+   than today.
+
+**The servo is behaving correctly.** It is faithfully reporting "no new information for
+874ms", and no servo-side change can invent information that was never delivered.
+
+#### ➡️ The real next lead: why does target delivery stall mid-gesture?
+
+A hand that is still moving should not produce an 874ms gap in `audio_scratch_to` calls.
+Candidates, none yet tested:
+
+- WebKit pointer-event coalescing or an outright delivery stall on the canvas (the
+  `pointer_events_probe.py` machinery already exists for this class of question).
+- Throttling or a dropped frame in the scrub bus (`seekBus.ts`) between pointer event and
+  `audioScratchTo`.
+- IPC backpressure — `audio_scratch_to` is a synchronous `#[tauri::command]` on the GTK
+  main thread, so a busy main thread delays the *call*, not just its reply. `[ipc-ping]` is
+  the standing control arm for exactly this.
+
+**Instrument the frontend side before touching either end**: the gap is currently measured
+where the call *lands in Rust*, which cannot distinguish "no pointer event fired" from
+"pointer event fired and the call took 800ms to arrive". Those have opposite fixes.
 
 **The same root produces a second, milder symptom on gestures that never mute at all.**
 The verified-clean 16s gesture was reported as "a bit erratic sounding, but continuous",
@@ -511,13 +586,15 @@ one-second average, every second, at `snaps=0` — so this is not snapping, it i
 lurching at each coalesced batch and coasting to near-zero between batches. Audibly, speed
 wobble.
 
-**Both symptoms are one fix.** Converge-and-park lurches when it converges and goes silent
-when it parks; hard gestures hear the silence, smooth ones hear the lurch. Smoothing the
-target across the inter-event gap — rather than treating each burst as a fresh destination
-to reach as fast as `SCRATCH_TARGET_MAX_RATE` allows — addresses both. ⚠️ Note this means
-**raising `SCRATCH_TARGET_MAX_RATE` (the deferred "Adjacent work" item below) would make
-the wobble worse, not better** — it raises the ceiling on exactly the lurch being measured
-here. Reassess that item after this fix, not before.
+**Both symptoms are one cause, and it is the delivery stall above, not the servo.** A
+stall starves the servo; when the next burst lands, the accumulated error is large and the
+servo sprints at up to `SCRATCH_TARGET_MAX_RATE` to clear it — that is the lurch. Long
+enough to converge first, and it parks — that is the silence. Fix the stall and both go
+away; there is nothing to smooth on the servo side that is not downstream of it.
+
+⚠️ **Raising `SCRATCH_TARGET_MAX_RATE` (the deferred "Adjacent work" item below) would
+make the wobble worse, not better** — it raises the ceiling on exactly the post-stall
+sprint measured here. Reassess that item only after the stall is understood.
 
 Adjacent and separate: **there is no anti-aliasing when decimating.** The lerp in the
 feeder is a reasonable interpolator for `rate < 1` but does nothing against aliasing at

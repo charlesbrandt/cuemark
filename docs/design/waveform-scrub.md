@@ -397,3 +397,42 @@ Watch `~/.local/share/com.cuemark.app/logs/cuemark.log` during live runs for
 `appsrc push_buffer took …ms` warnings and matched `[scratch/…] feeder start … mode=position`
 / `feeder stop` pairs — the servo pushes on the same 15ms cadence as velocity mode, so a new
 stall would surface there.
+
+## Live run 5 (2026-08-08, night) — downstream fault closed; a new one found upstream
+
+**The downstream silence this feature was blocked behind is fixed and verified**, so the
+"what is broken is downstream of everything in this doc" note above is resolved. It was
+`GstAudioBaseSink` resyncing its ringbuffer write pointer ~253ms backwards mid-gesture
+after `discont-wait` expired; widening the sink's alignment tolerance for the duration of
+a gesture fixes it. A 16s smooth drag now runs continuously with no dropouts, user-
+confirmed. Full account: `docs/design/scratch-audio-downstream-delivery.md`.
+
+**What replaced it is a fault this doc does own.** With the sink fixed, two audible
+symptoms remain — chatter on hard gestures, speed wobble on smooth ones — and both trace
+to **target delivery stalling for 500–874ms in the middle of a gesture the hand is still
+moving through**. The servo then has no new information: it converges on the stale target,
+parks (silence), and sprints when the next burst finally lands (wobble).
+
+Measured cadence, which is new information for this doc — `[scratch-tel]` now reports
+`targets N/s gap p50/p90/max`:
+
+| | this doc's assumption | measured |
+|---|---|---|
+| update rate | ~60/s (rAF) | **11–45/s** |
+| gap p50 | 25–40ms | 17–**105**ms |
+| gap p90 | — | **33–163ms** |
+| gap max | — | **65–874ms** |
+
+⚠️ **`SCRATCH_SERVO_LAG_CHUNKS`'s justification is stale in one specific way**: its "no
+realistic update cadence can outrun it" is true — a steady 0.2× hand at 160ms updates
+produces 0% silent chunks in `servo_test::replay` — but the value was justified against a
+cadence figure that was never measured and is wrong. The lag is fine; the *stalls* are the
+problem, and no lag setting addresses them (an adaptive lag was built and reverted; see the
+other doc's "Adaptive lag: implemented, measured, reverted").
+
+**Next step is a frontend-side instrument, not a servo change.** The gap is currently
+timed where the call lands in Rust, which cannot separate "no pointer event fired" from
+"pointer event fired and the IPC took 800ms". Those have opposite fixes. Candidates:
+WebKit pointer coalescing/stall on the canvas (`scripts/probes/pointer_events_probe.py`),
+throttling in this doc's own scrub bus, or main-thread IPC backpressure (`[ipc-ping]` is
+the standing control arm).
