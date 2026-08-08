@@ -578,6 +578,184 @@ Candidates, none yet tested:
 where the call *lands in Rust*, which cannot distinguish "no pointer event fired" from
 "pointer event fired and the call took 800ms to arrive". Those have opposite fixes.
 
+#### ✅ The frontend instrument is built (2026-08-08): `src/lib/audio/scrubStats.ts`
+
+Splits the path the same way `pollStats.ts` splits the position poll, so a stall lands in
+exactly one leg:
+
+```
+device ──evQueue──► JS handler ──rafWait──► bus flush ──dispatchLag──► invoke ──ipc──► resolved
+```
+
+| Shape | Cause, and the fix it implies |
+|---|---|
+| `gap` large, `evQueue` large on the arriving event | events were produced and queued behind a blocked main thread — do less on it during a gesture |
+| `gap` large, `evQueue` ≈ 0 | no events were produced: WebKit/device coalescing upstream, or the hand actually paused. Nothing downstream can fix it |
+| `gap` small, `rafWait` large | **this project's own scrub bus.** `updateScrub` coalesces into a `requestAnimationFrame`, so delivery is capped by the control window's frame rate — measured on this machine at 9–57fps (p50 24.5), which is suspiciously close to the 11–45 targets/s above. Fix is local: the audible path needs no rAF coalescing at all (`audio_scratch_to` is a bare atomic store after the first call), only a time-based bound for the 131 msg/s vinyl path |
+| `gap`/`rafWait` small, `ipc` large | backpressure — cross-check `[ipc-ping]`, the only arm that can exonerate the callee |
+| all legs small here, `[scratch-tel] gap max` still large | the stall is between `invoke()` and dispatch on the GTK main thread (`toRust`), which no JS-side change reaches |
+
+Two properties worth knowing before reading a run:
+
+- **Nothing is logged during the gesture.** Every sample is buffered and the whole gesture
+  is emitted at `endScrub`, per-second lines included. `debugLog` is an `invoke()` on the
+  bridge under measurement, so a live per-second line would contaminate the delivery it is
+  timing.
+- **`evQueue` is calibrated, not absolute** — `event.timeStamp` is platform-derived here
+  (`pointer_events_probe.py`'s new `stale` arm backdates one `GdkEvent.time` by 250ms and
+  the DOM stamp moves with it by exactly +250ms) but its origin is offset from
+  `performance.now()` by a per-page-load constant (−44ms and −466ms in two probe runs). The
+  instrument reports each sample above the session's running minimum and prints that floor,
+  so a first, uncalibrated gesture is recognisable rather than merely wrong. Discard it.
+
+`[scrub-sec/deck-N]` shares `[scratch-tel]`'s one-line-per-second cadence deliberately: a
+bad second can be read from both ends of the bridge at once, and `sent/s` here is the same
+quantity as `targets N/s` there.
+
+**Procedure** — one gentle gesture and one hard one in a single run, per the session-3
+method note below, on the **second** gesture onwards so the calibration floor is
+established. Then join the two per-second streams for the seconds where `arrived%` spikes:
+
+```bash
+grep -E '\[scrub-(deliver|sec)/|\[scratch-tel/' ~/.local/share/com.cuemark.app/logs/cuemark.log
+```
+
+`servo_test`'s equivalent on this side is `src/lib/audio/scrubStats.test.ts` — 12 tests that
+inject a stall into one leg and assert it appears in that leg **and nowhere else**, because
+an instrument that misattributes is worse than none and this investigation has already paid
+for that lesson twice.
+
+Also removed on the way through, as it sat inside the handler being timed:
+`WaveformCanvas`'s `getBoundingClientRect()` per `pointermove`, which forces a synchronous
+layout flush. The rect is now captured once at `pointerdown` (`dragRect`).
+
+#### ✅ RUN 2026-08-08 (night 2) — the stall is **absence of input**, not latency
+
+Two waveform drags in one session, zoom view, 1224px canvas (`[aux-loop]
+waveform/zoom/deck-0@1224x72`), rAF healthy throughout (~50–60fps, `gap p50=17 max=135`).
+User's account: **"the gentle one dropped out frequently; the hard drag created sound
+consistently."** Both ends of the bridge, joined per second:
+
+| gesture second | in/s | `gapMax` | `qMax` | `rafMax` | `ipcMax` | `arrived%` | cursor speed |
+|---|---|---|---|---|---|---|---|
+| gentle t=1 | 24 | 215 | 58 | 67 | 20 | 3% | 0.23× |
+| gentle t=2 | 11 | 268 | 93 | 61 | 30 | 0% | 0.65× |
+| **gentle t=3** | **5** | **1180** | **4** | **13** | **11** | **45%** | **0.28×** |
+| **gentle t=4** | **12** | **376** | **10** | **17** | **12** | **40%** | **0.17×** |
+| gentle t=5 | 37 | 228 | 59 | 63 | 15 | 15% | 0.35× |
+| gentle t=6…16 | 26–46 | 64–198 | 43–103 | 53–129 | 6–48 | **0%** | 0.96–2.19× |
+| hard t=0…9 | 25–66 | 34–509 | 18–207 | 16–129 | 7–80 | 1–24% | 2.3–4.8× |
+
+**The delivery question is closed, and closed against every candidate this doc listed:**
+
+- **Not the scrub bus / rAF.** `rafWait` max over both gestures is 129ms, and in the worst
+  second it is **13ms**. ⚠️ This **refutes the rAF-ceiling hypothesis** recorded above — the
+  coalescing does cost cadence (`sent` 25/s against `in` 31/s) but it is not the stall, and
+  the arithmetic match between "11–45 targets/s" and this machine's 9–57fps was a
+  coincidence. Do not re-derive it.
+- **Not IPC.** `ipc` max 48ms / 80ms, `[ipc-ping]` unremarkable.
+- **Not a blocked main thread queueing events.** Real queueing does occur — `qMax` reaches
+  103–207ms — but in the seconds where it does, `arrived` is **0%** and the audio is fine.
+- **The events were never produced.** In the two muted seconds the gap-ending event carried
+  `evQueue` of **4ms and 10ms**: freshly stamped, not delayed. Nothing was late; nothing
+  existed. This is the distinction the instrument was built to make, and it is the one the
+  Rust-side gap counter structurally could not.
+
+**What the fault actually is: `arrived ⇒ silence` is wrong for slow gestures, and slow
+gestures produce sparse input.** `arrived%` tracks hand speed inversely and exactly — ≤0.35×
+gives 15–45% muted, ≥0.96× gives 0% for eleven consecutive seconds. At 16s over 1224px
+(0.0131 s/px) the gentle hand was moving 13–27 px/s and the DOM delivered 5–12 events/s,
+~2.3px per event across the whole gesture. Between events the servo has no new information,
+converges inside `SCRATCH_TARGET_EPSILON_FRAMES`, and mutes **by design**. A record under a
+slowly-moving or momentarily-still hand still makes sound; this goes quiet.
+
+⚠️ **This inverts the session-3 control observation** ("only the hard one failed"). That
+failure was the sink ringbuffer fault, now fixed; what remains has the **opposite** speed
+dependence. Quoting the old direction at the new symptom will send the next session
+backwards. It also retires this doc's framing that "a hand that is still moving should not
+produce an 874ms gap" — a hand moving *slowly* does exactly that.
+
+⚠️ **Absence of events is unfalsifiable from the DOM.** Whether the hand paused for part of
+that 1180ms or moved sub-threshold cannot be recovered — there is no event to inspect. It
+also does not matter: both want the same behaviour from the feeder.
+
+**Recommended fix — coast, do not mute.** When `|err| < epsilon` *during* a gesture, keep
+the cursor walking at the speed implied by the recent target stream instead of fading, for a
+bounded window (~200–300ms) after which the existing fade takes over so a real stop still
+comes to rest. Deriving speed from a multi-event window of *absolute targets* is safe in a
+way the old velocity path never was: each new target re-anchors position absolutely, so no
+error accumulates and there is no inter-event divisor to be an artefact of delivery timing.
+
+🔴 **This is not the reverted adaptive lag, and the revert does not argue against it.**
+Adaptive lag changed how fast the servo *closes* an error and needed to predict a stall it
+could only observe afterwards. Coasting adds motion where there is no error left to close
+and predicts nothing — it reuses a speed already measured. It should also remove the
+**wobble**: the sprint-at-`SCRATCH_TARGET_MAX_RATE` after a gap happens because the cursor
+parked far from the next target; a coasting cursor is already near it.
+
+Gate it on a `servo_test` arm that replays a 0.2× hand with 1200ms input gaps and asserts
+both the silent-chunk fraction and the tracked mean speed — the same pairing that caught
+Fault 1, since a coast that is too eager tracks speed while walking through content the hand
+never asked for.
+
+#### ✅ Built 2026-08-08 (night 2) — `HandTracker` in `pipeline.rs`
+
+Implemented as a **tapered extrapolation of the target**, not as a change to the servo:
+`servo_step` remains a pure first-order lag onto whatever it is aimed at, and `HandTracker`
+decides what that is. While updates arrive the aim *is* the target; while they do not, the aim
+extrapolates along the estimated hand speed, tapering to a standstill over
+`SCRATCH_COAST_CHUNKS` (20 chunks, 300ms) and bounded by `SCRATCH_COAST_MAX_FRAMES`
+(2400 frames, 50ms of content). New telemetry field: `coast %`, the share of chunks that
+sounded only because of the coast — as it rises, `arrived%` should collapse on gentle
+gestures.
+
+Three things the A/B (setting `SCRATCH_COAST_CHUNKS` to 0) established, all measured rather
+than reasoned:
+
+- **19.7% muted without the coast, 0.0% with it**, on a 0.28× hand delivering 3 updates 17ms
+  apart every 400ms.
+- 🔴 **Burstiness is what mutes the servo, not sparseness** — and this corrects the mechanism
+  sketched above. A *uniform* 300ms cadence measures **0% silent either way**: each jump is
+  large and closing it takes about as long as the period, so the servo never converges. A
+  burst ends with a *small* jump the servo closes in ~150ms, and then nothing arrives for the
+  rest of the period. That is exactly the live shape (`gap p50=18ms` with `gapMax` 376–1180ms),
+  and it is why "11–45 updates/s" sounded survivable on paper and was not.
+- ⚠️ **The first schedule tried (a 300ms period) came out at 1.5% and would have passed on the
+  broken code** — the same trap `scratch_to_smoke` fell into for Fault 1. Any re-tuning here
+  must re-run the coast-off arm and confirm the test still fails without the fix.
+
+The harness also had to be fixed before it could measure anything: `replay_sampled` counted
+the chunks before the target had ever moved, where the cursor sits on it with zero error and
+correctly reports `arrived`. That made a uniform 300ms schedule read "7.5% silent" regardless
+of the servo, and the tell was that the number **did not move at all across the on/off A/B**.
+It now counts only from the first target change.
+
+Two deliberately opposed tests hold the window in place, so a wrong value fails one of them:
+`sparse_slow_hand_stays_audible` (sound where there should be sound) and
+`long_input_gap_still_comes_to_rest` (silence where there should be silence — it fails with
+"the coast has become a flywheel" at a 200-chunk window, and with "fell silent 229ms after the
+hand stopped" at zero). Plus `coast_does_not_outrun_the_hand` (mean cursor speed within 15% —
+in fact the coast *improves* speed accuracy, since muted chunks do not advance the cursor:
+0.254× against a 0.28× hand without it, 0.265× with), `coast_is_bounded_by_the_distance_cap`,
+and `snap_clears_the_coast`. All 11 `servo_test` arms pass, as do `scratch_to_smoke` and
+`vinyl_hold_smoke` against the real GStreamer pipeline.
+
+✅ **Listened to, same night, and it holds.** User: *"the audio stays playing the whole time
+that an action is happening (in both directions). It sounds slightly wobbly, but I'll take
+that."* Both directions, gentle and hard gestures.
+
+**The residual wobble is the dead-reckoning overshoot and is expected**: when a hand slows,
+the coast has already extrapolated past where it stopped and the next real target pulls the
+cursor back. Bounded by `SCRATCH_COAST_MAX_FRAMES`; if it ever needs reducing, shorten that
+cap first and `SCRATCH_COAST_CHUNKS` second. 🔴 **Do not reach for `SCRATCH_SERVO_LAG_CHUNKS`**
+— it is not the mechanism (measured), and an adaptive version was built and reverted.
+
+**This doc is now closed end to end**: the sink resync (the original subject) and the
+`arrived ⇒ silence` chatter that replaced it are both fixed and both confirmed live. What
+remains in the neighbourhood is not this doc's: the three-`pulsesink`/two-on-one-device
+configuration, which is `audio-dropout-mid-playback.md`'s H1 and the standing explanation for
+clipping during normal playback with cue open.
+
 **The same root produces a second, milder symptom on gestures that never mute at all.**
 The verified-clean 16s gesture was reported as "a bit erratic sounding, but continuous",
 and the telemetry shows why: within a single second, `rate mean=1.06` against `max=4.55`;

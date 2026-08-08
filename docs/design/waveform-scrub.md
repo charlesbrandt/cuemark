@@ -357,7 +357,10 @@ settles it immediately without needing the slow/fast comparison to come out clea
 | `vinyl_hold_smoke` (velocity-mode regression guard) | ✅ 0.045s drift in a 200ms gap |
 | `npm run check` | ✅ 238 files, 0 errors |
 | `npm test` | ✅ 34 tests |
-| `scripts/probes/pointer_events_probe.py` (new — Pointer Events for real mouse input) | ✅ GDK mouse → pointerdown/move/up, `pointerType=mouse` |
+| `scripts/probes/pointer_events_probe.py` (new — Pointer Events for real mouse input) | ✅ GDK mouse → pointerdown/move/up, `pointerType=mouse`; `stale` arm ✅ `timeStamp` is platform-derived (+250ms backdate → +250ms stamp shift), on an origin offset by a per-page-load constant |
+| `scrubStats.test.ts` (new — delivery-leg attribution) | ✅ 12 tests; a stall injected into one leg appears in that leg and nowhere else |
+| Live: delivery instrument against the chatter/wobble symptom | ✅ run 2026-08-08 (night 2) — delivery, rAF and IPC all exonerated; the dropouts are the designed `arrived ⇒ silence` fade firing during the sparse input a slow hand produces. Gentle drag drops out, hard drag is continuous — the **opposite** dependence from the session-3 sink fault |
+| Fix: coast instead of mute while a gesture is live (`HandTracker`) | ✅ built **and live-verified** 2026-08-08 — **19.7% muted → 0.0%** on a bursty 0.28× hand, A/B'd by disabling it; 11 `servo_test` arms + `scratch_to_smoke`/`vinyl_hold_smoke` on the real pipeline. User: *"the audio stays playing the whole time that an action is happening (in both directions)… slightly wobbly, but I'll take that"* |
 | Live run 1 (2026-08-08): vinyl jog | 🔴 found Faults 1 and 2 above; both fixed |
 | Live run 2 (2026-08-08): vinyl jog, forward, two speeds | ✅ motion tracks the wheel; no video jump (Fault 2 confirmed fixed) — ⚠️ **audio not listened to** |
 | Live run 3 (2026-08-08): vinyl jog, both directions, listened | 🔴 audio starts then dies for the whole gesture — but `[scratch-tel]` shows the feeder healthy throughout, so the fault is downstream (see above) |
@@ -436,3 +439,72 @@ timed where the call lands in Rust, which cannot separate "no pointer event fire
 WebKit pointer coalescing/stall on the canvas (`scripts/probes/pointer_events_probe.py`),
 throttling in this doc's own scrub bus, or main-thread IPC backpressure (`[ipc-ping]` is
 the standing control arm).
+
+## ✅ The instrument is built (2026-08-08) — `src/lib/audio/scrubStats.ts`
+
+Legs: `evQueue` (device → JS handler) / `rafWait` (input → bus flush) / `dispatchLag`
+(newest input → the value actually sent) / `ipc` (invoke → settled), plus input gaps,
+coalescing counts and a per-second breakdown on `[scratch-tel]`'s cadence so the two
+streams join. Emitted once per gesture, buffered until the end — `debugLog` is an
+`invoke()` on the bridge under measurement. How to read each shape, and the reading
+procedure, are in `scratch-audio-downstream-delivery.md`'s "The frontend instrument is
+built"; the leg-attribution guarantee is pinned by `src/lib/audio/scrubStats.test.ts`.
+
+✅ **Run 2026-08-08 (night 2), and it exonerates every part of the delivery path — including
+this doc's own scrub bus.** Two drags, gentle and hard, zoom view. `rafWait` max 129ms and
+**13ms in the worst second**; `ipc` max 48–80ms. ⚠️ The suspicion recorded here first — that
+`updateScrub`'s rAF coalescing was the ceiling, because 11–45 targets/s matched this
+machine's 9–57fps — **was wrong, and the numerical match was a coincidence.** The
+coalescing does cost cadence (`sent` 25/s against `in` 31/s) but it is not the stall. Do not
+re-derive that hypothesis.
+
+**The stall is that no pointer events were produced**: in both muted seconds the event that
+ended the gap carried `evQueue` of 4ms and 10ms — freshly stamped, not delayed. And the
+mute itself is this feature's own designed behaviour: `arrived%` tracks hand speed inversely
+and exactly (≤0.35× → 15–45% muted, ≥0.96× → 0% for eleven straight seconds), because a slow
+hand delivers 5–12 events/s at ~2.3px each, and between events the servo converges inside
+`SCRATCH_TARGET_EPSILON_FRAMES` and fades. So the remaining fault **is** in this doc's
+territory after all, in the envelope rather than in delivery: `arrived ⇒ silence` is wrong
+for precisely the gesture the feature exists for. Fix, evidence table and the reason it is
+*not* the reverted adaptive lag: `scratch-audio-downstream-delivery.md`, "RUN 2026-08-08
+(night 2)".
+
+### The coast (`HandTracker`, built 2026-08-08)
+
+A platter has mass. When the hand stops feeding it motion it does not stop dead, and that is
+both the audible fix and the honest physical model. Implemented as a **tapered extrapolation
+of the target** rather than a change to the servo: `servo_step` stays a pure first-order lag
+onto whatever it is aimed at, and `HandTracker` decides what that is — the real target while
+updates arrive, an extrapolation along the estimated hand speed while they do not, tapering to
+a standstill over 300ms and capped at 50ms of content.
+
+**Why estimating a velocity here does not contradict this doc's opening argument.** Velocity is
+not the control variable; position still is. Every real target re-anchors the cursor
+absolutely, so an estimate error cannot accumulate across a gesture, and its only effect is a
+bounded extrapolation that the next target corrects. The old velocity path had neither the
+bound nor the correction — that is the whole difference.
+
+✅ **Live-verified 2026-08-08 (night 2).** Continuous audio for the whole gesture in both
+directions, gentle and hard. **Residual: mild speed wobble, accepted by the user.** That is
+the dead-reckoning overshoot — when a hand slows, the coast has already extrapolated past
+where it stopped and the next real target pulls the cursor back. It is bounded by
+`SCRATCH_COAST_MAX_FRAMES` (50ms of content) and the levers if it ever becomes annoying are
+that cap and `SCRATCH_COAST_CHUNKS`, in that order. Do not reach for
+`SCRATCH_SERVO_LAG_CHUNKS` — it was already shown not to be the mechanism, and an adaptive
+version of it was built and reverted.
+
+⚠️ The window is deliberately too short to bridge the measured 1180ms gap. Covering that would
+make it a flywheel, and a hand that crosses no pixel for 1.2s has genuinely stopped — a held
+record is silent. `long_input_gap_still_comes_to_rest` pins that from the other side, so the
+pair of tests fails if the window is moved in either direction.
+
+Two changes on the measured path came with it:
+
+- `WaveformCanvas` no longer calls `getBoundingClientRect()` per `pointermove` — that forces
+  a synchronous layout flush inside the handler whose latency is being timed, on a main
+  thread simultaneously running `frame()`, an rAF-rate position poll and this canvas's own
+  redraw. The rect is captured once at `pointerdown` (`dragRect`); a canvas cannot move or
+  resize mid-press in any real gesture.
+- `noteScrubInput` is the first statement of the pointer handler, ahead of the
+  `DRAG_THRESHOLD_PX` guard: the sub-threshold events are still *delivery* evidence even
+  though they deliberately send nothing.

@@ -288,6 +288,21 @@ Notes that transfer to any input probe here:
   for the scrub bus, see `docs/design/waveform-scrub.md`.
 - Give WebKit's event queue time to drain (a few hundred ms) before asking the page what it
   saw; results are not available synchronously after `Gtk.main_do_event`.
+- **Set a realistic `GdkEvent.time`, not `Gdk.CURRENT_TIME`.** `CURRENT_TIME` is 0, which is
+  fine for testing delivery and useless for testing anything *derived* from the event's time:
+  a DOM stamp computed from 0 is indistinguishable from one taken off a different clock. Real
+  X11 events carry a monotonic millisecond stamp, so inject
+  `(GLib.get_monotonic_time() // 1000) & 0xFFFFFFFF`.
+- **To ask whether a derived value is real, perturb its input and check it moves.** The
+  question "does `event.timeStamp` carry the platform event's time, or the dispatch time?"
+  has opposite consequences — only the first can express a queueing delay — and no amount of
+  reading plausible-looking values settles it. The probe's `stale` arm backdates one event's
+  `GdkEvent.time` by 250ms; the DOM stamp moved with it by exactly +250ms, so it is
+  platform-derived (2026-08-08).
+- ⚠️ **`event.timeStamp` sits on an origin offset from `performance.now()` by a constant that
+  differs per page load** (−44ms and −466ms in two runs of the same probe). Absolute values are
+  meaningless; only variation above a running minimum is a delay. Whatever consumes it must
+  calibrate — see `src/lib/audio/scrubStats.ts`.
 
 ### Two rules these probes were shipped without, and paid for (2026-08-03)
 

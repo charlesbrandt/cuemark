@@ -869,8 +869,70 @@ controls that are *supposed* to free-run between events — shuttle-mode jog del
 keeps it.
 
 Reach for this whenever a continuous control feels erratic rather than merely mis-scaled:
-mis-scaled is a constant, erratic is usually timing dependence. Full write-up and the
-still-open `VINYL_SEC_PER_TICK` calibration: `docs/design/waveform-scrub.md`.
+mis-scaled is a constant, erratic is usually timing dependence. Full write-up:
+`docs/design/waveform-scrub.md` (`VINYL_SEC_PER_TICK` is calibrated — `1.8 / 256`; the
+Starlight encoder reports plain ±1 deltas, measured, so accumulation is exact).
+
+⚠️ **One bounded exception, added 2026-08-08 — read it before citing the rule above at a
+velocity estimate.** `HandTracker` in `pipeline.rs` *does* derive a hand speed from
+inter-event intervals, and it is correct to. What makes it safe is not the estimator but
+its role: velocity is **not the control variable** there, position still is. Every real
+target re-anchors the cursor absolutely, so an estimate error cannot accumulate, and its
+only effect is a bounded extrapolation (300ms, capped at 50ms of content) that the next
+event corrects. The rule is really "never let a burst-derived rate be the thing that
+*determines* position" — an unbounded, uncorrected integration. A bounded, self-correcting
+one is a different animal.
+
+---
+
+## A scrub/scratch that drops out: distinguish *absence* of input from *late* input first
+
+Root-caused 2026-08-08 (`docs/design/scratch-audio-downstream-delivery.md`). Three sessions
+were spent fixing this in the feeder, the servo and the scrub bus — all wrong, because the
+only available measurement was the gap between calls *arriving in Rust*, which cannot tell
+"no event fired" from "an event fired and took 800ms to get here". **Those have opposite
+fixes**, so measure the frontend legs before touching either end:
+
+```
+device ──evQueue──► JS handler ──rafWait──► bus flush ──dispatchLag──► invoke ──ipc──► resolved
+```
+
+`src/lib/audio/scrubStats.ts` reports all of them, one burst of lines per gesture
+(`[scrub-deliver/…]`, `[scrub-sec/…]`). Read them against the Rust `[scratch-tel/…]` line —
+same cadence, and `sent/s` there is the same quantity as `targets N/s` here.
+
+| Shape | Cause |
+|---|---|
+| `gap` large, `evQueue` large | events queued behind a blocked main thread |
+| `gap` large, `evQueue` ≈ 0 | **no events were produced** — nothing downstream can fix it |
+| `gap` small, `rafWait` large | the scrub bus's own rAF coalescing |
+| `gap`/`rafWait` small, `ipc` large | IPC backpressure — check `[ipc-ping]` |
+| all small, but Rust-side `gap max` large | between `invoke()` and GTK dispatch (`toRust`) |
+
+What it actually was, and the finding worth carrying forward: **a slowly-moving hand does
+not produce a steady event stream.** At 16s over 1224px the gentle drag moved 13–27 px/s and
+the DOM delivered **5–12 events/s** (~2.3px each) with gaps to 1180ms, while `rafWait` was
+13ms and `evQueue` on the gap-ending event was 4ms — freshly stamped, not late. The servo
+then converged inside its epsilon and faded **by design**, so `arrived%` tracked hand speed
+inversely and exactly: 15–45% muted below 0.35×, 0% above 0.96×.
+
+🔴 **Burstiness mutes a position servo, not sparseness** — measured, and it inverts the
+intuition. A *uniform* 300ms cadence never converges (each jump is large, closing it takes
+about as long as the period) and measures 0% silent. A **burst** ends with a small jump the
+servo closes in ~150ms, and then nothing arrives for the rest of the period. Live delivery
+is bursty (`gap p50=18ms` with `gapMax` 376–1180ms), which is why "11–45 updates/s" reads as
+survivable on paper and is not.
+
+Fix shipped: coast, don't mute (`HandTracker`, above). A platter has mass; when the hand
+stops feeding it motion it doesn't stop dead. Window deliberately too short (300ms) to bridge
+the 1180ms outlier — covering that makes it a flywheel, and a hand that crosses no pixel for
+1.2s has genuinely stopped, where a held record *is* silent. User-confirmed live: "the audio
+stays playing the whole time that an action is happening, in both directions", with mild
+residual wobble — the dead-reckoning overshoot, accepted.
+
+⚠️ **Two designed silences will masquerade as this bug** and cost a session if you forget:
+`arrived%` on a hand slowing to a stop, and `snaps` on a coarse overview drag that saturates
+`SCRATCH_TARGET_MAX_RATE`. Ask for **slow, smooth, zoomed** gestures when requesting a repro.
 
 ---
 
@@ -1021,6 +1083,30 @@ there, fix is a partial improvement" — the side-by-side made it obvious the fi
 had gone from making things *better* to *reliably worse*, which prompted
 looking for what the fix itself was causing (see next section) rather than
 concluding the earlier root-cause diagnosis was wrong.
+
+**The same rule applies to a unit test, and it is cheaper there — run the test with the fix
+disabled and confirm it fails.** A test written from a correct diagnosis can still fail to
+discriminate, and then it silently certifies nothing forever. Two instances in this project,
+both in the same feature:
+
+- `scratch_to_smoke` passed throughout the "scrubbing plays no audio" bug and would pass again
+  on the broken code: it asserts the cursor *arrives*, and it did — in one chunk, then sat
+  silent. The defect was the *shape* of the motion, a whole-gesture statistical property.
+- The first schedule written for `sparse_slow_hand_stays_audible` (2026-08-08) measured 1.5%
+  silent with the coast disabled, comfortably under its own 5% threshold. Only the disabled-fix
+  arm exposed that; re-pointed at a 400ms burst period it reads **19.7% disabled / 0.0%
+  enabled**.
+
+The disabled-fix arm also caught a **harness** fault the same session: `replay_sampled` was
+counting the chunks before the target had ever moved, where `arrived` is correct, which made
+one arm read "7.5% silent" no matter what the servo did. The tell was that the number did not
+move *at all* across the A/B. A metric that is identical in both arms is either measuring
+nothing or measuring the harness.
+
+For a behaviour with two failure directions, write **two opposed tests** so a wrong constant
+fails one of them — `sparse_slow_hand_stays_audible` (sound where there should be sound) and
+`long_input_gap_still_comes_to_rest` (silence where there should be silence, failing with "the
+coast has become a flywheel" if the window is too long).
 
 ## GStreamer gotcha: narrowing a live `queue`'s `max-size-*` cap while it's over
 ## the new limit re-applies backpressure immediately, not once it "catches up"
