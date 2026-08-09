@@ -20,10 +20,6 @@ export interface DemuxInfo {
   duration: number;
 }
 
-// Retained decoded frames, as a byte budget rather than a frame count — a 4K deck would
-// otherwise multiply the same count into many times the memory. Sized per deck at
-// construction from the demuxed resolution.
-//
 // Why retain more than the 2 this used to keep: decode is forward-only (a frame earlier
 // than the decoder's position can only be reached by resetting and re-decoding from the
 // nearest keyframe, and this library's GOPs are ~250 frames — see
@@ -31,16 +27,42 @@ export interface DemuxInfo {
 // during a reverse scrub is to still have it. Frames arrive pts-ascending and eviction is
 // oldest-first, so the ring is exactly the recent past a backward gesture moves into.
 // This costs no decode work at all; it is purely "stop closing frames so eagerly".
-const FRAME_RING_BYTES = 48 * 1024 * 1024;
+//
+// ⚠️ Sized by **duration first, bytes second** (changed 2026-08-09 after live evidence).
+// The original sizing was a pure byte budget, which gets the units wrong: what a reverse
+// gesture consumes is *seconds of content*, and frames-per-second varies independently of
+// bytes-per-frame. A 48MB budget bought 16 frames at 1080p — but 4 frames on the user's
+// real 3840x2026 library file, i.e. 0.16s, short enough that the ring served essentially
+// no gesture at all and the fix read as "not working" live. It also ignored frame rate
+// entirely, so a 6fps file got 2.7s and a 60fps file 0.27s from the identical budget.
+// Target the window in seconds and keep bytes as the ceiling, not the control variable.
+const RING_TARGET_SECONDS = 0.75;
+// Ceiling, hit only by very large frames. 4K at ~11.1MB/frame lands here rather than on
+// the duration target. Per *deck*, so budget for it twice on a two-deck set.
+const FRAME_RING_BYTES = 192 * 1024 * 1024;
 const MIN_HELD_FRAMES = 2; // the historical value — never retain less than this
+// Deliberately conservative: a VideoFrame pins a decoder buffer until close() and
+// VideoDecoder recycles from a bounded pool, so the failure mode of raising this is
+// decode stalling outright, not memory growth. See waveform-scrub.md.
 const MAX_HELD_FRAMES = 32;
 // localStorage override for live A/B without a rebuild: an HMR edit to this module
 // invalidates App.svelte and remounts it, which tears the deck down and pauses playback
 // (CLAUDE.md, "Dev server lifecycle"), making edit-driven tuning of this number expensive.
 const RING_OVERRIDE_KEY = "cuemark:codecFrameRing";
 
-/** Frames to retain for `w`×`h`, honouring the override, the byte budget and the bounds. */
-export function heldFrameCapacity(w: number, h: number, override?: number | null): number {
+/**
+ * Frames to retain for `w`×`h` at `fps`: enough for `RING_TARGET_SECONDS` of reverse
+ * travel, less if that would exceed the byte ceiling, honouring the override and bounds.
+ *
+ * `fps` is `DemuxInfo.fpsHint` and may be 0/absent for a stream the demuxer could not
+ * characterise — fall back to the byte ceiling alone there rather than inventing a rate.
+ */
+export function heldFrameCapacity(
+  w: number,
+  h: number,
+  fps: number,
+  override?: number | null,
+): number {
   if (override !== undefined && override !== null && Number.isFinite(override) && override >= MIN_HELD_FRAMES) {
     return Math.floor(override);
   }
@@ -48,8 +70,11 @@ export function heldFrameCapacity(w: number, h: number, override?: number | null
   // VideoFrame.allocationSize() is not worth trusting on this WebKitGTK for a value that
   // would then have to be recomputed per frame anyway.
   const bytesPerFrame = Math.max(1, w * h * 1.5);
-  const byBudget = Math.floor(FRAME_RING_BYTES / bytesPerFrame);
-  return Math.min(MAX_HELD_FRAMES, Math.max(MIN_HELD_FRAMES, byBudget));
+  const byCeiling = Math.floor(FRAME_RING_BYTES / bytesPerFrame);
+  const byDuration =
+    Number.isFinite(fps) && fps > 0 ? Math.ceil(RING_TARGET_SECONDS * fps) : Infinity;
+  const wanted = Math.min(byDuration, byCeiling);
+  return Math.min(MAX_HELD_FRAMES, Math.max(MIN_HELD_FRAMES, wanted));
 }
 
 function ringOverride(): number | null {
@@ -82,7 +107,12 @@ export class CodecPlayer {
   private readonly maxHeldFrames: number;
 
   constructor(readonly deckId: string, port: number, demux: DemuxInfo) {
-    this.maxHeldFrames = heldFrameCapacity(demux.codedWidth, demux.codedHeight, ringOverride());
+    this.maxHeldFrames = heldFrameCapacity(
+      demux.codedWidth,
+      demux.codedHeight,
+      demux.fpsHint,
+      ringOverride(),
+    );
     debugLog(
       `[codecPlayer:${deckId}] frame ring: ${this.maxHeldFrames} frames ` +
       `(${demux.codedWidth}x${demux.codedHeight}, ~${(demux.codedWidth * demux.codedHeight * 1.5 * this.maxHeldFrames / 1048576).toFixed(1)}MB, ` +

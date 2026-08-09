@@ -116,22 +116,39 @@ describe('CodecPlayer frame ring', () => {
     expect(closed.length + live.length).toBe(60);
   });
 
-  it('sizes the ring by byte budget, so a large frame retains fewer', async () => {
+  it('sizes the ring by duration, so the window is comparable across frame rates', async () => {
     const { mod } = await makePlayer();
-    const hd = mod.heldFrameCapacity(1920, 1080);
-    const small = mod.heldFrameCapacity(384, 288);
-    expect(hd).toBeGreaterThanOrEqual(2);
-    expect(small).toBeGreaterThan(hd); // cheap frames earn a longer window
-    // 48MB budget / (1920*1080*1.5 bytes) = 16 frames at 1080p.
-    expect(hd).toBe(16);
-    // A 4K frame must not multiply memory — it retains fewer still.
-    expect(mod.heldFrameCapacity(3840, 2160)).toBeLessThan(hd);
+    // 0.75s target: the frame *count* scales with fps so the *seconds* retained do not.
+    // This is what the byte-only sizing got wrong — same budget, 10x different windows.
+    expect(mod.heldFrameCapacity(1920, 1080, 25)).toBe(19); // ceil(0.75 * 25)
+    expect(mod.heldFrameCapacity(1920, 1080, 30)).toBe(23); // ceil(0.75 * 30)
+    expect(mod.heldFrameCapacity(1920, 1080, 8)).toBe(6); //  ceil(0.75 * 8)
+  });
+
+  it('falls back to the byte ceiling for very large frames', async () => {
+    const { mod } = await makePlayer();
+    // The user's real library file. 3840*2026*1.5 = 11.1MB/frame, so 0.75s (19 frames,
+    // 212MB) exceeds the 192MB ceiling and the ceiling wins — but it must still be a
+    // usable window, not the 4 frames / 0.16s the 48MB budget produced.
+    const uhd = mod.heldFrameCapacity(3840, 2026, 25);
+    expect(uhd).toBe(17);
+    expect(uhd / 25).toBeGreaterThan(0.5); // over half a second of reverse scrub
+    // A 4K frame still retains fewer than 1080p at the same rate — memory is bounded.
+    expect(uhd).toBeLessThan(mod.heldFrameCapacity(1920, 1080, 30));
   });
 
   it('never retains fewer than the historical 2, and is capped at the top end', async () => {
     const { mod } = await makePlayer();
-    expect(mod.heldFrameCapacity(7680, 4320)).toBeGreaterThanOrEqual(2);
-    expect(mod.heldFrameCapacity(16, 16)).toBeLessThanOrEqual(32);
+    expect(mod.heldFrameCapacity(7680, 4320, 25)).toBeGreaterThanOrEqual(2);
+    // A high frame rate wants more than the cap allows; the cap wins.
+    expect(mod.heldFrameCapacity(16, 16, 120)).toBe(32);
+  });
+
+  it('sizes off the byte ceiling alone when the demuxer reports no frame rate', async () => {
+    const { mod } = await makePlayer();
+    // fpsHint=0 must not become a 0-frame ring or an invented rate.
+    expect(mod.heldFrameCapacity(1920, 1080, 0)).toBe(32);
+    expect(mod.heldFrameCapacity(3840, 2026, 0)).toBe(17);
   });
 
   it('destroy() closes the whole ring', async () => {
