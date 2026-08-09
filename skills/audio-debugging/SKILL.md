@@ -208,7 +208,16 @@ Two probes in `audio/pipeline.rs` close that gap:
 [audio/deck-0] output_queue underrun (total=N) — ...          # instrument_queue_flow()
 [audio/deck-0] main sink 0: first buffer reached the sink     # instrument_sink_flow()
 [audio/deck-0] main sink 0: buffer flow resumed after a 3.2s gap
+[audio/deck-0] cue sink: first buffer reached the sink        # cue branch, since 2026-08-08
+[deliver-tel/deck-0] vol0=…/s(min …) margin …(min …) | sink0=… | cuevol=… | cuesink=…
 ```
+
+⚠️ **Check what these can and cannot see before concluding anything from a clean log.** The
+gap warning needs **>1s** of no buffers; `underrun` needs upstream starvation. **Brief
+clipping, glitching or distortion is below the resolution of every instrument in this
+pipeline** — so for those symptoms "the log is clean" is close to no information at all, and
+must never be reported as "the fault is gone". `[deliver-tel]`'s `margin(min …)` is the nearest
+thing available, and it measures *slack*, not audible artifacts.
 
 | Log | Meaning | Where to look |
 |---|---|---|
@@ -252,6 +261,49 @@ to hide the problem, while a USB device doing 48k→44.1k resampling does not.
 both. If one branch is clean and the other jitters, every upstream cause (CPU, decode,
 soundtouch) is excluded by construction — they cannot affect one branch and spare its sibling.
 That single observation is what cracked this.
+
+### Gating a "flow stopped" probe: a level check is never enough (learned twice)
+
+Any probe that reports "no buffers arrived for N seconds" will also fire on every span where
+**no buffers were supposed to arrive**. This project has now built that bug twice and fixed it
+the same way both times, so treat the pattern as settled:
+
+| Legitimate silence | What forges a dropout |
+|---|---|
+| Preroll → play | The gap between the single preroll buffer and the first play buffer |
+| Pause → resume | The last pre-pause buffer's timestamp surviving the pause |
+| Headphone cue off (`cue_valve` drops everything) | The last pre-close buffer's timestamp surviving the cue-off span |
+| A sink reopening after resume | The first measured second after play, which is device-open latency |
+
+**The fix is always two-sided, and the second side is the one people miss:**
+
+1. **Gate** the check on a relaxed `AtomicBool` (never a `current_state()` query — that takes
+   `GST_OBJECT_LOCK` on a streaming thread; see the `pipewiresink` deadlock history). Multiple
+   conditions compose as a conjunction: the cue sink gates on `at_playing` **and** `cue_open`.
+2. **Invalidate** the stored last-buffer timestamp when the gate closes, *from the side that
+   closes it* — the bus thread on any transition out of `Playing`, `set_cue_enabled()` on cue
+   off. The gate alone leaves a stale timestamp from just before the silence began.
+
+⚠️ **Step 2 is not optional and the cue case shows why most starkly**: the valve drops buffers
+*upstream* of the probed pad, so unlike the pause case **no later buffer ever arrives to clear
+the stale value** — the probe cannot self-heal, and the next cue-on reports the entire cue-off
+span as a dropout. Clear the flag *first*, then the timestamp, so a buffer already in flight
+cannot re-stamp it.
+
+**Always ship a positive control arm with the gate.** The cheapest way to pass "no false
+positives" is to break the diagnostic entirely, and a suppressed real dropout is strictly worse
+than the noise it replaced. Both guards here are two-arm tests — toggle everything and assert
+silence, then stall the pad for 2.5s inside a legitimately-open span and assert the warning
+still fires:
+
+```bash
+cargo test sink_flow_gap_gating -- --ignored --nocapture       # main sinks (D2)
+CUEMARK_CUE_DEVICE='…@RL,RR!FL,FR,RL,RR' \
+  cargo test cue_sink_flow_gap_gating -- --ignored --nocapture # cue sink
+```
+
+Both need a real device and the synthetic soak media (regenerate via the `gst-launch-1.0`
+command in `SOAK_A`'s doc comment — it is ~70MB and not committed).
 
 ### Occasional brief gap/click that does NOT interrupt playback — multi-device clock drift
 

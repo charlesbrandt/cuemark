@@ -161,7 +161,18 @@ fn instrument_queue_flow(output_queue: &gst::Element, deck_id: &str, playing: &A
 /// between two buffers that were *both* delivered inside one continuous `Playing` span —
 /// which is exactly the condition that makes it evidence of a fault.
 ///
-/// `playing` is read with a relaxed `AtomicBool` load and **must stay that way**: this
+/// **`gates` is a conjunction: every flag must be true for a gap to be measurable.** Main
+/// sinks pass just `at_playing`. The cue sink (added 2026-08-08) passes `at_playing` *and*
+/// `cue_open`, because `cue_valve` drops every buffer while cue is off — so without the
+/// second gate, each cue-off span is a perfect forgery of the very dropout this probe
+/// exists to catch, and a user toggling cue would manufacture a "gap" every time. ⚠️ The
+/// D2 lesson repeats exactly here and is easy to get wrong twice: **the gate alone is not
+/// sufficient.** The last buffer before the valve closes is recorded with both flags true,
+/// and no further buffer ever arrives to clear it (the valve drops them upstream of this
+/// pad), so `set_cue_enabled()` must invalidate `last` itself — see its call into
+/// `cue_sink_flow`. Both sides, same as the pause/resume case.
+///
+/// Each gate is read with a relaxed `AtomicBool` load and **must stay that way**: this
 /// probe runs on the sink's streaming thread, and a `current_state()` query there would
 /// take `GST_OBJECT_LOCK` under it. See `instrument_queue_flow()`'s doc comment for the
 /// full argument and the deadlock history it comes from.
@@ -174,7 +185,7 @@ fn instrument_sink_flow(
     sink: &gst::Element,
     deck_id: &str,
     label: &str,
-    playing: &Arc<AtomicBool>,
+    gates: Vec<Arc<AtomicBool>>,
 ) -> Option<SinkFlowState> {
     let Some(pad) = sink.static_pad("sink") else {
         log::warn!("[audio/{deck_id}] {label}: no sink pad to probe for flow diagnostics");
@@ -182,11 +193,10 @@ fn instrument_sink_flow(
     };
     let state: SinkFlowState = Arc::new(Mutex::new(SinkFlow::default()));
     let probe_state = state.clone();
-    let playing = playing.clone();
     let deck_id = deck_id.to_string();
     let label = label.to_string();
     pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
-        let is_playing = playing.load(Ordering::Relaxed);
+        let is_playing = gates.iter().all(|g| g.load(Ordering::Relaxed));
         let now = Instant::now();
         let mut st = probe_state.lock().unwrap();
         if !st.first_logged {
@@ -299,6 +309,145 @@ fn instrument_delivery(element: &gst::Element, pad_name: &str, label: &str) -> O
         gst::PadProbeReturn::Ok
     });
     Some(probe)
+}
+
+/// Report every `DeliveryProbe` on this pipeline once per 5s **while the deck is playing**,
+/// as `[deliver-tel/<deck>]`.
+///
+/// Added 2026-08-08. Until now the counters existed but were read only by the scratch
+/// feeder's own telemetry loop, which lives for the duration of a gesture — so during
+/// ordinary playback, the exact scenario `docs/design/audio-dropout-mid-playback.md` is
+/// about, nothing read them at all. That is why the 2026-08-05 live dropout could not be
+/// adjudicated after the fact: the one instrument that answers "did buffers keep reaching
+/// the device while the room went quiet" was structurally unreachable outside a scratch.
+///
+/// **Sampled every 1s, emitted every 5s.** The 5s cadence matches the rest of this
+/// project's standing instrumentation and keeps a multi-hour set readable; the 1s
+/// sampling is what preserves the resolution that matters, because the fault under
+/// investigation is a second-scale stall that a 5s mean would average away into nothing.
+/// Hence `min` per label — **that is the field to read**. A healthy branch reports a min
+/// within a buffer or two of its mean; `min 0/s` means a full second delivered nothing,
+/// which is the D1 signature and is invisible in the mean.
+///
+/// `margin` is `DeliveryProbe::margin_us` — buffer running time minus element running
+/// time. Its *minimum* over the window is the H5 field (see `DeliveryProbe`): steadily
+/// negative means buffers are arriving already late and the sink has no slack to absorb
+/// anything, whether or not a gap ever gets long enough to trip `instrument_sink_flow()`.
+///
+/// Gated on `at_playing` so an idle deck logs nothing, and the per-second baseline is
+/// reset while paused so the first line after a resume is not one giant delta.
+///
+/// Terminates when the pipeline is torn down: it holds a `Weak` to the probe vec, which
+/// only `PipelineInner` (and any live scratch feeder) keeps alive, so a rebuild drops it
+/// and the next tick exits rather than leaking a thread per `set_devices()`.
+fn spawn_delivery_reporter(deck_id: &str, probes: &DeliveryProbes, playing: &Arc<AtomicBool>) {
+    if probes.is_empty() {
+        return;
+    }
+    let weak = Arc::downgrade(probes);
+    let playing = playing.clone();
+    let deck_id = deck_id.to_string();
+    std::thread::spawn(move || {
+        // Per-label: last cumulative count, and the accumulating window stats.
+        let mut last_counts: Vec<u64> = Vec::new();
+        let mut win_total: Vec<u64> = Vec::new();
+        let mut win_min: Vec<f64> = Vec::new();
+        let mut win_margin_min: Vec<i64> = Vec::new();
+        let mut win_margin_last: Vec<i64> = Vec::new();
+        let mut samples = 0u32;
+        /// Ticks to baseline-only after a resume before measuring. See the skip below.
+        const RESUME_SKIP_TICKS: u8 = 2;
+        let mut resume_skip = RESUME_SKIP_TICKS;
+
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let Some(probes) = weak.upgrade() else { return };
+
+            if last_counts.len() != probes.len() {
+                last_counts = probes.iter().map(|p| p.count.load(Ordering::Relaxed)).collect();
+                win_total = vec![0; probes.len()];
+                win_min = vec![f64::MAX; probes.len()];
+                win_margin_min = vec![i64::MAX; probes.len()];
+                win_margin_last = vec![i64::MIN; probes.len()];
+                samples = 0;
+            }
+
+            let is_playing = playing.load(Ordering::Relaxed);
+            if !is_playing {
+                // Re-baseline without reporting: the counts kept moving during preroll and
+                // will move again on resume, and a delta spanning the pause is not a rate.
+                for (i, p) in probes.iter().enumerate() {
+                    last_counts[i] = p.count.load(Ordering::Relaxed);
+                    win_total[i] = 0;
+                    win_min[i] = f64::MAX;
+                    win_margin_min[i] = i64::MAX;
+                    win_margin_last[i] = i64::MIN;
+                }
+                samples = 0;
+                resume_skip = RESUME_SKIP_TICKS;
+                continue;
+            }
+            if resume_skip > 0 {
+                // Baseline only, twice. One skip is not enough, measured 2026-08-08: the
+                // first tick's delta straddles the pause, and the *second* second is where
+                // `pulsesink` reopening the device lands, which shows up as a legitimate
+                // `min 0/s` that has nothing to do with the stall this reporter exists to
+                // find. Reporting it would put a cry-wolf zero in the one field the design
+                // doc tells people to read — the same mistake D2 had to undo for
+                // `instrument_sink_flow()`.
+                for (i, p) in probes.iter().enumerate() {
+                    last_counts[i] = p.count.load(Ordering::Relaxed);
+                }
+                resume_skip -= 1;
+                continue;
+            }
+
+            for (i, p) in probes.iter().enumerate() {
+                let now = p.count.load(Ordering::Relaxed);
+                let delta = now.saturating_sub(last_counts[i]);
+                last_counts[i] = now;
+                win_total[i] += delta;
+                win_min[i] = win_min[i].min(delta as f64);
+                let m = p.margin_us.load(Ordering::Relaxed);
+                if m != i64::MIN {
+                    win_margin_last[i] = m;
+                    win_margin_min[i] = win_margin_min[i].min(m);
+                }
+            }
+            samples += 1;
+            if samples < 5 {
+                continue;
+            }
+
+            let report = probes
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let mean = win_total[i] as f64 / samples as f64;
+                    let min = if win_min[i] == f64::MAX { 0.0 } else { win_min[i] };
+                    let margin = if win_margin_last[i] == i64::MIN {
+                        "no ts".to_string()
+                    } else {
+                        format!(
+                            "{:+.0}ms(min {:+.0}ms)",
+                            win_margin_last[i] as f64 / 1000.0,
+                            win_margin_min[i] as f64 / 1000.0,
+                        )
+                    };
+                    format!("{}={mean:.0}/s(min {min:.0}) margin {margin}", p.label)
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            log::info!("[deliver-tel/{deck_id}] {report}");
+
+            for i in 0..probes.len() {
+                win_total[i] = 0;
+                win_min[i] = f64::MAX;
+                win_margin_min[i] = i64::MAX;
+            }
+            samples = 0;
+        }
+    });
 }
 
 /// Time-of-day in UTC, matching the log formatter in `lib.rs` so a timestamp printed
@@ -885,6 +1034,21 @@ struct PipelineInner {
     /// Buffer counters on the `volume`/`pulsesink` pads, handed to each scratch feeder so
     /// its per-second telemetry can report delivery next to rms. See `DeliveryProbe`.
     delivery_probes: DeliveryProbes,
+    /// Mirrors `cue_valve`'s open/closed state for the cue sink's flow probe, which must
+    /// not measure a gap across a span where the valve was dropping everything.
+    cue_open: Arc<AtomicBool>,
+    /// The cue output sink — a real `pulsesink` when a cue device is configured, else the
+    /// `fakesink` fallback. Kept because `make_sink()` does not name the element (the
+    /// branch id goes into a `cuemark.branch` stream property, not `name`), so there is
+    /// otherwise no way to tell it apart from a main `pulsesink` in the built graph.
+    /// Read only by `cue_sink_of()` in tests today; kept on the struct because
+    /// reconstructing "which sink is the cue one" after the fact is not possible.
+    #[cfg_attr(not(test), allow(dead_code))]
+    cue_sink_el: gst::Element,
+    /// The cue sink's flow-probe state, so `set_cue_enabled()` can invalidate its
+    /// last-buffer time when the valve closes. `None` when cue is on the fakesink
+    /// fallback (uninstrumented). See `instrument_sink_flow()`.
+    cue_sink_flow: Option<SinkFlowState>,
 }
 
 pub struct DeckAudioPipeline {
@@ -1096,7 +1260,7 @@ impl DeckAudioPipeline {
                 &snk,
                 &self.deck_id,
                 &format!("main sink {i}"),
-                &at_playing,
+                vec![at_playing.clone()],
             ));
             // Bracket the last stage: what leaves `volume` against what the sink accepts.
             // Both, not just the sink — a count that matches at `volume` and not at the
@@ -1188,6 +1352,44 @@ impl DeckAudioPipeline {
         // pipeline preroll, so the valve dropping all buffers (cue off) doesn't block the
         // pipeline from completing PAUSED — only the main sink controls preroll timing.
         cue_sink.set_property("async", false);
+
+        // ── Cue-branch instrumentation ────────────────────────────────────────────
+        // Added 2026-08-08 for docs/design/audio-dropout-mid-playback.md H1, which blames
+        // contention between the main and cue `pulsesink`s on one USB node — and which
+        // until now was the *only* branch in this pipeline carrying no probes at all. A
+        // live occurrence therefore produced a log that could not speak to the hypothesis
+        // it was supposed to test.
+        //
+        // Only instrumented when the cue sink is real. On the fakesink fallback the pad
+        // still sees buffers, but `sync=false` means its clock margin is meaningless and
+        // its delivery count measures nothing about any device — a reading that looks
+        // like evidence and is not.
+        let cue_is_real = !self.cue_device.is_empty() && cue_remap_outcome.is_ok();
+        // Second gate for the cue sink's flow probe: `cue_valve` drops every buffer while
+        // cue is off, so without this each cue-off span forges a dropout. Seeded from the
+        // deck's retained intent because a device rebuild re-enters load() mid-set with
+        // cue already open. See instrument_sink_flow()'s doc comment.
+        let cue_open = Arc::new(AtomicBool::new(self.cue_enabled));
+        let cue_sink_flow: Option<SinkFlowState> = if cue_is_real {
+            let st = instrument_sink_flow(
+                &cue_sink,
+                &self.deck_id,
+                "cue sink",
+                vec![at_playing.clone(), cue_open.clone()],
+            );
+            // Also registered with the bus thread, so a transition out of Playing
+            // invalidates it alongside the main sinks.
+            sink_flow_states.extend(st.clone());
+            // Bracket the cue branch's last stage the same way the main branch is
+            // bracketed: `cue_volume`'s src against the sink's own pad. A count that
+            // advances at `cuevol` and not at `cuesink` isolates the fault to that link;
+            // both advancing while the headphones are silent moves it past delivery.
+            delivery_probes.extend(instrument_delivery(&cue_volume, "src", "cuevol"));
+            delivery_probes.extend(instrument_delivery(&cue_sink, "sink", "cuesink"));
+            st
+        } else {
+            None
+        };
 
         let caps_48k = gst::Caps::builder("audio/x-raw")
             .field("rate", 48_000i32)
@@ -1511,6 +1713,9 @@ impl DeckAudioPipeline {
             log::info!("[audio/{}] duration={:.3}s", self.deck_id, dur);
         }
 
+        let delivery_probes_shared: DeliveryProbes = Arc::new(delivery_probes);
+        spawn_delivery_reporter(&self.deck_id, &delivery_probes_shared, &at_playing);
+
         self.inner = Some(PipelineInner {
             pipeline,
             volume_els,
@@ -1529,7 +1734,10 @@ impl DeckAudioPipeline {
             scratch_feeder: None,
             output_queue_el: output_queue,
             main_sink_els: main_sinks,
-            delivery_probes: Arc::new(delivery_probes),
+            delivery_probes: delivery_probes_shared,
+            cue_open,
+            cue_sink_el: cue_sink,
+            cue_sink_flow,
         });
         Ok(duration)
     }
@@ -1721,9 +1929,20 @@ impl DeckAudioPipeline {
     }
 
     /// Open or close the headphone cue branch via the valve gate.
+    ///
+    /// Also maintains the cue sink's flow-probe gate. Order matters on the way *down*:
+    /// clear `cue_open` first, then invalidate the probe's last-buffer time, so a buffer
+    /// already in flight cannot re-stamp it after the clear — with the flag false the
+    /// probe writes `None` itself. Doing only one of the two is the D2 trap: the gate
+    /// alone leaves a stale timestamp from just before the valve closed, and the next
+    /// cue-on reports the whole cue-off span as a dropout. See `instrument_sink_flow()`.
     pub fn set_cue_enabled(&mut self, enabled: bool) -> Result<(), String> {
         self.cue_enabled = enabled;
         if let Some(inner) = &self.inner {
+            inner.cue_open.store(enabled, Ordering::Relaxed);
+            if let Some(st) = &inner.cue_sink_flow {
+                st.lock().unwrap().last = None;
+            }
             inner.cue_valve_el.set_property("drop", !enabled);
             log::info!("[audio/{}] cue {}", self.deck_id, if enabled { "ON" } else { "OFF" });
         }
@@ -3113,8 +3332,18 @@ mod scratch_smoke_test {
     const GAP_WARNING: &str = "buffer flow resumed after a";
     const UNDERRUN_WARNING: &str = "output_queue underrun";
 
+    /// The cue branch's sink, so a test can stall the same pad `instrument_sink_flow()`
+    /// watches. Taken from `PipelineInner` rather than found by walking the graph: the cue
+    /// sink is a `pulsesink` like the main ones and `make_sink()` leaves them all with
+    /// auto-generated names, so nothing in the built pipeline distinguishes them.
+    fn cue_sink_of(p: &DeckAudioPipeline) -> Option<gst::Element> {
+        p.inner.as_ref().map(|i| i.cue_sink_el.clone())
+    }
+
     /// Every `pulsesink`/`autoaudiosink` in a built pipeline, so a test can attach its own
-    /// probes to the same pads `instrument_sink_flow()` watches.
+    /// probes to the same pads `instrument_sink_flow()` watches. ⚠️ Includes the **cue**
+    /// sink when one is configured — the filter cannot tell the branches apart (see
+    /// `cue_sink_of`). Main sinks are built first, so index 0 is a main sink.
     fn main_sinks_of(p: &DeckAudioPipeline) -> Vec<gst::Element> {
         let Some(inner) = p.inner.as_ref() else { return Vec::new() };
         inner
@@ -3825,6 +4054,106 @@ mod scratch_smoke_test {
             real[0]
         );
         println!("sink_flow_gap_gating OK — false positives gone, real stall still reported with an onset");
+    }
+
+    /// **Cue-branch sibling of `sink_flow_gap_gating`** (2026-08-08,
+    /// docs/design/audio-dropout-mid-playback.md H1).
+    ///
+    /// Instrumenting the cue sink reintroduces D2's trap in a new shape: `cue_valve` drops
+    /// every buffer while cue is off, so a cue-off span is a perfect forgery of the dropout
+    /// this probe exists to catch — and unlike the pause case, *no buffer ever arrives* to
+    /// clear the stale timestamp, because the valve drops them upstream of the probed pad.
+    /// That is why `set_cue_enabled()` invalidates `last` itself rather than relying on the
+    /// gate alone. Arm 1 asserts the toggling is silent; arm 2 asserts a genuine stall on
+    /// the cue sink, taken while cue is open, is still reported — because the cheapest way
+    /// to pass arm 1 is to break the probe entirely.
+    ///
+    /// Needs a real audio device **and a real cue device**, hence `#[ignore]`:
+    /// ```text
+    ///   CUEMARK_CUE_DEVICE='alsa_output.usb-…analog-surround-40@RL,RR!FL,FR,RL,RR' \
+    ///   cargo test cue_sink_flow_gap_gating -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn cue_sink_flow_gap_gating() {
+        init_test_logger();
+        gst::init().expect("gst init");
+        let path = soak_env("CUEMARK_TEST_AUDIO", SOAK_A);
+        assert!(std::path::Path::new(&path).exists(), "missing test media {path} — see SOAK_A's doc comment");
+        let cue_dev = soak_env("CUEMARK_CUE_DEVICE", "");
+        assert!(
+            !cue_dev.is_empty(),
+            "CUEMARK_CUE_DEVICE is unset — with no cue device the branch falls back to \
+             fakesink and is deliberately uninstrumented, so this test would pass vacuously"
+        );
+
+        let mut deck = DeckAudioPipeline::new("cue-gate-test");
+        deck.set_gain(0.02).expect("set_gain");
+        deck.set_cue_gain(0.02).expect("set_cue_gain");
+        deck.load(&path).expect("load");
+        deck.set_cue_device(&cue_dev).expect("set_cue_device"); // rebuilds the pipeline
+
+        const CUE_GAP: &str = "cue sink: buffer flow resumed after a";
+
+        // ── Negative arm: cue toggling must never manufacture a gap ───────────────
+        clear_captured();
+        deck.play().expect("play");
+        std::thread::sleep(Duration::from_secs(2));
+        deck.set_cue_enabled(true).expect("cue on");
+        std::thread::sleep(Duration::from_secs(3));
+        deck.set_cue_enabled(false).expect("cue off");
+        println!("[arm-1] cue off; holding 6s with the valve dropping everything");
+        std::thread::sleep(Duration::from_secs(6));
+        deck.set_cue_enabled(true).expect("cue on 2");
+        std::thread::sleep(Duration::from_secs(3));
+        // And across a pause, which stacks both gates at once.
+        deck.pause().expect("pause");
+        std::thread::sleep(Duration::from_secs(4));
+        deck.play().expect("play 2");
+        std::thread::sleep(Duration::from_secs(3));
+
+        let false_positives = captured_matching(CUE_GAP);
+        for l in &false_positives {
+            println!("[arm-1] UNEXPECTED: {l}");
+        }
+        assert!(
+            !captured_matching("cue sink: first buffer reached the sink").is_empty(),
+            "[arm-1] the cue probe never fired — nothing reached the cue sink, so the test \
+             proves nothing. Is CUEMARK_CUE_DEVICE a real device?"
+        );
+        assert!(
+            false_positives.is_empty(),
+            "[arm-1] {} cue-off/pause gap warning(s) survived the gate — set_cue_enabled() \
+             is not invalidating the probe's last-buffer time",
+            false_positives.len()
+        );
+        println!("[arm-1] OK — a 6s cue-off span and a 4s pause produced zero cue gap warnings");
+
+        // ── Positive arm: a real stall on the cue sink must still be reported ─────
+        clear_captured();
+        let cue_sink = cue_sink_of(&deck).expect("[arm-2] no cue sink element found to stall");
+        let stalled = Arc::new(AtomicBool::new(false));
+        let stalled_probe = stalled.clone();
+        let pad = cue_sink.static_pad("sink").expect("cue sink pad");
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_p, _i| {
+            if !stalled_probe.swap(true, Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(2500));
+            }
+            gst::PadProbeReturn::Ok
+        });
+        std::thread::sleep(Duration::from_secs(6));
+        deck.pause().expect("final pause");
+
+        let real = captured_matching(CUE_GAP);
+        for l in &real {
+            println!("[arm-2] {l}");
+        }
+        assert!(
+            !real.is_empty(),
+            "[arm-2] a deliberate 2.5s stall on the cue sink inside PLAYING with cue open \
+             was NOT reported — the cue gate is suppressing real dropouts"
+        );
+        println!("cue_sink_flow_gap_gating OK — cue toggling silent, real cue stall still reported");
     }
 
     /// **D1 reproducer attempt** (docs/design/audio-dropout-mid-playback.md).

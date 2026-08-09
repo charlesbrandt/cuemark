@@ -504,7 +504,14 @@ as of a same-day live verification pass** (see below) — neither should be cite
   `Playing` and the frame rate healthy, ~21s after headphone cue was enabled on a USB controller
   carrying both the main and cue sinks. Fix the 6:1 false-positive rate in
   `instrument_sink_flow()` first or the soak will be unreadable. 🟢 **"No reproducer yet" is
-  out of date** — see below.
+  out of date** — see below. 🟢 **Instrumented 2026-08-08**: the cue sink previously carried
+  **no probes at all** — the one branch H1 blames was the one branch that could not be
+  measured — and the delivery counters were readable only during a scratch gesture. Both fixed
+  (`[deliver-tel]`, above). ⚠️ **Nothing in this pipeline can see *clipping*.** The gap warning
+  needs >1s of silence and `underrun` needs starvation; brief glitching is below the resolution
+  of every instrument here, so **"the log is clean" and "the artifact is gone" are very nearly
+  independent statements** — an 80s clean run on the live topology (2026-08-09) is the
+  established baseline, not evidence of a fix.
 - `docs/design/scratch-audio-downstream-delivery.md` — 🟢 **CLOSED 2026-08-08, in two stages,
   both user-confirmed live.** (1) The silence was `GstAudioBaseSink` resyncing its ringbuffer
   write pointer ~253ms *backwards* after `discont-wait` expired, fixed by widening the sink's
@@ -669,6 +676,29 @@ the distribution, which is what made a slow baseline look like an outlier proble
 [post-frame] n=… bitmaps=… | sync … | to-postMessage …
 [ipc-ping]   noop n=… | total … | toRust … | toJs …
 ```
+
+The Rust side adds one, from `spawn_delivery_reporter()` in `pipeline.rs` — **sampled every 1s,
+emitted every 5s, only while a deck is playing**. It is the only instrument that reports what
+reaches each *sink* during ordinary playback (`[scratch-tel]` reports the same counters, but
+only for the duration of a gesture):
+
+```
+[deliver-tel] deck-0  vol0=…/s(min …) margin …(min …) | sink0=… | cuevol=… | cuesink=…
+```
+
+- ⚠️ **`min` is the field to read, not the mean.** The faults these counters exist for are
+  second-scale stalls that a 5s mean averages into nothing; `min 0/s` means a whole second
+  delivered nothing. The mean alone has never distinguished a healthy branch from a stalling one.
+- ⚠️ **A `cue*` row reads `0/s` whenever headphone cue is closed — that is `cue_valve` working**,
+  not a fault. Check the surrounding `cue ON`/`cue OFF` lines before reading a cue zero as
+  evidence, exactly like `arrived%`/`snaps` in `[scratch-tel]` being silence by design.
+- ⚠️ **The branches' rates are not comparable to each other** (measured 15/s main against 9/s
+  cue on the same deck — different channel counts and buffer sizing). Compare a branch against
+  *itself* over time.
+- `margin` is buffer running time minus element running time — the sink's slack. Steadily
+  negative means buffers arrive already late, which is a fault that never trips the gap warning.
+- The first two ticks after a resume are baselined rather than measured, because `pulsesink`
+  reopening the device lands in the second one and forged a `min 0/s` on every play press.
 
 `src/lib/audio/scrubStats.ts` adds two more, emitted **once per scrub/scratch gesture** (not on
 an interval) — buffered in memory for the whole gesture and flushed at the end, because
