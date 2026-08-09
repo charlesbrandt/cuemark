@@ -183,6 +183,48 @@ many.
 5. **Tier 2 keyframe-only reverse seek** (§3), which needs the new worker message.
 6. Directional prefetch and hot-region pinning, guided by the instrument from step 1.
 
+## 5a. State as of 2026-08-09 evening — READ THIS FIRST NEXT SESSION
+
+**The duration target is wrong in one direction and should probably be dropped.** Measured
+on the same machine, same track, three sizings:
+
+| Content | Original byte budget (48MB) | 0.75s arm | 0.35s arm (current `HEAD`) |
+|---|---|---|---|
+| 3840×2026 @25 | 4 frames / 0.16s | 17 / 0.68s | 9 / 0.36s |
+| 1280×720 @25 (Tobago) | **32 / 1.28s** | 19 / 0.76s | **9 / 0.36s** |
+
+The byte budget let cheap frames earn a long window for free (capped at
+`MAX_HELD_FRAMES`), and the duration target *removed* that — a 3.5× regression on
+sub-4K content, which is most of the library. The 4K fix was real; the cap on cheap
+content was collateral damage and was not noticed because the only file examined while
+designing it was the 4K one.
+
+**Likely correct answer: drop `RING_TARGET_SECONDS` entirely and keep the byte ceiling at
+192MB with `MAX_HELD_FRAMES = 32`.** That yields 17 frames at 4K (the fix) and 32 at 720p
+(the original good behaviour) — strictly better than both arms on both content types, and
+one constant instead of two. The duration target's only real job was stopping 4K from
+collapsing to 4 frames, and a larger ceiling already does that. Cost: frame rate is ignored
+again, so a 6fps file gets a very long window and a 60fps file a short one — but that
+window is free either way, which is why the byte-only rule was defensible to begin with.
+
+⚠️ **Do not conclude anything from Tobago.** `Jonas Rathsman - Tobago` is the one track the
+user reports a consistent audio artifact on, independent of and predating all of this work
+(`todo-20260808.md`; they suspect artifacts in the file itself). It is the worst possible
+A/B track — two faults, one signal. Use it only once the frame-cache question is settled
+elsewhere, and settle *it* by comparing the decoded signal against the recorded output, not
+by ear.
+
+**Open question the A/B was built to answer, still open**: whether presenting a frame costs
+enough main thread to starve audio. The 4K measurement is solid — 54–77ms per preview draw
+at 3840×2026, `busy 13–14%`, with `rafWait` tracking it — but whether that is what the user
+hears is unproven, and the servo instruments say the servo never gated (`arrived 0%
+snaps=0`, rms healthy). The cheapest clean test is a **1080p or 720p track that is not
+Tobago**, on a ring sized the same way, comparing `[aux-loop] preview drew=… dur max=…`.
+
+Note the machine struggles with 4K playback generally (user observation, consistent with
+the per-draw cost above) — so a 4K-specific presentation ceiling is plausible on its own
+terms and may not be a cuemark bug at all.
+
 ## 6. The general lesson
 
 **Size a cache in the units the consumer spends, not the units the resource is billed in.**
