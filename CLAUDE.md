@@ -303,61 +303,12 @@ See "Rendering pipeline" above and `src/lib/renderer/outputProtocol.ts` for the 
 
 ### Data model
 
-```typescript
-type DeckSource =
-  | { type: 'video'; filePath: string; duration: number }
-  | null
-
-// Global visualization layer — NOT a DeckSource. Composited above all decks in the
-// output stage (see "Visualization layer" below), with its own opacity. Selecting a
-// visualization never touches deck state or audio.
-interface Visualization {
-  fragmentSrc: string
-  uniforms: Record<string, number>
-  name?: string
-}
-
-interface Deck {
-  id: string              // 'deck-0', 'deck-1', etc. — no hardcoded limit
-  source: DeckSource
-  playing: boolean
-  playbackRate: number    // 0.25–4.0
-  gain: number            // 0–1 pre-fader trim (normalize source level between tracks)
-  volume: number          // 0–1 post-fader level (driven by crossfader); effective audio = gain × volume × masterVolume
-  opacity: number         // 0–1 visual compositor weight
-  loop: boolean
-  cuePoint: number        // seconds
-  hotCues: number[]       // up to 4 time markers
-  bpm: number | null      // fractional (beat-grid fit) or tapped BPM for this deck
-  downbeat: number | null // beat-level grid anchor (seconds); auto-set from the grid fit on load
-  loopIn: number | null   // custom loop region start (seconds); null = full track
-  loopOut: number | null  // custom loop region end (seconds); null = full track
-  // When loop=true and both loopIn/loopOut are set, ontimeupdate seeks back to loopIn
-  // at loopOut (native video.loop is disabled in that case — App.svelte manages it).
-}
-
-interface Session {
-  decks: Deck[]           // ordered array; render back-to-front
-  masterVolume: number
-  bpm: number | null      // master/reference BPM; set via tap tempo or "Main Beat" button
-  crossfaderMapping: {    // which two decks the hardware crossfader controls
-    left: string          // deck id
-    right: string         // deck id
-  }
-  crossfaderValue: number              // 0.0 (full left) – 1.0 (full right)
-  crossfaderTargets: CrossfaderTarget[] // 'opacity' | 'volume' — what the fader drives
-  effects: Effect[]       // global post-process chain
-  visualization: Visualization | null   // global layer, composited above all decks
-  visualizationOpacity: number          // 0–1; default 0.5 so video stays visible underneath
-}
-
-interface AudioAnalysis {
-  bass: number            // 0–1 normalized
-  mid: number
-  high: number
-  waveform: Float32Array
-}
-```
+`src/lib/state/types.ts` is the source of truth for `Deck`, `Session`, `Visualization`,
+`AudioAnalysis` and related types — read it directly rather than trusting a copy here; its
+inline comments carry the same field-level rationale (units, ranges, invariants) this section
+used to duplicate, and duplicating it let this doc drift out of sync with real fields
+(`eq`, `cueEnabled`, `syncLocked`, `masterDeckId`, `midiMapping`, Digger integration, `loadSeq`
+reload-detection) more than once.
 
 ### MIDI architecture
 
@@ -405,71 +356,6 @@ uniforms declared on `Visualization.uniforms`.
 **UI**: controls live in `src/components/VisualizationPanel.svelte` (shader picker + opacity
 slider), toggled from a toolbar button in `App.svelte` — mirrors the existing `Audio`/`Queue`
 panel-toggle pattern. `DeckCard.svelte` no longer has any shader-picker UI.
-
-## Directory structure
-
-```
-cuemark/
-  src/                          # Frontend (TypeScript/Svelte 5)
-    main.ts                     # Svelte mount entry point
-    App.svelte                  # Root component — deck grid + toolbar
-    app.css                     # Global dark UI styles
-    lib/
-      state/
-        types.ts                # Deck, Session, AudioAnalysis interfaces
-        session.ts              # Svelte writable store + addDeck/updateDeck/setCrossfaderMapping/etc.
-      renderer/
-        fbo.ts                  # DeckFBO — WebGL texture + framebuffer; uploadVideoFrame/FromCodec/ImageBitmap
-        compositor.ts           # Compositor — syncDecks(), composite(); RUNS IN THE OUTPUT WINDOW
-        outputProtocol.ts       # Control<->output window message contract + why frames, not snapshots
-        outputBus.ts            # Sender side: per-deck VideoFrame/<video> -> ImageBitmap -> BroadcastChannel
-        seekBus.ts              # Module-level registry: video elements + audio clock cache; seekDeck() / getDeckTime() / setDeckAudioTime()
-      audio/
-        pipeline.ts             # Typed TS wrappers around all Rust audio Tauri commands (audioLoad, audioPlay, …)
-        analyzer.ts             # AudioAnalyzer — Web Audio API FFT (waveform analysis only; not used for playback)
-        waveform.ts             # analyzeFile() → calls audio_analyze_file Tauri command (Rust/GStreamer); computeWaveform() for AudioBuffer; amplitude color LUTs
-        bpm.ts                  # detectBeatGrid(envelope, rate) — fractional BPM + grid phase (comb fit); detectBpm() integer fallback; tapTempo()
-        gridSource.ts           # Per-deck (deckId → trusted filePath) map gating saved-grid vs auto-fit precedence; see "Grid persistence" gotcha above
-        audioSettings.ts        # Svelte stores: mainOutputDeviceIds, cueOutputDeviceId, cueGain
-      midi/
-        handler.ts              # Tauri IPC listener → session mutations
-    components/
-      DeckCard.svelte           # Per-deck controls: transport, hot cues, BPM/Main Beat/Sync, loop in/out + bar presets, sliders
-      Crossfader.svelte         # Hardware crossfader UI — deck selectors (left/right), slider, Visual/Audio toggles
-      WaveformCanvas.svelte     # Per-deck waveform: overview + zoom (16s window); loop region highlight; fires onBpmDetected callback
-      VisualizationPanel.svelte # Global visualization shader picker + opacity slider (toggled from toolbar)
-  src-tauri/                    # Rust backend (Tauri 2)
-    src/
-      main.rs                   # Binary entry point
-      lib.rs                    # Tauri builder + setup; registers all Tauri commands
-      midi.rs                   # midir listener → MidiAction events
-      audio/                    # GStreamer audio backend
-        mod.rs                  # AudioManager (Mutex-wrapped), AudioState type, all Tauri command handlers
-        pipeline.rs             # DeckAudioPipeline — per-deck GStreamer graph (uridecodebin→volume→sink)
-        mixer.rs                # MasterMix — stub for future shared audiomixer topology (not yet active)
-        devices.rs              # list_audio_devices() — PipeWire/PulseAudio sink enumeration
-        analysis.rs             # Audio analysis (FFT, peak detection)
-        record.rs               # RecordingSink — audio recording (Opus/FLAC)
-      grid_store.rs             # grid_get_saved/grid_save Tauri commands — local sidecar (grids.json) for saved bpm/downbeat
-    capabilities/
-      default.json              # Tauri 2 capability config
-    icons/                      # App icons (placeholder PNGs)
-    build.rs
-    Cargo.toml
-    tauri.conf.json
-  index.html
-  package.json
-  vite.config.ts
-  tsconfig.json
-  svelte.config.js
-  todo.md
-  journal.md
-  docs/
-    design/                     # Feature/architecture design docs (see below)
-    upstream/                   # Draft WebKitGTK bug reports (with evidence + reproducers)
-  scripts/
-    probes/                     # Headless WebKitGTK feature probes (python3-gi; see verify-ui skill)
-```
 
 ## Active architecture plan (2026-07-25)
 
@@ -663,129 +549,9 @@ the exact window being diagnosed, including the build-provenance line this file 
 first. Rotated files are date-stamped, so a report from last week is still readable. If a log looks
 suspiciously short, check whether it rotated before theorizing about what is missing.
 
-### Standing performance instrumentation
-
-`src/lib/audio/pollStats.ts` emits one percentile line per bucket every 5s while a deck plays.
-Threshold-only logging was deliberately abandoned here: `if (ms > 300)` shows the tail and hides
-the distribution, which is what made a slow baseline look like an outlier problem.
-
-```
-[poll-stats] deck-0[/scratch] n=… | total … | toRust … | inRust … (lock …, query …) | toJs …
-[raf]        n=… (~Nfps) | gap … | frame-dur … | busy …%
-[aux-loop]   preview/deck-0 | waveform[/zoom]/deck-0@<W>x<H>   n=… drew=… | dur … | busy …%
-[post-frame] n=… bitmaps=… | sync … | to-postMessage …
-[ipc-ping]   noop n=… | total … | toRust … | toJs …
-```
-
-The Rust side adds one, from `spawn_delivery_reporter()` in `pipeline.rs` — **sampled every 1s,
-emitted every 5s, only while a deck is playing**. It is the only instrument that reports what
-reaches each *sink* during ordinary playback (`[scratch-tel]` reports the same counters, but
-only for the duration of a gesture):
-
-```
-[deliver-tel] deck-0  vol0=…/s(min …) margin …(min …) | sink0=… | cuevol=… | cuesink=…
-```
-
-- ⚠️ **`min` is the field to read, not the mean.** The faults these counters exist for are
-  second-scale stalls that a 5s mean averages into nothing; `min 0/s` means a whole second
-  delivered nothing. The mean alone has never distinguished a healthy branch from a stalling one.
-- ⚠️ **A `cue*` row reads `0/s` whenever headphone cue is closed — that is `cue_valve` working**,
-  not a fault. Check the surrounding `cue ON`/`cue OFF` lines before reading a cue zero as
-  evidence, exactly like `arrived%`/`snaps` in `[scratch-tel]` being silence by design.
-- ⚠️ **The branches' rates are not comparable to each other** (measured 15/s main against 9/s
-  cue on the same deck — different channel counts and buffer sizing). Compare a branch against
-  *itself* over time.
-- `margin` is buffer running time minus element running time — the sink's slack. Steadily
-  negative means buffers arrive already late, which is a fault that never trips the gap warning.
-- The first two ticks after a resume are baselined rather than measured, because `pulsesink`
-  reopening the device lands in the second one and forged a `min 0/s` on every play press.
-
-`src/lib/audio/scrubStats.ts` adds two more, emitted **once per scrub/scratch gesture** (not on
-an interval) — buffered in memory for the whole gesture and flushed at the end, because
-`debugLog` is itself an `invoke()` on the bridge under measurement:
-
-```
-[scrub-deliver/deck-0] pointer audible 18.7s | inputs n=… (…/s) gap … | evQueue … (floor …ms, n=…) | sent=… (…/s) skipped=… err=… coalesced …
-[scrub-deliver/deck-0] rafWait … | dispatchLag … | ipc …
-[scrub-deliver/deck-0] worst: gap …ms @…s (evQueue …ms on the arriving event) | rafWait …ms @…s | ipc …ms @…s
-[scrub-sec/deck-0]     t=… in=… sent=… | gapMax=… qMax=… rafMax=… lagMax=… ipcMax=…
-```
-
-- `sent/s` is the same quantity as `targets N/s` in the Rust-side `[scratch-tel]`, counted at the
-  other end of the bridge — a disagreement between them localizes a stall to the transport.
-  `[scrub-sec]` shares `[scratch-tel]`'s one-line-per-second cadence so the two join directly.
-- The leg a stall lands in decides the fix, and they are different fixes: `gap`+`evQueue` large =
-  events queued behind a blocked main thread; `gap` large with `evQueue` ≈ 0 = no events were
-  produced at all; `rafWait` large = the scrub bus's own rAF coalescing (cross-check `[raf] gap`);
-  `ipc` large = backpressure (cross-check `[ipc-ping]`). Full table in the module doc comment.
-- ⚠️ `evQueue` is **calibrated, not absolute**. `event.timeStamp` is platform-derived here
-  (verified — `pointer_events_probe.py`'s `stale` arm) but sits on an origin offset from
-  `performance.now()` by a constant that differs per page load, so only variation above the
-  session's running minimum is meaningful. A first gesture with a single-digit `n=` in the floor
-  field has not calibrated yet; discard it.
-- ⚠️ MIDI ticks carry no platform stamp, so a vinyl-jog gesture reports `evQueue —`. A gap there
-  is an upper bound on delivery latency, not an attribution.
-
-How to read them (full derivation in `docs/design/control-window-frame-budget.md`):
-
-- A synchronous `#[tauri::command]` runs on the GTK main thread, so an IPC round trip splits into
-  `toRust` (dispatch) / `inRust` (the actual work) / `toJs` (the reply reaching the JS callback).
-  Only `inRust` is the backend. Epoch ms is the **only** clock the Rust process and the webview
-  share — `performance.now()` and `Instant` have per-process origins and cannot be differenced.
-- **`[ipc-ping]` is the control arm.** If a command that does nothing is as slow as the one you
-  are blaming, the callee is exonerated — no leg arithmetic required. During a scratch you get a
-  second free control: `position()` returns the feeder's atomic cursor and never touches GStreamer.
-- **A position poll can never resolve faster than one main-loop turn** — but a main-loop turn
-  is **not** an rAF turn. When the thread is saturated the two track each other and `toJs` is a
-  fair proxy for the frame period; when rAF is throttled while the thread is idle they diverge
-  hard (13ms poll against a 41ms gap, 2026-08-03). **Check `busy%` before reading `toJs` as the
-  frame budget.**
-- **`frame-dur` covers only `App.svelte`'s `frame()`.** Two more rAF loops run per playing deck
-  — `DeckCard`'s preview `draw()` and `WaveformCanvas`'s playhead `loop()` — in the same rAF
-  turn. They report into `[aux-loop]`. `busy%` (share of wall-clock time) is the field that
-  settles attribution: sum it across every loop and subtract from 100 to see what is
-  *unaccounted*, which is how the residual was shown to be outside JS entirely.
-- ⚠️ **Only compare windows with a deck playing.** Idle windows contain no polls at all, so an
-  idle `62fps / frame-dur=0` line is not a control for a playing one. Reading them as comparable
-  produced a wrong conclusion on the first pass.
-- ⚠️ **`busy%` measures the JS that *records* canvas drawing, not the paint that follows it.**
-  WebKit's canvas 2D builds a display list and rasterizes it after the JS call returns, in a
-  phase no JS timer can observe. Symptoms of being in this regime: `busy%` low while
-  `WebKitWebProcess` CPU is high, and fps that does not respond to removing JS work. **Never
-  conclude "this canvas is cheap" from `busy%` alone — confirm with fps.** Fewer, cheaper draw
-  *calls* is the lever; the number of primitives per draw matters more than how often you draw.
-- ⚠️ **The converse bites just as hard: a change can take `busy%` to zero and move ~1fps.**
-  Caching `WaveformCanvas`'s overview bars cut per-draw JS 13–15ms → ≤1ms and `busy%` 8–9% → 0%
-  for **+1.0fps**, because the real limit was a half-vsync rAF throttle behind it
-  (`docs/design/control-window-frame-budget.md` §4). Worth keeping for the tail — gap p90
-  −13ms, max −140ms — but **report both numbers**; either one alone tells a false story.
-- ⚠️ **Bar count scales with canvas width, so record the width.** Two runs of the same file in
-  the same mode disagreed by 2× until the `[aux-loop]` label carried `@<W>x<H>`. Never A/B a
-  canvas cost across runs whose dimensions were not captured — and prefer A/Bing in one
-  session with only the code path switched.
-- ⚠️ **A DOM text mutation is expensive here; a canvas redraw is not.** Measured 2026-08-04:
-  rewriting one small `<span>` in a deck card costs **~20ms of `WebKitWebProcess` CPU per
-  mutation**, while `WaveformCanvas` redrawing a 2496×144 surface ~6×/s costs nothing
-  measurable. Publishing a per-frame readout at 60Hz held a playing deck at ~21fps; gating
-  both writes to the resolution they actually render at restored a flat ~61fps
-  (`docs/design/control-window-frame-budget.md` §6–§7). **Never write a `$state` that feeds
-  text on every rAF tick — gate it on the rendered string changing.** Throttling helps far
-  less than it should: the cost saturates between 1Hz and 5Hz, and `contain` / `will-change`
-  do not help at all (both measured; `will-change` was worse).
-- ⚠️ **`ps %cpu` is a lifetime average, not current load.** On a 2-hour-old process it read 7%
-  while the process was actually at 64%. Use `top -b -n 2 -d 3 -p <pid>` and take the *second*
-  sample. **Pair it with `busy%` always** — `busy%` low + CPU high is the signature of cost in
-  the paint phase, and it is the only way to see work `busy%` structurally cannot report.
-- ⚠️ **An IPC leg is a load gauge, not a cost.** `toJs` on the *no-op* ping reads 0ms on an
-  idle thread and 8ms on a busy one, and the position poll's `total` moves 2–3ms → 9ms across
-  the same switch, with nothing about the transport changed. A slow leg says "the main thread
-  is late getting back to callbacks", never "the callee is slow" — only an arm that changes
-  the callee can say that.
-- ⚠️ **Validate that an arm is really playing before believing its numbers.** A wedged
-  GStreamer pipeline produces a flawless-looking 62fps window: `deck.playing` is true, rAF is
-  full rate, and nothing errors. The tells are `[poll-stats] total` p50 ≈2ms instead of ≈9ms,
-  `[aux-loop] … drew=0`, and a `play` IPC retry storm every ~203ms in the log. Re-loading the
-  track (fresh `audio_load`) unwedges it; a bare play does not.
+See the `perf-log-reading` skill for the standing performance-log line formats
+([poll-stats], [raf], [aux-loop], [deliver-tel], [scrub-deliver]/[scrub-sec]) and how to read them —
+load it when investigating a performance regression, not every session.
 
 ## Skills
 
@@ -799,6 +565,7 @@ needed — don't load them on every session.
 | `verify-ui` | Screenshot/click/inspect the real webview headlessly via tauri-driver + Xvfb |
 | `midi` | Hercules Starlight channel layout, full control map, adding or re-calibrating a controller |
 | `digger-integration` | Digger API endpoints, WebSocket queue updates, cuemark/Digger boundary rules |
+| `perf-log-reading` | Investigating a performance regression or reading a `[poll-stats]`/`[deliver-tel]`/`[scrub-deliver]` log dump |
 
 Several automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb +
 `VITE_ENABLE_DEBUG_HOOK=1`):
