@@ -270,6 +270,16 @@ Delivery legs are instrumented per gesture by `src/lib/audio/scrubStats.ts`
 (`[scrub-deliver]`/`[scrub-sec]`) — read them before blaming the servo again, which three
 sessions did by mistake.
 
+**Reverse scrub video is served from a retained ring of decoded frames** in
+`codecPlayer.ts`, sized by *duration* (`RING_TARGET_SECONDS`) with a byte ceiling — decode
+is forward-only and GOPs here are ~250 frames, so an out-of-order frame costs ~125 frames of
+software decode (no VA-API on this machine) and doing that per scrub step is a live **audio**
+regression, built and reverted 2026-08-09. 🛑 **Do not lower `BACKWARD_JUMP_SECONDS` or make
+the `setClock` anchor accumulate backward travel** — widen the ring instead. The design,
+the brittleness inventory and the directional-working-set roadmap (keyframe thumbnail cache,
+directional prefetch, hot-region pinning) are in `docs/design/codec-frame-cache.md`; the
+operational "which knob, what symptom" version is the `tuning-knobs` skill.
+
 **`deck.downbeat` is a beat-level phase anchor, NOT bar-beat-1** — every consumer
 (`getPhase`, `quantizeToGrid`, `nudgePhaseToMaster`) works mod one beat, and nothing detects
 bar identity yet. It must carry the comb fit's *measured* `gridOffset`; anchoring it at `t=0`
@@ -566,6 +576,7 @@ needed — don't load them on every session.
 | `midi` | Hercules Starlight channel layout, full control map, adding or re-calibrating a controller |
 | `digger-integration` | Digger API endpoints, WebSocket queue updates, cuemark/Digger boundary rules |
 | `perf-log-reading` | Investigating a performance regression or reading a `[poll-stats]`/`[deliver-tel]`/`[scrub-deliver]` log dump |
+| `tuning-knobs` | A feature is running and correct but *feels* wrong live, or a shipped fix reads as "not working" — which constant to reach for, its live symptom, and which ones are known traps |
 
 Several automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb +
 `VITE_ENABLE_DEBUG_HOOK=1`):
