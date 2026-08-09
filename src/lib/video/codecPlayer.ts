@@ -36,7 +36,27 @@ export interface DemuxInfo {
 // no gesture at all and the fix read as "not working" live. It also ignored frame rate
 // entirely, so a 6fps file got 2.7s and a 60fps file 0.27s from the identical budget.
 // Target the window in seconds and keep bytes as the ceiling, not the control variable.
-const RING_TARGET_SECONDS = 0.75;
+//
+// 🔬 **A/B arm in progress (2026-08-09 evening) — 0.35 is a test value, not a settled one.**
+// The 0.75 arm gave 17 frames at 4K and drew a user report of audio gating out during a
+// reverse jog. Measured mechanism under suspicion: presenting a frame from a 3840x2026
+// source costs **54-77ms of main thread** in DeckCard's preview draw
+// (`[aux-loop] preview/deck-0 … dur max=77.0 | busy 14%`), and a wider ring means *more*
+// distinct frames presented per reverse gesture — ~4 on the old 4-frame ring against ~17
+// here, i.e. roughly 1.2s of added main-thread blocking spread through the gesture. That
+// is the same starvation shape as the legacy drawImage finding in CLAUDE.md.
+//
+// This arm halves the frame count (17 -> 9 at 4K/25fps) with everything else identical.
+// Read the verdict off `[aux-loop] preview/deck-N drew=… dur max=…` across the two arms
+// **together with** whether the audio symptom tracks — the servo telemetry already showed
+// `arrived 0% snaps=0` on the 0.75 arm, so scratch-tel alone will not adjudicate this.
+// If audio recovers here, per-frame presentation cost is the real ceiling at 4K and a
+// wider ring is the wrong direction on that content regardless of how cheap the frames
+// were to retain. See docs/design/codec-frame-cache.md.
+// Exported so tests derive their expectations from it rather than hard-coding the arm's
+// numbers — otherwise every A/B flip churns unrelated assertions and invites someone to
+// "fix" a test by pasting in whatever the code now returns.
+export const RING_TARGET_SECONDS = 0.35;
 // Ceiling, hit only by very large frames. 4K at ~11.1MB/frame lands here rather than on
 // the duration target. Per *deck*, so budget for it twice on a two-deck set.
 const FRAME_RING_BYTES = 192 * 1024 * 1024;
