@@ -211,16 +211,140 @@ done.
 This was latent, not introduced by this work: a paused deck has always had
 `playing === false`, but nothing drove its clock at rAF rate until scrubbing did.
 
-⚠️ **Known limitation, not fixed: reverse scrub video is coarse.** With the gate corrected,
-a forward scrub tracks smoothly (the clock leads, decode follows within `aheadSeconds()`).
+⚠️ **Known limitation (as first shipped): reverse scrub video was coarse — and then found to
+be worse than that, see "Reverse scrub video: fixed" below.** With the gate corrected, a
+forward scrub tracks smoothly (the clock leads, decode follows within `aheadSeconds()`).
 Backward, the held frames are all ahead of the clock and the only way to show the right
-frame is a seek — which `setClock()` only issues once the clock has fallen
-`BACKWARD_JUMP_SECONDS = 0.5` behind. So a reverse scrub updates the picture every 0.5s of
-content travel and freezes in between. Audio, the actual cueing signal, is exact throughout.
-Making this smooth means a scrub-aware seek policy in `CodecPlayer`, and a per-rAF seek on
-a 4K H.264 stream is exactly the call a live `gdb` backtrace once caught WebKitGTK
-deadlocked inside (`pcm-buffer-playback.md`, "Ninth mechanism") — so it needs its own
-design, not a quick threshold change.
+frame is a seek — which `setClock()` only issued once the clock had fallen
+`BACKWARD_JUMP_SECONDS = 0.5` behind.
+
+The "gdb backtrace deadlock" precedent cited here originally (`pcm-buffer-playback.md`,
+"Ninth mechanism") does **not** apply to this path and should not be used to justify
+avoiding frequent seeks on `CodecPlayer` — that deadlock is inside WebKitGTK's
+`MediaPlayerPrivateGStreamer`, reached via `gst_element_send_event()` from a legacy
+`<video>` element's `v.currentTime` write. `CodecPlayer.seek()` never touches a `<video>`
+element or WebKit's internal GStreamer media pipeline at all — it's `VideoDecoder.reset()`
++ decode from the nearest keyframe, entirely inside WebCodecs
+(`docs/design/webcodecs-video-path.md` already makes this "mechanism A cannot occur on the
+codec path by construction" point for the same reason). The real constraint on seek
+frequency here is decode cost (redecoding from a keyframe on every call), not a WebKitGTK
+deadlock risk, and it's naturally bounded anyway: `setClock()` is driven by App.svelte's
+position poll, which allows only one in-flight `audio_get_position` IPC per deck (~150-190ms
+round trip, see the IPC latency baseline) — so seeks here can't exceed that cadence no
+matter how low the threshold is set.
+
+### Reverse scrub video (2026-08-09): the mechanism is understood; the obvious fix is a regression — REVERTED
+
+**Why it shows nothing at all, which is worse than the "coarse" this doc claimed.**
+`setClock()` unconditionally snaps its `lastClockPos` anchor to every incoming position,
+*including backward ones under the threshold*. So the `contentPos < lastClockPos -
+BACKWARD_JUMP_SECONDS` test only ever sees **one poll's worth of movement**, never a
+gesture's accumulated travel. `setClock` is called once per resolved position poll
+(~150-190ms, one in-flight IPC per deck), and the vinyl calibration above tops out at 0.92×
+content speed — so a single poll step is at most ~0.16s, a third of the 0.5s threshold.
+A sustained reverse jog is made *entirely* of sub-threshold steps, so it **never seeks at
+all** and the picture freezes on whatever frame was showing when the reversal began. The
+doc's "updates every 0.5s of content travel" described intended behaviour that the code
+does not implement.
+
+🔴 **The obvious fix — accumulate against a forward-only anchor, lower the threshold to
+0.15s — was built, unit-tested, and is a live audio regression. Reverted 2026-08-09.**
+User report: *"this seems to break some of the other work we had done to make the jog wheel
+play more smoothly. Audio stops after short jogs."* **Do not re-apply it**, and do not
+reach for a lower `BACKWARD_JUMP_SECONDS` as a standalone change.
+
+**Why it breaks audio — the cost of a seek, not the seek policy.** `handleSeek()`
+(`codecWorker.ts`) is `decoder.reset()` → reconfigure → `nextFeedIndex =
+keyframeAuIndexAtOrBefore(target)` → `pump()`. That re-decodes **the whole GOP from the
+nearest keyframe** every time, discarding all decoder state; frames before the target are
+decoded and immediately closed by `dropBeforeUs`, so the work is spent and thrown away.
+**There is no VA-API on this machine — every frame of that is software decode** (see
+CLAUDE.md's re-verification). Making that fire every ~0.15s of travel puts a sustained
+software-decode burst on the CPU for the whole gesture, which starves both the main thread
+(→ pointer events and scrub-bus flushes stall → no new targets) and the GStreamer audio
+threads. The servo then does exactly what it is designed to do with no new target:
+`HandTracker` coasts for its 300ms / 50ms-of-content window, and then `arrived ⇒ silence`.
+Short jogs are hit hardest because they cross the threshold once, mid-gesture, and the
+resulting burst lands squarely inside the gesture. This is the same starvation shape as the
+legacy `drawImage` finding in CLAUDE.md, reached by a different route.
+
+⚠️ **This is the cost concern the "needs its own design, not a quick threshold change" note
+above was really protecting** — the note attached that warning to the wrong reason (the
+WebKitGTK deadlock, which genuinely does not apply here, see above). The deadlock rationale
+was wrong *and* the conclusion was right, so correcting the rationale is not a licence to
+make seeks cheap-and-frequent. Two independent things were being conflated.
+
+📏 **Measured 2026-08-09, and it rules out every seek-per-scrub-step design: the GOP is
+~250 frames.** `ffprobe` over the media cache's real library files — keyframe interval
+**8.34s** (1920×1080 H.264, 29.97fps) and **10.0s** (1080×1080 H.264, 25fps). So an
+arbitrary-position `handleSeek()` decodes **~125 frames on average, 250 worst case**, at
+1080p, in software, and `dropBeforeUs` throws away everything before the target — the
+average seek spends ~125 frames of decode to deliver one usable frame. Any policy that
+issues one of those per scrub step is unaffordable no matter how the threshold is tuned.
+Re-measure with `ffprobe -select_streams v:0 -show_entries frame=key_frame,pts_time` before
+assuming a different library behaves better.
+
+### ✅ Step 1 built 2026-08-09: the retained frame ring (`codecPlayer.ts`)
+
+**Make short reverse moves need no seek at all**, rather than tuning when seeks fire.
+`HELD_FRAMES = 2` was why *any* backward motion needed a seek: the main thread closed every
+frame but the newest two the instant they arrived, so the frame a reverse jog wants was
+decoded moments ago and then thrown away. The ring retains a recent window instead, serving
+short reverse jogs — the exact reported gesture — straight from memory, with **zero** added
+decode work, no `decoder.reset()`, and no competition with the audio threads. It is purely
+"stop closing frames so eagerly".
+
+This composes with the decode-ahead gate rather than fighting it: backward motion during a
+scrub stops the decoder feeding on its own (`pts - clockPos > aheadSeconds()` breaks as
+`clockPos` retreats), so nothing overwrites the window while the gesture reverses into it.
+
+Sized by **byte budget, not frame count** (`heldFrameCapacity()`), so a 4K deck cannot
+quietly multiply the memory: `FRAME_RING_BYTES = 48MB`, bounded to 2–32 frames. At 1080p
+that is 16 frames ≈ 0.64s at 25fps; small frames earn a longer window. Caching a *whole*
+GOP as raw frames is not an option at these GOP lengths — 250 × 3.1MB ≈ 775MB per deck.
+`localStorage['cuemark:codecFrameRing']` overrides the count for live A/B without a
+rebuild, since an HMR edit to this module remounts `App.svelte` and tears the deck down.
+The chosen size is logged per deck at construction (`[codecPlayer:deck-N] frame ring: …`).
+
+⚠️ **The risk to watch in live testing is decoder-pool stall, not memory.** A `VideoFrame`
+holds a decoder buffer until `close()`, and `VideoDecoder` implementations recycle from a
+bounded pool — retaining too many can stall decode outright (symptom: video stops updating
+*forward*, and `[codecPlayer] first decoded frame` is followed by nothing). If that appears,
+drop the ring via the localStorage override before assuming anything else is wrong; the
+eviction path closes frames, so a leak would be a bug rather than the design. 32 is a
+deliberately conservative cap for this reason.
+
+Coverage (`codecPlayer.test.ts`, 8 tests): a 0.4s backward move returns the *exact* earlier
+frame and issues no seek; the same move under a forced 2-frame ring returns a frame ahead of
+the request (pinning the old behaviour); oldest-first eviction with every evicted frame
+closed; byte-budget sizing incl. the 4K case; the 2-frame floor and 32 cap; `destroy()`
+closes the ring; forward playback unchanged; a real past-threshold jump still seeks.
+
+⏳ **Not yet live-verified.** Unit tests said nothing about the last regression either — the
+gesture-shape cautions above apply, and the thing to listen for is that audio is *unchanged*
+from the current known-good behaviour.
+
+**Remaining two-tier policy** (steps 2-3, not built), which never pays a GOP walk mid-gesture:
+
+| Reverse travel | Source | Decode cost |
+|---|---|---|
+| within the ring (~0.5-1s) | held frames, exact | **zero** |
+| beyond the ring | seek to the nearest keyframe and show *only* that keyframe — `dropBeforeUs = null`, decode the single key AU, no walk to the exact target | **1 frame** per GOP boundary crossed |
+| gesture end | one exact seek to settle the picture | ~125 frames, but once, and outside the gesture |
+
+The middle tier is the key trick: it gives visible, regular motion during a long reverse
+sweep (quantized to GOP boundaries, so every ~8-10s of content) for essentially nothing,
+instead of exact-but-unaffordable. It needs a new worker message distinct from `seek` —
+`handleSeek()`'s `dropBeforeUs` + `pump()` walk is precisely what must *not* run. The
+gesture-end seek mirrors what the legacy path has always done (App.svelte: don't touch the
+video clock until scratch ends, then one normal snap).
+
+**Whatever is tried next must be measured against audio, not just looked at.** The unit
+tests for the reverted version all passed and said nothing about the regression — the same
+lesson `scratch_to_smoke` already taught this doc (Fault 1: it asserted the cursor arrived,
+while the feature was inaudible). The gesture-shape cautions above apply: slow, smooth,
+zoomed, and check `[scratch-tel]` for `arrived%`/`snaps` before blaming or crediting
+anything.
 
 ## Live run 3 (2026-08-08) — the feeder is exonerated; the fault is downstream
 
@@ -368,6 +492,8 @@ settles it immediately without needing the slow/fast comparison to come out clea
 | Live: `VINYL_SEC_PER_TICK` calibration | ✅ ±1 deltas confirmed; `1.8 / 256` |
 | Live: vinyl jog **audio** (Fault 1 fix), incl. reverse | 🔴 audio starts then dies — the downstream fault, not this feature (see below) |
 | Live: vinyl jog across pauses > `SCRATCH_IDLE_MS` | ⏳ not yet run |
+| Reverse scrub video fix (`codecPlayer.ts` anchor + threshold, 2026-08-09) | 🔴 **reverted** — unit tests passed, live audio regressed ("audio stops after short jogs"). Seek cost, not seek policy; see above |
+| Reverse scrub step 1 — retained frame ring (`codecPlayer.ts`, 2026-08-09) | ✅ `codecPlayer.test.ts` (8 tests), `npm test` 54, `npm run check` 0 errors — ⏳ not yet live-verified; watch for decoder-pool stall and confirm audio is *unchanged* |
 | Live: waveform drag, paused (audible) | 🔴 run 2026-08-08 evening — **the servo and the drag gesture are correct**; audio dies mid-gesture from the same downstream fault |
 | Live: waveform drag, playing (silent seek follow) | ⏳ not yet run |
 
