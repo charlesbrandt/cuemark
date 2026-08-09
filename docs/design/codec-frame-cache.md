@@ -36,7 +36,7 @@ The frame ring works, but the surrounding machinery has properties that made a o
 sizing constant produce a silent, invisible, hard-to-attribute failure — which is exactly
 what happened.
 
-### 2.1 Sizing was expressed in the wrong units (fixed, but the lesson generalises)
+### 2.1 Sizing was chosen against a sample of one (settled — see §5a)
 
 The ring was first sized by a byte budget. The quantity a gesture actually consumes is
 **seconds of content**, and frames-per-second varies independently of bytes-per-frame. A
@@ -44,7 +44,8 @@ The ring was first sized by a byte budget. The quantity a gesture actually consu
 file (**0.16s**) — and it would have handed a 6fps file 2.7s and a 60fps file 0.27s. The
 feature shipped, ran correctly, and read as "not working" live.
 
-Now sized by duration with bytes as a ceiling. The general lesson is in §6.
+The fix for that was a duration target, which fixed 4K and cut every cheaper file — the
+final answer is a larger byte budget alone (§5a), and the amended lesson is in §6.
 
 ### 2.2 There is no way to see the cache working
 
@@ -183,29 +184,49 @@ many.
 5. **Tier 2 keyframe-only reverse seek** (§3), which needs the new worker message.
 6. Directional prefetch and hot-region pinning, guided by the instrument from step 1.
 
-## 5a. State as of 2026-08-09 evening — READ THIS FIRST NEXT SESSION
+## 5a. Sizing — SETTLED 2026-08-09 evening
 
-**The duration target is wrong in one direction and should probably be dropped.** Measured
-on the same machine, same track, three sizings:
+**The duration target is gone. The ring is sized by a 192MB byte budget alone, capped at
+`MAX_HELD_FRAMES = 32`.** Measured on the same machine, same track, four sizings:
 
-| Content | Original byte budget (48MB) | 0.75s arm | 0.35s arm (current `HEAD`) |
-|---|---|---|---|
-| 3840×2026 @25 | 4 frames / 0.16s | 17 / 0.68s | 9 / 0.36s |
-| 1280×720 @25 (Tobago) | **32 / 1.28s** | 19 / 0.76s | **9 / 0.36s** |
+| Content | Original byte budget (48MB) | 0.75s arm | 0.35s arm | **192MB budget (shipped)** |
+|---|---|---|---|---|
+| 3840×2026 @25 | 4 frames / 0.16s | 17 / 0.68s | 9 / 0.36s | **17 / 0.68s** |
+| 1280×720 @25 (Tobago) | **32 / 1.28s** | 19 / 0.76s | **9 / 0.36s** | **32 / 1.28s** |
 
-The byte budget let cheap frames earn a long window for free (capped at
-`MAX_HELD_FRAMES`), and the duration target *removed* that — a 3.5× regression on
-sub-4K content, which is most of the library. The 4K fix was real; the cap on cheap
-content was collateral damage and was not noticed because the only file examined while
-designing it was the 4K one.
+The shipped column is the best cell of every row: it matches the best 4K arm and restores
+the best sub-4K one, with one constant instead of two. `RING_TARGET_SECONDS` and the `fps`
+parameter of `heldFrameCapacity()` were removed outright rather than left at a permissive
+value, so there is no dormant second control variable to rediscover.
 
-**Likely correct answer: drop `RING_TARGET_SECONDS` entirely and keep the byte ceiling at
-192MB with `MAX_HELD_FRAMES = 32`.** That yields 17 frames at 4K (the fix) and 32 at 720p
-(the original good behaviour) — strictly better than both arms on both content types, and
-one constant instead of two. The duration target's only real job was stopping 4K from
-collapsing to 4 frames, and a larger ceiling already does that. Cost: frame rate is ignored
-again, so a 6fps file gets a very long window and a 60fps file a short one — but that
-window is free either way, which is why the byte-only rule was defensible to begin with.
+Two consequences worth carrying forward:
+
+- **Frame rate is ignored again, deliberately.** A 6fps file gets a very long window and a
+  60fps file a short one from the same budget. That window costs no decode — only retained
+  buffers — which is what made byte-only sizing defensible before and still does. If a
+  high-frame-rate file ever scrubs short in practice, the fix is a duration **floor** on top
+  of the ceiling, never a target that can shrink a window the ceiling would have allowed.
+- **The ring is now wider than `BACKWARD_JUMP_SECONDS`** (1.28s of 1080p against a 0.5s
+  jump threshold). Nothing needs changing — `setClock` only ever sees one poll's worth of
+  movement, so a real gesture reaches the far end of the ring in many small steps — but a
+  *single* leap wider than 0.5s still seeks by design, and a test that moves the clock in
+  one jump will now trip that. `codecPlayer.test.ts` walks the gesture step-by-step for
+  exactly this reason.
+
+### How the duration target got it wrong
+
+Worth keeping, because the mistake is repeatable and it was not a measurement error. The
+byte budget let cheap frames earn a long window for free (capped at `MAX_HELD_FRAMES`), and
+the duration target *removed* that — a 3.5× regression on sub-4K content, which is most of
+the library. The 4K fix was real; the cap on cheap content was collateral damage, and it
+went unnoticed because **the only file examined while designing the constant was the 4K
+one**. Both duration arms were measured carefully and both measurements were correct; the
+sample was one file. The generalisation in §6 was written from that same sample and is
+weaker than it reads — see the amendment there.
+
+**Any future change to this sizing is checked against at least one 4K and one sub-1080p
+file before it ships**, which is one deck load each and readable straight off the
+`[codecPlayer] frame ring:` line.
 
 ⚠️ **Do not conclude anything from Tobago.** `Jonas Rathsman - Tobago` is the one track the
 user reports a consistent audio artifact on, independent of and predating all of this work
@@ -227,13 +248,27 @@ terms and may not be a cuemark bug at all.
 
 ## 6. The general lesson
 
-**Size a cache in the units the consumer spends, not the units the resource is billed in.**
-The consumer of this cache spends *seconds of content*; the resource is billed in *bytes*.
-Sizing by bytes made the window vary by 4× across resolution and 10× across frame rate
-while the constant stayed reassuringly fixed, and produced a feature that was live, correct,
-and useless. Convert to the consumer's units, then apply the resource limit as a ceiling —
-and log the resulting figure in the consumer's units so a wrong answer is visible at a
-glance.
+Originally stated as: *size a cache in the units the consumer spends, not the units the
+resource is billed in* — the consumer spends seconds of content, the resource is billed in
+bytes, so target seconds and keep bytes as a ceiling. **That was built and removed the same
+day** (§5a). Half of it survives and the half that didn't is the more useful half:
+
+- ✅ **Log the figure in the consumer's units.** This is the part that carried its weight,
+  and it is what makes a wrong window visible in one deck load. `17 frames … ~0.68s of
+  reverse scrub` says immediately what `189.4MB` never would.
+- ❌ **Do not convert the *control variable* to the consumer's units when the resource
+  budget is what makes the window free.** Bytes were not an accounting artefact here — they
+  are what the ring actually costs. Targeting seconds meant *declining* window that cost
+  nothing, on every file cheaper than the one the target was tuned against. A budget spends
+  what it has; a target spends what it was told to, including on content it never saw.
+- ⚠️ **The failure that produced both the bug and the wrong lesson was the sample, not the
+  units.** One 4K file, measured well, twice. Any constant whose effect varies with content
+  needs its effect enumerated across the *range* of content — here, one line of arithmetic
+  per resolution, which is cheaper than either of the arms that were actually run.
+
+The narrow rule that holds: **express the ceiling in the units the resource is billed in,
+report the result in the units the consumer spends, and tabulate that result across the
+content you actually have before choosing the number.**
 
 See `skills/tuning-knobs/SKILL.md` for the operational version of this: which knob to reach
 for, what its live symptom is, and how to check it without a rebuild.

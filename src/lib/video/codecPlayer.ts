@@ -28,37 +28,30 @@ export interface DemuxInfo {
 // oldest-first, so the ring is exactly the recent past a backward gesture moves into.
 // This costs no decode work at all; it is purely "stop closing frames so eagerly".
 //
-// ⚠️ Sized by **duration first, bytes second** (changed 2026-08-09 after live evidence).
-// The original sizing was a pure byte budget, which gets the units wrong: what a reverse
-// gesture consumes is *seconds of content*, and frames-per-second varies independently of
-// bytes-per-frame. A 48MB budget bought 16 frames at 1080p — but 4 frames on the user's
-// real 3840x2026 library file, i.e. 0.16s, short enough that the ring served essentially
-// no gesture at all and the fix read as "not working" live. It also ignored frame rate
-// entirely, so a 6fps file got 2.7s and a 60fps file 0.27s from the identical budget.
-// Target the window in seconds and keep bytes as the ceiling, not the control variable.
+// ⚠️ Sized by a **byte budget alone**, deliberately, and *not* by a target number of
+// seconds (settled 2026-08-09 evening after three measured arms — codec-frame-cache.md
+// §5a). The history is worth keeping because the obvious-looking fix was tried and made
+// things worse on most of the library:
 //
-// 🔬 **A/B arm in progress (2026-08-09 evening) — 0.35 is a test value, not a settled one.**
-// The 0.75 arm gave 17 frames at 4K and drew a user report of audio gating out during a
-// reverse jog. Measured mechanism under suspicion: presenting a frame from a 3840x2026
-// source costs **54-77ms of main thread** in DeckCard's preview draw
-// (`[aux-loop] preview/deck-0 … dur max=77.0 | busy 14%`), and a wider ring means *more*
-// distinct frames presented per reverse gesture — ~4 on the old 4-frame ring against ~17
-// here, i.e. roughly 1.2s of added main-thread blocking spread through the gesture. That
-// is the same starvation shape as the legacy drawImage finding in CLAUDE.md.
+//   content            48MB budget      0.75s target     0.35s target    192MB budget
+//   3840x2026 @25      4 / 0.16s        17 / 0.68s       9  / 0.36s      17 / 0.68s
+//   1280x720  @25      32 / 1.28s       19 / 0.76s       9  / 0.36s      32 / 1.28s
 //
-// This arm halves the frame count (17 -> 9 at 4K/25fps) with everything else identical.
-// Read the verdict off `[aux-loop] preview/deck-N drew=… dur max=…` across the two arms
-// **together with** whether the audio symptom tracks — the servo telemetry already showed
-// `arrived 0% snaps=0` on the 0.75 arm, so scratch-tel alone will not adjudicate this.
-// If audio recovers here, per-frame presentation cost is the real ceiling at 4K and a
-// wider ring is the wrong direction on that content regardless of how cheap the frames
-// were to retain. See docs/design/codec-frame-cache.md.
-// Exported so tests derive their expectations from it rather than hard-coding the arm's
-// numbers — otherwise every A/B flip churns unrelated assertions and invites someone to
-// "fix" a test by pasting in whatever the code now returns.
-export const RING_TARGET_SECONDS = 0.35;
-// Ceiling, hit only by very large frames. 4K at ~11.1MB/frame lands here rather than on
-// the duration target. Per *deck*, so budget for it twice on a two-deck set.
+// The original 48MB budget's real fault was being too small for 4K (0.16s served no
+// gesture at all and the feature read as "not working" live), not being expressed in
+// bytes. A duration target fixed 4K and simultaneously *took the window away from cheap
+// frames*, which the byte budget had been handing out for free — a 3.5x regression on
+// sub-4K content, i.e. most of the library. Raising the ceiling to 192MB fixes 4K without
+// that cost: strictly better than either duration arm on both content types, with one
+// constant instead of two.
+//
+// Known and accepted: frame rate is ignored, so a 6fps file gets a very long window and a
+// 60fps file a short one. That window is free either way — the ring costs no decode, only
+// retained buffers — which is what made byte-only sizing defensible to begin with. If a
+// high-frame-rate file ever *does* scrub short, the answer is a duration **floor** on top
+// of this, never a target that can shrink a window the ceiling would have allowed.
+//
+// Per *deck*, so budget for it twice on a two-deck set.
 const FRAME_RING_BYTES = 192 * 1024 * 1024;
 const MIN_HELD_FRAMES = 2; // the historical value — never retain less than this
 // Deliberately conservative: a VideoFrame pins a decoder buffer until close() and
@@ -71,16 +64,12 @@ const MAX_HELD_FRAMES = 32;
 const RING_OVERRIDE_KEY = "cuemark:codecFrameRing";
 
 /**
- * Frames to retain for `w`×`h` at `fps`: enough for `RING_TARGET_SECONDS` of reverse
- * travel, less if that would exceed the byte ceiling, honouring the override and bounds.
- *
- * `fps` is `DemuxInfo.fpsHint` and may be 0/absent for a stream the demuxer could not
- * characterise — fall back to the byte ceiling alone there rather than inventing a rate.
+ * Frames to retain for `w`×`h`: as many as fit in `FRAME_RING_BYTES`, within the bounds
+ * and honouring the override. No frame-rate term — see the note above the constants.
  */
 export function heldFrameCapacity(
   w: number,
   h: number,
-  fps: number,
   override?: number | null,
 ): number {
   if (override !== undefined && override !== null && Number.isFinite(override) && override >= MIN_HELD_FRAMES) {
@@ -91,10 +80,7 @@ export function heldFrameCapacity(
   // would then have to be recomputed per frame anyway.
   const bytesPerFrame = Math.max(1, w * h * 1.5);
   const byCeiling = Math.floor(FRAME_RING_BYTES / bytesPerFrame);
-  const byDuration =
-    Number.isFinite(fps) && fps > 0 ? Math.ceil(RING_TARGET_SECONDS * fps) : Infinity;
-  const wanted = Math.min(byDuration, byCeiling);
-  return Math.min(MAX_HELD_FRAMES, Math.max(MIN_HELD_FRAMES, wanted));
+  return Math.min(MAX_HELD_FRAMES, Math.max(MIN_HELD_FRAMES, byCeiling));
 }
 
 function ringOverride(): number | null {
@@ -130,9 +116,10 @@ export class CodecPlayer {
     this.maxHeldFrames = heldFrameCapacity(
       demux.codedWidth,
       demux.codedHeight,
-      demux.fpsHint,
       ringOverride(),
     );
+    // The seconds figure is the point of this line: bytes are what the ring is billed in,
+    // seconds are what a gesture spends, and a wrong window is only obvious in seconds.
     debugLog(
       `[codecPlayer:${deckId}] frame ring: ${this.maxHeldFrames} frames ` +
       `(${demux.codedWidth}x${demux.codedHeight}, ~${(demux.codedWidth * demux.codedHeight * 1.5 * this.maxHeldFrames / 1048576).toFixed(1)}MB, ` +

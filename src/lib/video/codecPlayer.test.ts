@@ -83,35 +83,38 @@ describe('CodecPlayer frame ring', () => {
   it('a backward move within the retained window is served exactly, with no seek', async () => {
     const { player, worker, mod } = await makePlayer();
     const fps = 25;
-    deliverFrames(worker, 10.0, 20, fps); // 10.00s .. 10.76s
-    const newest = 10.0 + 19 / fps;
+    // Deliver more than the ring holds, so eviction has run and the window is full.
+    const cap = mod.heldFrameCapacity(1920, 1080);
+    const delivered = cap + 5;
+    deliverFrames(worker, 10.0, delivered, fps);
+    const newest = 10.0 + (delivered - 1) / fps;
     player.setClock(newest, false);
 
-    // Derived from the ring's real capacity rather than a hard-coded distance: the point
-    // is "anywhere inside the window is exact", and the window moves with the A/B arm.
-    // One frame in from the oldest edge, so the assertion is about the ring and not about
-    // off-by-one at the boundary.
+    // Walk back the way a gesture does — a step per rAF, each far under
+    // BACKWARD_JUMP_SECONDS — rather than one jump the width of the ring. That distinction
+    // matters now that the ring (1.28s at 1080p/25) is *wider* than the 0.5s jump
+    // threshold: a single leap to the oldest edge trips setClock's seek heuristic by
+    // design, and the far end of the ring is reachable precisely because a real scrub
+    // arrives as many small steps (docs/design/waveform-scrub.md).
+    //
     // Indexed by frame number, not derived by subtracting seconds: getFrameForTime()
     // compares raw floats, so a target computed a hair below a frame's pts silently
     // selects the *previous* frame and the assertion fails for a reason that has nothing
     // to do with the ring. Build the target with the same expression deliverFrames used.
-    const cap = mod.heldFrameCapacity(1920, 1080, fps);
-    const targetIndex = 20 - cap + 1; // one frame in from the oldest retained
-    const target = 10.0 + targetIndex / fps;
+    const oldestIndex = delivered - cap;
+    for (let i = delivered - 2; i >= oldestIndex + 1; i--) {
+      const target = 10.0 + i / fps;
+      const frame = player.getFrameForTime(target);
+      expect(frame).not.toBeNull();
+      expect(frame!.timestamp).toBe(Math.round(target * 1_000_000));
+      player.setClock(target, false);
+    }
 
-    const frame = player.getFrameForTime(target);
-    expect(frame).not.toBeNull();
-    expect(frame!.timestamp).toBe(Math.round(target * 1_000_000));
-
-    // ...and it is a genuine reverse move, not a degenerate one-frame step that would
-    // still pass if the ring collapsed to its floor. Counted in frames: seconds here are
-    // exact multiples of 1/25 that floating point cannot represent, so the same statement
-    // in seconds fails on equality at the boundary.
-    expect(19 - targetIndex).toBe(cap - 2);
-    expect(cap - 2).toBeGreaterThan(4); // a real gesture's worth, not one or two frames
-
-    player.setClock(target, false);
+    // No decode was asked for anywhere in that gesture — the whole point of the ring.
     expect(worker.posted.filter((m) => m.type === 'seek')).toHaveLength(0);
+    // ...and it was a genuine reverse move, not a degenerate one-frame step that would
+    // still pass if the ring collapsed to its floor.
+    expect(cap - 2).toBeGreaterThan(4);
   });
 
   it('the old 2-frame ring could not have served that move', async () => {
@@ -136,48 +139,47 @@ describe('CodecPlayer frame ring', () => {
     expect(closed.length + live.length).toBe(60);
   });
 
-  it('sizes the ring by duration, so the retained seconds hold across frame rates', async () => {
+  it('sizes the ring by bytes, so cheap frames keep the long window they can afford', async () => {
     const { mod } = await makePlayer();
-    const target = mod.RING_TARGET_SECONDS;
-    // The frame *count* scales with fps so the *seconds* retained do not. This is what the
-    // byte-only sizing got wrong — same budget, 10x different windows across content.
-    // Expectations derive from the constant so an A/B flip does not churn this test.
-    for (const fps of [8, 25, 30]) {
-      expect(mod.heldFrameCapacity(1920, 1080, fps)).toBe(Math.ceil(target * fps));
-    }
-    // The invariant that actually matters, stated directly.
-    for (const fps of [8, 25, 30]) {
-      const secondsRetained = mod.heldFrameCapacity(1920, 1080, fps) / fps;
-      expect(secondsRetained).toBeGreaterThanOrEqual(target);
-      expect(secondsRetained).toBeLessThan(target + 1 / fps);
-    }
+    // The regression this pins (codec-frame-cache.md §5a): a duration target took the
+    // window *away* from sub-4K content, which is most of the library — 720p went from 32
+    // frames to 9. Cheap frames must reach the cap.
+    expect(mod.heldFrameCapacity(1280, 720)).toBe(32);
+    expect(mod.heldFrameCapacity(1920, 1080)).toBe(32);
+    // ...and expensive ones must still get a usable window rather than collapsing to the
+    // floor: the user's real 3840x2026 file at ~11.1MB/frame is what the 48MB budget gave
+    // 4 frames (0.16s) and drove this whole investigation.
+    const fourK = mod.heldFrameCapacity(3840, 2026);
+    expect(fourK).toBe(17);
+    expect(fourK / 25).toBeGreaterThan(0.5); // over half a second of reverse scrub at 25fps
   });
 
-  it('falls back to the byte ceiling when frames are too large for the duration target', async () => {
+  it('the byte ceiling binds hardest on the largest frames, never below the floor', async () => {
     const { mod } = await makePlayer();
-    // 8K: 7680*4320*1.5 = 49.8MB/frame, so the 192MB ceiling binds at 4 frames well before
-    // any plausible duration target does. Independent of the A/B arm.
-    const eightK = mod.heldFrameCapacity(7680, 4320, 25);
-    expect(eightK).toBeLessThan(Math.ceil(mod.RING_TARGET_SECONDS * 25));
+    // 8K: 7680*4320*1.5 = 49.8MB/frame, so 192MB buys 4.
+    const eightK = mod.heldFrameCapacity(7680, 4320);
     expect(eightK).toBeGreaterThanOrEqual(2); // never below the historical floor
-    // A large frame always retains fewer than a small one at the same rate.
-    expect(eightK).toBeLessThan(mod.heldFrameCapacity(640, 480, 25));
+    expect(eightK).toBeLessThan(mod.heldFrameCapacity(3840, 2026));
+    // Monotonic in frame size — the only variable the sizing has.
+    expect(mod.heldFrameCapacity(3840, 2026)).toBeLessThan(mod.heldFrameCapacity(640, 480));
+    // Absurdly large frames still yield a ring, not zero.
+    expect(mod.heldFrameCapacity(30000, 30000)).toBe(2);
   });
 
-  it('caps the ring at the top end, whatever the frame rate asks for', async () => {
+  it('caps the ring at the top end, however cheap the frames are', async () => {
     const { mod } = await makePlayer();
-    // A tiny frame at a high rate wants more than the cap allows; the cap wins. 32 is
-    // deliberate — the failure mode of raising it is decoder-pool stall, not memory.
-    expect(mod.heldFrameCapacity(16, 16, 1000)).toBe(32);
+    // A tiny frame could afford thousands; the cap wins. 32 is deliberate — the failure
+    // mode of raising it is decoder-pool stall, not memory growth.
+    expect(mod.heldFrameCapacity(16, 16)).toBe(32);
   });
 
-  it('sizes off the byte ceiling alone when the demuxer reports no frame rate', async () => {
-    const { mod } = await makePlayer();
-    // fpsHint=0 must not become a 0-frame ring or an invented rate — it falls through to
-    // the ceiling, which for a small frame means the cap.
-    expect(mod.heldFrameCapacity(1920, 1080, 0)).toBe(32);
-    // ...and for an 8K frame, the byte ceiling itself.
-    expect(mod.heldFrameCapacity(7680, 4320, 0)).toBe(mod.heldFrameCapacity(7680, 4320, 25));
+  it('ignores the demuxer frame rate entirely, including a missing one', async () => {
+    const { mod } = await makePlayer({ fps: 0 });
+    // fpsHint plays no part in sizing any more, so a stream the demuxer could not
+    // characterise sizes exactly like one it could — no invented rate, no 0-frame ring.
+    // (fpsHint is still used for the seconds figure in the construction log line.)
+    expect(mod.heldFrameCapacity(1920, 1080)).toBe(32);
+    expect(mod.heldFrameCapacity(7680, 4320)).toBeGreaterThanOrEqual(2);
   });
 
   it('destroy() closes the whole ring', async () => {

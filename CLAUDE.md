@@ -271,7 +271,12 @@ Delivery legs are instrumented per gesture by `src/lib/audio/scrubStats.ts`
 sessions did by mistake.
 
 **Reverse scrub video is served from a retained ring of decoded frames** in
-`codecPlayer.ts`, sized by *duration* (`RING_TARGET_SECONDS`) with a byte ceiling — decode
+`codecPlayer.ts`, sized by a byte budget alone (`FRAME_RING_BYTES = 192MB`, capped at
+`MAX_HELD_FRAMES = 32`) — 17 frames at 4K, 32 at 1080p and below. A duration target
+(`RING_TARGET_SECONDS`) was tried on 2026-08-09 and **removed the same day**: it fixed 4K
+and simultaneously cut sub-4K content, i.e. most of the library, from 32 frames to 9. A
+larger ceiling fixes 4K without that cost. If a high-frame-rate file ever scrubs short, add
+a duration *floor*, never a target that can shrink a window the ceiling would allow. Decode
 is forward-only and GOPs here are ~250 frames, so an out-of-order frame costs ~125 frames of
 software decode (no VA-API on this machine) and doing that per scrub step is a live **audio**
 regression, built and reverted 2026-08-09. 🛑 **Do not lower `BACKWARD_JUMP_SECONDS` or make

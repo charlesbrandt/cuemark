@@ -22,16 +22,22 @@ resolved value. If the log line is absent, you are debugging a build, not a cons
 | | |
 |---|---|
 | **Symptom** | Scrubbing/jogging *backward* freezes the picture; forward is smooth. Audio is fine throughout. |
-| **Where** | `RING_TARGET_SECONDS` (and `FRAME_RING_BYTES` ceiling) in `src/lib/video/codecPlayer.ts` |
+| **Where** | `FRAME_RING_BYTES = 192MB` in `src/lib/video/codecPlayer.ts` — the only sizing input, plus the `MAX_HELD_FRAMES` cap below |
 | **Log line** | `[codecPlayer:deck-0] frame ring: 17 frames (3840x2026, ~189.4MB, ~0.68s of reverse scrub)` |
-| **Read it as** | The last figure is the whole story: **how many seconds of backward travel are served for free.** Compare it to the gesture you are making. A 1-second jog against a 0.16s ring will look broken. |
+| **Read it as** | The last figure is the whole story: **how many seconds of backward travel are served for free.** Compare it to the gesture you are making. A 1-second jog against a 0.16s ring will look broken. Frame rate does not enter the sizing, only this readout — so the same budget is a long window on a slow file and a short one on a fast file, by design. |
 | **Live override, no rebuild** | `localStorage['cuemark:codecFrameRing'] = '24'` — a raw frame count, applied at the next deck load. |
 | **Ceiling** | `MAX_HELD_FRAMES = 32`. **Do not raise it casually**: a `VideoFrame` pins a decoder buffer until `close()` and `VideoDecoder` recycles from a bounded pool, so the failure mode is decode stalling *outright*, not gradual memory growth. |
 | **Tell that you overshot** | *Forward* playback stops updating; `[codecPlayer] first decoded frame` appears and then nothing follows. Drop the override before suspecting anything else. |
 
-This is the knob that has actually bitten. A 48MB byte budget gave 16 frames at 1080p but
-**4 frames / 0.16s** on a real 3840×2026 file — the fix was live and read as "not working".
-Full write-up: `docs/design/codec-frame-cache.md`.
+This is the knob that has actually bitten, twice, in opposite directions. A 48MB byte budget
+gave 16 frames at 1080p but **4 frames / 0.16s** on a real 3840×2026 file — the fix was live
+and read as "not working". The correction — sizing by a *duration target* instead — fixed 4K
+and cut 720p from 32 frames to 9, a regression on most of the library, because the target was
+chosen against the single 4K file in front of the person choosing it. 🛑 **Do not reintroduce
+`RING_TARGET_SECONDS`**: raising the byte ceiling gets 4K its window without taking anyone
+else's. Whichever way you turn this, **check what the new value does to both a 4K and a
+sub-1080p file** — the log line above tells you in one deck load each.
+Full write-up: `docs/design/codec-frame-cache.md` §5a.
 
 ### 2. Silent-scrub seek throttle — jog feels laggy/steppy on a *playing* deck
 
