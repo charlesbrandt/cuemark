@@ -4,7 +4,7 @@ import { seekDeck, getDeckTime, quantizeToGrid, setScratching, isScratching, beg
 import { nudgePhaseToMaster } from "../audio/phaseNudge";
 import { syncRate, syncGain, syncVolume } from "../audio/audioSync";
 import { audioScratch, audioStopScratch } from "../audio/pipeline";
-import { cueGain, tempoRange, scratchMode } from "../audio/audioSettings";
+import { cueGain, tempoRange, scratchMode, jogSecondsPerRev } from "../audio/audioSettings";
 import { noteScrubInput } from "../audio/scrubStats";
 import { debugLog } from "../debugLog";
 import { get } from "svelte/store";
@@ -170,7 +170,25 @@ const SCRATCH_IDLE_MS = 500;
 // which is the only thing the 248-vs-276 spread measures, since the speed question is
 // already answered by maxAbs. Re-run the [jog-cal/…] procedure in
 // docs/design/waveform-scrub.md if the platter ever feels off-speed.
-const VINYL_SEC_PER_TICK = 1.8 / 256; // 0.00703
+//
+// ⚠️ Split in two on 2026-08-10, and the split is the point. The encoder resolution is a
+// **measured hardware fact**; the seconds-per-revolution is a **taste setting** the user
+// turns by ear (`jogSecondsPerRev`, see its doc comment and
+// docs/design/slow-jog-audio-inaudible.md §6). Folding them into one constant is what let
+// "the wheel feels wrong" and "the mapping is unfaithful" argue over the same number — and
+// it invites a wrong hardware value to be hidden by a compensating taste value, which no
+// later calibration would then be able to detect.
+const VINYL_TICKS_PER_REV = 256;
+
+/**
+ * Seconds of content per encoder tick. Read per gesture rather than captured at module
+ * load: this is A/B'd live by ear, and an HMR edit to re-read it would remount App.svelte
+ * and tear the deck down (CLAUDE.md, "Dev server lifecycle"), which makes the comparison
+ * cost a re-load and a re-play every time.
+ */
+function vinylSecPerTick(): number {
+  return get(jogSecondsPerRev) / VINYL_TICKS_PER_REV; // default 1.8/256 = 0.00703
+}
 
 // Ends a vinyl gesture once ticks stop, handing the deck back to the normal branch.
 // Longer than SCRATCH_IDLE_MS was for velocity mode's benefit is unnecessary here — the
@@ -180,7 +198,7 @@ const VINYL_SEC_PER_TICK = 1.8 / 256; // 0.00703
 const vinylTarget: Record<string, number> = {};
 
 // Per-gesture raw encoder tally, logged once when the gesture ends. This is the
-// calibration instrument for VINYL_SEC_PER_TICK, and it has to live here rather than in
+// calibration instrument for VINYL_TICKS_PER_REV, and it has to live here rather than in
 // midi.rs: that logger throttles continuous controls to one line per 500ms per key (see
 // its log_throttle map), so the Rust log shows a jog wheel emitting a tidy ±1 every half
 // second no matter how fast it is really spinning — which is exactly the measurement the
@@ -188,7 +206,7 @@ const vinylTarget: Record<string, number> = {};
 //
 // `absSum` is the number the procedure in docs/design/waveform-scrub.md consumes: rotate
 // one revolution slowly, then quickly, and compare. Equal ⇒ the values are deltas since
-// the last message, accumulation is exact, and VINYL_SEC_PER_TICK = 1.8 / absSum.
+// the last message, accumulation is exact, and absSum IS ticks-per-revolution.
 // Unequal ⇒ they are speed-scaled and no single constant is correct. `maxAbs`/`values`
 // answer the same question a second way in one pass: an encoder reporting plain deltas
 // never emits anything but ±1.
@@ -204,7 +222,7 @@ const SCRATCH_MODE_PARAMS = {
     //
     // ⚠️ The reason recorded here until 2026-08-08 was wrong: this comment claimed the
     // Hercules encoder "appears to report larger step values, not just ±1, as physical
-    // speed increases". It does not. The [jog-cal/…] calibration (see VINYL_SEC_PER_TICK
+    // speed increases". It does not. The [jog-cal/…] calibration (see VINYL_TICKS_PER_REV
     // above) measured `maxAbs=1 values=[1]` over 524 messages across two gestures ~3x
     // apart in speed. ticksPerSec grows exactly as fast as ticks counted per second — so
     // if this saturates early, that is the EMA divisor collapsing onto SCRATCH_MIN_DT_MS
@@ -285,14 +303,29 @@ function stopScratch(deckId: string) {
     if (tally) {
       delete vinylTally[deckId];
       const secs = (performance.now() - tally.t0) / 1000;
-      // One line per gesture — see vinylTally for what each field is for. `1.8/absSum` is
-      // printed rather than computed by hand later because the whole calibration is
-      // "turn the wheel exactly one revolution and read this number off".
+      // One line per gesture — see vinylTally for what each field is for.
+      //
+      // Reports **ticks/revolution**, not a seconds-per-tick, since 2026-08-10: that is the
+      // hardware fact this gesture actually measures, and it is independent of the
+      // `jogSecondsPerRev` taste setting. The old line printed `1.8/absSum`, which silently
+      // assumed the default scale — so once that setting moves the number is wrong, and it
+      // is wrong in a way that reads as a plausible calibration result. It also invited
+      // reasoning from *uncontrolled* gestures: five sessions' worth of readings only ever
+      // meant anything because someone turned the wheel exactly one revolution on purpose.
+      // Measured ticks/rev across five such gestures: 243–276, hence VINYL_TICKS_PER_REV=256.
+      //
+      // `revs=` restates it as a sanity check: if that does not match what your hand did,
+      // every other number on this line is uninterpretable. Say how far you turned.
+      const ticksPerRev = tally.absSum;
       debugLog(
         `[jog-cal/${deckId}] msgs=${tally.n} absSum=${tally.absSum} net=${tally.net} ` +
         `maxAbs=${tally.maxAbs} values=[${[...tally.values].sort((a, b) => a - b).join(',')}] ` +
         `over ${secs.toFixed(2)}s (${(tally.n / Math.max(secs, 0.001)).toFixed(0)} msg/s) | ` +
-        `if this was exactly one revolution, VINYL_SEC_PER_TICK = ${(1.8 / Math.max(tally.absSum, 1)).toFixed(5)}`
+        `if this was exactly ONE revolution, ticks/rev = ${ticksPerRev} ` +
+        `(assumed ${VINYL_TICKS_PER_REV}); revs at that assumption = ` +
+        `${(tally.absSum / VINYL_TICKS_PER_REV).toFixed(2)} | ` +
+        `scale ${get(jogSecondsPerRev).toFixed(2)}s/rev → mean ` +
+        `${((tally.absSum * (get(jogSecondsPerRev) / VINYL_TICKS_PER_REV)) / Math.max(secs, 0.001)).toFixed(2)}x`
       );
     }
     endScrub(deckId).then(settled);
@@ -413,7 +446,7 @@ export async function startMidiListener(): Promise<() => void> {
             // Accumulate ticks into an absolute position and let the feeder servo to it.
             // Seeded from the deck's current position on the first tick of a gesture;
             // every later tick is pure displacement, so burst delivery is irrelevant.
-            // See VINYL_SEC_PER_TICK above for why this replaced the velocity path.
+            // See vinylSecPerTick() above for why this replaced the velocity path.
             const base = vinylTarget[deckId] ?? getDeckTime(deckId) ?? 0;
             if (vinylTarget[deckId] === undefined) {
               beginScrub(deckId, base, true);
@@ -434,7 +467,7 @@ export async function startMidiListener(): Promise<() => void> {
             // Store what updateScrub actually accepted, not what we asked for: at a track
             // boundary those differ, and keeping the raw sum would open a silent dead zone
             // as long as the overshoot. See updateScrub's doc comment.
-            vinylTarget[deckId] = updateScrub(deckId, base + a.value * VINYL_SEC_PER_TICK);
+            vinylTarget[deckId] = updateScrub(deckId, base + a.value * vinylSecPerTick());
 
             clearTimeout(scratchIdleTimers[deckId]);
             scratchIdleArmedAt[deckId] = performance.now();

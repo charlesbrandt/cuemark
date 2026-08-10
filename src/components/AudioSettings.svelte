@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listAudioDevices, type AudioDevice } from "../lib/audio/pipeline";
-  import { mainOutputDeviceIds, cueOutputDeviceId, tempoRange, scratchMode } from "../lib/audio/audioSettings";
+  import { mainOutputDeviceIds, cueOutputDeviceId, tempoRange, scratchMode, jogSecondsPerRev } from "../lib/audio/audioSettings";
   import { fontScale } from "../lib/settings/displaySettings";
   import { session, setMidiMapping } from "../lib/state/session";
 
@@ -115,6 +115,34 @@
       {$scratchMode === "vinyl" ? "slow, precise — decays to a stop" : "fast ff/rev — free-runs at speed"}
     </span>
   </div>
+
+  {#if $scratchMode === "vinyl"}
+    <!--
+      A/B by ear. The faithful 1.8s/rev (33 1/3 rpm) is inaudible at the 3-8 rpm a hand
+      actually uses to hunt for a beat on a small wheel — see jogSecondsPerRev's doc comment
+      and docs/design/slow-jog-audio-inaudible.md §6. Both readouts are shown because the
+      trade is the whole point: pitch goes up and positioning gets coarser together.
+    -->
+    <div class="settings-row">
+      <span class="row-label">Jog scale</span>
+      <input
+        type="range"
+        min="0.2"
+        max="3.6"
+        step="0.1"
+        bind:value={$jogSecondsPerRev}
+      />
+      <span class="jog-scale-value">{$jogSecondsPerRev.toFixed(1)}s/rev</span>
+      <button type="button" class="font-scale-reset" onclick={() => jogSecondsPerRev.set(1.8)}>
+        Vinyl
+      </button>
+      <span class="hint-inline">
+        1.0&times; at {(60 / $jogSecondsPerRev).toFixed(0)} rpm &middot;
+        a slow 6 rpm turn &rarr; {(6 * $jogSecondsPerRev / 60).toFixed(2)}&times;
+        {#if 6 * $jogSecondsPerRev / 60 < 0.35}(likely too low to hear){/if}
+      </span>
+    </div>
+  {/if}
 
   <div class="settings-row">
     <span class="row-label">Display</span>
@@ -252,6 +280,12 @@
     color: var(--text);
     font-variant-numeric: tabular-nums;
     min-width: 34px;
+  }
+
+  .jog-scale-value {
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+    min-width: 58px;
   }
 
   .font-scale-reset {

@@ -49,3 +49,28 @@ export const tempoRange = persistentWritable<number>("cuemark:tempoRange", 20);
  * shuttle mode vs. vinyl mode". Global (not per-deck) for now. Persisted across restarts.
  */
 export const scratchMode = persistentWritable<"shuttle" | "vinyl">("cuemark:scratchMode", "vinyl");
+
+/**
+ * Vinyl-mode jog scale: **seconds of audio covered by one full revolution of the wheel.**
+ *
+ * The default 1.8 is a real 12" platter at 33⅓ rpm, which is where this feature started —
+ * turn the wheel at record speed and you get 1.0x, exactly like a hand on vinyl.
+ *
+ * ⚠️ **That faithful mapping is not obviously the right one on a small controller wheel**,
+ * and this setting exists because the question is a matter of taste that has to be answered
+ * by ear (`docs/design/slow-jog-audio-inaudible.md` §6). Measured 2026-08-10: sustained
+ * cueing gestures on the Starlight run at **0.10–0.26x**, i.e. 3–8 rpm, because that is the
+ * speed a hand naturally uses to hunt for a beat on a wheel a few inches across. At 0.15x
+ * the audio is pitched down ~2.7 octaves — present at full level, and almost inaudible.
+ * Halving this doubles the pitch for the same hand motion.
+ *
+ * The trade is real in both directions and there is no free setting: **lower = more audible
+ * but coarser positioning**, since one revolution now covers less content. Nothing here is
+ * a bug fix — the pipeline is doing exactly what it is told at every value.
+ *
+ * ⚠️ Do **not** fold the encoder's ticks-per-revolution into this. That is a measured
+ * hardware property (`VINYL_TICKS_PER_REV` in `handler.ts`, 256, confirmed by five
+ * calibration gestures), not a preference, and making it adjustable would let a wrong
+ * hardware number hide inside a taste setting. Persisted across restarts.
+ */
+export const jogSecondsPerRev = persistentWritable<number>("cuemark:jogSecondsPerRev", 1.8);
