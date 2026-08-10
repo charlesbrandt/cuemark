@@ -113,6 +113,32 @@ Use `Monitor` tool with `persistent: true` and `timeout_ms: 3600000`.
 kill $(cat /tmp/cuemark-dev.pid) 2>/dev/null; rm -f /tmp/cuemark-dev.pid
 ```
 
+🔴 **That kills `cargo tauri dev` but NOT the Vite server it spawned, and the next launch then
+silently runs against the stale one.** Caught 2026-08-09: the relaunch logged
+`error when starting dev server: Port 1420 is already in use` and
+`The "beforeDevCommand" terminated with a non-zero status code`, then **started the app
+anyway**, serving the frontend from the previous session's Vite. The codec worker failed to
+import (`[codecPlayer:deck-0] worker.onerror: undefined (undefined:undefined)`) and the user
+lost video entirely — reported as a regression in the Rust change that had just been made,
+which it was not. This is the "Vite serves a stale transform" hazard in CLAUDE.md with a
+louder failure mode.
+
+Kill both, and **scope the pattern to this repo** — there are unrelated Vite servers on this
+machine (ports 5173/5175, `/app/node_modules/...`) that a bare `pkill -f vite` would take out:
+
+```bash
+kill $(cat /tmp/cuemark-dev.pid) 2>/dev/null
+pkill -f "node /home/account/repos/cuemark/node_modules/.bin/vite"
+sleep 2
+pgrep -af "repos/cuemark.*vite|target/debug/cuemark" | grep -v "bash -c" || echo "all stopped"
+```
+
+Then after relaunching, confirm the *new* server actually started before trusting anything:
+
+```bash
+grep -E "VITE.*ready|already in use" /tmp/cuemark-dev.log   # want the first, never the second
+```
+
 **Always stop before making Rust changes** (`src-tauri/`). After editing Rust code: stop, make the edit, restart. `cargo tauri dev` auto-detects frontend changes and hot-reloads them without a restart.
 
 **`pkill -f "target/debug/cuemark"` matches every instance, not just the one you mean** —

@@ -257,7 +257,26 @@ failure modes and coalesces losslessly. Shuttle-mode jog deliberately stays on t
 path (`scratch()`) — free-running between ticks is the point of that mode.
 **Read `docs/design/waveform-scrub.md` before touching** `WaveformCanvas`'s pointer
 handlers, the scrub bus, `jog_nudge`'s vinyl branch, or the feeder's servo. `VINYL_SEC_PER_TICK`
-is calibrated (`1.8 / 256`; the Starlight encoder reports plain ±1 deltas, measured live).
+is calibrated (`1.8 / 256`; the Starlight encoder reports plain ±1 deltas, measured live —
+re-confirmed 2026-08-09 at 243 and 247 ticks/revolution).
+
+✅ **"Slow-jog audio gates out" — RESOLVED 2026-08-10, and it was never a gate.** Captured at
+the device monitor: the signal is continuous at −24.9 dBFS median, with **four** isolated
+25ms silent windows across a 13s gesture. What the user heard was **pitch**: sustained jog
+gestures run the cursor at **0.10–0.26x** (3–8 rpm against the 33⅓ rpm that gives 1.0x), which
+shifts the audio ~2.7 octaves down — present at full level, essentially inaudible.
+`corr(rate, zcr) = +0.64`; the one fast second reads `zcr 1952 Hz` against `37–348 Hz` for the
+slow ones. **No pipeline defect.** What remains is a taste question about the jog mapping,
+now exposed as the `Jog scale` setting (`jogSecondsPerRev`). Full account, including five
+refuted mechanisms not to re-run: `docs/design/slow-jog-audio-inaudible.md`.
+
+⚠️ **The generalisable part**: every instrument in the audio path is a level, a count, or a
+state — `rms` is blind to frequency, so the feeder's own `rms` read healthy the entire time
+and *could not have shown this*. **An instrument that cannot vary with the fault carries no
+information about it; a clean reading from one is no evidence, not weak evidence.** When the
+producing stage reports healthy AND delivery counters advance AND the user still reports the
+fault, stop reading telemetry and **capture the signal** — see the `audio-debugging` skill,
+"Capture the actual output and look at it".
 
 ⚠️ **One bounded exception to "never by rate", added 2026-08-08: `HandTracker` in
 `pipeline.rs`.** A slowly-moving hand does not produce a steady event stream — measured at
@@ -594,6 +613,7 @@ Several automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb
 | `scripts/watchdog-test.sh <video>` | `docs/design/freeze-watchdog.md` phase 3 gate — tiered recovery (`kill -STOP`/`freezeMainThread(0)`/`kill -KILL`) plus a 15s false-positive smoke check. Run after touching `watchdog.rs` or the recovery/adoption path. |
 | `scripts/watchdog-soak-test.sh <video> [seconds]` | The design doc's full 10-minute false-positive soak (default 600s) — looped playback + a MIDI-rate burst every 60s, asserts zero watchdog triggers. Run before relying on recovery in prod, not on every change. |
 | `scripts/check-launcher-staleness.sh [path]` | Is `~/.local/bin/cuemark` behind the code? Exit 0 fresh / 1 stale / 2 not built. No toolchain or running app needed. Run before diagnosing anything against a non-dev launch. |
+| `scripts/scratch-capture.sh` + `scripts/scratch-envelope.py` | **Any audio symptom the in-pipeline probes call healthy.** Captures the PipeWire device monitor — downstream of everything — and reports a per-window envelope (`rms`, `hp200`, zero-crossing rate) with `[scratch-tel]` joined inline, separating **GATED / PITCHED / CLEAN**. `rms` is blind to frequency, so this sees the whole class of faults the pipeline's own instruments structurally cannot. Ended a four-session investigation in one pass. See the `audio-debugging` skill for the traps (the stub recorder, the wrong-node capture, UTC vs local). |
 | `scripts/probes/offscreencanvas_webgl_capture_probe.py` | Can pixels be read back out of a WebGL canvas on this WebKitGTK? Run **before designing anything that moves rendered content between windows or processes**, and before trusting any pixel assertion against WebGL output. Seconds, no app, no Xvfb. |
 | `scripts/probes/webgl_readback_variants_probe.py` | Route matrix for the same question — attachment formats, explicit `readBuffer`, PBO + `getBufferSubData`, `copyTexSubImage2D` — with a `LIBGL_ALWAYS_SOFTWARE=1` control arm that separates driver faults from WebKit faults. Run this before concluding anything about readback. |
 | `scripts/probes/webgl_readpixels_diag_probe.py` | Why a readback failed: reports the returned bytes *and* the GL error, `getError()` sanity, framebuffer completeness, and the implementation's preferred read format. |

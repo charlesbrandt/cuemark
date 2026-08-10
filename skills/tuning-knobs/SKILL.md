@@ -39,6 +39,17 @@ else's. Whichever way you turn this, **check what the new value does to both a 4
 sub-1080p file** — the log line above tells you in one deck load each.
 Full write-up: `docs/design/codec-frame-cache.md` §5a.
 
+### 1b. Jog scale — a slow jog makes no *audible* sound (but the meters look fine)
+
+| | |
+|---|---|
+| **Symptom** | Turning the jog wheel slowly produces a burst at the start of the motion and then near-silence, while the wheel is still turning. Meters, `arrived%`, delivery counters all healthy. |
+| **Where** | **Settings → Jog scale** (`jogSecondsPerRev`, default 1.8s/rev = 33⅓ rpm). No rebuild, no restart — it is read per gesture. |
+| **What it actually is** | **Not a fault.** At 0.10–0.26x the audio is pitched ~2.7 octaves down: full level, sub-100 Hz, inaudible on most monitoring. `rms` cannot see this — it is blind to frequency. |
+| **Confirm before turning** | `[scratch-tel] … rate mean=` under ~0.35 across the gesture. Or capture it: `scripts/scratch-capture.sh` → verdict `PITCHED`. |
+| **The trade** | Lower s/rev = higher pitch for the same hand motion = **coarser positioning**, in exact proportion. There is no free value; this is a taste call, which is why it is a UI setting and not a constant. |
+| **🛑 Not the knob** | `VINYL_TICKS_PER_REV = 256` is a *measured hardware fact* (five calibration gestures, 243–276). Do not "tune" it to compensate for feel — that hides a wrong hardware value inside a preference and defeats every later calibration. |
+
 ### 2. Silent-scrub seek throttle — jog feels laggy/steppy on a *playing* deck
 
 | | |

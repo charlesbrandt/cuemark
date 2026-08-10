@@ -194,6 +194,63 @@ in ERROR until the user re-loads the track.
 
 ---
 
+## Capture the actual output and look at it (2026-08-10) — the instrument of last resort, and it should be reached for sooner
+
+**Reach for this the moment the pipeline's own instruments read healthy and the user still
+reports a fault.** Not after the fifth hypothesis. Every probe in this file is a *level*, a
+*count*, or a *state* — none of them is the signal, and a fault that changes none of those is
+invisible to all of them at once.
+
+```bash
+scripts/scratch-capture.sh                      # pre-flights the pw-link, refuses on the wrong node
+scripts/scratch-envelope.py /tmp/cuemark-scratch-<ts>.wav \
+    --start-epoch "$(cat /tmp/cuemark-scratch-<ts>.epoch)" --log /tmp/cuemark-dev.log
+```
+
+It taps the **PipeWire device monitor**, downstream of everything including the
+two-`pulsesink`s-on-one-device topology, so a fault anywhere in the chain lands in it. The
+analyser prints a per-window envelope (`rms`, `hp200`, zero-crossing rate), joins
+`[scratch-tel]` lines inline against wall clock, and separates the three outcomes the log
+cannot:
+
+| verdict | means | where to look next |
+|---|---|---|
+| `GATED` | interior silence ≥150ms reached the device | join the gap start against `[scratch-tel]`; `arrived`/`ramps`/`snaps` say whether the feeder muted |
+| `PITCHED` | level holds, energy collapses below 200 Hz | nothing is muted — the content is shifted down by a low cursor speed. No gate constant will fix it |
+| `CLEAN` | both hold | the loss is downstream of the tap: analog, routing, the controller's mixer |
+
+**Why this earns its own section**: it ended a four-session investigation in one pass
+(`slow-jog-audio-inaudible.md`). The answer was `PITCHED` — a slow jog runs the cursor at
+0.10–0.26x, which drops the audio ~2.7 octaves, present at full level and inaudible.
+**`rms` is blind to frequency**, so the feeder's own `rms` field read healthy throughout and
+*could never have shown this*. Five mechanisms were proposed and refuted against instruments
+that were structurally incapable of varying with the fault.
+
+> An instrument that cannot vary with the fault carries no information about it. A clean
+> reading from one is not weak evidence — it is no evidence.
+
+### Three traps, all of which fired on first use
+
+- 🔴 **`audio_record_start/stop` is a stub.** `src-tauri/src/audio/record.rs` logs, returns
+  `Ok`, and writes nothing (the encoder chain is "step 8"). The design doc that prescribed it
+  did not know that. Use the capture script.
+- 🔴 **A capture reading ~−53 dBFS and flat is the wrong node, not a quiet take.**
+  `pw-record` silently falls back to the default source — here the H1n mic — producing a
+  perfectly plausible "clean" envelope of the room. It was caught only because it matched an
+  idle control take to within 0.7 dB. The analyser now checks this *first* and refuses to
+  interpret anything below it; `scratch-capture.sh` pre-flights the link.
+- 🔴 **Trim lead-in silence before judging a gap.** The deck sits paused before the gesture
+  starts, so a capture opens with true digital silence. Scored over the whole file that reads
+  as one long gate — and because `GATED` is checked before `PITCHED`, it *masked* the correct
+  verdict on the very take that settled the bug. Now measured over the interior only.
+
+### Timezone
+
+⚠️ **Log stamps are UTC; `date`, the capture filename and the `.epoch` file are local.** The
+`--log` join parsed them as local until 2026-08-10 and therefore matched nothing, **silently**
+— no warning, just an envelope with no telemetry beside it. Check `date -u` against the log's
+last line before concluding a join found nothing.
+
 ## "Audio is choppy" / "audio is silent" — read `output_queue` first (2026-08-02)
 
 **Start here for any audio symptom**, before touching buffer sizes or tempo code. Reaching
