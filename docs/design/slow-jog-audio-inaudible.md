@@ -197,3 +197,124 @@ Deck **paused**, vinyl mode, one slow steady one-direction turn of ≥5s.
 - ⚠️ A capture that reads ~−53 dBFS and flat is the *wrong node* (the H1n mic), not a quiet
   take. The script checks for this first and refuses to interpret anything below it.
 - ⚠️ Ask for **exactly one revolution** if `[jog-cal]` is going to be used for anything (§4.3).
+
+---
+
+## 10. 🔴 REOPENED 2026-08-10 (late) — the user was never listening to the main output
+
+**The "pitched, not gated" verdict above is measured correctly and answers the wrong
+question.** It was derived from channels 0,1 of the device monitor — the **main** output.
+The user monitors on **headphones plugged into the Starlight**, which is the **cue** output
+(`[audio/cue] remap: target=RL,RR full=FL,FR,RL,RR idx=[2,3]`), i.e. channels 2,3. Nobody
+asked which one they were listening to until after the investigation closed.
+
+Re-analysing the *same* fast-jog capture (`/tmp/cuemark-scratch-173949.wav`, 15s, 4ch) by
+channel pair:
+
+| second | MAIN (ch 0,1) | CUE / headphones (ch 2,3) |
+|---|---|---|
+| 1 | −23.0 dBFS | −34.0 dBFS |
+| 2–14 | **−19.3 to −24.3 dBFS, continuous** | **−999 dBFS — exact digital zero, all 13s** |
+
+Two things make this decisive rather than suggestive:
+
+- **−999 dBFS is literal zero samples**, not a noise floor. The idle monitor on this device
+  reads −54 dBFS (§6), so silence here is *quieter than silence* — something is writing
+  zeros, not failing to write.
+- **−34.0 dBFS in second 1 is exactly right.** `cue_volume = gain × cue_gain × master =
+  1.0 × 0.27 × 0.425 = 0.115` against `main = gain × vol × master = 0.425`, i.e. 11.4 dB
+  down; −23.0 − 11.4 = −34.4. The cue branch was working correctly, at the correct level,
+  and then stopped.
+
+So the cue branch delivers ~1 second of correct audio at the start of a scratch gesture and
+then hard-zeros for the rest of it. **That is the user's original symptom verbatim** —
+"starts playing at the beginning of each jog motion, and then quickly goes to silence until
+the next motion" (§1) — and it has been the symptom the whole time.
+
+### What is ruled out already
+
+- **Not the cue toggle being off.** `[audio/deck-0] cue ON` at 21:31:12, 3.3s after the only
+  `load()` of the session, and no reload after. The valve was open for the capture at 21:39.
+- **Not `scratch()` touching the cue branch.** It sets `input_selector`'s active pad and
+  `valve_normal.drop = true`; it does not reference `cue_valve`, `cue_volume` or `cue_queue`.
+- **Not starvation.** `[scratch-tel]`'s delivery probes read `cuevol=68/s cuesink=68/s`
+  *during* the zeros. Buffers arrive at the cue sink at full rate and contain silence.
+- **Not a sample-rate renegotiation at the tee.** `SCRATCH_SAMPLE_RATE` is 48000 and
+  `capsfilter2` forces the same `caps_48k` as the normal branch.
+
+### Why every instrument missed it
+
+The feeder's `rms` is measured on the bytes handed to `appsrc` — **upstream of the tee**, so
+it is structurally incapable of seeing a loss that happens on one branch below the split. The
+delivery probes count *buffers*, not content, so a branch delivering silence at 68/s reads
+identically to one delivering music at 68/s. Between them they cover the whole path except
+the one place the fault is. This is C-class in `silent-failure-inventory.md`, and it is the
+third distinct instance in this investigation.
+
+⚠️ **The capture tooling has the same blind spot by default.** `scratch-envelope.py` analyses
+channels 0,1 unless told otherwise, so it reported **CLEAN** on a capture whose headphone
+channels were digitally silent. Always run both pairs:
+
+```bash
+python3 scripts/scratch-envelope.py <cap>.wav                 # mains
+python3 scripts/scratch-envelope.py <cap>.wav --channels 2,3  # cue / headphones
+```
+
+### Next step
+
+One capture that spans **normal playback and then a jog**, with cue on, read on channels 2,3.
+That distinguishes "the cue branch is broken generally" from "scratch breaks the cue branch",
+which is the last fork before reading GStreamer state directly. Do not form a mechanism
+hypothesis before it — five have already been refuted on this bug, and the two that were
+adopted (pitch, and the coast-reversal fade) were both measured against the wrong channel.
+
+### §10.1 — the caps-renegotiation hypothesis is REFUTED (2026-08-10, same evening)
+
+The first mechanism proposed for §10 was a caps renegotiation at the cue branch's
+`mix-matrix`: `caps_48k` constrained **rate alone**, so the scratch branch inherited
+`appsrc`'s unpositioned channel-mask while the normal branch negotiated its own, and
+switching `input_selector` would then renegotiate an element whose hand-built N×2 matrix is
+only meaningful against a known channel layout.
+
+**Refuted by `instrument_caps()`, which was built in the same commit precisely so the
+hypothesis could fail cheaply.** Across a full load + playback + jog cycle the probe emitted
+exactly **two** CAPS events, both at load, none when scratch engaged:
+
+```
+ch_conv.sink (mix-matrix in): audio/x-raw, rate=48000, F32LE, channels=2, channel-mask=0x3
+ch_caps.src  (to cue sink):   audio/x-raw, rate=48000, F32LE, channels=4, channel-mask=0x33
+```
+
+Both layouts are **correct** — 0x33 is FL,FR,RL,RR — and neither changes during a gesture.
+User-confirmed by ear in the same run: "It sounds the same as before."
+
+**Do not re-run this.** The negotiated layout on the cue branch is right, stays right, and is
+not what silences it.
+
+Status of the accompanying change: `caps_48k` and `scratch_caps` are now fully specified
+(format, layout, channels, channel-mask). That is **inert** with respect to this bug and is
+kept only as hygiene — two selector inputs presenting identical caps is a property worth
+having, and it costs nothing. It is not a fix and must not be recorded as one. Revert freely
+if it ever gets in the way.
+
+### §10.2 — the instrument that was missing, and the next reading
+
+`instrument_level()` (added 2026-08-10) logs **per-channel RMS of the actual samples** once a
+second at four points: `cue after valve`, `cue after volume`, `cue post-matrix (to sink)`, and
+`main vol0 (reference)`.
+
+This is the first probe anywhere on the cue branch that reads buffer *content*. Everything
+that existed before counts buffers, reports negotiation, or measures level at the `appsrc` —
+upstream of the tee, and therefore structurally blind to a loss on one branch below the split.
+That is exactly why "68 buffers/s at the cue sink" and "digital silence at the device" were
+both true for four sessions without ever contradicting each other.
+
+**How to read it** — whichever probe first shows `-inf` while `main vol0` still shows real
+audio is the link that zeroes the signal, and the bug is then located to one element:
+
+| first `-inf` | conclusion |
+|---|---|
+| `cue after valve` | the tee/valve stops feeding the branch when scratch engages |
+| `cue after volume` | the gain stage is being zeroed |
+| `cue post-matrix` | the channel routing drops it |
+| none of them | the loss is below GStreamer — go to PipeWire's mixing of two sinks on one node, `audio-dropout-mid-playback.md` H1 |

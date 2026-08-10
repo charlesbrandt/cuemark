@@ -195,6 +195,7 @@ def main():
     ap.add_argument("--quiet", action="store_true", help="summary only, no per-window timeline")
     args = ap.parse_args()
 
+    explicit_channels = any(a == "--channels" or a.startswith("--channels=") for a in sys.argv[1:])
     channels = [int(c) for c in args.channels.split(",") if c.strip() != ""]
     mono, rate, n_ch = read_wav(args.wav, channels)
     duration = len(mono) / rate
@@ -313,6 +314,34 @@ def main():
             print("  CLEAN — continuous level with real high-frequency content. Whatever the")
             print("  user hears is downstream of this tap (analog path, controller mixer,")
             print("  monitoring), not in the pipeline.")
+
+    # The other channel pair, always, unless it was asked for explicitly.
+    #
+    # 🔴 This exists because the default very nearly buried the bug it was built to find.
+    # On a 4.0 device the main output is FL,FR (0,1) and the cue/headphone output is RL,RR
+    # (2,3) — and a listener on headphones is hearing 2,3. On 2026-08-10 this script analysed
+    # 0,1 by default and returned **CLEAN** for a capture whose headphone channels were at
+    # exact digital zero for thirteen straight seconds, which is the verdict the whole
+    # investigation then reasoned from. Reporting one pair as "the" answer is what made a
+    # correct measurement answer the wrong question.
+    if n_ch >= 4 and not explicit_channels:
+        other = [c for c in (0, 1, 2, 3) if c not in channels][:2]
+        o_mono, _, _ = read_wav(args.wav, other)
+        o_wins = analyse(o_mono, rate, args.window)
+        o_ranked = sorted(dbfs(w["rms"]) for w in o_wins)
+        o_p = lambda q: o_ranked[min(len(o_ranked) - 1, int(q * len(o_ranked)))]
+        # Exact zero is not a quiet passage: nothing analog reaches -999 dBFS, so a pair
+        # sitting there is being *written* silent by something upstream.
+        dead = sum(1 for w in o_wins if w["rms"] <= 0.0)
+        role = "cue/headphones" if 2 in other else "main"
+        print()
+        print(f"OTHER CHANNEL PAIR {other} ({role}) — checked because a listener may be on it")
+        print(f"  rms dBFS : p10={o_p(0.1):.1f} p50={o_p(0.5):.1f} p90={o_p(0.9):.1f}")
+        print(f"  digital-zero windows: {dead}/{len(o_wins)} ({100.0*dead/len(o_wins):.0f}%)")
+        if dead > len(o_wins) * 0.1:
+            print(f"  🔴 This pair is SILENT while the analysed pair is not. If the listener is")
+            print(f"     on {role}, every verdict above is about an output nobody is hearing.")
+            print(f"     Re-run with --channels {other[0]},{other[1]} and read that instead.")
 
 
 if __name__ == "__main__":

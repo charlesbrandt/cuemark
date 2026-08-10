@@ -260,15 +260,29 @@ handlers, the scrub bus, `jog_nudge`'s vinyl branch, or the feeder's servo. `VIN
 is calibrated (`1.8 / 256`; the Starlight encoder reports plain ±1 deltas, measured live —
 re-confirmed 2026-08-09 at 243 and 247 ticks/revolution).
 
-✅ **"Slow-jog audio gates out" — RESOLVED 2026-08-10, and it was never a gate.** Captured at
-the device monitor: the signal is continuous at −24.9 dBFS median, with **four** isolated
-25ms silent windows across a 13s gesture. What the user heard was **pitch**: sustained jog
-gestures run the cursor at **0.10–0.26x** (3–8 rpm against the 33⅓ rpm that gives 1.0x), which
-shifts the audio ~2.7 octaves down — present at full level, essentially inaudible.
-`corr(rate, zcr) = +0.64`; the one fast second reads `zcr 1952 Hz` against `37–348 Hz` for the
-slow ones. **No pipeline defect.** What remains is a taste question about the jog mapping,
-now exposed as the `Jog scale` setting (`jogSecondsPerRev`). Full account, including five
-refuted mechanisms not to re-run: `docs/design/slow-jog-audio-inaudible.md`.
+🔴 **"Slow-jog audio gates out" — OPEN. The cue branch goes to digital zero during a
+scratch.** Measured at the device monitor, **by channel pair**, 2026-08-10: during normal
+playback both outputs run at ~−19 dBFS; ~1s after a scratch gesture begins the main output
+continues at −19 dBFS and the **cue/headphone output (`RL,RR` = channels 2,3) drops to −999
+dBFS — literal zero samples**, for the rest of the gesture. It is not starvation: the cue
+branch's delivery probes read `cuevol=68/s cuesink=68/s` throughout the zeros, so buffers
+arrive at full rate carrying silence. Prime suspect and the fix now in the tree: `caps_48k`
+constrained **rate alone**, so the scratch branch inherited `appsrc`'s unpositioned
+channel-mask while the normal branch negotiated its own — and switching `input_selector`
+renegotiated the cue branch's `mix-matrix`, which is only meaningful against a known channel
+layout. `caps_48k` is now fully specified and `instrument_caps()` logs `[caps/…]` on both
+sides of that element. **Awaiting live confirmation.**
+
+⚠️ **The prior "RESOLVED — it was pitch" verdict was measured correctly and answered the
+wrong question**, and the mistake is the reusable lesson: the analysis ran on channels 0,1
+(**main**) while the user was monitoring on **headphones**, which on this device is a
+different physical channel pair. The pitch arithmetic is real — sustained jog gestures do run
+the cursor at 0.10–0.26x, ~2.7 octaves down, and `Jog scale` (`jogSecondsPerRev`) is a
+genuine taste lever — but it was never what the user was hearing, and the same capture had
+digitally-silent headphone channels nobody had looked at. **Ask which output the listener is
+actually on before analysing any capture, and read both pairs:**
+`scripts/scratch-envelope.py <cap>.wav --channels 2,3`. Full account, including six refuted
+mechanisms not to re-run: `docs/design/slow-jog-audio-inaudible.md` §10.
 
 ⚠️ **The generalisable part**: every instrument in the audio path is a level, a count, or a
 state — `rms` is blind to frequency, so the feeder's own `rms` read healthy the entire time

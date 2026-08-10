@@ -743,6 +743,96 @@ fn make_eos_passthrough_valve(valve: &gst::Element) {
     });
 }
 
+/// Logs every CAPS event crossing `pad_name` on `element`, tagged `label`.
+///
+/// Added 2026-08-10 for the cue-branch silence in `slow-jog-audio-inaudible.md` §10, where
+/// the headphone output measured **exact digital zero** for the whole of a scratch gesture
+/// while the main output ran at −19 dBFS and the cue branch's own delivery probes counted
+/// 68 buffers/s. Buffers arriving and containing silence points at negotiation, not flow,
+/// and negotiation was the one thing in this pipeline that nothing observed: every existing
+/// probe counts buffers, timestamps or levels, and a caps change is none of those.
+///
+/// Attach it around the element whose behaviour depends on the negotiated layout — here
+/// `ch_conv`, whose hand-built N×2 `mix-matrix` is only meaningful against a known input
+/// channel layout.
+fn instrument_caps(element: &gst::Element, pad_name: &str, label: &str, deck_id: &str) {
+    let Some(pad) = element.static_pad(pad_name) else { return };
+    let label = label.to_string();
+    let deck_id = deck_id.to_string();
+    pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        let Some(event) = info.event() else { return gst::PadProbeReturn::Ok };
+        if let gst::EventView::Caps(c) = event.view() {
+            log::info!("[caps/{deck_id}] {label}: {}", c.caps());
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
+/// Per-channel RMS of the samples actually crossing `pad_name`, logged once a second.
+///
+/// **The cue branch has never had an instrument that looks at buffer *content*.** Its
+/// delivery probes count buffers, `instrument_caps` reports negotiation, and the feeder's
+/// own `rms` is measured at the `appsrc` — upstream of the tee, so it cannot see a loss on
+/// one branch below the split. That left the exact question this bug turns on unobservable:
+/// during a scratch gesture the headphone output measures **digital zero at the device**
+/// while 68 buffers/s arrive at the cue sink with correct 4-channel caps
+/// (`slow-jog-audio-inaudible.md` §10). Buffers that are present, correctly shaped, and full
+/// of silence can only be distinguished from working audio by reading the samples.
+///
+/// Per-channel rather than overall, because the answer is expected to be channel-specific:
+/// downstream of the mix-matrix, rows 0,1 are silent *by design* and rows 2,3 carry the
+/// headphone feed, so an overall RMS would blur the one distinction that matters.
+///
+/// Assumes F32LE, which `caps_48k` now pins on both selector inputs.
+fn instrument_level(element: &gst::Element, pad_name: &str, label: &str, deck_id: &str) {
+    let Some(pad) = element.static_pad(pad_name) else { return };
+    let label = label.to_string();
+    let deck_id = deck_id.to_string();
+    // (per-channel sum of squares, frames, window start)
+    let state = Arc::new(Mutex::new((Vec::<f64>::new(), 0u64, Instant::now())));
+    pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+        let Some(buf) = info.buffer() else { return gst::PadProbeReturn::Ok };
+        let channels = pad
+            .current_caps()
+            .and_then(|c| c.structure(0).and_then(|s| s.get::<i32>("channels").ok()))
+            .unwrap_or(2)
+            .max(1) as usize;
+        let Ok(map) = buf.map_readable() else { return gst::PadProbeReturn::Ok };
+        let data = map.as_slice();
+        let mut st = state.lock().unwrap();
+        if st.0.len() != channels {
+            st.0 = vec![0.0; channels];
+        }
+        let n = data.len() / 4;
+        for i in 0..n {
+            let v = f32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]])
+                as f64;
+            st.0[i % channels] += v * v;
+        }
+        st.1 += (n / channels) as u64;
+        if st.2.elapsed() >= Duration::from_secs(1) {
+            let frames = st.1.max(1) as f64;
+            let per_ch: Vec<String> = st
+                .0
+                .iter()
+                .map(|s| {
+                    let rms = (s / frames).sqrt();
+                    if rms > 0.0 { format!("{:.1}", 20.0 * rms.log10()) } else { "-inf".to_string() }
+                })
+                .collect();
+            log::info!(
+                "[level/{deck_id}] {label}: [{}] dBFS/ch frames={}",
+                per_ch.join(" "),
+                st.1
+            );
+            st.0 = vec![0.0; channels];
+            st.1 = 0;
+            st.2 = Instant::now();
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
 /// Encode a filesystem path as a file:// URI suitable for uridecodebin.
 ///
 /// Each byte is examined individually so multi-byte UTF-8 sequences (e.g. 'ç' → 0xC3 0xA7)
@@ -1215,10 +1305,15 @@ impl DeckAudioPipeline {
         // PTS on each pushed buffer.
         appsrc_el.set_property("do-timestamp", true);
         let appsrc = appsrc_el.downcast_ref::<AppSrc>().unwrap().clone();
+        // channel-mask is explicit here for the same reason it is on caps_48k below: without
+        // it these are *unpositioned* stereo channels, and the cue branch's mix-matrix needs a
+        // known layout to route into. Setting it at the source as well as at capsfilter2 means
+        // no element between them has to invent one.
         let scratch_caps = gst::Caps::builder("audio/x-raw")
             .field("format", "F32LE")
             .field("layout", "interleaved")
             .field("channels", 2i32)
+            .field("channel-mask", gst::Bitmask(0x3))
             .field("rate", pcm_buffer::SCRATCH_SAMPLE_RATE as i32)
             .build();
         appsrc.set_caps(Some(&scratch_caps));
@@ -1341,6 +1436,13 @@ impl DeckAudioPipeline {
                                 .field("channel-mask", gst::Bitmask(r.channel_mask))
                                 .build());
 
+                            // Bracket the mix-matrix: what it is asked to map, and what it
+                            // produced. See instrument_caps() — a renegotiation here is the
+                            // suspect for the cue branch going to digital zero the moment a
+                            // scratch gesture switches input_selector.
+                            instrument_caps(&ch_conv, "sink", "ch_conv.sink (mix-matrix in)", &self.deck_id);
+                            instrument_caps(&ch_caps, "src", "ch_caps.src (to cue sink)", &self.deck_id);
+
                             Some((ch_conv, ch_caps))
                         }
                         None => None,
@@ -1391,8 +1493,33 @@ impl DeckAudioPipeline {
             None
         };
 
+        // ⚠️ **Fully specified on purpose, and it must stay that way.** This filter sits on
+        // *both* of input_selector's inputs — `rate_caps` on the normal branch and
+        // `capsfilter2` on the scratch branch — so anything it leaves open is negotiated
+        // independently per branch, and switching the selector then changes the caps seen by
+        // everything downstream: output_queue, tee, both main sinks, and the cue branch.
+        //
+        // Until 2026-08-10 this constrained **rate alone**. The scratch branch therefore took
+        // its format/layout/channel-mask from `appsrc`'s caps (F32LE, 2ch, *no channel-mask* —
+        // unpositioned channels), while the normal branch took its own from the decoder chain.
+        // The measured consequence: on the cue branch, whose `ch_conv` carries a hand-built
+        // N×2 `mix-matrix` that is only meaningful against a **known** input channel layout,
+        // the headphone output went to **exact digital zero** for the whole of every scratch
+        // gesture — literal zero samples, quieter than the device's own −54 dBFS monitor floor
+        // — while the main output continued at −19 dBFS and the cue branch's delivery probes
+        // still counted 68 buffers/s. Buffers arriving full of silence is a negotiation
+        // failure, not a flow one. See docs/design/slow-jog-audio-inaudible.md §10.
+        //
+        // Pinning every field makes the two branches caps-identical, so the selector switch
+        // is a no-op downstream and `mix-matrix` never renegotiates. `audioconvert` +
+        // `audioresample` sit upstream of both filters, so both branches can always satisfy
+        // this; the mask is plain front-left/front-right (0x3).
         let caps_48k = gst::Caps::builder("audio/x-raw")
             .field("rate", 48_000i32)
+            .field("format", "F32LE")
+            .field("layout", "interleaved")
+            .field("channels", 2i32)
+            .field("channel-mask", gst::Bitmask(0x3))
             .build();
         rate_caps.set_property("caps", &caps_48k);
         capsfilter2.set_property("caps", &caps_48k);
@@ -1530,6 +1657,22 @@ impl DeckAudioPipeline {
             cue_volume.link(&cue_queue).map_err(|e| format!("cue_volume→cue_queue: {e}"))?;
         }
         cue_queue.link(&cue_sink).map_err(|e| format!("cue_queue→cue_sink: {e}"))?;
+
+        // Content levels along the whole cue path, plus one main-branch reference to read
+        // them against. See instrument_level(): the cue branch measures digital zero at the
+        // device during a scratch while its buffer counters read full rate, and no existing
+        // probe distinguishes "buffers full of music" from "buffers full of silence". Each
+        // stage here answers one link of the question — valve (is the tee feeding it),
+        // cue_volume (did the gain stage zero it), post-matrix (did the routing drop it) —
+        // and `main vol0` says whether the tee is delivering audio at all that second.
+        instrument_level(&cue_valve, "src", "cue after valve", &self.deck_id);
+        instrument_level(&cue_volume, "src", "cue after volume", &self.deck_id);
+        if let Some((_, ref ch_caps)) = cue_channel_remap {
+            instrument_level(ch_caps, "src", "cue post-matrix (to sink)", &self.deck_id);
+        }
+        if let Some(v0) = volume_els.first() {
+            instrument_level(v0, "src", "main vol0 (reference)", &self.deck_id);
+        }
 
         let queue_weak = queue.downgrade();
         let deck_id = self.deck_id.clone();
