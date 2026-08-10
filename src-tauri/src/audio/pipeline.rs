@@ -2560,9 +2560,32 @@ impl HandTracker {
             self.speed += SCRATCH_SPEED_EMA_ALPHA * (observed - self.speed);
             self.last_target = target;
             self.idle_chunks = 0.0;
-            // The hand's own position is authoritative again; drop the extrapolation.
-            self.coast_offset = 0.0;
-            return target;
+            // The hand's own position is authoritative again, so the extrapolation must go —
+            // but it is *absorbed* against the motion the hand actually delivered, never
+            // dropped outright.
+            //
+            // ⚠️ This was `self.coast_offset = 0.0` until 2026-08-09, and that is a
+            // **backward jump of the aim point** whenever the coast ran further than the hand
+            // did: the aim goes from `last_target + coast_offset` to `target`, which is behind
+            // it. The servo chases backwards, `commanded_rate` goes negative, and the sign flip
+            // in the feeder loop zeroes `fade_pos` — a 5ms gain ramp, then another when motion
+            // resumes. Measured live on a strictly one-direction jog (`values=[1]`, net 247 of
+            // 247 ticks): **2–8 ramps per second**, rising with `coast%` and vanishing above
+            // ~0.4x where the coast barely engages (`ramps=0` at 0.44x–1.87x, 5 at 0.29x).
+            // That fade chain is the "audio tapers out during a slow jog" report, and it is
+            // the residue of the coasting fix that closed the *silence* half on 2026-08-08.
+            //
+            // Absorbing keeps the aim point monotonic in the direction of travel: if the hand
+            // out-ran the coast the offset is fully consumed and the aim advances to `target`;
+            // if it did not, the remainder is carried and the aim *holds still* rather than
+            // reversing. Either way the offset only ever shrinks on a real target, so absolute
+            // position stays authoritative and a bad speed estimate still cannot accumulate.
+            self.coast_offset = if delta > 0.0 {
+                (self.coast_offset - delta).max(0.0)
+            } else {
+                (self.coast_offset - delta).min(0.0)
+            };
+            return target + self.coast_offset;
         }
 
         self.idle_chunks += 1.0;
@@ -3148,6 +3171,60 @@ mod servo_test {
              the 'gentle drag drops out' bug (the servo converges inside the gaps and fades)",
             silent_fraction * 100.0
         );
+    }
+
+    /// The aim point must never move **backwards** while the input only moves forwards.
+    ///
+    /// This is the 2026-08-09 live failure, and it is a correctness property rather than a
+    /// tuning one, which is why it is asserted here rather than left to a live listen. Zeroing
+    /// `coast_offset` on each real target dropped the aim from `last_target + coast_offset` back
+    /// to `target`; whenever the coast had out-run the hand that is a reversal, the feeder's
+    /// sign check zeroes `fade_pos`, and the gesture picks up a 5ms gain ramp — twice per
+    /// occurrence, since motion then resumes forward. The live jog measured **2–8 `ramps` per
+    /// second** on a strictly one-direction wheel (`values=[1]`), scaling with `coast%` and
+    /// disappearing above ~0.4x. The user heard it as the audio tapering out mid-gesture.
+    ///
+    /// The hand must **decelerate** for this to bite, which is the whole point: coasting is
+    /// dead reckoning, so it overshoots exactly when the hand slows, and it is the overshoot
+    /// that the next target used to correct by jumping the aim backwards. A constant-speed
+    /// hand does not reproduce it at all — and neither does a wide burst gap, where each
+    /// target advances far more than the 50ms cap and the aim only ever leaps forward. Both
+    /// of those pass on the broken code; this schedule fails on it by 1000+ frames.
+    ///
+    /// A real jog is decelerating somewhere in almost every second — the live gestures ran
+    /// `rate mean=0.18` against `max=0.37` within a single reporting window.
+    #[test]
+    fn forward_gesture_never_reverses_the_aim_point() {
+        // Hand coasting to a stop: 0.40x decaying to ~0.04x over 3s, sampled every ~45ms
+        // (the live jog delivered targets at 8-34/s).
+        for &(fast, slow) in &[(0.40, 0.04), (0.28, 0.10), (0.60, 0.20)] {
+            let mut tracker = HandTracker::new(0.0);
+            let mut target = 0.0f64;
+            let mut prev_aim = 0.0f64;
+            let mut hand_pos = 0.0f64;
+            let mut next_update_ms = 0.0f64;
+            let mut worst = 0.0f64;
+            for chunk in 0..200 {
+                let t_ms = chunk as f64 * SCRATCH_CHUNK_MS as f64;
+                let frac = t_ms / 3000.0;
+                let speed = fast + (slow - fast) * frac.min(1.0); // decelerating
+                hand_pos += speed * CHUNK;
+                if t_ms >= next_update_ms {
+                    target = hand_pos;
+                    next_update_ms = t_ms + 45.0;
+                }
+                let aim = tracker.step(target, CHUNK);
+                worst = worst.min(aim - prev_aim);
+                prev_aim = aim;
+            }
+            assert!(
+                worst >= -1e-6,
+                "aim point went backwards by {:.0} frames on a forward-only gesture \
+                 decelerating {fast}x -> {slow}x. That is a direction reversal, and the feeder \
+                 answers every one of them with a 5ms fade — 2-8 per second, live.",
+                -worst,
+            );
+        }
     }
 
     /// The coast must not become a flywheel. A hand that stops for over a second has really
