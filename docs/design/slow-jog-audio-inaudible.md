@@ -1,13 +1,26 @@
-# Slow-jog scratch audio is inaudible — RESOLVED: pitched, not gated
+# Slow-jog scratch audio is inaudible — 🔴 OPEN: the cue branch is GATED
 
-**Status**: mechanism resolved 2026-08-10 by capturing the device monitor. **There is no
-pipeline defect.** The audio is produced, delivered, and rendered continuously at a healthy
-level; at the cursor speeds a jog gesture actually produces it is shifted ~3 octaves down and
-is barely reproducible. What remains is a **design question about the jog mapping** (§6), not
-a bug.
+> ⚠️ **§1–§9 below describe a RETRACTED verdict and are kept only as a record of how it went
+> wrong. Read §10 onward for the current state.** The short version: §1–§9 analysed the
+> **main** output (channels 0,1) while the user was listening on **headphones**, which on this
+> device is a different physical channel pair (`RL,RR` = channels 2,3). The pitch arithmetic
+> in §1–§2 is real and `Jog scale` is a genuine taste lever, but it was never what the user was
+> hearing — and the same capture had digitally-silent headphone channels nobody had looked at.
 
-Renamed from `slow-jog-audio-gating.md` — the original title asserted a gate, and there
-isn't one.
+**Status (2026-08-10, late)**: 🔴 **OPEN.** The cue/headphone branch is chopped into ~75–80%
+digital silence during a scratch gesture while main plays normally. Confirmed **GATED, not
+pitched**, by a device capture read on channels 2,3 — when cue audio is present its spectral
+balance is identical to main's. Not localised to an element. Three further hypotheses were
+refuted on 2026-08-10 (§10.1, §10.3, §10.4).
+
+**Start here**: §10.6 for current state and the next reading. §10.5 for the measurement
+lesson, which is the durable part.
+
+**Ask which output the listener is on before analysing any capture, and read both pairs**:
+`scripts/scratch-envelope.py <cap>.wav --channels 2,3`.
+
+Renamed from `slow-jog-audio-gating.md` when the gate verdict was retracted. The gate is
+back — on a different channel pair than the one that was originally checked.
 
 **Read first**: `scratch-audio-downstream-delivery.md` (the two real faults, closed
 2026-08-08; both confirmed still working throughout this investigation).
@@ -318,3 +331,218 @@ audio is the link that zeroes the signal, and the bug is then located to one ele
 | `cue after volume` | the gain stage is being zeroed |
 | `cue post-matrix` | the channel routing drops it |
 | none of them | the loss is below GStreamer — go to PipeWire's mixing of two sinks on one node, `audio-dropout-mid-playback.md` H1 |
+
+### §10.3 — the level probe answered, and the sink-alignment hypothesis is REFUTED (2026-08-10, late evening)
+
+**The level probe's verdict: "none of them."** Across four gestures on three builds, every
+one of the four probes carried real audio for the entire gesture while the user heard
+silence in the headphones:
+
+```
+cue after valve:            [-11.7 -11.9]
+cue after volume:           [-25.5 -25.6]
+cue post-matrix (to sink):  [-inf -inf -25.5 -25.6]     ← ch 2,3 = RL,RR = the cue pair
+main vol0 (reference):      [-19.3 -19.4]
+```
+
+The `-inf` on channels 0,1 is **correct and is not the fault** — `compute_cue_remap()`
+routes the stereo cue into `RL,RR` only, exactly as `remap: target=RL,RR idx=[2,3]` reports.
+Read this table with the channel mapping in hand or it looks like a smoking gun.
+
+By §10.2's table that verdict means "below GStreamer". ⚠️ **That table's fourth row was too
+coarse and cost a cycle.** `GstAudioBaseSink`'s ringbuffer sits *after* the last pad, so
+there is one more GStreamer-internal stage between the deepest probe and PipeWire. Reading
+"none of them" as "therefore PipeWire" skips it.
+
+**The hypothesis that stage suggested, and its refutation.** `stop_scratch_feeder()`'s F10
+fix (`scratch_sink_alignment()`, widening `alignment-threshold`/`discont-wait` for the
+gesture) was applied to `inner.main_sink_els` **only** — the cue sink was never in the list,
+so it kept stock 40ms/1s and should have reproduced F10 verbatim on the headphone branch.
+The timing fit was compelling: audio survived ~1s into a gesture and `discont-wait` defaults
+to exactly 1000ms. It is now fixed anyway (`scratch_fed_sinks()`, main + cue) because
+excluding the cue sink was wrong on its own terms, but **it is not this bug**:
+
+| gesture | rate profile | alignment read-back | audible? |
+|---|---|---|---|
+| 22:21:46 (12.0s) | 0.20 → 1.22 → 0.44 | both sinks 2000ms/3600000ms | **yes** |
+| 22:25:28 (8.4s) | slow throughout | both sinks 2000ms/3600000ms | no |
+| 22:26:04 (3.3s) | normal speed | both sinks 2000ms/3600000ms | no |
+
+Three failures against one success with the widening confirmed in effect on both sinks. A
+normal-speed rotation fails too, so **it is not a speed threshold** — an intermediate reading
+that briefly looked right when the one audible gesture happened to be the faster one.
+
+**⚠️ Two instruments in this file were themselves blind, and both were written during this
+investigation.** The first version of the widened-alignment log printed the *length of the
+slice passed in* — a count of intended writes, not an effect — and reported
+`on 2 sink(s) incl. cue` for a build whose cue-sink behaviour was never established. It now
+reads the properties back per sink and prints `name=2000ms/3600000ms` or
+`name=SKIPPED(no property)`. Separately, `scratch_widens_sink_alignment_then_restores` read
+`main_sinks_of()` alone, so it passed green for the entire life of the bug it existed to
+guard; it now chains `cue_sink_of()` and asserts on ≥2 sinks. **A guard that watches a subset
+of the sinks the feeder feeds is not a guard**, and a log line that reports a call is not
+evidence of an effect — see `silent-failure-inventory.md`.
+
+### §10.4 — PipeWire node suspend/resume — REFUTED (2026-08-10, same evening)
+
+> ⚠️ **This section is kept as a refuted hypothesis. Do not re-run it.** The reasoning below
+> was written before the controlled arms ran; the refutation is at the end of the section.
+
+What appeared to separate the single audible gesture from every silent one was **not** speed,
+code, or topology. It looked like elapsed time since the node last carried audio:
+
+```
+22:21:43.224  Playing → Paused
+22:21:46.019  gesture starts  ← 2.8s after active playback — AUDIBLE
+   … 3.5 min idle …
+22:25:28.851  gesture starts  ← SILENT
+   … 27s idle …
+22:26:04.651  gesture starts  ← SILENT
+```
+
+`pw-dump` shows the Starlight node at **`state=suspended`** whenever nothing is playing.
+PipeWire suspends an idle node and re-negotiates its port links on resume, and the cue
+stream is the 4-channel one whose content lives entirely in `RL,RR`. At rest both streams
+dump correctly — stream 120 `["FL","FR"]`, stream 161 `["FL","FR","RL","RR"]`, both unmuted
+at volume 1.0 — so **the misconfiguration is not static and cannot be found by dumping an
+idle graph.**
+
+This accounts for every observation that previously did not fit, including the original
+user description ("starts playing at the beginning of each jog motion, then quickly goes to
+silence" — the node resuming as the gesture opens), the four sessions of healthy in-pipeline
+telemetry, and the one inexplicable success.
+
+⚠️ **It also means the planned H1 topology test would have produced a false positive.**
+Moving main off the Starlight leaves cue alone on the node — but a second stream is also
+what keeps a node *awake*, so "cue works when main moves" would have been read as "two
+`pulsesink`s on one node is the bug" when the operative change was suspend behaviour. H1 and
+this may be one mechanism seen from two angles. **Run the suspend arms first.**
+
+**REFUTED by the controlled arms.** Both were run with a 4Hz `pw-dump` sampler recording the
+node's state transitions, so the node state at each gesture is measured, not inferred:
+
+| arm | pause → jog | node state at gesture start | audible? |
+|---|---|---|---|
+| A — node awake | 22:30:12.651 → 22:30:13.005 (0.35s) | `idle` → `running`, **never suspended** | **no** |
+| B — node suspended | 22:30:32.224 → 22:30:53.965 (21.7s) | `suspended` → `running` | **no** |
+
+Arm A never let the node suspend and was silent anyway. Suspend/resume is not the mechanism,
+and the apparent correlation in the timeline above was three points fitted after the fact.
+
+⚠️ **The generalisable error, which is the same one §10.3 made:** a timeline of a handful of
+gestures will always suggest *some* ordering variable, and this bug's base rate was roughly
+1 audible gesture in 7. With n that small, "what was different about the one that worked" has
+many equally good answers and no power to choose between them. Both §10.3 and §10.4 were
+built that way and both died on the first controlled arm. **Do not form another hypothesis
+from a gesture timeline — get an instrument that reads differently in the two states.**
+
+### §10.5 — the device capture: GATED, not pitched; and the RMS blindness that hid it
+
+**The capture settled two questions the pipeline's instruments could not.** One 30s take of
+the device monitor during a continuous jog, read on **both** channel pairs:
+
+| pair | silent windows | rms p50 | `hp200 - rms` p50 |
+|---|---|---|---|
+| 0,1 — main | 230/1198 (19%) | −20.9 dBFS | −7.9 dB |
+| 2,3 — **cue/headphones** | **966/1198 (81%)** | −27.9 dBFS | −7.8 dB |
+
+1. **It is GATED, not PITCHED.** When cue audio is present its spectral balance is
+   *identical* to main's (−7.8 vs −7.9 dB). The pitch theory is now dead on its own merits,
+   measured on the correct pair — not merely retracted for having been measured on the wrong
+   one (§10, the original error). Do not revive it.
+2. **The cue branch is chopped into ~75–80% digital silence for the whole gesture, at every
+   rate.** Not "1s of audio then silence" as §10 recorded — continuous chopping. Per-second
+   cue silence by third of the take: 85% (slow) → 74% (fast) → 78% (slow). ⚠️ The user
+   confirmed afterwards they **could not** reach the audible state during this take, so that
+   85/74/78 spread is variation *within* the fault, **not** a working-vs-broken contrast, and
+   jog rate is not established as a control variable.
+
+**⚠️ The measurement lesson — an RMS over a window averages a duty cycle into a level.**
+A 25% duty cycle is −6.0 dB of mean-square *exactly*. Throughout this investigation the cue
+pads read ~−25 dBFS against main's ~−19, and that 6 dB was explained away as `cue_gain`. It
+was (at least partly) the gating, in plain sight, disguised as attenuation. **Gating and
+attenuation are indistinguishable in a windowed RMS** — the same structural blindness as
+"`rms` is blind to frequency" from §10, now the second time it has cost this investigation a
+cycle. The tell that separates them: during *normal playback* main and cue read equal
+(−19 vs −19), and the gap opens only during a scratch; a real gain difference is present in
+both.
+
+**`instrument_level()` now reports `dBFS/zero%` per channel**, counting bit-exact zero
+samples. Decoded content is essentially never bit-exact zero across a whole window, so a low
+`zero%` at one probe and a high one at the next localises the gating to a single element.
+This is the instrument that should have existed four sessions ago.
+
+**Baseline from a clean (non-reproducing) gesture, 22:43** — worth having, because two things
+in it are easy to mistake for the fault:
+
+```
+cue after valve:            [-11.5/0%z -11.5/0%z]
+cue after volume:           [-19.0/0%z -18.9/0%z]
+cue post-matrix (to sink):  [-inf/100%z -inf/100%z -19.0/0%z -18.9/0%z]
+main vol0 (reference):      [-19.4/0%z -19.2/0%z]
+```
+
+- `-inf/100%z` on channels 0,1 of the post-matrix probe is **correct by design** — the
+  mix-matrix routes the cue into `RL,RR` only. It is not a smoking gun.
+- `zero%` spikes of 30–35% appear at `stop_scratch`/feeder-restart boundaries and are
+  **identical on main and cue**. That is the feeder's designed ramp, not the fault. The fault
+  signature is `zero%` rising on cue while main stays low.
+- In this clean state `cue after volume` sits 7.5 dB below `cue after valve`, which is
+  `master_volume` = 0.425 = −7.4 dB exactly. In the broken sessions that drop was **13.8 dB**.
+
+**The 6.4 dB discrepancy is NOT yet localised — two explanations remain open.** It could be
+the duty cycle (75% silence = −6.0 dB) or a `cue_gain` difference. `gain`, `vol` and
+`master_volume` were logged identical across broken and working sessions, but **`cue_gain`
+was not logged at all**, so the two cannot be separated retroactively. Both gaps are now
+closed: `zero%` distinguishes gating from attenuation directly, and `load()` logs `cue_gain`
+and the resulting `cue_volume`. ⚠️ An earlier draft of this section claimed the 6.4 dB
+localised the fault to `cue_volume`; it does not — that inference compared two different
+sessions with an unlogged variable between them.
+
+**Found on the way — a real bug, unrelated to the gating.** `set_cue_gain()` wrote
+`gain * cue_gain`, dropping `master_volume`, while the build path and `apply_volume()` both
+include it. Adjusting cue gain jumped the headphone branch by `1/master_volume` (2.35x,
++7.4 dB) and left it wrong until an unrelated call recomputed it. Fixed by routing through
+`apply_volume()`. Note `pipeline.rs`'s own comment documents **the same bug, same missing
+factor, already fixed once for the main sinks** — this product is computed in three places
+and two of them have been wrong at different times. Collapsing them is a worthwhile follow-up.
+
+### §10.6 — state, and the next reading
+
+**Status: OPEN.** The gating is confirmed real and confirmed *not* pitch. It is not localised
+to an element. It did not reproduce in the final session of 2026-08-10 ("audible longer"),
+so the reproduction conditions are still not understood — base rate has been roughly 1
+audible gesture in 7, with no controlled variable yet found.
+
+**Refuted this session — do not re-run** (in addition to §3's six):
+
+| # | hypothesis | how it died |
+|---|---|---|
+| §10.1 | caps renegotiation on the cue branch | 2 CAPS events, both at load, correct layouts |
+| §10.3 | cue sink excluded from the scratch alignment widening | fixed and read back on both sinks; 3 silent gestures after |
+| §10.4 | PipeWire node suspend/resume | arm A never suspended and was silent anyway |
+
+**Next reading is mechanical and needs no new hypothesis.** Reproduce the chopping, then:
+
+```bash
+grep "\[level/" /tmp/cuemark-dev.log | tail -20
+```
+
+| `zero%` behaviour | conclusion |
+|---|---|
+| high at `cue after valve` | the tee/valve is feeding silence — the split itself |
+| jumps at `cue after volume` | `cue_volume` is being modulated toward zero during the gesture |
+| jumps at `cue post-matrix` | the mix-matrix is dropping content |
+| ~0% everywhere on ch 2,3 | GStreamer delivers continuously; the loss is below it → the two-`pulsesink`s-on-one-node topology (`audio-dropout-mid-playback.md` H1) |
+
+That last row is a live possibility, not a fallback. **The H1 topology test is now
+unconfounded** — the earlier objection (moving main off the node also removes what keeps the
+node awake) died with §10.4. Single variable: leave cue on the Starlight `RL,RR`, move
+**main** to `Built-in Audio Analog Stereo` or the `PCM2902C`, re-run.
+
+⚠️ **Method note for whoever picks this up.** Three hypotheses died this session and all three
+were formed the same way: reasoning from telemetry that reads identically in the working and
+broken states. Before spending a build on an idea, ask *which instrument would read
+differently if this were true* — and if the answer is "none of the current ones", build the
+instrument first. The `zero%` probe took ten minutes and is worth more than all three
+hypotheses combined.

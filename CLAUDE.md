@@ -260,18 +260,30 @@ handlers, the scrub bus, `jog_nudge`'s vinyl branch, or the feeder's servo. `VIN
 is calibrated (`1.8 / 256`; the Starlight encoder reports plain ±1 deltas, measured live —
 re-confirmed 2026-08-09 at 243 and 247 ticks/revolution).
 
-🔴 **"Slow-jog audio gates out" — OPEN. The cue branch goes to digital zero during a
-scratch.** Measured at the device monitor, **by channel pair**, 2026-08-10: during normal
-playback both outputs run at ~−19 dBFS; ~1s after a scratch gesture begins the main output
-continues at −19 dBFS and the **cue/headphone output (`RL,RR` = channels 2,3) drops to −999
-dBFS — literal zero samples**, for the rest of the gesture. It is not starvation: the cue
-branch's delivery probes read `cuevol=68/s cuesink=68/s` throughout the zeros, so buffers
-arrive at full rate carrying silence. Prime suspect and the fix now in the tree: `caps_48k`
-constrained **rate alone**, so the scratch branch inherited `appsrc`'s unpositioned
-channel-mask while the normal branch negotiated its own — and switching `input_selector`
-renegotiated the cue branch's `mix-matrix`, which is only meaningful against a known channel
-layout. `caps_48k` is now fully specified and `instrument_caps()` logs `[caps/…]` on both
-sides of that element. **Awaiting live confirmation.**
+🔴 **"Slow-jog audio gates out" — OPEN, not localised. The cue branch is chopped into
+~75–80% digital silence during a scratch** while main plays normally. Measured at the device
+monitor **by channel pair** (2026-08-10): a 30s take during a continuous gesture reads
+**966/1198 windows digitally zero (81%) on `RL,RR` = channels 2,3** against 19% on main.
+Confirmed **GATED, not pitched** — when cue audio is present its spectral balance is
+identical to main's (`hp200 − rms` −7.8 vs −7.9 dB). It is not starvation: delivery probes
+read `cuevol=67/s cuesink=67/s` throughout. **It reproduces roughly 6 gestures in 7 and no
+control variable has been found** — jog rate looked like one and is not established.
+
+⚠️ **Four hypotheses have been refuted here; do not re-run them** — caps renegotiation on the
+cue branch, the cue sink being excluded from the scratch alignment widening (fixed anyway,
+correct on its own terms), PipeWire node suspend/resume, and jog rate. All four were formed
+by reasoning from telemetry that reads *identically* in the working and broken states. See
+`docs/design/slow-jog-audio-inaudible.md` §10.6 for the table and the next reading.
+
+⚠️ **`instrument_level()` reports `dBFS/zero%` per channel — read `zero%` first.** A windowed
+RMS averages a duty cycle into a level: 25% duty cycle is −6.0 dB *exactly*, so the cue pads
+reading ~−25 dBFS against main's ~−19 was the gating in plain sight, mistaken for `cue_gain`
+for a full session. **Gating and attenuation are indistinguishable in a windowed RMS.** The
+tell: during normal playback main and cue read equal, and the gap opens only during a
+scratch. Two things in a clean reading look like faults and are not — `-inf/100%z` on
+channels 0,1 of the post-matrix probe is the mix-matrix working as designed, and 30–35%
+`zero%` spikes at gesture boundaries are the feeder's designed ramp (they appear *equally* on
+main and cue; the fault signature is cue rising while main stays low).
 
 ⚠️ **The prior "RESOLVED — it was pitch" verdict was measured correctly and answered the
 wrong question**, and the mistake is the reusable lesson: the analysis ran on channels 0,1
@@ -285,12 +297,19 @@ actually on before analysing any capture, and read both pairs:**
 mechanisms not to re-run: `docs/design/slow-jog-audio-inaudible.md` §10.
 
 ⚠️ **The generalisable part**: every instrument in the audio path is a level, a count, or a
-state — `rms` is blind to frequency, so the feeder's own `rms` read healthy the entire time
-and *could not have shown this*. **An instrument that cannot vary with the fault carries no
-information about it; a clean reading from one is no evidence, not weak evidence.** When the
-producing stage reports healthy AND delivery counters advance AND the user still reports the
-fault, stop reading telemetry and **capture the signal** — see the `audio-debugging` skill,
-"Capture the actual output and look at it".
+state — `rms` is blind to frequency *and* blind to duty cycle, so the feeder's own `rms` read
+healthy the entire time and *could not have shown this*. **An instrument that cannot vary
+with the fault carries no information about it; a clean reading from one is no evidence, not
+weak evidence.** When the producing stage reports healthy AND delivery counters advance AND
+the user still reports the fault, stop reading telemetry and **capture the signal** — see the
+`audio-debugging` skill, "Capture the actual output and look at it".
+
+⚠️ **Before spending a build on a hypothesis, ask which instrument would read differently if
+it were true — and if the answer is "none of the current ones", build the instrument first.**
+The `zero%` probe took ten minutes and was worth more than the three hypotheses that died
+around it. A timeline of a handful of gestures will always suggest *some* ordering variable;
+with a ~1-in-7 base rate it has no power to choose between the many equally good answers, and
+two hypotheses were built that way and died on the first controlled arm.
 
 ⚠️ **One bounded exception to "never by rate", added 2026-08-08: `HandTracker` in
 `pipeline.rs`.** A slowly-moving hand does not produce a steady event stream — measured at

@@ -128,6 +128,34 @@ Ordered by (live-cost avoided) ÷ (effort). Not scheduled.
    prints does not. Instruments that cannot see a thing should say so where they are read,
    not where they are defined.
 
+## Added 2026-08-10 (late) — three more, two of them written during the investigation
+
+| # | instrument | how it failed silently |
+|---|---|---|
+| **D1** | the widened-alignment log line | printed the **length of the slice passed in** — a count of intended writes — not what the property read back as. It reported `on 2 sink(s) incl. cue` for a build whose cue-sink behaviour was never established either way, and that reading was used to advance the investigation. Now reads each property back and prints `name=2000ms/3600000ms` or `name=SKIPPED(no property)`. |
+| **D2** | `scratch_widens_sink_alignment_then_restores` | read `main_sinks_of()` alone, so it **passed green for the entire life of the bug it was written to guard** — the widening covered only main sinks and the cue sink kept stock 40ms/1s. A guard that watches a subset of the sinks the feeder feeds is not a guard. Now chains `cue_sink_of()` and asserts ≥2 sinks. |
+| **D3** | `instrument_level()`'s per-channel RMS | a windowed RMS **averages a duty cycle into a level**: 25% duty cycle is −6.0 dB exactly. The cue pads read ~−25 dBFS against main's ~−19 and the gap was attributed to `cue_gain` for a full session; the device capture later measured the same branch at 81% digitally-zero windows. Now reports `dBFS/zero%` per channel. |
+
+⚠️ **D1 and D2 were both authored during the very investigation they then misled.** That is
+the same shape as §5 of `slow-jog-audio-inaudible.md`, where the capture tool built to end a
+chain of wrong answers produced one of its own on first use. **A new instrument is at its
+least trustworthy the moment you most want to believe it.** Check a fresh instrument against
+a state whose answer you already know before you let it adjudicate anything.
+
+⚠️ **D3 generalises past this bug.** Any windowed mean — RMS, an average rate, a p50 —
+destroys the distinction between "smaller" and "intermittent". `rms` was already documented
+as blind to *frequency*; it is equally blind to *duty cycle*, and both blindnesses cost this
+investigation a cycle each. When a level reads low, ask whether it is quieter or chopped,
+and prefer a counter that cannot conflate them.
+
+Also fixed 2026-08-10, found while reading for D3 and unrelated to the gating:
+`set_cue_gain()` computed `gain * cue_gain`, dropping `master_volume`, while the build path
+and `apply_volume()` both include it — adjusting cue gain jumped the headphone branch
+`1/master_volume` (2.35x) and left it wrong until an unrelated call recomputed it. ⚠️ **This
+product is computed in three places and two have now been wrong at different times** — see
+`pipeline.rs`'s own comment recording the identical bug already fixed once for the main
+sinks. Collapsing the three to one is a real follow-up.
+
 ## Standing rule
 
 **An instrument is not evidence until you have seen what it was attached to.** Six

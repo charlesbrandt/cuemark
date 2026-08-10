@@ -673,14 +673,72 @@ const SINK_ALIGN_DEFAULTS_NS: (u64, u64) = (40_000_000, 1_000_000_000);
 /// `GstAudioBaseSink` — it has neither property, and `set_property` on a property a
 /// GObject does not have **panics** rather than erroring. That fallback path would
 /// otherwise turn a missing-plugin install into a crash on the first jog gesture.
-fn set_sink_alignment(sinks: &[gst::Element], align_ns: u64, discont_wait_ns: u64) {
-    for snk in sinks {
-        if snk.find_property("alignment-threshold").is_none() {
-            continue;
-        }
-        snk.set_property("alignment-threshold", align_ns);
-        snk.set_property("discont-wait", discont_wait_ns);
-    }
+/// Returns a per-sink report of what the property **reads back as**, not what was written.
+///
+/// ⚠️ The read-back is the point. The first version of this logged the length of the slice
+/// it was handed, which is a count of intended writes — it reported "on 2 sink(s) incl. cue"
+/// for a build whose cue-sink behaviour was never established either way, and that is the
+/// silent-success pattern docs/design/silent-failure-inventory.md exists to catalogue. A
+/// sink that lacks the property is skipped here and must be *visible* as skipped.
+fn set_sink_alignment(
+    sinks: &[gst::Element],
+    align_ns: u64,
+    discont_wait_ns: u64,
+) -> Vec<(String, Option<(u64, u64)>)> {
+    sinks
+        .iter()
+        .map(|snk| {
+            let name = snk.name().to_string();
+            if snk.find_property("alignment-threshold").is_none() {
+                return (name, None);
+            }
+            snk.set_property("alignment-threshold", align_ns);
+            snk.set_property("discont-wait", discont_wait_ns);
+            let got: (u64, u64) = (
+                snk.property("alignment-threshold"),
+                snk.property("discont-wait"),
+            );
+            (name, Some(got))
+        })
+        .collect()
+}
+
+/// Render `set_sink_alignment()`'s report for the log: `name=align/discont` in ms, or
+/// `name=SKIPPED(no property)`, so a sink that silently did not take the setting is
+/// impossible to read as a sink that did.
+fn format_alignment_report(report: &[(String, Option<(u64, u64)>)]) -> String {
+    report
+        .iter()
+        .map(|(name, got)| match got {
+            Some((a, d)) => format!("{name}={}ms/{}ms", a / 1_000_000, d / 1_000_000),
+            None => format!("{name}=SKIPPED(no property)"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Every sink the scratch feeder's buffers actually reach — the main sinks **and the cue
+/// sink**.
+///
+/// ⚠️ **The cue sink is not optional here, and omitting it was a real bug** (found
+/// 2026-08-10, see docs/design/slow-jog-audio-inaudible.md). The feeder pushes into the
+/// tee *upstream* of the cue branch, so a scratch gesture's just-in-time timestamps reach
+/// the cue sink exactly as they reach the main ones — and `GstAudioBaseSink`'s give-up
+/// behaviour is per-sink. Widening only the main sinks left the cue sink on stock
+/// 40ms/1s, so it reproduced F10 verbatim on the headphone output while main played
+/// correctly: ~1s of correct audio into a gesture (`discont-wait` = 1s exactly), then the
+/// ringbuffer resync writes every subsequent buffer into already-played segments and the
+/// headphones go to digital zero for the rest of the gesture.
+///
+/// This is invisible to every pad probe in this file — including `instrument_level()`,
+/// which reads *real audio* at `ch_caps.src` throughout the silence — because the fault is
+/// inside the sink's ringbuffer, downstream of the last pad. Delivery counters keep
+/// advancing at full rate for the same reason. Confirm this one at the device monitor
+/// (`scripts/scratch-capture.sh`), never from the pipeline's own instruments.
+fn scratch_fed_sinks(inner: &PipelineInner) -> Vec<gst::Element> {
+    let mut sinks = inner.main_sink_els.clone();
+    sinks.push(inner.cue_sink_el.clone());
+    sinks
 }
 
 fn make_el(factory: &str) -> Result<gst::Element, String> {
@@ -768,7 +826,25 @@ fn instrument_caps(element: &gst::Element, pad_name: &str, label: &str, deck_id:
     });
 }
 
-/// Per-channel RMS of the samples actually crossing `pad_name`, logged once a second.
+/// Per-channel RMS **and zero-duty-cycle** of the samples actually crossing `pad_name`,
+/// logged once a second.
+///
+/// ⚠️ **Read `zero%` before `dBFS`. The RMS alone cannot distinguish gating from
+/// attenuation** and it misled this investigation for a full session. A 25% duty cycle is
+/// −6.0 dB of mean-square exactly, so a branch chopped into 75% digital silence reads as a
+/// branch turned down 6 dB — which is what the cue pads showed all along (~−25 dBFS against
+/// main's ~−19), and it was explained away as `cue_gain`. The device capture later measured
+/// the cue pair at **81% digitally-zero windows** during a gesture while the same pads read
+/// a healthy-looking level (`slow-jog-audio-inaudible.md` §10.5).
+///
+/// The tell that separates them: during *normal playback* main and cue read equal (−19 vs
+/// −19), and the ~6 dB gap opens only during a scratch. A gain difference would be present
+/// in both.
+///
+/// `zero%` counts samples that are exactly `0.0`, per channel, which is unambiguous — decoded
+/// content is essentially never bit-exact zero for a whole window, so a high `zero%` on one
+/// probe and a low one on the probe above it localises where the silence enters to a single
+/// element.
 ///
 /// **The cue branch has never had an instrument that looks at buffer *content*.** Its
 /// delivery probes count buffers, `instrument_caps` reports negotiation, and the feeder's
@@ -788,8 +864,13 @@ fn instrument_level(element: &gst::Element, pad_name: &str, label: &str, deck_id
     let Some(pad) = element.static_pad(pad_name) else { return };
     let label = label.to_string();
     let deck_id = deck_id.to_string();
-    // (per-channel sum of squares, frames, window start)
-    let state = Arc::new(Mutex::new((Vec::<f64>::new(), 0u64, Instant::now())));
+    // (per-channel sum of squares, per-channel exact-zero sample count, frames, window start)
+    let state = Arc::new(Mutex::new((
+        Vec::<f64>::new(),
+        Vec::<u64>::new(),
+        0u64,
+        Instant::now(),
+    )));
     pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
         let Some(buf) = info.buffer() else { return gst::PadProbeReturn::Ok };
         let channels = pad
@@ -802,32 +883,45 @@ fn instrument_level(element: &gst::Element, pad_name: &str, label: &str, deck_id
         let mut st = state.lock().unwrap();
         if st.0.len() != channels {
             st.0 = vec![0.0; channels];
+            st.1 = vec![0u64; channels];
         }
         let n = data.len() / 4;
         for i in 0..n {
             let v = f32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]])
                 as f64;
-            st.0[i % channels] += v * v;
+            let ch = i % channels;
+            st.0[ch] += v * v;
+            if v == 0.0 {
+                st.1[ch] += 1;
+            }
         }
-        st.1 += (n / channels) as u64;
-        if st.2.elapsed() >= Duration::from_secs(1) {
-            let frames = st.1.max(1) as f64;
+        st.2 += (n / channels) as u64;
+        if st.3.elapsed() >= Duration::from_secs(1) {
+            let frames = st.2.max(1) as f64;
             let per_ch: Vec<String> = st
                 .0
                 .iter()
-                .map(|s| {
+                .zip(st.1.iter())
+                .map(|(s, zeros)| {
                     let rms = (s / frames).sqrt();
-                    if rms > 0.0 { format!("{:.1}", 20.0 * rms.log10()) } else { "-inf".to_string() }
+                    let db = if rms > 0.0 {
+                        format!("{:.1}", 20.0 * rms.log10())
+                    } else {
+                        "-inf".to_string()
+                    };
+                    // zero% is the load-bearing half of this pair — see the doc comment.
+                    format!("{db}/{:.0}%z", 100.0 * (*zeros as f64) / frames)
                 })
                 .collect();
             log::info!(
-                "[level/{deck_id}] {label}: [{}] dBFS/ch frames={}",
+                "[level/{deck_id}] {label}: [{}] dBFS/zero% per ch  frames={}",
                 per_ch.join(" "),
-                st.1
+                st.2
             );
             st.0 = vec![0.0; channels];
-            st.1 = 0;
-            st.2 = Instant::now();
+            st.1 = vec![0u64; channels];
+            st.2 = 0;
+            st.3 = Instant::now();
         }
         gst::PadProbeReturn::Ok
     });
@@ -1544,10 +1638,16 @@ impl DeckAudioPipeline {
                 .and_then(glib::EnumClass::with_type)?;
             enum_class.to_value(result_int)
         });
+        // cue_gain and the resulting cue volume are logged beside the main ones because
+        // their absence blocked a diagnosis on 2026-08-10: the cue branch measured ~6.4 dB
+        // below where `master_volume` alone put it, and nothing in the log could say whether
+        // that was a cue_gain setting or a duty cycle. Two candidate explanations, no way to
+        // separate them after the fact. Log the input, not just the outcome.
         log::info!(
-            "[audio/{}] load(): applying gain={:.3} vol={:.3} master_volume={:.3} -> volume={:.3} to {} main sink(s)",
+            "[audio/{}] load(): applying gain={:.3} vol={:.3} master_volume={:.3} -> volume={:.3} to {} main sink(s); cue_gain={:.3} -> cue_volume={:.3}",
             self.deck_id, self.gain, self.vol, self.master_volume,
-            self.gain * self.vol * self.master_volume, volume_els.len()
+            self.gain * self.vol * self.master_volume, volume_els.len(),
+            self.cue_gain, self.gain * self.cue_gain * self.master_volume
         );
         for vol in &volume_els {
             // Bug fix: this omitted master_volume (unlike apply_volume(), the canonical
@@ -2044,11 +2144,16 @@ impl DeckAudioPipeline {
     }
 
     /// Independent gain for the cue/headphone output (0–4).
+    ///
+    /// ⚠️ **Goes through `apply_volume()` rather than writing `cue_volume` directly.** Until
+    /// 2026-08-10 it set `gain * cue_gain` here, dropping `master_volume` — the same product
+    /// that `apply_volume()` and the build path both compute *with* it. Adjusting cue gain
+    /// therefore jumped the headphone branch by `1/master_volume` (2.35x, +7.4 dB at the
+    /// usual 0.425) and left it wrong until any later `set_gain`/`set_volume`/
+    /// `set_master_volume_factor` happened to recompute it. One expression, one place.
     pub fn set_cue_gain(&mut self, gain: f32) -> Result<(), String> {
         self.cue_gain = gain.clamp(0.0, 4.0);
-        if let Some(inner) = &self.inner {
-            inner.cue_volume_el.set_property("volume", (self.gain * self.cue_gain) as f64);
-        }
+        self.apply_volume();
         Ok(())
     }
 
@@ -2238,14 +2343,14 @@ impl DeckAudioPipeline {
         // thread from the first buffer, and the failure it prevents begins accumulating
         // immediately (the gesture that first exposed it opened 93ms late).
         let (align_ns, discont_wait_ns) = scratch_sink_alignment();
-        set_sink_alignment(&inner.main_sink_els, align_ns, discont_wait_ns);
+        let scratch_sinks = scratch_fed_sinks(inner);
+        let report = set_sink_alignment(&scratch_sinks, align_ns, discont_wait_ns);
         log::info!(
-            "[audio/{}] scratch: sink alignment-threshold={}ms discont-wait={}ms (defaults {}ms/{}ms)",
+            "[audio/{}] scratch: sink alignment widened (defaults {}ms/{}ms) — read back: {}",
             self.deck_id,
-            align_ns / 1_000_000,
-            discont_wait_ns / 1_000_000,
             SINK_ALIGN_DEFAULTS_NS.0 / 1_000_000,
             SINK_ALIGN_DEFAULTS_NS.1 / 1_000_000,
+            format_alignment_report(&report),
         );
 
         inner
@@ -2302,7 +2407,7 @@ impl DeckAudioPipeline {
         // only the resync seek, and leaving the sinks widened because a buffer was absent
         // would be a silent, sticky change to normal playback.
         set_sink_alignment(
-            &inner.main_sink_els,
+            &scratch_fed_sinks(inner),
             SINK_ALIGN_DEFAULTS_NS.0,
             SINK_ALIGN_DEFAULTS_NS.1,
         );
@@ -3940,11 +4045,24 @@ mod scratch_smoke_test {
         std::thread::sleep(Duration::from_millis(300));
         pipeline.pause().expect("pause");
 
+        // ⚠️ The cue sink is asserted on deliberately and must not be dropped from this
+        // list. Until 2026-08-10 this test read main_sinks_of() alone and passed green for
+        // the entire life of the bug it was written to guard: the widening covered only
+        // main sinks, so the cue sink kept stock 40ms/1s and silenced the headphone output
+        // ~1s into every gesture. A guard that watches a subset of the sinks the feeder
+        // feeds is not a guard. See scratch_fed_sinks().
         let sinks: Vec<gst::Element> = main_sinks_of(&pipeline)
             .into_iter()
+            .chain(cue_sink_of(&pipeline))
             .filter(|s| s.find_property("alignment-threshold").is_some())
             .collect();
-        assert!(!sinks.is_empty(), "no GstAudioBaseSink to assert on");
+        assert!(
+            sinks.len() >= 2,
+            "expected at least one main sink plus the cue sink to assert on, got {} — \
+             if the cue sink stopped being a GstAudioBaseSink this test is no longer \
+             guarding the cue branch",
+            sinks.len()
+        );
 
         let read = |s: &gst::Element| -> (u64, u64) {
             (s.property("alignment-threshold"), s.property("discont-wait"))
