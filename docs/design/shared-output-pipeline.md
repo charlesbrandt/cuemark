@@ -288,10 +288,47 @@ Each stage is separately live-testable, and audio always needs a live pass.
    minutes with `lag=0 drop=0` on both handoffs. (The capture-and-tabulate route via
    `scratch-envelope.py --by-gesture` was not needed: against a 1-in-50 baseline the direct
    observation is conclusive on its own — the same reasoning §10.8 used.)
-4. **Multi-deck, multi-node — NOT DONE.** Gate: two decks on the Starlight during a scratch
-   (the case that motivated C over B in the first place); device change on one deck while the
-   other plays; a second output node in use at the same time.
-5. **Flip the default**, keep the flag as an escape hatch for one release. Blocked on 4.
+4. ✅ **Multi-deck, multi-node — DONE 2026-08-11, live-confirmed, one real bug found and
+   fixed.** All three gates run against real hardware (two decks, Starlight Front + USB
+   CODEC as a second node simultaneously) via a WebDriver-driven instance on the real
+   display (see `verify-ui` skill, "Real-hardware audio E2E" — this is the pattern to
+   reuse for future live-audio testing):
+   - **Two decks on the Starlight during a scratch**: `scratch-envelope.py` on a 14s
+     capture spanning a simulated slow-jog scratch on deck-0 while deck-1 played
+     normally — **CLEAN**, 1/558 silent windows (0%), `deliver-tel` `lag=0 drop=0` on
+     deck-1 throughout. The case that motivated rung C over B holds.
+   - **Device change on one deck while another plays**: clean in isolation (121ms/41ms
+     detach windows, zero drops, only the rebuilding deck's own single-window blip) —
+     but chained device changes surfaced a real bug, below.
+   - **A second output node in use at the same time**: both `analog-surround-40`
+     (Starlight, 4ch) and `analog-stereo` (USB CODEC, 2ch) ran concurrently, each deck
+     carrying a second `main1` branch to the new node alongside its `main0` on
+     Starlight — confirmed via real `pw-record` captures on both nodes (not just log
+     telemetry), all channels healthy.
+
+   🔴 **Real bug found and fixed 2026-08-11: a deck could go silently, permanently
+   silent after a device-list rebuild.** `set_devices()`/`set_cue_device()` decided
+   whether to resume playback (`was_playing`) by reading
+   `pipeline.current_state() == Playing` — a non-blocking snapshot of GStreamer's own
+   state machine. On this appsink-terminated shared-output path, that snapshot can
+   still read the pre-rebuild state for a while after a prior `set_state(Playing)`
+   returns ASYNC. Live: `audio_set_main_devices` rebuilds every loaded deck in a
+   sequential loop, and a second device-list change arriving soon after the first
+   (exactly what happened testing this stage) hit that window — `was_playing` read
+   `false` for a deck that was audibly playing seconds earlier, `play()` was never
+   called, and the deck's position clock froze with `deck.playing` still reading
+   `true` in the frontend and **no error anywhere**. A plain `audio_play()` call fixed
+   it instantly once found, which is what pointed at a stuck-state bug rather than a
+   real audio-path failure.
+
+   **Fix**: both functions now read `self.playing` (`is_playing()`) instead — the
+   pipeline's own intended-state flag, set only by `play()`/`pause()`, already
+   documented as surviving device rebuilds for exactly this reason. Regression test
+   `set_devices_back_to_back_preserves_playing` (`pipeline.rs`, `#[ignore]`d, real
+   hardware) fires two rebuilds back-to-back with no settle time — confirmed it fails
+   on the old code (`current_state()` reads `Paused`) and passes on the fix.
+5. **Flip the default.** Unblocked — stage 4 is done. Not yet flipped; do it in its own
+   change with its own soak, not bundled into the bugfix above.
 
 Keep the old topology reachable for the whole of this. Every measurement in this
 investigation that mattered had a control arm, and the flag is what makes the control arm

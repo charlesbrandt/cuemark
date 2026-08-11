@@ -2462,11 +2462,19 @@ impl DeckAudioPipeline {
         // lives in — see seek()'s doc comment). Restore via seek_output_domain, not
         // seek(), which would treat it as content time and wrongly divide by rate again.
         let position = self.position().unwrap_or(0.0);
-        let was_playing = self
-            .inner
-            .as_ref()
-            .map(|i| i.pipeline.current_state() == gst::State::Playing)
-            .unwrap_or(false);
+        // `self.playing` (via is_playing()), not `pipeline.current_state()`. The latter
+        // is a non-blocking snapshot of GStreamer's *own* state machine, which can still
+        // read the pre-rebuild state (Paused) for a while after a live/appsink-terminated
+        // pipeline's `set_state(Playing)` returns ASYNC — confirmed live 2026-08-11: a
+        // second set_devices() arriving soon after the first (exactly what a multi-device
+        // or multi-deck rebuild does) read current_state()==Paused for a deck that was
+        // audibly playing seconds before, so `was_playing` came back false, `self.play()`
+        // was never called, and the deck was left silently stuck in Paused — `deck.playing`
+        // in the frontend still said true, no error anywhere. `self.playing` is the app's
+        // own intended-state flag (set only by play()/pause()), immune to this race by
+        // construction — that's the exact property its doc comment already promises
+        // ("survives device rebuilds").
+        let was_playing = self.is_playing();
 
         self.load(&file_path)?;
 
@@ -2489,13 +2497,10 @@ impl DeckAudioPipeline {
             None => return Ok(()),
         };
 
-        // See set_devices()'s comment: position() is already in the seek/output domain.
+        // See set_devices()'s comment: position() is already in the seek/output domain,
+        // and was_playing must come from self.playing, not current_state() — same race.
         let position = self.position().unwrap_or(0.0);
-        let was_playing = self
-            .inner
-            .as_ref()
-            .map(|i| i.pipeline.current_state() == gst::State::Playing)
-            .unwrap_or(false);
+        let was_playing = self.is_playing();
 
         self.load(&file_path)?;
 
@@ -4873,6 +4878,80 @@ mod scratch_smoke_test {
             real[0]
         );
         println!("sink_flow_gap_gating OK — false positives gone, real stall still reported with an onset");
+    }
+
+    /// **Stage-4 shared-output finding, live 2026-08-11**
+    /// (docs/design/shared-output-pipeline.md).
+    ///
+    /// `set_devices()` used to decide whether to resume playback after a rebuild by
+    /// reading `pipeline.current_state() == Playing` — a non-blocking snapshot of
+    /// GStreamer's own state machine. On the shared-output (appsink-terminated) path
+    /// that snapshot can still read the pre-rebuild state for a while after a prior
+    /// `set_state(Playing)` returns ASYNC. Live: `audio_set_main_devices` rebuilds every
+    /// loaded deck in a loop, and a second device-list change arriving soon after the
+    /// first hits exactly this window — `was_playing` read false for a deck that was
+    /// audibly playing seconds earlier, `play()` was never called, and the deck went
+    /// silently, permanently silent (position frozen, `deck.playing` in the frontend
+    /// still `true`, no error anywhere). Fixed by reading `self.playing` (`is_playing()`)
+    /// instead — the app's own intended-state flag, set only by `play()`/`pause()`,
+    /// documented as surviving device rebuilds for exactly this reason.
+    ///
+    /// This fires two rebuilds back-to-back with no settle time in between — the exact
+    /// shape of the live repro — then asserts both the flag *and* GStreamer's actual
+    /// state agree the pipeline is Playing, since the bug was a divergence between the
+    /// two that the flag alone would not have caught before the fix.
+    ///
+    /// Needs a real audio device on the shared-output path, hence `#[ignore]`:
+    ///   cargo test set_devices_back_to_back_preserves_playing -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn set_devices_back_to_back_preserves_playing() {
+        init_test_logger();
+        gst::init().expect("gst init");
+        std::env::set_var("CUEMARK_SHARED_OUTPUT", "1");
+        let path = soak_env("CUEMARK_TEST_AUDIO", SOAK_A);
+        assert!(std::path::Path::new(&path).exists(), "missing test media {path} — see SOAK_A's doc comment");
+        let device = soak_env(
+            "CUEMARK_TEST_DEVICE",
+            "alsa_output.usb-Guillemot_Corporation_DJControl_Starlight-00.analog-surround-40@FL,FR!FL,FR,RL,RR",
+        );
+
+        let graph = Arc::new(Mutex::new(OutputGraph::new()));
+        let mut deck = DeckAudioPipeline::new("devswitch-test");
+        deck.set_output_graph(graph);
+        deck.load(&path).expect("load");
+        deck.set_devices(&[device.clone()]).expect("initial set_devices");
+        deck.play().expect("play");
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(deck.is_playing(), "should be playing after initial play()");
+
+        // Two rebuilds, no settle time — what audio_set_main_devices's per-deck loop
+        // does across decks, and what a fast second device change does to one deck.
+        deck.set_devices(&[device.clone()]).expect("set_devices 1");
+        deck.set_devices(&[device.clone()]).expect("set_devices 2");
+
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            deck.is_playing(),
+            "is_playing() must still read true after back-to-back rebuilds"
+        );
+
+        let inner = deck.inner.as_ref().expect("pipeline should still be loaded");
+        let (_, current, _) = inner.pipeline.state(gst::ClockTime::from_mseconds(2000));
+        assert_eq!(
+            current,
+            gst::State::Playing,
+            "pipeline must have actually reached Playing, not just be flagged as playing \
+             — this is the exact silent-stuck-paused bug from 2026-08-11"
+        );
+
+        let pos1 = deck.position().expect("position");
+        std::thread::sleep(Duration::from_millis(300));
+        let pos2 = deck.position().expect("position 2");
+        assert!(pos2 > pos1, "position must be advancing, not frozen: {pos1} -> {pos2}");
+
+        deck.pause().expect("final pause");
+        println!("set_devices_back_to_back_preserves_playing OK");
     }
 
     /// **Cue-branch sibling of `sink_flow_gap_gating`** (2026-08-08,
