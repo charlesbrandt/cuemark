@@ -266,9 +266,11 @@ pitched**, and not starvation (delivery probes read `cuevol=67/s cuesink=67/s` t
 Cause: **two `pulsesink`s on one PipeWire node.** Fix: **one `pulsesink` per device node**,
 fed by an `audiomixer` summing one live `appsrc` per deck branch, with deck pipelines
 terminating in `appsink`s (`audio/mixer.rs`'s `OutputGraph`, rung C of the fix ladder).
-Enabled by `CUEMARK_SHARED_OUTPUT=1`; **still defaults off** pending the multi-deck /
-multi-node pass. **Read `docs/design/shared-output-pipeline.md` before touching any of it**,
-and `slow-jog-audio-inaudible.md` §10.14 for the closing account.
+**Default since 2026-08-11**, after the multi-deck/multi-node pass and a 600s soak (13
+back-to-back device rebuilds, zero stuck-after-rebuild, zero handoff drops) both passed on
+real hardware; set `CUEMARK_SHARED_OUTPUT=0` to fall back to the legacy per-branch sinks.
+**Read `docs/design/shared-output-pipeline.md` before touching any of it**, and
+`slow-jog-audio-inaudible.md` §10.14 for the closing account.
 
 ⚠️ **The mechanism was never named, and the fix does not name it.** §10.11 established that
 two sinks *and* the Starlight are each necessary and neither sufficient; §10.12 that the two

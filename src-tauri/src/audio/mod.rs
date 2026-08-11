@@ -28,9 +28,9 @@ pub struct AudioManager {
     /// gain×vol. Stored here so new pipelines pick it up at load time.
     master_volume: f32,
     /// One `pulsesink` per device node, shared by every deck — the fix for
-    /// `slow-jog-audio-inaudible.md`'s cue gating. Active only under
-    /// `CUEMARK_SHARED_OUTPUT=1`; on the legacy path it is constructed and never used, and
-    /// building no output pipelines costs nothing. See
+    /// `slow-jog-audio-inaudible.md`'s cue gating. Active by default since 2026-08-11
+    /// (`CUEMARK_SHARED_OUTPUT=0` reverts to the legacy path, where this is constructed
+    /// and never used — building no output pipelines costs nothing). See
     /// `docs/design/shared-output-pipeline.md`.
     ///
     /// An `Arc` because `with_pipeline_detached()` removes a deck from `pipelines` for the

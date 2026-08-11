@@ -639,16 +639,15 @@ pub(super) fn deck_output_caps() -> gst::Caps {
 /// Is the shared output graph in use? See `docs/design/shared-output-pipeline.md`.
 ///
 /// One `pulsesink` per device node instead of one per deck branch. This is the fix for
-/// `slow-jog-audio-inaudible.md`'s cue gating (two sinks on the Starlight node), and it
-/// changes the clock architecture, so it stays behind a flag until it has been through the
-/// staged live tests in the design doc.
-///
-/// ⚠️ Keep the legacy path reachable for the whole of that. Every measurement in this
-/// investigation that meant anything had a control arm, and the flag is what makes the
-/// control arm free — the alternative is an HMR-remount-per-switch A/B, which this project
-/// has already learned is expensive and error-prone (see CLAUDE.md, "Dev server lifecycle").
+/// `slow-jog-audio-inaudible.md`'s cue gating (two sinks on the Starlight node).
+/// **Default `1` since 2026-08-11** — all five staging gates passed on real hardware,
+/// including a 600s soak (`shared_output_soak`, `pipeline.rs` tests) covering 13
+/// back-to-back device rebuilds with zero stuck-after-rebuild, zero handoff drops, zero
+/// sink-flow gaps. Set `CUEMARK_SHARED_OUTPUT=0` to fall back to the legacy per-branch
+/// sinks — kept reachable deliberately, since every measurement in the investigation that
+/// meant anything had a control arm, and the flag is what keeps that arm free.
 pub(super) fn shared_output_enabled() -> bool {
-    std::env::var("CUEMARK_SHARED_OUTPUT").map(|v| v == "1").unwrap_or(false)
+    std::env::var("CUEMARK_SHARED_OUTPUT").map(|v| v != "0").unwrap_or(true)
 }
 
 fn sink_buffer_times() -> (i64, i64) {
@@ -5186,5 +5185,196 @@ mod scratch_smoke_test {
         // Deliberately NOT asserted: a clean run is the expected (and so far only)
         // outcome, and a failing assertion here would read as "the harness broke" rather
         // than "the fault reproduced". Record the counts in the design doc instead.
+    }
+
+    /// **Shared-output default-flip soak** (docs/design/shared-output-pipeline.md, stage
+    /// 5). Stage 4 (2026-08-11) proved correctness with short, targeted probes — a 14s
+    /// scratch capture, 121ms/41ms device-change windows — never a continuous run. This
+    /// project has been burned before by treating a short clean run as evidence
+    /// (`audio-dropout-mid-playback.md`'s 80s baseline is explicitly "not evidence of a
+    /// fix"), so this closes the gap the doc's own staging table leaves open: reuses
+    /// `cue_dropout_soak`'s harness (master-volume churn, cue toggling, loop-seek) wired
+    /// to a real `OutputGraph`, plus the one thing stage 4 actually found — a back-to-back
+    /// device rebuild going silently stuck `Paused` — fired repeatedly across the whole
+    /// run instead of once, rotating across every deck in the soak.
+    ///
+    /// Each rebuild burst re-checks the exact stage-4 signature (`is_playing()` true but
+    /// GStreamer's own state not `Playing`, or position frozen). Handoff `drop` counts
+    /// (`[deliver-tel]`'s `<label>.handoff=` lines) and the two "shared output" wiring
+    /// error lines (`no output graph`, `could not attach main output`) are asserted zero
+    /// at the end — this codebase's usual failure mode for this path is silent, per
+    /// `docs/design/silent-failure-inventory.md`.
+    ///
+    /// ```text
+    /// CUEMARK_SOAK_SECS=600 \
+    ///   CUEMARK_MAIN_DEVICE='alsa_output.usb-…analog-surround-40@FL,FR!FL,FR,RL,RR' \
+    ///   CUEMARK_CUE_DEVICE='alsa_output.usb-…analog-surround-40@RL,RR!FL,FR,RL,RR' \
+    ///   CUEMARK_OTHER_DEVICE=alsa_output.pci-0000_00_1b.0.analog-stereo \
+    ///   cargo test shared_output_soak -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn shared_output_soak() {
+        init_test_logger();
+        gst::init().expect("gst init");
+        std::env::set_var("CUEMARK_SHARED_OUTPUT", "1");
+
+        let secs: u64 = soak_env("CUEMARK_SOAK_SECS", "600").parse().expect("CUEMARK_SOAK_SECS");
+        let main_dev = soak_env(
+            "CUEMARK_MAIN_DEVICE",
+            "alsa_output.usb-Guillemot_Corporation_DJControl_Starlight-00.analog-surround-40@FL,FR!FL,FR,RL,RR",
+        );
+        let cue_dev = soak_env(
+            "CUEMARK_CUE_DEVICE",
+            "alsa_output.usb-Guillemot_Corporation_DJControl_Starlight-00.analog-surround-40@RL,RR!FL,FR,RL,RR",
+        );
+        // Optional second output node exercised concurrently with the Starlight, matching
+        // stage 4's "two nodes at once" gate. Empty = single-node soak.
+        let other_dev = soak_env("CUEMARK_OTHER_DEVICE", "");
+        let n_decks: usize = soak_env("CUEMARK_SOAK_DECKS", "2").parse().expect("CUEMARK_SOAK_DECKS");
+        let rebuild_every: u64 =
+            soak_env("CUEMARK_SOAK_REBUILD_EVERY", "45").parse().expect("CUEMARK_SOAK_REBUILD_EVERY");
+
+        println!(
+            "=== shared_output_soak secs={secs} decks={n_decks} main={main_dev:?} \
+             cue={cue_dev:?} other={other_dev:?} rebuild_every={rebuild_every}s"
+        );
+
+        let graph = Arc::new(Mutex::new(OutputGraph::new()));
+        let mut decks: Vec<DeckAudioPipeline> = Vec::new();
+        for (i, path) in [SOAK_A, SOAK_B].iter().take(n_decks).enumerate() {
+            assert!(std::path::Path::new(path).exists(), "missing test media {path}");
+            let mut d = DeckAudioPipeline::new(&format!("shared-soak-{i}"));
+            d.set_output_graph(graph.clone());
+            let mut devices = vec![main_dev.clone()];
+            if !other_dev.is_empty() {
+                devices.push(other_dev.clone());
+            }
+            d.devices = devices;
+            d.cue_device = cue_dev.clone();
+            d.set_gain(0.02).expect("set_gain");
+            d.set_cue_gain(0.02).expect("set_cue_gain");
+            d.load(path).expect("load");
+            decks.push(d);
+        }
+        clear_captured();
+        for d in &mut decks {
+            d.play().expect("play");
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        for d in &decks {
+            assert!(d.is_playing(), "deck should be playing after initial play()");
+        }
+
+        let start = Instant::now();
+        let mut tick = 0u64;
+        let mut cue_on = false;
+        let mut last_report = Instant::now();
+        let mut last_rebuild = Instant::now();
+        let mut rebuild_deck = 0usize;
+        let mut rebuild_count = 0u64;
+        let mut stuck_after_rebuild = 0u64;
+
+        while start.elapsed() < Duration::from_secs(secs) {
+            // Same H3 master-volume churn as cue_dropout_soak, present as a constant.
+            let f = if tick % 4 == 0 { 0.0 } else { 0.5 + 0.5 * ((tick % 8) as f32 / 8.0) };
+            for d in &mut decks {
+                d.set_master_volume_factor(f);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            tick += 1;
+
+            if tick % 30 == 0 {
+                cue_on = !cue_on;
+                for d in &mut decks {
+                    d.set_cue_enabled(cue_on).expect("set_cue_enabled");
+                }
+            }
+
+            for d in &mut decks {
+                if d.position().unwrap_or(0.0) > 300.0 {
+                    let _ = d.seek(2.0);
+                }
+            }
+
+            // Stage-4's actual repro: two device rebuilds, no settle time, aimed at one
+            // deck at a time — rotating so every deck in the soak gets hit eventually,
+            // not just deck 0.
+            if last_rebuild.elapsed() >= Duration::from_secs(rebuild_every) {
+                last_rebuild = Instant::now();
+                let idx = rebuild_deck % decks.len();
+                let devices = decks[idx].devices.clone();
+                decks[idx].set_devices(&devices).expect("set_devices 1");
+                decks[idx].set_devices(&devices).expect("set_devices 2");
+                rebuild_count += 1;
+                std::thread::sleep(Duration::from_millis(500));
+
+                let ok_flag = decks[idx].is_playing();
+                let inner = decks[idx].inner.as_ref().expect("pipeline should still be loaded");
+                let (_, gst_state, _) = inner.pipeline.state(gst::ClockTime::from_mseconds(2000));
+                let pos1 = decks[idx].position().unwrap_or(-1.0);
+                std::thread::sleep(Duration::from_millis(300));
+                let pos2 = decks[idx].position().unwrap_or(-1.0);
+                let advancing = pos2 > pos1;
+                if !ok_flag || gst_state != gst::State::Playing || !advancing {
+                    stuck_after_rebuild += 1;
+                    println!(
+                        "[{:>5.0}s] STUCK after rebuild #{rebuild_count} on deck {idx}: \
+                         is_playing={ok_flag} gst_state={gst_state:?} pos {pos1:.2}->{pos2:.2}",
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+                rebuild_deck += 1;
+            }
+
+            if last_report.elapsed() >= Duration::from_secs(30) {
+                last_report = Instant::now();
+                let pos: Vec<String> = decks.iter().map(|d| format!("{:.1}", d.position().unwrap_or(-1.0))).collect();
+                println!(
+                    "[{:>5.0}s] pos=[{}]  gaps={} underruns={} rebuilds={} stuck={}",
+                    start.elapsed().as_secs_f64(),
+                    pos.join(", "),
+                    captured_matching(GAP_WARNING).len(),
+                    captured_matching(UNDERRUN_WARNING).len(),
+                    rebuild_count,
+                    stuck_after_rebuild,
+                );
+            }
+        }
+        for d in &mut decks {
+            let _ = d.pause();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+
+        let gaps = captured_matching(GAP_WARNING);
+        let underruns = captured_matching(UNDERRUN_WARNING);
+        let no_graph_errors = captured_matching("but no output graph was handed to this deck");
+        let attach_errors = captured_matching("could not attach main output to the shared");
+        let handoff_lines: Vec<String> =
+            CAPTURED.lock().unwrap().iter().filter(|l| l.contains(".handoff=")).cloned().collect();
+        let nonzero_drop: Vec<&String> = handoff_lines.iter().filter(|l| !l.contains("drop=0")).collect();
+
+        println!(
+            "\n=== RESULT shared_output_soak ran {}s over {rebuild_count} device rebuilds",
+            start.elapsed().as_secs()
+        );
+        println!("    sink-flow gaps      : {}", gaps.len());
+        println!("    queue underruns     : {}", underruns.len());
+        println!("    stuck-after-rebuild : {stuck_after_rebuild}");
+        println!("    wiring errors       : no_graph={} attach={}", no_graph_errors.len(), attach_errors.len());
+        println!("    handoff drops       : {} of {} lines", nonzero_drop.len(), handoff_lines.len());
+        for l in nonzero_drop.iter().take(10) {
+            println!("      {l}");
+        }
+
+        assert_eq!(
+            stuck_after_rebuild, 0,
+            "a deck went silently stuck after a device rebuild — the 2026-08-11 bug is back"
+        );
+        assert!(no_graph_errors.is_empty(), "a deck built without an output graph under CUEMARK_SHARED_OUTPUT=1 — wiring bug");
+        assert!(attach_errors.is_empty(), "a branch failed to attach to the shared output graph — see the log for which one");
+        assert!(nonzero_drop.is_empty(), "the handoff dropped buffers during the soak — see the lines above");
+
+        println!("shared_output_soak OK");
     }
 }

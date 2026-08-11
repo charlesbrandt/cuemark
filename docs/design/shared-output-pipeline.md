@@ -1,6 +1,10 @@
 # Shared output pipeline — one `pulsesink` per device node
 
-Status: **built and LIVE-CONFIRMED behind `CUEMARK_SHARED_OUTPUT=1`** (2026-08-11) — cue survives a scratch on the shared Starlight node, and position tracks honestly. Stages 1–3 done; **stage 4 (multi-deck / multi-node) is untested** and the flag still defaults off. `slow-jog-audio-inaudible.md` §10.14 is the closing entry. This is rung **C** of the fix ladder in
+Status: ✅ **DEFAULT since 2026-08-11.** Built, live-confirmed on real hardware through all
+five staging gates (cue-survives-scratch, multi-deck/multi-node, and a 600s soak — see
+"Staging" below) — `CUEMARK_SHARED_OUTPUT` now defaults to `1`; set it to `0` to fall back
+to the legacy per-branch-sink topology. `slow-jog-audio-inaudible.md` §10.14 is the closing
+entry for the bug this fixed. This is rung **C** of the fix ladder in
 `slow-jog-audio-inaudible.md` §10.10, chosen deliberately over rungs A/B and over the
 `clock.force-quantum` / `buffer-time` workaround of §10.13.
 
@@ -327,8 +331,24 @@ Each stage is separately live-testable, and audio always needs a live pass.
    `set_devices_back_to_back_preserves_playing` (`pipeline.rs`, `#[ignore]`d, real
    hardware) fires two rebuilds back-to-back with no settle time — confirmed it fails
    on the old code (`current_state()` reads `Paused`) and passes on the fix.
-5. **Flip the default.** Unblocked — stage 4 is done. Not yet flipped; do it in its own
-   change with its own soak, not bundled into the bugfix above.
+5. ✅ **Flip the default — DONE 2026-08-11.** Stage 4 was three short targeted gates
+   (14s scratch capture, 121ms/41ms device-change windows), not a duration soak — the
+   distinction this project has been burned by before (`audio-dropout-mid-playback.md`'s
+   80s baseline is explicitly "not evidence of a fix"). Closed the gap with a dedicated
+   `#[ignore]`d test, `shared_output_soak` (`pipeline.rs`), reusing `cue_dropout_soak`'s
+   harness (master-volume churn, cue toggling, loop-seek) wired to a real `OutputGraph`,
+   plus stage 4's actual finding — a back-to-back device rebuild — fired every 45s across
+   the whole run instead of once, rotating across both decks.
+
+   **Result, real Starlight hardware, 2026-08-11: 600s, 2 decks, 13 device rebuilds,
+   0 stuck-after-rebuild, 0 sink-flow gaps, 0 queue underruns, 0 wiring errors, 0 handoff
+   drops across 223 `[deliver-tel]` lines, 0 WARN/ERROR anywhere in the log.**
+   `CUEMARK_SHARED_OUTPUT` now defaults to `1` in `shared_output_enabled()`
+   (`audio/pipeline.rs`); set it to `0` to fall back to the legacy per-branch sinks.
+
+   ```text
+   CUEMARK_SOAK_SECS=600 cargo test shared_output_soak -- --ignored --nocapture
+   ```
 
 Keep the old topology reachable for the whole of this. Every measurement in this
 investigation that mattered had a control arm, and the flag is what makes the control arm
