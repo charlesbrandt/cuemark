@@ -191,6 +191,73 @@ kill $(cat /tmp/tauri-driver.pid) 2>/dev/null; rm -f /tmp/tauri-driver.pid
 kill $(cat /tmp/xvfb.pid) 2>/dev/null; rm -f /tmp/xvfb.pid
 ```
 
+## Real-hardware audio E2E (WebDriver on the real display + pw-record)
+
+For testing that needs **real audio on real hardware** — device routing, multi-deck
+mixing, scratch gestures — not just DOM/screenshot assertions. Proven end-to-end
+2026-08-11 testing `docs/design/shared-output-pipeline.md` stage 4: it found and
+verified the fix for a real bug (a deck silently, permanently stuck `Paused` after a
+device rebuild) that log telemetry alone did not catch. Reuse this pattern rather than
+re-deriving it.
+
+**Difference from the standard flow above**: launch `tauri-driver` with
+`DISPLAY=:0` (the user's real session), not Xvfb `:99`. PipeWire is system-wide, so
+audio reaches real hardware either way — the real display just lets the user watch
+and listen alongside you, and is required if you want them to confirm anything by
+ear. Tell the user before doing this: it replaces whatever `cargo tauri dev` window
+they had open with a driven instance, and every device-list change is audible.
+
+1. Build with **both** `VITE_ENABLE_DEBUG_HOOK=1` (for `window.__cuemarkDebug`, see
+   above) **and** any runtime env the test needs (e.g. `CUEMARK_SHARED_OUTPUT=1`) —
+   the latter must also be exported when launching `tauri-driver`, since it spawns
+   the binary inheriting its own environment, not the build environment's.
+2. **Drive real UI controls, never bypass the Svelte store with a direct
+   `window.__TAURI__.core.invoke(...)` call for anything the store also owns** (device
+   selection, most settings). Confirmed the hard way: calling `audio_set_main_devices`
+   directly left the frontend's persisted `mainOutputDeviceIds` store unchanged: ~18s
+   later something re-ran the UI's own device-sync effect with the stale value and
+   silently reverted the device — a real, audible, unplanned click the user heard and
+   reported mid-session. Click the actual checkbox/button instead:
+   ```js
+   const labels=[...document.querySelectorAll(".device-check")];
+   const l=labels.find(x=>x.textContent.trim()==="DJControl Starlight — Front");
+   l.querySelector("input").click();
+   ```
+   This keeps frontend and backend state in sync by construction and is what a real
+   user's click does, so nothing fights it later.
+3. **Simulate a scratch gesture from inside the page**, not via repeated WebDriver
+   round-trips (too slow/jittery to look like a real gesture) — `execute/async` with a
+   `setTimeout` chain calling `invoke('audio_scratch_to', {deckId, targetSecs, holdMs})`
+   at a steady interval, computing `targetSecs` from a slow rate (0.10–0.3x) to match
+   real slow-jog gestures (`docs/design/waveform-scrub.md`). Extend the session's
+   script timeout first (`POST /session/$SESSION/timeouts {"script": 20000}`) or a
+   multi-second async script gets killed mid-gesture.
+4. **Capture real audio, don't trust delivery telemetry alone.** `deliver-tel`'s
+   `lag=0 drop=0` only proves buffers *left* the deck's appsink — it says nothing
+   about whether the shared sink is actually Playing. Use `scripts/scratch-capture.sh`
+   (built-in pre-flight confirms the recorder attached to the right monitor ports —
+   `pw-record --target` resolves against source names and silently falls back to the
+   default source, i.e. a live mic, on any mismatch) or a one-off:
+   ```sh
+   timeout 5 pw-record -P '{ stream.capture.sink=true }' \
+     --target '<node-name>' --rate 48000 --channels <N> /tmp/check.wav
+   ```
+   then check RMS per channel (near `-240 dBFS` is real digital silence, not "quiet").
+   Analyze a scratch capture with `scripts/scratch-envelope.py` — reads `zero%`, not
+   just dBFS, which is what actually distinguishes gating from attenuation.
+5. **A deck reaching natural EOS mid-test is expected, not a bug** — `playing` flips
+   to `false`, the pipeline pauses, and that deck goes correctly silent. Check
+   `__cuemarkDebug.getSession().decks` for `playing`/`getAudioTime` before treating any
+   silence as a fault; a frozen `getAudioTime` on a deck whose `playing` still reads
+   `true`, though, is the real tell — that's a stuck pipeline, not an ended track (this
+   is exactly the signature the stage-4 bug above left, and how it was caught: a
+   `getAudioTime` value that stopped advancing while `deck.playing` still said `true`,
+   confirmed by a silent real capture, confirmed further by a manual `audio_play()`
+   call unsticking it).
+6. **Tear down and relaunch the user's normal `cargo tauri dev` session afterward** —
+   don't leave them on a debug-hook-enabled driven instance. Same commands as
+   "Tear down" above, then relaunch per the `run-app` skill.
+
 ## Lightweight webview probes without the app (python3-gi)
 
 For "does this machine's WebKitGTK support/do X?" questions — feature detection,
