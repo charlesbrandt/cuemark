@@ -12,7 +12,7 @@ use tauri::{Emitter, Manager, State};
 
 use crate::media_cache::MediaCache;
 use self::devices::AudioDevice;
-use self::mixer::MasterMix;
+use self::mixer::OutputGraph;
 use self::pipeline::DeckAudioPipeline;
 use self::record::{RecordFormat, RecordingSink};
 
@@ -27,7 +27,15 @@ pub struct AudioManager {
     /// Master volume factor (0–1). Applied to all deck pipelines as a multiplier on top of
     /// gain×vol. Stored here so new pipelines pick it up at load time.
     master_volume: f32,
-    mixer: MasterMix,
+    /// One `pulsesink` per device node, shared by every deck — the fix for
+    /// `slow-jog-audio-inaudible.md`'s cue gating. Active only under
+    /// `CUEMARK_SHARED_OUTPUT=1`; on the legacy path it is constructed and never used, and
+    /// building no output pipelines costs nothing. See
+    /// `docs/design/shared-output-pipeline.md`.
+    ///
+    /// An `Arc` because `with_pipeline_detached()` removes a deck from `pipelines` for the
+    /// duration of a blocking call, and that deck still has to reach the graph.
+    output_graph: Arc<Mutex<OutputGraph>>,
     record: RecordingSink,
 }
 
@@ -39,7 +47,7 @@ impl AudioManager {
             main_devices: Vec::new(),
             cue_device: String::new(),
             master_volume: 1.0,
-            mixer: MasterMix::new(),
+            output_graph: Arc::new(Mutex::new(OutputGraph::new())),
             record: RecordingSink::new(),
         }
     }
@@ -191,11 +199,15 @@ pub async fn audio_load(app: tauri::AppHandle, cache: State<'_, Arc<MediaCache>>
             let main_devices = mgr.main_devices.clone();
             let cue_device = mgr.cue_device.clone();
             let master_volume = mgr.master_volume;
+            let output_graph = mgr.output_graph.clone();
             mgr.pipelines.remove(&deck_id).unwrap_or_else(|| {
                 let mut p = DeckAudioPipeline::new(&deck_id);
                 p.devices = main_devices;
                 p.cue_device = cue_device;
                 p.master_volume = master_volume;
+                // Must be set before load() — the graph is consulted while the pipeline is
+                // being built, not after.
+                p.set_output_graph(output_graph);
                 let app_clone = app.clone();
                 let did = deck_id.clone();
                 p.set_eos_callback(move || {
@@ -388,6 +400,12 @@ pub fn audio_set_master_volume(state: State<'_, AudioState>, volume: f32) -> Res
     let mut mgr = state.lock().unwrap();
     let factor = volume.clamp(0.0, 1.0);
     mgr.master_volume = factor;
+    // Applied in both places on purpose. On the shared path the graph's per-node master
+    // stage is the real one; the per-deck factor stays in place so switching
+    // CUEMARK_SHARED_OUTPUT off mid-session does not silently lose master attenuation.
+    // Both are linear gains and the deck-side one is 1.0 unless the user moved it, so
+    // there is no double-attenuation to reason about.
+    mgr.output_graph.lock().unwrap().set_master_volume(factor);
     for pipeline in mgr.pipelines.values_mut() {
         pipeline.set_master_volume_factor(factor);
     }
@@ -430,9 +448,10 @@ pub async fn audio_set_main_devices(app: tauri::AppHandle, device_ids: Vec<Strin
                 return Ok(());
             }
             mgr.main_devices = device_ids.clone();
-            // MasterMix uses the first device as its primary target (or empty = default).
-            let primary = device_ids.first().map(|s| s.as_str()).unwrap_or("");
-            mgr.mixer.set_main_device(primary)?;
+            // Nothing to do here for the shared output graph: it learns about devices from
+            // each deck's rebuild below (`set_devices` → `load()` → `OutputGraph::attach`),
+            // which is also what tears down the branches on the old node. The `MasterMix`
+            // stub that used to be called here never did anything.
             mgr.pipelines.keys().cloned().collect()
             // mutex released here
         };
@@ -463,7 +482,7 @@ pub async fn audio_set_cue_device(app: tauri::AppHandle, device_id: String) -> R
                 return Ok(());
             }
             mgr.cue_device = device_id.clone();
-            mgr.mixer.set_cue_device(&device_id)?;
+            // See audio_set_main_devices: the graph is driven by the per-deck rebuilds below.
             mgr.pipelines.keys().cloned().collect()
             // mutex released here
         };
@@ -485,7 +504,8 @@ pub async fn audio_set_cue_device(app: tauri::AppHandle, device_id: String) -> R
 #[tauri::command]
 pub fn audio_set_cue_gain(state: State<'_, AudioState>, gain: f32) -> Result<(), String> {
     let mut mgr = state.lock().unwrap();
-    mgr.mixer.set_cue_gain(gain)?;
+    // Cue gain is per deck (each deck's cue branch has its own `volume`), so unlike master
+    // volume there is no node-level stage for it in the shared output graph.
     for pipeline in mgr.pipelines.values_mut() {
         if let Err(e) = pipeline.set_cue_gain(gain) {
             log::error!("[audio] set_cue_gain failed for {}: {e}", pipeline.deck_id);

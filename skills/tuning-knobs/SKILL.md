@@ -80,6 +80,33 @@ Full write-up: `docs/design/codec-frame-cache.md` §5a.
 | **🛑 Do not re-tune the servo lag** | Three sessions blamed the servo by mistake. A slow hand produces only **5–12 pointer events/s with gaps to 1180ms**; the coasting already exists for exactly this. Read the delivery legs first. |
 | **Designed silence** | `arrived%` on a decelerating hand and `snaps` on a coarse drag are silence **by design**. A sustained negative delivery margin during a scratch is **the fix working**, not a fault. `output_queue underrun` fires once per chunk by construction (66.8/s against a 66.7/s chunk rate) and adjudicates nothing. |
 
+### 4b. Shared output graph — cue gates during a scratch, or a jog feels laggy
+
+| | |
+|---|---|
+| **Symptom A** | Headphone cue chops to silence during a scratch while main plays normally, on a device where main and cue are two channel pairs of the *same* node (the DJControl Starlight). |
+| **Fix, not a knob** | `CUEMARK_SHARED_OUTPUT=1`. One `pulsesink` per device node instead of one per deck branch. This is the actual fix (`docs/design/shared-output-pipeline.md`), live-confirmed 2026-08-11. Still defaults **off** pending the multi-deck pass. |
+| **Log line** | `[audio/out/<node>] attached deck-0/cue (2 branch(es) now on this node, 4 ch)` — two branches, **one** node, is the whole point. |
+| **Symptom B** | With the shared graph on, a scratch gesture feels laggy while `late%` in the feeder telemetry is unchanged (so it is not the feeder). |
+| **Where** | `MIX_QUEUE_NS = 30ms` in `src-tauri/src/audio/mixer.rs` — the jitter buffer between each handoff and its mixer pad. |
+| **Read it as** | Added latency on the scratch path, on top of the sink's own `buffer-time`. It only has to absorb handoff jitter; the deck's `output_queue` (100ms) is upstream and does the real buffering. |
+| **🛑 Not the knob** | The scratch servo constants (§4). Three sessions have already blamed the servo for something else. |
+| **🛑 Also not the knob** | `sink_buffer_times()` / `CUEMARK_SINK_BUFFER_MS`. Lowering it reaches a smaller PipeWire quantum, which *once* made the gating go away — but it was re-tested and **the gating returns after a short playback duration**. It moves the symptom without fixing it, and it walks into the 2026-08-02 choppiness regression. Dead lever. |
+
+⚠️ **Three properties of the shared graph are load-bearing and silent when broken** — if you
+are changing `mixer.rs` rather than tuning it, run
+`scripts/probes/shared_output_mixer_probe.py` (always with its `--not-live` control arm):
+`is-live=true` on every output `appsrc` (false ⇒ **zero** buffers while any branch is idle,
+i.e. one paused deck silences the node); the deck pipelines' `use_clock()`; and `position()`
+subtracting the graph's latency (**measured 171.3ms** — uncorrected, video leads audio by that
+much, constantly).
+
+⚠️ **Two instruments read differently on this path and neither is a fault.**
+`output_queue underrun` fires continuously during ordinary playback (the appsink renders
+just-in-time, so the queue empties between every buffer) — it is logged at *info* there for
+that reason. And the scratch alignment report says `appsink0=SKIPPED(no property)`, correct
+because `appsink` is not a `GstAudioBaseSink`.
+
 ### 5. Decode-ahead gate — do not tune to fix reverse scrub
 
 | | |

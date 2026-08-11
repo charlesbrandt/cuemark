@@ -260,20 +260,75 @@ handlers, the scrub bus, `jog_nudge`'s vinyl branch, or the feeder's servo. `VIN
 is calibrated (`1.8 / 256`; the Starlight encoder reports plain ±1 deltas, measured live —
 re-confirmed 2026-08-09 at 243 and 247 ticks/revolution).
 
-🔴 **"Slow-jog audio gates out" — OPEN, not localised. The cue branch is chopped into
-~75–80% digital silence during a scratch** while main plays normally. Measured at the device
-monitor **by channel pair** (2026-08-10): a 30s take during a continuous gesture reads
-**966/1198 windows digitally zero (81%) on `RL,RR` = channels 2,3** against 19% on main.
-Confirmed **GATED, not pitched** — when cue audio is present its spectral balance is
-identical to main's (`hp200 − rms` −7.8 vs −7.9 dB). It is not starvation: delivery probes
-read `cuevol=67/s cuesink=67/s` throughout. **It reproduces roughly 6 gestures in 7 and no
-control variable has been found** — jog rate looked like one and is not established.
+🟢 **"Slow-jog audio gates out" — FIXED 2026-08-11, live-confirmed.** The cue branch was
+chopped into ~80% digital silence during a scratch while main played normally — **GATED, not
+pitched**, and not starvation (delivery probes read `cuevol=67/s cuesink=67/s` throughout).
+Cause: **two `pulsesink`s on one PipeWire node.** Fix: **one `pulsesink` per device node**,
+fed by an `audiomixer` summing one live `appsrc` per deck branch, with deck pipelines
+terminating in `appsink`s (`audio/mixer.rs`'s `OutputGraph`, rung C of the fix ladder).
+Enabled by `CUEMARK_SHARED_OUTPUT=1`; **still defaults off** pending the multi-deck /
+multi-node pass. **Read `docs/design/shared-output-pipeline.md` before touching any of it**,
+and `slow-jog-audio-inaudible.md` §10.14 for the closing account.
 
-⚠️ **Four hypotheses have been refuted here; do not re-run them** — caps renegotiation on the
-cue branch, the cue sink being excluded from the scratch alignment widening (fixed anyway,
-correct on its own terms), PipeWire node suspend/resume, and jog rate. All four were formed
-by reasoning from telemetry that reads *identically* in the working and broken states. See
-`docs/design/slow-jog-audio-inaudible.md` §10.6 for the table and the next reading.
+⚠️ **The mechanism was never named, and the fix does not name it.** §10.11 established that
+two sinks *and* the Starlight are each necessary and neither sufficient; §10.12 that the two
+streams are indistinguishable at the PipeWire layer in both the failing and working arms. What
+was established is that **one sink on the node is sufficient**, so the fix reaches that
+configuration structurally. If it ever resurfaces on other hardware, the remaining tap is
+below PipeWire (ALSA/USB) — §10.12's last paragraph.
+
+**Three things in the shared graph are load-bearing and silent when broken:**
+- **`is-live=true` on every output `appsrc`.** With it false the mixer emits **zero** buffers
+  for as long as any branch is idle — one paused deck silences the whole node. Measured:
+  `scripts/probes/shared_output_mixer_probe.py --not-live`.
+- **Deck pipelines `use_clock()` the graph's clock.** In practice that is `GstSystemClock`
+  and `pulsesink` slaves its device to it — rate agreement holds, but via the sink's slaving
+  rather than the device clock the design first assumed. The log line says which.
+- **`position()` subtracts the graph's latency — measured 171.3ms.** An `appsink` reports the
+  last buffer handed off, not what the device is playing. Uncorrected, video leads audio by a
+  sixth of a second on every deck, constantly, and it reads exactly like "the video decoder is
+  early".
+
+Each node also carries a permanent silent `audiotestsrc` keepalive: an `audiomixer` with no
+pads cannot reach PLAYING, and a retained node with no live pad runs dry and never resumes.
+
+⚠️ **Two instruments changed meaning on this path.** `output_queue underrun` now fires
+continuously during ordinary playback (the appsink renders just-in-time, so the queue empties
+between every buffer) — downgraded to info here, still a warning on the legacy path. And the
+scratch sink-alignment widening reports `SKIPPED(no property)` because `appsink` is not a
+`GstAudioBaseSink`; that is correct, since re-stamping at the handoff means the shared sink
+never sees a discontinuity to resync on. Neither is a regression.
+
+⚠️ **The `buffer-time`/quantum lever (§10.13) is a dead rung** — `clock.force-quantum 512`
+worked once, but reaching the same quantum from inside the app via `sink_buffer_times()` does
+**not** hold: the gating returns after a short playback duration. It moves the symptom without
+fixing it. `sink_buffer_times()` keeps its 200ms default.
+
+**It is not the device.** `/proc/asound/card1/stream0` is a bare USB Audio Class endpoint (4ch
+S24_3LE, 44100 only, `Channel map: FL FR RL RR`) — no Dolby, no DSP. "Analog Surround 4.0" is
+*PulseAudio's profile name* for a 4-channel analog output, not a surround format. And the
+gating was measured in the PipeWire sink **monitor**, upstream of the DAC. The Starlight is
+**one PCM, one subdevice, four channels** (`subdevices_count: 1`) — "Front" and "Rear" are
+channels 0–1 and 2–3 of a single stream, which is exactly why one sink per *node* is the
+honest shape and why `front_and_rear_of_one_device_are_one_node` is a unit test.
+
+⚠️ **Six hypotheses were refuted along the way; do not re-run them** — caps renegotiation on
+the cue branch, PipeWire node suspend/resume, jog rate, the cue sink being excluded from the
+scratch alignment widening (that one was *correctly applied and insufficient*, not refuted),
+channel-layout mismatch between the branches, and generic co-tenancy (two `pulsesink`s on the
+*USB CODEC* scratch cleanly). Full account: `docs/design/slow-jog-audio-inaudible.md` §10.
+
+⚠️ **`scratch-envelope.py` defaults changed 2026-08-10** — `--channels` now defaults to `auto`
+(picks the pair carrying signal, warns when the pick is near-arbitrary), an all-silent pair now
+says so instead of printing no verdict, and the cross-pair note distinguishes a *dead* pair from
+a **live-but-gated** one. Two new modes: `--extract OUT.wav` writes the analysed pair as plain
+stereo so a capture can be *listened to* rather than only tabulated, and `--by-gesture` ranks
+each `feeder start`/`stop` gesture by how long its audio survived and contrasts the extremes —
+refusing to draw the contrast when no gesture in the take stayed audible, since ranking an
+all-failing take sorts failures by degree and reads exactly like success-vs-failure.
+**Capture the working state, not more of the broken one**: the failing state is over-sampled at
+n=64: a useful take is a long one with many varied turns including the ones that sound
+continuous, which `--by-gesture` then sorts out with nothing marked by hand.
 
 ⚠️ **`instrument_level()` reports `dBFS/zero%` per channel — read `zero%` first.** A windowed
 RMS averages a duty cycle into a level: 25% duty cycle is −6.0 dB *exactly*, so the cue pads
@@ -647,6 +702,8 @@ Several automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb
 | `scripts/watchdog-soak-test.sh <video> [seconds]` | The design doc's full 10-minute false-positive soak (default 600s) — looped playback + a MIDI-rate burst every 60s, asserts zero watchdog triggers. Run before relying on recovery in prod, not on every change. |
 | `scripts/check-launcher-staleness.sh [path]` | Is `~/.local/bin/cuemark` behind the code? Exit 0 fresh / 1 stale / 2 not built. No toolchain or running app needed. Run before diagnosing anything against a non-dev launch. |
 | `scripts/scratch-capture.sh` + `scripts/scratch-envelope.py` | **Any audio symptom the in-pipeline probes call healthy.** Captures the PipeWire device monitor — downstream of everything — and reports a per-window envelope (`rms`, `hp200`, zero-crossing rate) with `[scratch-tel]` joined inline, separating **GATED / PITCHED / CLEAN**. `rms` is blind to frequency, so this sees the whole class of faults the pipeline's own instruments structurally cannot. Ended a four-session investigation in one pass. See the `audio-debugging` skill for the traps (the stub recorder, the wrong-node capture, UTC vs local). |
+| `scripts/probes/shared_output_mixer_probe.py` | **Before changing the shared output graph** (`audio/mixer.rs`) — one `audiomixer` into one `pulsesink`, fed by live `appsrc` branches: does an idle pad stall the aggregator, does the 4-channel matrix chain negotiate, can a branch attach to a PLAYING mixer. Always run `--not-live` too: it is the control arm that proves the idle-pad check can fail, and it fails *hard* (zero buffers at the sink for as long as one branch is idle). Seconds, no app; stop cuemark first if using the real device. |
+| `scripts/probes/shared_node_stream_diff.py` | **Why does the same two-sink topology gate on one device and not another?** Samples `pw-top` (xruns, quantum, rate, wait/busy) and `pw-dump` (negotiated format, node state) for cuemark's own streams during a jog gesture, joined by the private `cuemark.branch` key — both streams present as `NAME = cuemark` and pw-top alone cannot tell main from cue. `--compare A.json B.json` diffs a failing arm against a working one. Capture **both** arms the same way; the comparison is the whole value. Pre-flight refuses on an idle/suspended stream, which reports `ERR 0` forever and reads exactly like a healthy one. |
 | `scripts/probes/offscreencanvas_webgl_capture_probe.py` | Can pixels be read back out of a WebGL canvas on this WebKitGTK? Run **before designing anything that moves rendered content between windows or processes**, and before trusting any pixel assertion against WebGL output. Seconds, no app, no Xvfb. |
 | `scripts/probes/webgl_readback_variants_probe.py` | Route matrix for the same question — attachment formats, explicit `readBuffer`, PBO + `getBufferSubData`, `copyTexSubImage2D` — with a `LIBGL_ALWAYS_SOFTWARE=1` control arm that separates driver faults from WebKit faults. Run this before concluding anything about readback. |
 | `scripts/probes/webgl_readpixels_diag_probe.py` | Why a readback failed: reports the returned bytes *and* the GL error, `getError()` sanity, framebuffer completeness, and the implementation's preferred read format. |

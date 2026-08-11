@@ -24,7 +24,22 @@ only for the duration of a gesture):
 
 ```
 [deliver-tel] deck-0  vol0=…/s(min …) margin …(min …) | sink0=… | cuevol=… | cuesink=…
+                      | main0.handoff=…/s lag=… drop=…  | cue.handoff=…/s lag=… drop=…
 ```
+
+The `handoff` legs appear **only on the shared-output path** (`CUEMARK_SHARED_OUTPUT=1`,
+`docs/design/shared-output-pipeline.md`), one per deck branch. Everything else on this line
+measures one side of the `appsink`→`appsrc` boundary or the other; these measure the boundary
+itself, which is the one place a stall could hide from every other probe in the pipeline.
+
+- `handoff=N/s` — buffers pushed into the output graph per second. Should match `sink0`/`cuesink`.
+- **`lag`** — buffers pulled from the appsink but not yet pushed. **Healthy is `0`.** A growing
+  `lag` is the output graph backpressuring, i.e. the shared node is not draining.
+- **`drop`** — pushes that failed. **Healthy is `0`, and it is cumulative**, so any non-zero
+  value means audio was lost at some point in the session, not necessarily now. A burst at a
+  device change is expected (the branch is being detached); a rising `drop` during steady
+  playback is a real fault.
+- Baselined across pauses like the rest of the line, so a report never straddles a pause.
 
 - ⚠️ **`min` is the field to read, not the mean.** The faults these counters exist for are
   second-scale stalls that a 5s mean averages into nothing; `min 0/s` means a whole second
@@ -39,6 +54,14 @@ only for the duration of a gesture):
   negative means buffers arrive already late, which is a fault that never trips the gap warning.
 - The first two ticks after a resume are baselined rather than measured, because `pulsesink`
   reopening the device lands in the second one and forged a `min 0/s` on every play press.
+- ⚠️ **On the shared-output path, `output_queue underrun` fires continuously during ordinary
+  playback and means nothing.** The `appsink` renders just-in-time, so the queue is empty
+  between every buffer by construction — measured at 67/s through a clean 4-minute take. It is
+  logged at *info* on that path for exactly this reason (it stays a warning on the legacy path,
+  where it still means what it always meant). If you are looking at a shared-output log, read
+  the `handoff` legs instead. Likewise the scratch alignment report reads
+  `appsink0=SKIPPED(no property)` there — correct, since `appsink` is not a `GstAudioBaseSink`
+  and re-stamping at the handoff means the shared sink never sees a discontinuity anyway.
 
 `src/lib/audio/scrubStats.ts` adds two more, emitted **once per scrub/scratch gesture** (not on
 an interval) — buffered in memory for the whole gesture and flushed at the end, because

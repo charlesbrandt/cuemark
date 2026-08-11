@@ -18,7 +18,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 type EosCallback = Arc<dyn Fn() + Send + Sync>;
 
 use gstreamer::{self as gst, glib, prelude::*};
-use gstreamer_app::AppSrc;
+use gstreamer_app::{AppSink, AppSrc};
+
+use super::mixer::{wire_handoff, BranchKey, HandoffCounters, OutputGraph};
 use tauri::Emitter;
 use super::analysis;
 use super::pcm_buffer::{self, PcmBuffer};
@@ -78,7 +80,12 @@ const SCRATCH_STARTUP_QUEUE_CAP_NS: u64 = 2_000_000_000; // 2s
 /// (`docs/design/pipewiresink-play-hang.md`), so a diagnostic must not introduce a new
 /// lock acquisition on a streaming thread. A relaxed atomic load costs nothing and
 /// cannot deadlock; being one bus-message late on a state change is irrelevant here.
-fn instrument_queue_flow(output_queue: &gst::Element, deck_id: &str, playing: &Arc<AtomicBool>) {
+fn instrument_queue_flow(
+    output_queue: &gst::Element,
+    deck_id: &str,
+    playing: &Arc<AtomicBool>,
+    shared_output: bool,
+) {
     const LOG_EVERY: Duration = Duration::from_secs(5);
 
     fn connect_counted(
@@ -87,6 +94,7 @@ fn instrument_queue_flow(output_queue: &gst::Element, deck_id: &str, playing: &A
         deck_id: String,
         playing: Arc<AtomicBool>,
         message: &'static str,
+        warn: bool,
     ) {
         // (events seen, last time one was logged). The first event logs immediately so
         // the onset is timestamped precisely; the rest collapse into a running total.
@@ -99,25 +107,49 @@ fn instrument_queue_flow(output_queue: &gst::Element, deck_id: &str, playing: &A
             st.0 += 1;
             if st.1.is_none_or(|last| last.elapsed() >= LOG_EVERY) {
                 st.1 = Some(Instant::now());
-                log::warn!(
-                    "[audio/{deck_id}] output_queue {signal} (total={}) — {message} \
-                     See instrument_queue_flow()'s doc comment for how to read this.",
-                    st.0
-                );
+                if warn {
+                    log::warn!(
+                        "[audio/{deck_id}] output_queue {signal} (total={}) — {message} \
+                         See instrument_queue_flow()'s doc comment for how to read this.",
+                        st.0
+                    );
+                } else {
+                    log::info!(
+                        "[audio/{deck_id}] output_queue {signal} (total={}) — {message}",
+                        st.0
+                    );
+                }
             }
             None
         });
     }
 
-    connect_counted(
-        output_queue,
-        "underrun",
-        deck_id.to_string(),
-        playing.clone(),
-        "the pipeline is not producing audio fast enough to keep the sink fed; expect \
-         audible choppiness. Points UPSTREAM (decode/soundtouch/CPU contention), NOT at \
-         the sink buffer.",
-    );
+    // ⚠️ **On the shared-output path this signal is structurally uninformative, and saying
+    // "expect audible choppiness" 67 times a second while the audio is perfect is worse than
+    // saying nothing.** It was measured firing continuously through a clean 4-minute live
+    // take (2026-08-11): the `appsink` renders just-in-time against the clock, so
+    // `output_queue` empties between every buffer by construction — the same pattern already
+    // documented for the scratch feeder, now the steady state during ordinary playback too.
+    // Downgraded to info with honest wording rather than deleted, because the *count* is
+    // still worth having next to the handoff counters.
+    //
+    // On the legacy path an underrun means what it always meant, so the warning stays.
+    let (message, warn) = if shared_output {
+        (
+            "expected on the shared-output path — the appsink renders just-in-time, so this \
+             queue is empty between buffers by construction. It adjudicates nothing here; \
+             read [deliver-tel]'s handoff leg (lag/drop) instead.",
+            false,
+        )
+    } else {
+        (
+            "the pipeline is not producing audio fast enough to keep the sink fed; expect \
+             audible choppiness. Points UPSTREAM (decode/soundtouch/CPU contention), NOT at \
+             the sink buffer.",
+            true,
+        )
+    };
+    connect_counted(output_queue, "underrun", deck_id.to_string(), playing.clone(), message, warn);
 }
 
 /// Log the first buffer that actually reaches a main output sink, and any resumption
@@ -340,7 +372,12 @@ fn instrument_delivery(element: &gst::Element, pad_name: &str, label: &str) -> O
 /// Terminates when the pipeline is torn down: it holds a `Weak` to the probe vec, which
 /// only `PipelineInner` (and any live scratch feeder) keeps alive, so a rebuild drops it
 /// and the next tick exits rather than leaking a thread per `set_devices()`.
-fn spawn_delivery_reporter(deck_id: &str, probes: &DeliveryProbes, playing: &Arc<AtomicBool>) {
+fn spawn_delivery_reporter(
+    deck_id: &str,
+    probes: &DeliveryProbes,
+    playing: &Arc<AtomicBool>,
+    handoffs: Vec<(String, Arc<HandoffCounters>)>,
+) {
     if probes.is_empty() {
         return;
     }
@@ -355,6 +392,8 @@ fn spawn_delivery_reporter(deck_id: &str, probes: &DeliveryProbes, playing: &Arc
         let mut win_margin_min: Vec<i64> = Vec::new();
         let mut win_margin_last: Vec<i64> = Vec::new();
         let mut samples = 0u32;
+        let mut last_pushed: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
         /// Ticks to baseline-only after a resume before measuring. See the skip below.
         const RESUME_SKIP_TICKS: u8 = 2;
         let mut resume_skip = RESUME_SKIP_TICKS;
@@ -383,6 +422,9 @@ fn spawn_delivery_reporter(deck_id: &str, probes: &DeliveryProbes, playing: &Arc
                     win_margin_min[i] = i64::MAX;
                     win_margin_last[i] = i64::MIN;
                 }
+                for (label, c) in &handoffs {
+                    last_pushed.insert(label.clone(), c.pushed.load(Ordering::Relaxed));
+                }
                 samples = 0;
                 resume_skip = RESUME_SKIP_TICKS;
                 continue;
@@ -397,6 +439,9 @@ fn spawn_delivery_reporter(deck_id: &str, probes: &DeliveryProbes, playing: &Arc
                 // `instrument_sink_flow()`.
                 for (i, p) in probes.iter().enumerate() {
                     last_counts[i] = p.count.load(Ordering::Relaxed);
+                }
+                for (label, c) in &handoffs {
+                    last_pushed.insert(label.clone(), c.pushed.load(Ordering::Relaxed));
                 }
                 resume_skip -= 1;
                 continue;
@@ -438,7 +483,30 @@ fn spawn_delivery_reporter(deck_id: &str, probes: &DeliveryProbes, playing: &Arc
                 })
                 .collect::<Vec<_>>()
                 .join(" | ");
-            log::info!("[deliver-tel/{deck_id}] {report}");
+
+            // Handoff leg, shared-output path only. Everything else in this line measures
+            // one side of the appsink→appsrc boundary or the other; this measures the
+            // boundary itself, which is the one place a stall could hide from every
+            // pre-existing probe. `pulled` and `pushed` must track each other — a growing
+            // gap, or a non-zero `drop`, is the handoff losing audio.
+            let handoff = handoffs
+                .iter()
+                .map(|(label, c)| {
+                    let pulled = c.pulled.load(Ordering::Relaxed);
+                    let pushed = c.pushed.load(Ordering::Relaxed);
+                    let dropped = c.dropped.load(Ordering::Relaxed);
+                    format!(
+                        " | {label}.handoff={}/s lag={} drop={dropped}",
+                        (pushed.saturating_sub(last_pushed.get(label).copied().unwrap_or(pushed)))
+                            / samples.max(1) as u64,
+                        pulled.saturating_sub(pushed),
+                    )
+                })
+                .collect::<String>();
+            for (label, c) in &handoffs {
+                last_pushed.insert(label.clone(), c.pushed.load(Ordering::Relaxed));
+            }
+            log::info!("[deliver-tel/{deck_id}] {report}{handoff}");
 
             for i in 0..probes.len() {
                 win_total[i] = 0;
@@ -549,6 +617,38 @@ fn sink_slave_method() -> Option<i32> {
             None
         }
     }
+}
+
+/// The caps every deck branch emits: 48kHz F32LE stereo, front-left/front-right.
+///
+/// One definition, used by `rate_caps`, `capsfilter2` **and** the shared output graph's
+/// `appsrc`s. The two sides of the handoff agreeing on caps is not cosmetic — see the
+/// "fully specified on purpose" comment in `load()`: when the scratch branch and the normal
+/// branch disagreed on channel-mask alone, the cue branch went to exact digital zero for
+/// the whole of every gesture while its buffer counters still read full rate.
+pub(super) fn deck_output_caps() -> gst::Caps {
+    gst::Caps::builder("audio/x-raw")
+        .field("rate", 48_000i32)
+        .field("format", "F32LE")
+        .field("layout", "interleaved")
+        .field("channels", 2i32)
+        .field("channel-mask", gst::Bitmask(0x3))
+        .build()
+}
+
+/// Is the shared output graph in use? See `docs/design/shared-output-pipeline.md`.
+///
+/// One `pulsesink` per device node instead of one per deck branch. This is the fix for
+/// `slow-jog-audio-inaudible.md`'s cue gating (two sinks on the Starlight node), and it
+/// changes the clock architecture, so it stays behind a flag until it has been through the
+/// staged live tests in the design doc.
+///
+/// ⚠️ Keep the legacy path reachable for the whole of that. Every measurement in this
+/// investigation that meant anything had a control arm, and the flag is what makes the
+/// control arm free — the alternative is an HMR-remount-per-switch A/B, which this project
+/// has already learned is expensive and error-prone (see CLAUDE.md, "Dev server lifecycle").
+pub(super) fn shared_output_enabled() -> bool {
+    std::env::var("CUEMARK_SHARED_OUTPUT").map(|v| v == "1").unwrap_or(false)
 }
 
 fn sink_buffer_times() -> (i64, i64) {
@@ -967,18 +1067,21 @@ fn pw_channel_to_gst_bit(ch: &str) -> Option<u32> {
     }
 }
 
-/// Pre-computed routing info for the cue channel-remap branch.
-struct CueRemap {
+/// Pre-computed routing info for a branch's channel remap.
+///
+/// Used by **both** the cue branch and every main branch since 2026-08-11 — see
+/// `compute_channel_remap`'s doc comment for why main used to go without one.
+pub(super) struct ChannelRemap {
     /// Number of output channels for the GStreamer capsfilter.
-    out_channels: i32,
+    pub(super) out_channels: i32,
     /// GStreamer audio channel-mask bitmask for the capsfilter.
-    channel_mask: u64,
+    pub(super) channel_mask: u64,
     /// Mix-matrix rows: one [left_coeff, right_coeff] pair per output channel.
     /// audioconvert interprets rows as output channels and columns as input channels.
-    matrix_rows: Vec<[f32; 2]>,
+    pub(super) matrix_rows: Vec<[f32; 2]>,
 }
 
-/// Build a CueRemap from the `target!full_layout` suffix of a device ID.
+/// Build a ChannelRemap from the `target!full_layout` suffix of a device ID.
 ///
 /// Strategy: instead of trying to re-label a 2-channel stereo stream (WirePlumber
 /// ignores channel-position labels on stereo→multi-channel connections and always
@@ -986,8 +1089,24 @@ struct CueRemap {
 /// channel count. PipeWire then does a 1:1 port connection, and the silence/audio
 /// values in each channel end up in the correct physical output.
 ///
-/// Returns `Ok(None)` when the target is the default front pair (no remap needed —
-/// safe to route straight to the node), and `Err` when `target`/`full_layout` can't
+/// **Applies to main branches too, since 2026-08-11.** It did not until then, and that was a
+/// silent-ignore bug in its own right: `make_sink()` strips everything after `@`, so choosing
+/// "DJControl Starlight — Rear" as a *main* device sent a plain stereo stream and let
+/// pipewire-pulse's channelmix decide where it landed — the picker offered the choice and the
+/// pipeline discarded it without a log line. It also left the two branches presenting
+/// *different channel layouts* on one node (main stereo, cue 4-channel), which is one of the
+/// candidate mechanisms for `slow-jog-audio-inaudible.md` §10.9's confirmed shared-node fault.
+/// See §10.10 there: this is step A of the ladder that ends in one sink per node.
+///
+/// ⚠️ **`target == "FL,FR"` is deliberately NOT an early exit** (it was until 2026-08-11).
+/// "The front pair needs no remap" was true only because an unmapped stereo stream *happens*
+/// to land on the first pair. Making it explicit costs one matrix with two identity rows and
+/// means a multi-channel node always gets a full-width stream from every branch — the property
+/// the shared-sink work needs, and the only way `Front` and `Rear` can be told apart at all.
+///
+/// Returns `Ok(None)` when no remap applies — a device id with no `@` suffix, or a node with
+/// two channels or fewer, both of which are genuinely stereo and want a stereo stream — and
+/// `Err` when `target`/`full_layout` can't
 /// be parsed as channel-position tokens (e.g. a corrupted persisted device id). The
 /// `Err` case matters: silently treating an unparseable non-default target as "no
 /// remap needed" would send a plain stereo stream straight at the shared node, same
@@ -998,11 +1117,14 @@ struct CueRemap {
 /// queries, until the offending cuemark process was killed). The persisted device id
 /// that triggered it was corrupted (stray `[`/`]`/space characters around the channel
 /// lists — origin unconfirmed, possibly a stale value from manual devtools testing),
-/// so this can recur any time a malformed id reaches this parser. Callers must fall
-/// back to `fakesink` on `Err`, never to an unmapped real sink.
-fn compute_cue_remap(target: &str, full_layout: &str) -> Result<Option<CueRemap>, String> {
-    if target == "FL,FR" || full_layout.is_empty() {
-        return Ok(None); // default front pair — no remap needed
+/// so this can recur any time a malformed id reaches this parser. The **cue** branch falls
+/// back to `fakesink` on `Err`, never to an unmapped real sink. The **main** branch cannot do
+/// that — silently muting the master output mid-set is worse than any routing error — so it
+/// logs loudly and falls back to a plain stereo sink, which is exactly what it did
+/// unconditionally before 2026-08-11 and is therefore not a new risk.
+pub(super) fn compute_channel_remap(target: &str, full_layout: &str) -> Result<Option<ChannelRemap>, String> {
+    if full_layout.is_empty() {
+        return Ok(None); // no layout suffix — a genuinely stereo device
     }
 
     let all_channels: Vec<&str> = full_layout.split(',').map(str::trim).collect();
@@ -1043,9 +1165,146 @@ fn compute_cue_remap(target: &str, full_layout: &str) -> Result<Option<CueRemap>
     }
 
     log::info!(
-        "[audio/cue] remap: target={target} full={full_layout} n_ch={n} mask={mask:#x} idx={target_indices:?}"
+        "[audio/remap] target={target} full={full_layout} n_ch={n} mask={mask:#x} idx={target_indices:?}"
     );
-    Ok(Some(CueRemap { out_channels: n as i32, channel_mask: mask, matrix_rows }))
+    Ok(Some(ChannelRemap { out_channels: n as i32, channel_mask: mask, matrix_rows }))
+}
+
+/// Split a device id of the form `node@target!full_layout` and compute its remap.
+///
+/// Factored out of the cue branch on 2026-08-11 so the main branches parse device ids the
+/// same way instead of discarding the suffix. `Ok(None)` means "route straight to the node"
+/// (no `@` suffix at all); `Err` means the suffix was present but unparseable, which each
+/// caller handles differently — see `compute_channel_remap`'s doc comment.
+pub(super) fn parse_device_remap(device: &str) -> Result<Option<ChannelRemap>, String> {
+    if device.is_empty() {
+        return Ok(None);
+    }
+    let Some(at) = device.find('@') else {
+        return Ok(None); // plain single-purpose device id — no remap needed
+    };
+    let after = &device[at + 1..];
+    match after.find('!') {
+        Some(bang) => compute_channel_remap(&after[..bang], &after[bang + 1..]),
+        None => Err(format!("malformed device id (missing '!' after '@'): {device:?}")),
+    }
+}
+
+/// Build the `audioconvert(mix-matrix) → capsfilter` pair that routes a stereo branch into
+/// `remap`'s target channels of an N-channel node.
+fn make_remap_chain(
+    remap: &ChannelRemap,
+    label: &str,
+    deck_id: &str,
+) -> Result<(gst::Element, gst::Element), String> {
+    let ch_conv = make_el("audioconvert")?;
+
+    // N×2 mix-matrix: routes the two input (stereo) channels into the correct output
+    // channel slots; all other output channels stay silent.
+    let matrix_arrays: Vec<gst::Array> = remap
+        .matrix_rows
+        .iter()
+        .map(|row| gst::Array::new([row[0], row[1]]))
+        .collect();
+    ch_conv.set_property("mix-matrix", gst::Array::new(matrix_arrays));
+
+    let ch_caps = make_el("capsfilter")?;
+    ch_caps.set_property(
+        "caps",
+        &gst::Caps::builder("audio/x-raw")
+            .field("channels", remap.out_channels)
+            .field("channel-mask", gst::Bitmask(remap.channel_mask))
+            .build(),
+    );
+
+    // Bracket the mix-matrix: what it is asked to map, and what it produced. See
+    // instrument_caps() — a renegotiation here is what sent the cue branch to exact digital
+    // zero for the whole of every scratch gesture before 2026-08-10.
+    instrument_caps(&ch_conv, "sink", &format!("{label} ch_conv.sink (mix-matrix in)"), deck_id);
+    instrument_caps(&ch_caps, "src", &format!("{label} ch_caps.src (to sink)"), deck_id);
+
+    Ok((ch_conv, ch_caps))
+}
+
+#[cfg(test)]
+mod channel_remap_tests {
+    use super::{compute_channel_remap, parse_device_remap};
+
+    const STARLIGHT: &str = "alsa_output.usb-Guillemot.analog-surround-40";
+    const LAYOUT: &str = "FL,FR,RL,RR";
+
+    /// The cue branch's live configuration: stereo into the rear pair of a 4-channel node.
+    /// Rows are output channels, columns are the two input channels.
+    #[test]
+    fn rear_pair_routes_to_channels_two_and_three() {
+        let r = compute_channel_remap("RL,RR", LAYOUT).unwrap().expect("remap expected");
+        assert_eq!(r.out_channels, 4);
+        assert_eq!(
+            r.matrix_rows,
+            vec![[0.0, 0.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+        );
+    }
+
+    /// ⚠️ The 2026-08-11 behaviour change. `FL,FR` used to return `Ok(None)`, which sent a
+    /// plain stereo stream and let pipewire-pulse decide where it landed — the reason picking
+    /// "— Front"/"— Rear" as a *main* device did nothing at all. A 4-channel node must now get
+    /// a 4-channel stream from every branch, front pair included.
+    #[test]
+    fn front_pair_is_remapped_explicitly_not_skipped() {
+        let r = compute_channel_remap("FL,FR", LAYOUT).unwrap().expect("front pair must remap");
+        assert_eq!(r.out_channels, 4);
+        assert_eq!(
+            r.matrix_rows,
+            vec![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [0.0, 0.0]]
+        );
+    }
+
+    /// Front and rear must be complementary — no output channel carries both branches, which
+    /// is what makes one shared 4-channel sink possible (slow-jog-audio-inaudible.md §10.10 B).
+    #[test]
+    fn front_and_rear_matrices_do_not_overlap() {
+        let front = compute_channel_remap("FL,FR", LAYOUT).unwrap().unwrap();
+        let rear = compute_channel_remap("RL,RR", LAYOUT).unwrap().unwrap();
+        assert_eq!(front.channel_mask, rear.channel_mask, "same node, same mask");
+        for (f, r) in front.matrix_rows.iter().zip(rear.matrix_rows.iter()) {
+            let f_live = f[0] != 0.0 || f[1] != 0.0;
+            let r_live = r[0] != 0.0 || r[1] != 0.0;
+            assert!(!(f_live && r_live), "channel driven by both branches: {f:?} / {r:?}");
+        }
+    }
+
+    /// A genuinely stereo device wants a stereo stream, not a padded one.
+    #[test]
+    fn stereo_devices_and_bare_ids_get_no_remap() {
+        assert!(compute_channel_remap("FL,FR", "FL,FR").unwrap().is_none());
+        assert!(compute_channel_remap("FL,FR", "").unwrap().is_none());
+        assert!(parse_device_remap("").unwrap().is_none());
+        assert!(parse_device_remap("alsa_output.usb-foo.analog-stereo").unwrap().is_none());
+    }
+
+    #[test]
+    fn parses_the_device_id_format_the_picker_produces() {
+        let id = format!("{STARLIGHT}@RL,RR!{LAYOUT}");
+        let r = parse_device_remap(&id).unwrap().expect("remap expected");
+        assert_eq!(r.out_channels, 4);
+        assert_eq!(r.matrix_rows[2], [1.0, 0.0]);
+    }
+
+    /// A malformed id must be an `Err`, never a silent `None` — an unmapped stereo stream at
+    /// a shared node is the same-channel collision that deadlocked PipeWire on 2026-08-02.
+    /// The cue branch turns this into a fakesink; main logs and falls back to plain stereo.
+    #[test]
+    fn malformed_ids_are_errors_not_silent_passthrough() {
+        assert!(parse_device_remap(&format!("{STARLIGHT}@RL,RR")).is_err(), "missing '!'");
+        assert!(parse_device_remap(&format!("{STARLIGHT}@XX,YY!{LAYOUT}")).is_err(), "bad token");
+        assert!(
+            parse_device_remap(&format!("{STARLIGHT}@SL,SR!{LAYOUT}")).is_err(),
+            "target absent from layout"
+        );
+        // The bracket-wrapped `audio.position` format devices.rs strips (see its parser):
+        // if one ever reaches here unstripped it must fail loudly rather than route blind.
+        assert!(parse_device_remap(&format!("{STARLIGHT}@[ RL, RR ]![ {LAYOUT} ]")).is_err());
+    }
 }
 
 /// Build one output sink targeting `device`.
@@ -1065,7 +1324,32 @@ fn compute_cue_remap(target: &str, full_layout: &str) -> Result<Option<CueRemap>
 /// and the reproducer: `docs/design/pipewiresink-play-hang.md` and
 /// `scripts/probes/pipewiresink_multisink_deadlock.py`. Do not switch back without
 /// re-running that probe.
-fn make_sink(device: &str, deck_id: &str) -> Result<gst::Element, String> {
+/// The deck-side terminal element when the shared output graph is in use: an `appsink`
+/// where a `pulsesink` used to be.
+///
+/// `sync=true` is the load-bearing property. It is what paces the deck pipeline against its
+/// clock — which `load()` sets to the shared device clock — so the deck produces at exactly
+/// the rate the device consumes. Without it the deck free-runs and the handoff overflows in
+/// seconds; with it but *without* the shared clock, the deck runs on the system clock and
+/// drifts against the device forever. Both halves are required; see
+/// `OutputGraph::shared_clock`.
+///
+/// `drop=false` keeps the backpressure chain intact: a full appsink blocks its streaming
+/// thread, which backpressures `output_queue` exactly as the sink's ringbuffer did before.
+/// Dropping here instead would turn a downstream stall into silent sample loss — the
+/// failure mode this whole investigation exists to stop shipping.
+fn make_appsink(label: &str) -> Result<gst::Element, String> {
+    let el = make_el("appsink")?;
+    el.set_property("sync", true);
+    el.set_property("max-buffers", 4u32);
+    el.set_property("drop", false);
+    el.set_property("enable-last-sample", false);
+    el.set_property("caps", deck_output_caps());
+    log::info!("[audio/{label}] sink: appsink → shared output graph");
+    Ok(el)
+}
+
+pub(super) fn make_sink(device: &str, deck_id: &str) -> Result<gst::Element, String> {
     // Device string may encode a stereo-pair target: "node-name@CH1,CH2".
     // Strip the @suffix here — the actual channel remapping is done via GStreamer caps
     // inserted before this sink by the caller (the sink routes by caps channel positions,
@@ -1233,6 +1517,16 @@ struct PipelineInner {
     /// last-buffer time when the valve closes. `None` when cue is on the fakesink
     /// fallback (uninstrumented). See `instrument_sink_flow()`.
     cue_sink_flow: Option<SinkFlowState>,
+    /// Shared output graph state. Empty on the legacy (one-pulsesink-per-branch) path.
+    ///
+    /// The branch keys must be detached when this pipeline goes away, or the graph keeps a
+    /// dead `appsrc` on the node's mixer forever — which, because every mixer pad is live,
+    /// is silent rather than loud. Both teardown paths (`load()`'s rebuild and `Drop`) go
+    /// through `detach_output_branches()`.
+    output_branches: Vec<BranchKey>,
+    /// Output-side latency of the **main** branch's node, in nanoseconds — subtracted by
+    /// `position()`. See `OutputGraph::latency_ns` for why this is not optional.
+    output_latency_ns: u64,
 }
 
 pub struct DeckAudioPipeline {
@@ -1278,6 +1572,12 @@ pub struct DeckAudioPipeline {
     /// (`seek_output_domain`, `load`, `play`), so it can never go stale in the other
     /// direction.
     last_scratch_frame: Option<f64>,
+    /// The process-wide shared output graph, when one is in use.
+    ///
+    /// An `Arc` rather than a borrow from `AudioManager` because
+    /// `with_pipeline_detached()` removes this deck from the manager's map for the duration
+    /// of a blocking call, and a detached deck still has to reach the graph.
+    output_graph: Option<Arc<Mutex<OutputGraph>>>,
 }
 
 impl DeckAudioPipeline {
@@ -1299,6 +1599,27 @@ impl DeckAudioPipeline {
             app: None,
             pcm_buffer: None,
             last_scratch_frame: None,
+            output_graph: None,
+        }
+    }
+
+    /// Hand this deck the shared output graph. Must be called before `load()` — the graph
+    /// is consulted while the pipeline is being built, not after.
+    pub fn set_output_graph(&mut self, graph: Arc<Mutex<OutputGraph>>) {
+        self.output_graph = Some(graph);
+    }
+
+    /// Release every branch this deck holds on the shared output graph.
+    ///
+    /// Idempotent, and safe to call on the legacy path (where `output_branches` is empty).
+    fn detach_output_branches(inner: &mut PipelineInner, graph: &Option<Arc<Mutex<OutputGraph>>>) {
+        if inner.output_branches.is_empty() {
+            return;
+        }
+        let Some(graph) = graph else { return };
+        let mut g = graph.lock().unwrap();
+        for key in inner.output_branches.drain(..) {
+            g.detach(&key);
         }
     }
 
@@ -1321,6 +1642,11 @@ impl DeckAudioPipeline {
 
         if let Some(ref mut inner) = self.inner {
             Self::take_and_join_feeder(inner);
+            // Before the pipeline goes to Null: hand the shared graph its mixer pads back.
+            // Doing it after would leave the appsrcs alive with a dead appsink upstream —
+            // and since every mixer pad is live, a dead branch contributes silence rather
+            // than an error, so nothing would ever say so.
+            Self::detach_output_branches(inner, &self.output_graph);
             // Belt-and-suspenders: if a scratch was in progress, uridecodebin's state
             // is locked (see scratch()) — unlock before tearing the pipeline down to
             // Null so the state change actually propagates to it.
@@ -1435,10 +1761,72 @@ impl DeckAudioPipeline {
         };
         let mut volume_els: Vec<gst::Element> = Vec::with_capacity(main_devs.len());
         let mut main_sinks: Vec<gst::Element> = Vec::with_capacity(main_devs.len());
+        // Per-device channel remap, parallel to volume_els/main_sinks. `None` = route the
+        // plain stereo stream straight at the node (a genuinely stereo device, or a device id
+        // whose suffix failed to parse — see below).
+        let mut main_channel_remaps: Vec<Option<(gst::Element, gst::Element)>> =
+            Vec::with_capacity(main_devs.len());
         let mut delivery_probes: Vec<Arc<DeliveryProbe>> = Vec::new();
+        // With the shared output graph in use, every branch here terminates in an appsink;
+        // the channel matrix and the one real `pulsesink` live in the per-node output
+        // pipeline instead. The rest of this function — the tee, the gain stages, the valve,
+        // the scratch branch, the selector — is deliberately identical on both paths.
+        let shared_output = shared_output_enabled() && self.output_graph.is_some();
+        if shared_output_enabled() && self.output_graph.is_none() {
+            log::error!(
+                "[audio/{}] CUEMARK_SHARED_OUTPUT=1 but no output graph was handed to this \
+                 deck — falling back to the legacy per-branch sinks. This is a wiring bug in \
+                 AudioManager, not a configuration problem.",
+                self.deck_id
+            );
+        }
+        // (appsink, device id, branch label) — attached to the graph once the pipeline is
+        // built, just before its first state change. Attaching mid-build would leave a live
+        // mixer pad pointing at a half-constructed branch.
+        let mut pending_handoffs: Vec<(gst::Element, String, String)> = Vec::new();
+
         for (i, dev) in main_devs.iter().enumerate() {
             let vol = make_el("volume")?;
-            let snk = make_sink(dev, &format!("{}/{}", self.deck_id, i))?;
+            let snk = if shared_output {
+                let el = make_appsink(&format!("{}/{}", self.deck_id, i))?;
+                pending_handoffs.push((el.clone(), dev.clone(), format!("main{i}")));
+                el
+            } else {
+                make_sink(dev, &format!("{}/{}", self.deck_id, i))?
+            };
+            // Main branches carry the same N-channel mix-matrix the cue branch has, as of
+            // 2026-08-11. Before that `make_sink()` stripped the `@pair!layout` suffix and
+            // nothing else looked at it, so picking "— Rear" as a *main* device silently did
+            // nothing, and main and cue presented **different channel layouts** on one node.
+            // See compute_channel_remap's doc comment and slow-jog-audio-inaudible.md §10.10.
+            //
+            // Unlike the cue branch, a parse failure here does NOT fall back to fakesink:
+            // silently muting the master output mid-set is worse than a routing error, and a
+            // plain stereo sink is exactly what this branch did unconditionally before, so it
+            // is not a new risk. It is logged at error level because it is not recoverable
+            // without re-selecting the device.
+            let main_remap = match parse_device_remap(dev) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!(
+                        "[audio/{}/{}] main device id {:?} failed to parse ({e}) — falling back \
+                         to a plain stereo sink on the bare node, so this output may land on the \
+                         wrong channel pair. Re-select the device in Settings to clear the \
+                         stale/corrupted id.",
+                        self.deck_id, i, dev
+                    );
+                    None
+                }
+            };
+            // On the shared path the matrix belongs to the output graph — one per branch,
+            // summed by the node's `audiomixer`. Building it here as well would map stereo
+            // into N channels twice and the second matrix would find only its own first pair
+            // populated, silencing every branch that does not target the front pair.
+            let main_remap = match (&main_remap, shared_output) {
+                (_, true) => None,
+                (Some(r), false) => Some(make_remap_chain(r, &format!("main{i}"), &self.deck_id)?),
+                (None, false) => None,
+            };
             // Only the primary sink (i=0) participates in preroll — it controls the
             // pipeline's READY→PAUSED state transition. Secondary sinks use async=false
             // so they don't block preroll; they join at PLAYING time using the primary's clock.
@@ -1459,6 +1847,7 @@ impl DeckAudioPipeline {
             delivery_probes.extend(instrument_delivery(&snk, "sink", &format!("sink{i}")));
             volume_els.push(vol);
             main_sinks.push(snk);
+            main_channel_remaps.push(main_remap);
         }
 
         // ── Cue branch ────────────────────────────────────────────────────────────
@@ -1472,21 +1861,12 @@ impl DeckAudioPipeline {
         let cue_queue  = make_el("queue")?;
         // Decide the cue routing *before* building any sink: a device id that requests
         // a non-default channel pair but fails to parse must never fall through to a
-        // plain sink targeting the shared node (see compute_cue_remap's doc comment —
+        // plain sink targeting the shared node (see compute_channel_remap's doc comment —
         // that exact failure mode deadlocked PipeWire system-wide on 2026-08-02).
         //
         // Device ID format: `node@target!full_layout` e.g. `alsa_out...@RL,RR!FL,FR,RL,RR`
-        let cue_remap_outcome: Result<Option<CueRemap>, String> = if self.cue_device.is_empty() {
-            Ok(None)
-        } else if let Some(at) = self.cue_device.find('@') {
-            let after = &self.cue_device[at + 1..];
-            match after.find('!') {
-                Some(bang) => compute_cue_remap(&after[..bang], &after[bang + 1..]),
-                None => Err(format!("malformed device id (missing '!' after '@'): {:?}", self.cue_device)),
-            }
-        } else {
-            Ok(None) // plain single-purpose device id — no remap needed
-        };
+        let cue_remap_outcome: Result<Option<ChannelRemap>, String> =
+            parse_device_remap(&self.cue_device);
 
         // Use a real sink only when a device is configured and (for multi-channel
         // targets) its channel remap parsed cleanly; fakesink otherwise so the
@@ -1503,42 +1883,28 @@ impl DeckAudioPipeline {
                     log::error!(
                         "[audio/{}-cue] cue device id {:?} failed to parse ({e}) — routing to \
                          fakesink instead of risking a same-channel collision with another sink \
-                         on the shared node (see compute_cue_remap's doc comment). Re-select the \
-                         cue device in Settings to clear the stale/corrupted id.",
+                         on the shared node (see compute_channel_remap's doc comment). Re-select \
+                         the cue device in Settings to clear the stale/corrupted id.",
                         self.deck_id, self.cue_device
                     );
                     let fs = make_el("fakesink")?;
                     fs.set_property("sync", false);
                     (fs, None)
                 }
+                Ok(_) if shared_output => {
+                    let el = make_appsink(&format!("{}-cue", self.deck_id))?;
+                    pending_handoffs.push((
+                        el.clone(),
+                        self.cue_device.clone(),
+                        "cue".to_string(),
+                    ));
+                    // Matrix lives in the output graph on this path — see the main branch.
+                    (el, None)
+                }
                 Ok(remap) => {
                     let sink = make_sink(&self.cue_device, &format!("{}-cue", self.deck_id))?;
                     let channel_remap = match remap {
-                        Some(r) => {
-                            let ch_conv = make_el("audioconvert")?;
-
-                            // N×2 mix-matrix: routes the two input (stereo) channels into the
-                            // correct output channel slots; all other output channels stay silent.
-                            let matrix_arrays: Vec<gst::Array> = r.matrix_rows.iter()
-                                .map(|row| gst::Array::new([row[0], row[1]]))
-                                .collect();
-                            ch_conv.set_property("mix-matrix", gst::Array::new(matrix_arrays));
-
-                            let ch_caps = make_el("capsfilter")?;
-                            ch_caps.set_property("caps", &gst::Caps::builder("audio/x-raw")
-                                .field("channels", r.out_channels)
-                                .field("channel-mask", gst::Bitmask(r.channel_mask))
-                                .build());
-
-                            // Bracket the mix-matrix: what it is asked to map, and what it
-                            // produced. See instrument_caps() — a renegotiation here is the
-                            // suspect for the cue branch going to digital zero the moment a
-                            // scratch gesture switches input_selector.
-                            instrument_caps(&ch_conv, "sink", "ch_conv.sink (mix-matrix in)", &self.deck_id);
-                            instrument_caps(&ch_caps, "src", "ch_caps.src (to cue sink)", &self.deck_id);
-
-                            Some((ch_conv, ch_caps))
-                        }
+                        Some(r) => Some(make_remap_chain(r, "cue", &self.deck_id)?),
                         None => None,
                     };
                     (sink, channel_remap)
@@ -1608,13 +1974,7 @@ impl DeckAudioPipeline {
         // is a no-op downstream and `mix-matrix` never renegotiates. `audioconvert` +
         // `audioresample` sit upstream of both filters, so both branches can always satisfy
         // this; the mask is plain front-left/front-right (0x3).
-        let caps_48k = gst::Caps::builder("audio/x-raw")
-            .field("rate", 48_000i32)
-            .field("format", "F32LE")
-            .field("layout", "interleaved")
-            .field("channels", 2i32)
-            .field("channel-mask", gst::Bitmask(0x3))
-            .build();
+        let caps_48k = deck_output_caps();
         rate_caps.set_property("caps", &caps_48k);
         capsfilter2.set_property("caps", &caps_48k);
 
@@ -1672,7 +2032,7 @@ impl DeckAudioPipeline {
         output_queue.set_property("max-size-buffers", 0u32);
         output_queue.set_property("max-size-bytes", 0u32);
         output_queue.set_property("max-size-time", OUTPUT_QUEUE_STEADY_CAP_NS);
-        instrument_queue_flow(&output_queue, &self.deck_id, &at_playing);
+        instrument_queue_flow(&output_queue, &self.deck_id, &at_playing, shared_output);
 
         cue_valve.set_property("drop", !self.cue_enabled);
         make_eos_passthrough_valve(&cue_valve);
@@ -1689,6 +2049,10 @@ impl DeckAudioPipeline {
         for (vol, snk) in volume_els.iter().zip(main_sinks.iter()) {
             pipeline.add(vol).map_err(|e| format!("[{}] pipeline add volume: {e}", self.deck_id))?;
             pipeline.add(snk).map_err(|e| format!("[{}] pipeline add sink: {e}", self.deck_id))?;
+        }
+        for remap in main_channel_remaps.iter().flatten() {
+            pipeline.add(&remap.0).map_err(|e| format!("[{}] pipeline add main ch_conv: {e}", self.deck_id))?;
+            pipeline.add(&remap.1).map_err(|e| format!("[{}] pipeline add main ch_caps: {e}", self.deck_id))?;
         }
         if let Some(ref s) = spectrum_opt {
             pipeline.add(s).map_err(|e| format!("[{}] pipeline add spectrum: {e}", self.deck_id))?;
@@ -1731,13 +2095,21 @@ impl DeckAudioPipeline {
         output_queue.link(&tee).map_err(|e| format!("output_queue→tee: {e}"))?;
 
         // tee → main branches (one per configured output device)
-        for (vol, snk) in volume_els.iter().zip(main_sinks.iter()) {
+        // volume → [ch_conv → ch_caps →] sink, mirroring the cue branch below.
+        for ((vol, snk), remap) in volume_els.iter().zip(main_sinks.iter()).zip(main_channel_remaps.iter()) {
             let tee_pad = tee.request_pad_simple("src_%u")
                 .ok_or_else(|| format!("[{}] tee: could not request main src pad", self.deck_id))?;
             let vol_sink_pad = vol.static_pad("sink")
                 .ok_or_else(|| format!("[{}] volume: no sink pad", self.deck_id))?;
             tee_pad.link(&vol_sink_pad).map_err(|e| format!("tee→volume: {e}"))?;
-            vol.link(snk).map_err(|e| format!("volume→sink: {e}"))?;
+            match remap {
+                Some((ch_conv, ch_caps)) => {
+                    vol.link(ch_conv).map_err(|e| format!("volume→main ch_conv: {e}"))?;
+                    ch_conv.link(ch_caps).map_err(|e| format!("main ch_conv→ch_caps: {e}"))?;
+                    ch_caps.link(snk).map_err(|e| format!("main ch_caps→sink: {e}"))?;
+                }
+                None => vol.link(snk).map_err(|e| format!("volume→sink: {e}"))?,
+            }
         }
 
         // tee → cue branch
@@ -1772,6 +2144,18 @@ impl DeckAudioPipeline {
         }
         if let Some(v0) = volume_els.first() {
             instrument_level(v0, "src", "main vol0 (reference)", &self.deck_id);
+        }
+        // Main's own post-matrix level, so the two branches can be read at the *same* point in
+        // the graph. Until 2026-08-11 the main reference sat at `volume`'s src and cue's at
+        // `ch_caps`, one stage apart, which is a difference in the instruments rather than in
+        // the signal — exactly the kind of asymmetry §10.5 warns about.
+        //
+        // ⚠️ Reading it: the silent rows are the mix-matrix working as designed. On this
+        // device main reads `-inf/100%z` on channels 2,3 and cue on channels 0,1; the fault
+        // signature is a *target* channel going to `100%z` while the other branch's target
+        // stays live. See instrument_level()'s doc comment — read `zero%`, not dBFS.
+        if let Some((_, ref ch_caps)) = main_channel_remaps.first().and_then(|r| r.as_ref()) {
+            instrument_level(ch_caps, "src", "main0 post-matrix (to sink)", &self.deck_id);
         }
 
         let queue_weak = queue.downgrade();
@@ -1932,6 +2316,76 @@ impl DeckAudioPipeline {
             log::info!("[bus/{}] monitor thread exiting", deck_id_log);
         });
 
+        // ── Shared output graph: attach every branch, then adopt its clock ────────
+        // Both steps must happen before the first state change. Attaching later would let
+        // the appsink's callback fire with no appsrc to push into; adopting the clock later
+        // would let the pipeline preroll against the system clock and then have it swapped
+        // underneath, which GStreamer handles by re-basing — but only after the drift has
+        // already been baked into the first buffers.
+        let mut output_branches: Vec<BranchKey> = Vec::new();
+        let mut handoffs: Vec<(String, Arc<HandoffCounters>)> = Vec::new();
+        let mut output_latency_ns: u64 = 0;
+        if !pending_handoffs.is_empty() {
+            let graph = self.output_graph.clone().expect("shared_output implies a graph");
+            let mut g = graph.lock().unwrap();
+            for (idx, (el, device, branch)) in pending_handoffs.iter().enumerate() {
+                let key: BranchKey = (self.deck_id.clone(), branch.clone());
+                let label = format!("{}/{}", self.deck_id, branch);
+                match g.attach(device, key.clone(), &label) {
+                    Ok(appsrc) => {
+                        let appsink = el
+                            .downcast_ref::<AppSink>()
+                            .ok_or_else(|| format!("[{}] appsink downcast failed", label))?;
+                        handoffs.push((branch.clone(), wire_handoff(appsink, appsrc, label)));
+                        output_branches.push(key);
+                        // The main branch's node decides the position correction. Branch 0 is
+                        // always a main branch (the cue entry is pushed last), and cue is a
+                        // monitoring output whose latency nothing reads.
+                        if idx == 0 {
+                            output_latency_ns = g.latency_ns(device);
+                        }
+                    }
+                    Err(e) => {
+                        // Same asymmetry as the legacy path, for the same reason: a cue
+                        // branch that cannot be routed goes quiet, a main branch must not.
+                        // Here an unattached appsink simply swallows buffers — the tee keeps
+                        // flowing, nothing blocks, and that branch is silent.
+                        if branch == "cue" {
+                            log::error!(
+                                "[audio/{label}] could not attach cue to the shared output \
+                                 graph ({e}) — cue is silent. Re-select the cue device."
+                            );
+                        } else {
+                            log::error!(
+                                "[audio/{label}] could not attach main output to the shared \
+                                 output graph ({e}) — THIS OUTPUT IS SILENT. Re-select the \
+                                 device in Settings, or unset CUEMARK_SHARED_OUTPUT to fall \
+                                 back to the legacy per-branch sinks."
+                            );
+                        }
+                    }
+                }
+            }
+            match g.shared_clock() {
+                Some(clock) => {
+                    // Without this the deck runs on GstSystemClock while the device consumes
+                    // at its own rate, and the handoff slowly over- or underflows forever.
+                    // See OutputGraph::shared_clock.
+                    pipeline.use_clock(Some(&clock));
+                    log::info!(
+                        "[audio/{}] using shared output clock {} (output latency {:.0}ms \
+                         subtracted from reported position)",
+                        self.deck_id, clock.name(), output_latency_ns as f64 / 1e6
+                    );
+                }
+                None => log::warn!(
+                    "[audio/{}] shared output graph provided no clock — this deck will drift \
+                     against the device. See OutputGraph::shared_clock.",
+                    self.deck_id
+                ),
+            }
+        }
+
         pipeline
             .set_state(gst::State::Paused)
             .map_err(|e| format!("[{}] set_state(Paused) failed: {e}", self.deck_id))?;
@@ -1957,7 +2411,12 @@ impl DeckAudioPipeline {
         }
 
         let delivery_probes_shared: DeliveryProbes = Arc::new(delivery_probes);
-        spawn_delivery_reporter(&self.deck_id, &delivery_probes_shared, &at_playing);
+        spawn_delivery_reporter(
+            &self.deck_id,
+            &delivery_probes_shared,
+            &at_playing,
+            handoffs,
+        );
 
         self.inner = Some(PipelineInner {
             pipeline,
@@ -1981,6 +2440,8 @@ impl DeckAudioPipeline {
             cue_open,
             cue_sink_el: cue_sink,
             cue_sink_flow,
+            output_branches,
+            output_latency_ns,
         });
         Ok(duration)
     }
@@ -2544,19 +3005,39 @@ impl DeckAudioPipeline {
             }
         }
 
+        // ⚠️ Subtract the shared output graph's latency, and do it here rather than at any
+        // display site. `GstAudioBaseSink` reported position as what the *device* was
+        // playing, netting out its own 200ms ringbuffer. An `appsink` reports the last
+        // buffer it handed off, which the output graph then buffers again. Uncorrected,
+        // every deck reads ~200ms ahead of what is audible; audio is the master clock, so
+        // video leads audio by the same constant everywhere. That presents as "the video
+        // decoder is early" and would be chased in entirely the wrong file.
+        //
+        // Zero on the legacy path, so this is a no-op there.
+        let latency_secs = inner.output_latency_ns as f64 / 1_000_000_000.0;
+
         // A negative position is never meaningful to callers (the waveform's playhead
         // math divides by duration and draws off-canvas on a negative result) — clamp
         // defensively even though sampled query_position output (2000+ samples across
-        // play/pause/seek/rate-change) never showed one in practice.
+        // play/pause/seek/rate-change) never showed one in practice. The clamp also
+        // absorbs the first ~200ms after a load, where the correction would otherwise take
+        // the reported position negative.
         inner
             .pipeline
             .query_position::<gst::ClockTime>()
-            .map(|t| (t.nseconds() as f64 / 1_000_000_000.0).max(0.0))
+            .map(|t| (t.nseconds() as f64 / 1_000_000_000.0 - latency_secs).max(0.0))
     }
 }
 
 impl Drop for DeckAudioPipeline {
     fn drop(&mut self) {
+        // Give the shared graph its mixer pads back before the pipeline dies. A branch left
+        // attached keeps a live appsrc on the node's mixer with nothing feeding it, which
+        // (every pad being live) contributes silence rather than an error — invisible.
+        let graph = self.output_graph.clone();
+        if let Some(inner) = self.inner.as_mut() {
+            Self::detach_output_branches(inner, &graph);
+        }
         if let Some(ref mut inner) = self.inner {
             Self::take_and_join_feeder(inner);
             inner.uridecodebin_el.set_locked_state(false);

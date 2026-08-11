@@ -90,6 +90,27 @@ does not begin until `01:39:30`.
 
 ## The leading hypothesis
 
+> 🟢 **2026-08-11 — H1's mechanism is now established as real, by a different bug.**
+> `slow-jog-audio-inaudible.md` §10.9 ran a two-arm device test on this exact topology and
+> confirmed that **two `pulsesink`s on one PipeWire node** cause audio loss: the cue branch was
+> chopped into ~80% digital silence during scratch gestures (21% audible against main's 94%),
+> and moving *either* branch off the shared node — cue elsewhere, or main elsewhere with cue
+> left untouched on the same device, pair and profile — eliminated it entirely.
+>
+> ⚠️ **That does not close *this* doc.** What is established is that the shared-node topology
+> can lose audio, not that it produced *this* 10.8 s stall. The two differ in signature: there
+> the loss is buffers arriving full of silence with delivery counters at full rate; here
+> `output_queue` ran dry and `underrun` fired, which points upstream. Reconciling that tension
+> is still most of the work (see the paragraph below, which predates the confirmation and
+> still stands). What has changed is that H1 is no longer speculative about its mechanism —
+> and that the fix ladder in §10.10 there (one sink per node; ultimately one output pipeline
+> per node shared by all decks, `audio/mixer.rs`'s `MasterMix`) removes this configuration
+> from the product, which would settle H1 by construction rather than by measurement.
+>
+> Relevant here specifically: **two decks playing to one device is already two `pulsesink`s on
+> one node before cue is involved**, which is why the "up to four `pulsesink`s" note below is
+> the load-bearing sentence in this section.
+
 **H1 — the headphone cue branch on the same physical USB device.** Cue was switched on at
 `01:38:10`, 21 s before the stall, and off at `01:39:43`. Enabling it opens a second
 `pulsesink` on the *same* PulseAudio device as the main sink (main → FL/FR, cue → RL/RR of the
@@ -559,3 +580,27 @@ ambiguous.
 - `legacy-video-fallback-cost.md` — the same session's other, larger finding.
 - `control-window-frame-budget.md` — how to read `[poll-stats]`, and why `total p50=2ms` is
   ambiguous rather than diagnostic.
+
+## H1 and the shared output pipeline (2026-08-11)
+
+H1 — contention between the main and cue `pulsesink`s on one USB node — is **structurally
+removed** by the shared output graph (`docs/design/shared-output-pipeline.md`,
+`CUEMARK_SHARED_OUTPUT=1`): one `pulsesink` per device node, however many decks and branches
+are live. That is the same hazard this document blames, and the same fix that closed the
+cue-gating fault in `slow-jog-audio-inaudible.md` §10.14.
+
+⚠️ **Do not mark this document fixed on that basis.** Three reasons:
+
+1. **It is a different fault.** This one is 10.8s of silence mid-track with no scratch
+   involved and `output_queue` dry (pointing *upstream*); the gating fault was interior
+   silence on the cue branch only, with delivery counters at full rate throughout. Sharing a
+   suspected cause is not sharing a diagnosis.
+2. **It has never been reproduced on demand**, so there is no arm to run. The shared graph
+   changes the topology it was hypothesised against; it does not produce evidence.
+3. **Nothing here can see clipping**, and the gap warning needs >1s of silence — so a clean
+   run remains very nearly independent of "the artifact is gone" (the standing caution in this
+   file, unchanged).
+
+What would actually close it: a soak on the shared path long enough to cover the original
+event's ~20-minute scale, with the false-positive rate in `instrument_sink_flow()` fixed first
+— which is still this document's stated prerequisite and is still not done.

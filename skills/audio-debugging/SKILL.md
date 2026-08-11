@@ -29,10 +29,44 @@ Then read `journal.md` for the most recent session notes.
 
 ## Current pipeline topology
 
+**There are two output topologies**, selected by `CUEMARK_SHARED_OUTPUT` at deck-load time.
+Everything upstream of the `tee` is identical in both; only where the branches terminate
+differs. Check which one you are debugging *before* reading any sink-side instrument — several
+of them mean different things on each path (see the two warnings at the end of this section).
+
+Shared per deck, both paths:
+
 ```
 uridecodebin → queue(max-buffers=2) → audioconvert → audioresample
-  → capsfilter(rate=48000) → pitch(tempo) → output_queue(100ms) → volume → pipewiresink
+  → capsfilter(48000/F32LE/2ch) → pitch(tempo) → [spectrum] → input_selector
+  → output_queue(100ms) → tee ├─ volume₀ …
+                              ├─ volume₁ …
+                              └─ cue_valve → cue_volume → cue_queue …
 ```
+
+**Legacy path (default today)** — each branch ends in its own `pulsesink`, so one deck opens
+up to four, and main+cue on one device is *two sinks on one node*:
+
+```
+  … volume₀ → [mix-matrix → caps] → pulsesink₀
+  … cue_queue → [mix-matrix → caps] → pulsesink_cue
+```
+
+**Shared-output path (`CUEMARK_SHARED_OUTPUT=1`)** — each branch ends in an `appsink` that
+hands buffers to a per-node output pipeline, which sums them into **one** `pulsesink`:
+
+```
+  … volume₀   → appsink ─┐  push_buffer
+  … cue_queue → appsink ─┴─► appsrc(is-live) → queue(30ms) → mix-matrix → caps ─┐
+                             appsrc(is-live) → queue(30ms) → mix-matrix → caps ─┼→ audiomixer
+                             audiotestsrc(silence, keepalive) ─────────────────┘      ↓
+                                                            master volume → pulsesink (N ch)
+```
+
+This is the fix for the cue-gating bug (`docs/design/slow-jog-audio-inaudible.md` §10.14);
+`docs/design/shared-output-pipeline.md` is the design of record. **Read it before changing
+`audio/mixer.rs`**, and run `scripts/probes/shared_output_mixer_probe.py` with its
+`--not-live` control arm.
 
 **`pitch` element** (soundtouch, `gst-plugins-bad`) — sets playback tempo without pitch change via the
 `tempo` property. Set at any time; no seek, no flush, no pipeline state transition. Range: 0.1–10.0.
@@ -219,15 +253,25 @@ cannot:
 | `PITCHED` | level holds, energy collapses below 200 Hz | nothing is muted — the content is shifted down by a low cursor speed. No gate constant will fix it |
 | `CLEAN` | both hold | the loss is downstream of the tap: analog, routing, the controller's mixer |
 
-**Why this earns its own section**: it ended a four-session investigation in one pass
-(`slow-jog-audio-inaudible.md`). The answer was `PITCHED` — a slow jog runs the cursor at
-0.10–0.26x, which drops the audio ~2.7 octaves, present at full level and inaudible.
-**`rms` is blind to frequency**, so the feeder's own `rms` field read healthy throughout and
-*could never have shown this*. Five mechanisms were proposed and refuted against instruments
-that were structurally incapable of varying with the fault.
+**Why this earns its own section**: it broke a stalled investigation open
+(`slow-jog-audio-inaudible.md`) after five mechanisms had been proposed and refuted against
+instruments that were structurally incapable of varying with the fault.
+**`rms` is blind to frequency *and* blind to duty cycle**, so the feeder's own `rms` field
+read healthy throughout and *could never have shown either* candidate.
 
 > An instrument that cannot vary with the fault carries no information about it. A clean
 > reading from one is not weak evidence — it is no evidence.
+
+⚠️ **The verdict this section used to report — `PITCHED` — was measured correctly and
+answered the wrong question, and that is the more useful lesson.** The analysis ran on
+channels 0,1 (**main**) while the user was monitoring on **headphones**, a different physical
+channel pair on that device. The pitch arithmetic is real (a slow jog runs the cursor at
+0.10–0.26x, ~2.7 octaves down, full level, inaudible on most monitoring) and `Jog scale` is a
+genuine taste lever — but it was never what the user was hearing, and the same capture had
+digitally-silent headphone channels nobody had looked at. **Ask which output the listener is
+actually on before analysing any capture, and read both pairs**
+(`--channels 2,3`). The real answer was `GATED`, and the cause was two `pulsesink`s on one
+PipeWire node — fixed 2026-08-11 by the shared output graph (§10.14).
 
 ### Three traps, all of which fired on first use
 
@@ -1410,10 +1454,15 @@ on why `toDataURL()` was used instead of WebDriver's `/screenshot` endpoint).
 **Symptom**: output sounds clipped or distorted even when per-deck volume and gain sliders are
 turned down. Master volume slider appears to have no effect.
 
-**Root cause confirmed 2026-06-28**: `MasterMix.set_master_volume()` (`mixer.rs`) is a stub — it
-stores the value but never applies it to GStreamer. `MasterMix` is scaffolding for a future
-shared-audiomixer topology; its `_main_pipeline` is always `None`. The actual master volume is now
-implemented in `AudioManager` directly (see below).
+**Root cause confirmed 2026-06-28**: `MasterMix.set_master_volume()` (`mixer.rs`) was a stub —
+it stored the value but never applied it to GStreamer. The actual master volume is implemented
+in `AudioManager` directly (see below).
+
+> ⚠️ **Updated 2026-08-11: `MasterMix` is gone.** `mixer.rs` now holds `OutputGraph`, the real
+> one-`pulsesink`-per-node topology, and on the shared-output path master volume is applied by
+> a `volume` element per node after the mixer — the stage it always belonged in. The per-deck
+> factor below is still applied as well, so switching the flag off mid-session cannot silently
+> lose master attenuation; both are linear gains and the deck-side one is 1.0 unless moved.
 
 **Gain chain per deck** (as of 2026-06-28):
 
@@ -1428,11 +1477,15 @@ GStreamer volume element = gain × vol × master_volume
 `master_volume` is stored in `AudioManager.master_volume` and propagated to all active deck
 pipelines via `set_master_volume_factor()`. New pipelines inherit it at `audio_load` time.
 
-**PipeWire summing**: each `DeckAudioPipeline` has its own `pipewiresink`; PipeWire sums all
-streams at hardware level. With N decks at gain=1, vol=1, master=1 you can get up to N× summed
+**Summing**: on the legacy path each branch has its own `pulsesink` and PipeWire sums the
+streams at hardware level; on the shared-output path an `audiomixer` sums them per node before
+the single sink. Either way the arithmetic below is the same. With N decks at gain=1, vol=1, master=1 you can get up to N× summed
 amplitude. Reduce master volume if two fully-loaded decks clip: pulling to ~0.6 gives ~4 dB of
 headroom for two simultaneous sources.
 
-**What is still a stub** (2026-06-28):
-- `MasterMix` in `mixer.rs` — the shared audiomixer topology hasn't been built
+**What is still a stub**:
 - `set_eq()` in `pipeline.rs` — EQ sliders show in the UI but do nothing to GStreamer
+- `record.rs` — `audio_record_start/stop` returns `Ok` and writes nothing. The shared output
+  graph is the natural place to tap for this (one node, one mix, post-master) and did not
+  exist when the stub was written.
+- ~~`MasterMix`~~ — built 2026-08-11 as `OutputGraph`; see the topology section above.

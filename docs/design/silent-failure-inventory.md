@@ -49,6 +49,7 @@ speculative.
 | A9 | `GST_PLUGIN_FEATURE_RANK` VA-API demotion | a **no-op** — no VA-API driver exists on this machine | CLAUDE.md |
 | A10 | CSS `width` on a `<canvas>` in a flex child | silently falls back to the 300px intrinsic default | CLAUDE.md "Canvas sizing rule" |
 | A11 | `texImage2D(…, null)` | allocates, leaves contents **undefined** | `compositor.ts` / `fbo.ts` |
+| A12 | Picking a channel pair ("— Front"/"— Rear") for a **main** device | discarded — `make_sink()` strips everything after `@` and nothing else read the suffix, so main went out as plain stereo wherever pipewire-pulse's channelmix put it. The picker offered the choice and the pipeline dropped it with no log line. **Fixed 2026-08-11** (`parse_device_remap` now runs on main branches too) | `slow-jog-audio-inaudible.md` §10.10, `pipeline.rs` |
 
 ### B. Guards and checks that gate nothing
 
@@ -155,6 +156,39 @@ and `apply_volume()` both include it — adjusting cue gain jumped the headphone
 product is computed in three places and two have now been wrong at different times** — see
 `pipeline.rs`'s own comment recording the identical bug already fixed once for the main
 sinks. Collapsing the three to one is a real follow-up.
+
+## E — three silent failures found building the shared output pipeline (2026-08-11)
+
+All three are in `audio/mixer.rs`, all three were caught by a hardware test written alongside
+the code, and none of them errors, warns, or shows up in any counter. They are recorded
+together because they share one shape: **a GStreamer state change that returns successfully
+while leaving the thing you asked for absent.**
+
+- **E1 — `set_state(Playing)` returns before a clock is selected.** `pipeline.clock()` reads
+  `None` immediately after. Nothing errors; every deck just quietly runs on `GstSystemClock`
+  and drifts against the device forever, presenting as a click every few minutes with no
+  instrument implicating the clock. Fix: wait for the state change to settle.
+- **E2 — an `audiomixer` with no request pads cannot reach PLAYING**, and says so only by
+  sitting in PAUSED until whatever timeout you happened to write. The node's clock and latency
+  are read at creation and are needed *by* the first branch attaching, so the ordering was
+  circular. Fix: a permanent silent `audiotestsrc` keepalive on every node.
+- **E3 — an aggregator with non-live pads waits forever for data on each pad.** With
+  `is-live=false` on the output `appsrc`s, the sink receives **zero** buffers for as long as
+  any one branch is idle — while other branches are actively feeding. One paused deck silences
+  the whole node, with no error anywhere. Measured, deliberately, as the control arm of
+  `scripts/probes/shared_output_mixer_probe.py`.
+
+⚠️ **E3's real lesson is about the probe, not the pipeline.** The main arm of that probe passed
+on the first run. That PASS was worth nothing until `--not-live` demonstrated the check could
+*fail* — an instrument that cannot register the failure it is claiming to rule out is not
+evidence, which is the same rule §D and the standing rule below arrive at from other
+directions. Build the negative arm before believing the positive one.
+
+Two instruments also **changed meaning** under this refactor without breaking, which is its own
+silent-failure class — the reading stays plausible while its interpretation rots:
+`output_queue underrun` now fires continuously during ordinary playback (downgraded to info on
+that path), and the scratch alignment report reads `SKIPPED(no property)` because `appsink` is
+not a `GstAudioBaseSink`. Both are documented at their call sites and in §10.14.
 
 ## Standing rule
 
