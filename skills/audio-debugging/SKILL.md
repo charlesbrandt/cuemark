@@ -29,10 +29,12 @@ Then read `journal.md` for the most recent session notes.
 
 ## Current pipeline topology
 
-**There are two output topologies**, selected by `CUEMARK_SHARED_OUTPUT` at deck-load time.
-Everything upstream of the `tee` is identical in both; only where the branches terminate
-differs. Check which one you are debugging *before* reading any sink-side instrument — several
-of them mean different things on each path (see the two warnings at the end of this section).
+**There are two output topologies**, selected by `CUEMARK_SHARED_OUTPUT` at deck-load time —
+**defaults to the shared-output path since 2026-08-11**; set `CUEMARK_SHARED_OUTPUT=0` to get
+the legacy one. Everything upstream of the `tee` is identical in both; only where the branches
+terminate differs. Check which one you are debugging *before* reading any sink-side instrument
+— several of them mean different things on each path (see the two warnings at the end of this
+section).
 
 Shared per deck, both paths:
 
@@ -44,15 +46,15 @@ uridecodebin → queue(max-buffers=2) → audioconvert → audioresample
                               └─ cue_valve → cue_volume → cue_queue …
 ```
 
-**Legacy path (default today)** — each branch ends in its own `pulsesink`, so one deck opens
-up to four, and main+cue on one device is *two sinks on one node*:
+**Legacy path (`CUEMARK_SHARED_OUTPUT=0`)** — each branch ends in its own `pulsesink`, so one
+deck opens up to four, and main+cue on one device is *two sinks on one node*:
 
 ```
   … volume₀ → [mix-matrix → caps] → pulsesink₀
   … cue_queue → [mix-matrix → caps] → pulsesink_cue
 ```
 
-**Shared-output path (`CUEMARK_SHARED_OUTPUT=1`)** — each branch ends in an `appsink` that
+**Shared-output path (default since 2026-08-11)** — each branch ends in an `appsink` that
 hands buffers to a per-node output pipeline, which sums them into **one** `pulsesink`:
 
 ```

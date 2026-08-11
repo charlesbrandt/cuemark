@@ -1166,9 +1166,12 @@ line now says which clock was chosen and why, so this cannot silently drift out 
 
 #### Still open in the neighbourhood
 
-- **Multi-deck and multi-node are untested** (stage 4 of the design doc). Two decks on one
-  node is the case that motivated C in the first place, and it has not been exercised live.
-- `CUEMARK_SHARED_OUTPUT` still defaults **off**. Flipping it is stage 5, after stage 4.
+- ✅ **Multi-deck and multi-node — DONE 2026-08-11** (stage 4 of the design doc, same day).
+  Two decks on one node — the case that motivated C in the first place — plus a second node
+  concurrently, both live-confirmed.
+- ✅ **`CUEMARK_SHARED_OUTPUT` now defaults on — DONE 2026-08-11** (stage 5), closed by a
+  600s real-hardware soak (`shared_output_soak`, `pipeline.rs`): 13 device rebuilds, 0
+  stuck-after-rebuild, 0 handoff drops. `=0` still reverts to the legacy path.
 - `audio-dropout-mid-playback.md`'s H1 is the same hazard and should be re-read against this
   fix — but it is a *different* fault (silence mid-playback, no scratch involved) and the
-  shared graph has not been soaked for it.
+  shared graph has not been soaked for it specifically.

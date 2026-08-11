@@ -85,7 +85,7 @@ Full write-up: `docs/design/codec-frame-cache.md` §5a.
 | | |
 |---|---|
 | **Symptom A** | Headphone cue chops to silence during a scratch while main plays normally, on a device where main and cue are two channel pairs of the *same* node (the DJControl Starlight). |
-| **Fix, not a knob** | `CUEMARK_SHARED_OUTPUT=1`. One `pulsesink` per device node instead of one per deck branch. This is the actual fix (`docs/design/shared-output-pipeline.md`), live-confirmed 2026-08-11. Still defaults **off** pending the multi-deck pass. |
+| **Fix, not a knob** | One `pulsesink` per device node instead of one per deck branch (`docs/design/shared-output-pipeline.md`). **Default since 2026-08-11**, after a 600s real-hardware soak; `CUEMARK_SHARED_OUTPUT=0` reverts to the old per-branch-sink path. |
 | **Log line** | `[audio/out/<node>] attached deck-0/cue (2 branch(es) now on this node, 4 ch)` — two branches, **one** node, is the whole point. |
 | **Symptom B** | With the shared graph on, a scratch gesture feels laggy while `late%` in the feeder telemetry is unchanged (so it is not the feeder). |
 | **Where** | `MIX_QUEUE_NS = 30ms` in `src-tauri/src/audio/mixer.rs` — the jitter buffer between each handoff and its mixer pad. |

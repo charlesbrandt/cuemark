@@ -27,8 +27,9 @@ only for the duration of a gesture):
                       | main0.handoff=…/s lag=… drop=…  | cue.handoff=…/s lag=… drop=…
 ```
 
-The `handoff` legs appear **only on the shared-output path** (`CUEMARK_SHARED_OUTPUT=1`,
-`docs/design/shared-output-pipeline.md`), one per deck branch. Everything else on this line
+The `handoff` legs appear **only on the shared-output path** — the default since 2026-08-11
+(`CUEMARK_SHARED_OUTPUT=0` for the legacy path, which has no handoff legs at all;
+`docs/design/shared-output-pipeline.md`) — one per deck branch. Everything else on this line
 measures one side of the `appsink`→`appsrc` boundary or the other; these measure the boundary
 itself, which is the one place a stall could hide from every other probe in the pipeline.
 
