@@ -8,6 +8,7 @@
 import { writable } from "svelte/store";
 import { session } from "./session";
 import type { Deck } from "./types";
+import { playStart, playHeartbeat, playFinish } from "../digger/api";
 
 export interface HistoryEntry {
   id: string;
@@ -36,15 +37,40 @@ export function setPendingTrackMeta(deckId: string, title: string, artist: strin
 interface Live {
   entry: HistoryEntry;
   playStartedAt: number | null; // epoch ms if currently playing, else null
+  // Resolves to Digger's plays.id once POST /plays/start returns, or null if this
+  // deck has no diggerTrackId (untracked load) or the request failed — best-effort,
+  // Digger being unreachable shouldn't block local history tracking.
+  diggerPlayId: Promise<number | null> | null;
 }
 
 const live = new Map<string, Live>();
 
-function finalize(deckId: string) {
+// Accumulates playedMs (if currently playing) and stops the running clock. Returns
+// the Live record so the caller can decide whether this is a real end (report
+// playFinish) or just a pause (report playHeartbeat) — finalize() itself doesn't
+// know which, since both paths reach it the same way.
+function finalize(deckId: string): Live | undefined {
   const l = live.get(deckId);
-  if (!l || l.playStartedAt === null) return;
-  l.entry.playedMs += Date.now() - l.playStartedAt;
-  l.playStartedAt = null;
+  if (!l) return undefined;
+  if (l.playStartedAt !== null) {
+    l.entry.playedMs += Date.now() - l.playStartedAt;
+    l.playStartedAt = null;
+  }
+  return l;
+}
+
+function reportFinish(l: Live | undefined) {
+  if (!l?.diggerPlayId) return;
+  l.diggerPlayId.then((playId) => {
+    if (playId !== null) playFinish(playId, l.entry.playedMs).catch(console.error);
+  });
+}
+
+function reportHeartbeat(l: Live | undefined) {
+  if (!l?.diggerPlayId) return;
+  l.diggerPlayId.then((playId) => {
+    if (playId !== null) playHeartbeat(playId, l.entry.playedMs).catch(console.error);
+  });
 }
 
 // Extra playedMs accrued since the last finalize/update, for a deck currently playing —
@@ -71,7 +97,7 @@ session.subscribe((s) => {
     const prevFilePath = prev ? filePathOf(prev) : null;
 
     if (filePath && filePath !== prevFilePath) {
-      finalize(deck.id);
+      reportFinish(finalize(deck.id));
       const meta = pendingMeta.get(deck.id);
       pendingMeta.delete(deck.id);
       const entry: HistoryEntry = {
@@ -84,10 +110,13 @@ session.subscribe((s) => {
         startedAt: Date.now(),
         playedMs: 0,
       };
-      live.set(deck.id, { entry, playStartedAt: deck.playing ? Date.now() : null });
+      const diggerPlayId = deck.diggerTrackId !== null
+        ? playStart(deck.diggerTrackId, deck.id).catch((e) => { console.error(e); return null; })
+        : null;
+      live.set(deck.id, { entry, playStartedAt: deck.playing ? Date.now() : null, diggerPlayId });
       history.update((h) => [entry, ...h].slice(0, MAX_ENTRIES));
     } else if (!filePath && prevFilePath) {
-      finalize(deck.id);
+      reportFinish(finalize(deck.id));
       live.delete(deck.id);
     } else if (filePath) {
       const l = live.get(deck.id);
@@ -95,7 +124,7 @@ session.subscribe((s) => {
         if (deck.playing && l.playStartedAt === null) {
           l.playStartedAt = Date.now();
         } else if (!deck.playing && l.playStartedAt !== null) {
-          finalize(deck.id);
+          reportHeartbeat(finalize(deck.id));
           history.update((h) => h); // trigger reactivity for the now-frozen playedMs
         }
       }
@@ -105,9 +134,23 @@ session.subscribe((s) => {
   // Deck removed entirely (removeDeck()) — finalize and drop its live tracking.
   for (const deckId of [...prevDecks.keys()]) {
     if (!seen.has(deckId)) {
-      finalize(deckId);
+      reportFinish(finalize(deckId));
       live.delete(deckId);
       prevDecks.delete(deckId);
     }
   }
 });
+
+// Heartbeat every 30s for decks currently playing — the design doc's convention
+// (docs/design/play-tracking.md in the digger repo), so a crash loses at most 30s
+// of duration on the open plays row instead of the whole session.
+setInterval(() => {
+  const now = Date.now();
+  for (const l of live.values()) {
+    if (l.playStartedAt === null || !l.diggerPlayId) continue;
+    const durationMs = l.entry.playedMs + (now - l.playStartedAt);
+    l.diggerPlayId.then((playId) => {
+      if (playId !== null) playHeartbeat(playId, durationMs).catch(console.error);
+    });
+  }
+}, 30_000);

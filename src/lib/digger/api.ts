@@ -29,6 +29,7 @@ export interface CuemarkPayload {
   hotCues: number[];
   bpm: number | null;
   downbeat: number | null;
+  gain: number | null;
 }
 
 const STORAGE_KEY = 'cuemark:diggerBaseUrl';
@@ -184,4 +185,46 @@ export async function setTrackBpm(trackId: number, bpm: number): Promise<void> {
     body: JSON.stringify({ bpm }),
   });
   if (!r.ok) throw new Error(`set bpm ${r.status}`);
+}
+
+export async function setTrackGain(trackId: number, gain: number): Promise<void> {
+  const r = await fetch(`${_baseUrl}/tracks/${trackId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ gain }),
+  });
+  if (!r.ok) throw new Error(`set gain ${r.status}`);
+}
+
+// Session/play-history reporting — Digger's own `plays` table doubles as cuemark's
+// set log (docs/design/play-tracking.md "Cuemark: standardize on the same log" in
+// the digger repo): insert-on-start, ~30s heartbeats, finalize on track-end. No
+// separate "Sessions" concept needed on either side.
+export async function playStart(trackId: number, sourceRef: string): Promise<number> {
+  const r = await fetch(`${_baseUrl}/plays/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ track_id: trackId, context: 'cuemark', source_ref: sourceRef }),
+  });
+  if (!r.ok) throw new Error(`plays/start ${r.status}`);
+  const { id } = await r.json();
+  return id;
+}
+
+export async function playHeartbeat(playId: number, durationMs: number): Promise<void> {
+  const r = await fetch(`${_baseUrl}/plays/${playId}/heartbeat`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ duration_ms: durationMs }),
+  });
+  if (!r.ok) throw new Error(`plays/heartbeat ${r.status}`);
+}
+
+export async function playFinish(playId: number, durationMs: number): Promise<void> {
+  const r = await fetch(`${_baseUrl}/plays/${playId}/finish`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ duration_ms: durationMs }),
+  });
+  if (!r.ok) throw new Error(`plays/finish ${r.status}`);
 }

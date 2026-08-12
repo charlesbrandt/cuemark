@@ -5,7 +5,7 @@
   import { nudgePhaseToMaster } from "../lib/audio/phaseNudge";
   import { tempoRange } from "../lib/audio/audioSettings";
   import { gridSave } from "../lib/audio/pipeline";
-  import { pushMarker, setTrackBpm } from "../lib/digger/api";
+  import { pushMarker, setTrackBpm, setTrackGain } from "../lib/digger/api";
   import { markGridSaved } from "../lib/audio/gridSource";
   import { recordAuxLoop } from "../lib/audio/pollStats";
   import { debugLog } from "../lib/debugLog";
@@ -396,6 +396,11 @@
       step="0.01"
       value={deck.gain}
       oninput={(e) => updateDeck(deck.id, { gain: +e.currentTarget.value })}
+      onchange={(e) => {
+        if (deck.diggerTrackId !== null) {
+          setTrackGain(deck.diggerTrackId, +e.currentTarget.value).catch(console.error);
+        }
+      }}
     />
     <strong>{deck.gain.toFixed(2)}</strong>
   </div>
