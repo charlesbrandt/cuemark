@@ -928,15 +928,29 @@
       // matters when that stat fails, e.g. no local NAS mount, Digger reachable instead.
       const fallbackUrl = deck.diggerFileId != null ? getDiggerFileUrl(deck.diggerFileId) : undefined;
       audioLoad(deckId, filePath, fallbackUrl).then((duration) => {
-        // A new DeckAudioPipeline is created with default gain/rate/volume=1.0. Re-apply
-        // current session values so saved MIDI state (or UI slider changes made before
-        // this track was loaded) take effect on the fresh pipeline.
+        // A new DeckAudioPipeline is created with default gain/rate/volume=1.0 and
+        // cue_enabled=false (pipeline.rs). Re-apply current session values so saved MIDI
+        // state (or UI slider/cue-button state set before this track was loaded) takes
+        // effect on the fresh pipeline.
         const d = get(session).decks.find((d) => d.id === deckId);
         if (d) {
           clearDeckAudioSync(deckId);
           syncGain(deckId, d.gain);
           syncRate(deckId, d.playbackRate);
           syncVolume(deckId, d.volume);
+          // Cue is guarded separately by _prevCueStates (see the cueEnabled $effect
+          // above) rather than audioSync.ts's module maps. teardownVideoBackendFull
+          // clears this deck's entry so the guard doesn't look "unchanged" against a
+          // pipeline that no longer exists, but clearing a plain Map is not a store
+          // mutation, so the reactive $effect never reruns on its own to notice — it
+          // only fires again on some *unrelated* future session change (a fader nudge,
+          // MIDI event, etc). Without this explicit re-send, a deck reloaded while cue
+          // was already on shows the button lit while the fresh pipeline's cue_valve is
+          // silently closed, until something else happens to touch the store. Send
+          // directly and mark the guard consistent, exactly like the MIDI direct-call
+          // path bypasses the store for rate/gain/volume.
+          _prevCueStates.set(deckId, d.cueEnabled);
+          audioSetCue(deckId, d.cueEnabled).catch(console.error);
         }
         const s = get(session).decks.find((d) => d.id === deckId)?.source;
         if (duration && s?.type === "video" && s.filePath === filePath && (!s.duration || !Number.isFinite(s.duration))) {
