@@ -88,6 +88,10 @@ function midiDeckId(hardcoded: string | undefined): string | undefined {
 // Per-deck jog state: saves the rate that was active before jog started so it can be restored.
 const jogBaseRate: Record<string, number> = {};
 const jogTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+// Tick-velocity EMA for the playing-deck jog bend below — same shape as scratchVelocity,
+// kept separate because the two branches (playing vs paused) run independently and a
+// gesture switching between them mid-session must not inherit a stale reading.
+const jogVelocity: Record<string, { lastT: number; emaTicksPerSec: number }> = {};
 
 // Paused-deck jog scratch: true bidirectional audio scratch (PCM-buffer feeder branch —
 // pitch bends with speed/direction, like real vinyl) rather than a silent position-only
@@ -254,6 +258,46 @@ const SCRATCH_MODE_PARAMS = {
     holdMs: 40,
   },
 } as const;
+
+// ── Playing-deck jog bend: variable speed, not a fixed step ────────────────────────
+//
+// This is a different mechanism from vinyl/shuttle scratch above — the deck is already
+// playing, so there is no paused feeder and no absolute position to servo to. What the
+// jog wheel does here is bend the *rate* of audio that's already advancing, so unlike
+// the "position, never rate" rule for the scratch feeder (see CLAUDE.md, "Direct
+// manipulation" — that rule is specifically about the paused-deck scratch path), a rate
+// really is the right control variable for this branch. It was, until now, just the
+// wrong shape of one: every tick applied the same fixed ±0.02 offset from the base rate
+// regardless of how fast the wheel was actually spinning (todo-20260808.md item 5: "the
+// jog wheel currently speeds up playback by a fixed amount ... I would like it to
+// respond similar to a vinyl control [with] variable speed adjustments"). Scaling the
+// bend by tick velocity — the same EMA-of-ticks/sec estimate shuttle mode above already
+// uses for this exact hardware/encoder — makes a gentle nudge barely bend pitch and a
+// fast spin bend it further, up to JOG_BEND_MAX.
+//
+// Runaway stays bounded the same two ways it already was: the bend is recomputed from
+// jogBaseRate every tick rather than compounding onto the previous nudge (see the
+// comment at the call site — this was the 2026-07 fix, still load-bearing and
+// unchanged), and the final Math.max/Math.min clamp below never lets soundtouch see
+// outside [0.25, 4.0] regardless of what the EMA reads.
+//
+// ⚠️ Not yet live-calibrated against the Starlight in this (playing-deck) branch — the
+// only measured tick rates on record are from the paused-deck vinyl calibration
+// (docs/design/waveform-scrub.md's [jog-cal/…] procedure: ~41/s slow, ~131/s fast, full
+// wheel revolutions). JOG_BEND_PER_TICK_PER_SEC is chosen so that range maps to roughly
+// 4.5% bend at the slow end and saturates at JOG_BEND_MAX near the fast end — deliberately
+// modest, since a "pitch bend while playing" is conventionally a small, quick nudge (a
+// few percent) rather than a scratch-scale speed change. Re-tune both constants by ear
+// once this can be tried on real hardware; nothing about the shape (EMA velocity → clamped
+// bend, no compounding) should need to change, only these two numbers.
+const JOG_BEND_PER_TICK_PER_SEC = 0.0011;
+const JOG_BEND_MAX = 0.15;
+// Seed for the very first tick of a gesture, before any inter-tick interval exists to
+// measure — mirrors shuttle's params.minRate/params.ratePerTickPerSec seed above (a
+// deliberately modest assumed rate, not a spike). Using a.value*1000 here (the naive
+// "one tick in ~1ms" reading) would make the first tick of every gesture bend far
+// harder than any sustained spin, before the EMA has a real reading to correct it.
+const JOG_BEND_SEED_TICKS_PER_SEC = 20;
 
 const scratchVelocity: Record<string, { lastT: number; emaTicksPerSec: number }> = {};
 const scratchIdleTimers: Record<string, ReturnType<typeof setTimeout>> = {};
@@ -509,12 +553,24 @@ export async function startMidiListener(): Promise<() => void> {
           break;
         }
         if (!(deckId in jogBaseRate)) jogBaseRate[deckId] = d.playbackRate;
+        // Bend magnitude tracks how fast the wheel is turning (EMA of ticks/sec — see
+        // "Playing-deck jog bend" above), not a fixed step per tick.
+        const jogNow = performance.now();
+        const prevJog = jogVelocity[deckId];
+        const jogInstTicksPerSec = prevJog
+          ? (a.value / Math.max(SCRATCH_MIN_DT_MS, jogNow - prevJog.lastT)) * 1000
+          : Math.sign(a.value) * JOG_BEND_SEED_TICKS_PER_SEC;
+        const jogEmaTicksPerSec = prevJog
+          ? prevJog.emaTicksPerSec * (1 - SCRATCH_EMA_ALPHA) + jogInstTicksPerSec * SCRATCH_EMA_ALPHA
+          : jogInstTicksPerSec;
+        jogVelocity[deckId] = { lastT: jogNow, emaTicksPerSec: jogEmaTicksPerSec };
+        const bend = Math.max(-JOG_BEND_MAX, Math.min(JOG_BEND_MAX, jogEmaTicksPerSec * JOG_BEND_PER_TICK_PER_SEC));
         // Offset from the saved base, not from d.playbackRate — the latter is already the
         // previous tick's nudged value, so adding to it compounds every event instead of
-        // producing a bounded ±2% bend. A spinning wheel fires many ticks well inside the
+        // producing a bounded bend. A spinning wheel fires many ticks well inside the
         // 150ms idle-reset window, so compounding ran the rate to the 4.0 clamp in under a
         // second (audible pitch runaway + soundtouch buffer stress). See journal.md.
-        const nudged = Math.max(0.25, Math.min(4.0, jogBaseRate[deckId] + a.value * 0.02));
+        const nudged = Math.max(0.25, Math.min(4.0, jogBaseRate[deckId] + bend));
         syncRate(d.id, nudged);                    // audio: immediate, no Svelte overhead
         queueDeckPatch(d.id, { playbackRate: nudged, syncLocked: false }); // UI: rAF-throttled — see deck_playback_rate
         // above and CLAUDE.md "session store is coarse-grained": a direct updateDeck() here
@@ -526,6 +582,7 @@ export async function startMidiListener(): Promise<() => void> {
         jogTimers[deckId] = setTimeout(() => {
           const base = jogBaseRate[deckId];
           delete jogBaseRate[deckId];
+          delete jogVelocity[deckId]; // next gesture starts its EMA fresh, not mid-decay
           if (base !== undefined) {
             syncRate(deckId, base);
             queueDeckPatch(deckId, { playbackRate: base });
