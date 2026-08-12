@@ -20,23 +20,43 @@ todo format.
    option" from the play-queue section below (auto-load `GET /queue/next` when a deck's clip
    ends) exposed as a toggle instead of two buttons nobody uses. Scope: UI swap plus wiring
    actual auto-advance logic — medium.
-2. **[LOW] Default gain synced from Digger.** Store a per-track default gain in Digger, apply
-   it on load (reset to default unless Digger supplies one), mirroring the existing
-   bpm/downbeat pull-on-load pattern. Cross-repo: needs a Digger schema field +
-   `GET /tracks/{id}/cuemark` addition, plus applying it in cuemark's load path. Medium, two
-   repos.
-3. **[LOW] Auto-save session history to Digger as "Sessions"**, with transition points
-   recorded for future auto-DJ training. `history.ts` already tracks this locally; needs a new
-   Digger endpoint (e.g. `POST /sessions`) plus a push call analogous to the existing
-   `pushMarker` fire-and-forget pattern. Medium-large, two repos — and probably wants #1 done
-   first, since "transition points" only means something once auto-advance exists.
-4. **Codebase review/refactor for maintainability.** Real concern, but not a scoped task as
+2. **Codebase review/refactor for maintainability.** Real concern, but not a scoped task as
    written — needs its own short audit (likely candidates: `App.svelte`'s size, the audio
    pipeline's accumulated complexity reflected in how much of CLAUDE.md it now occupies)
    before it's actionable. Flagging rather than scoping blind.
 
 (Resizable Digger Queue column shipped — `DiggerQueue.svelte`'s drag handle,
-2026-08-11 — and dropped from this list.)
+2026-08-11 — and dropped from this list. Default gain sync and session-history reporting
+shipped 2026-08-12 — see "Digger sync: gain + play history" below.)
+
+## Digger sync: gain + play history — DONE (2026-08-12)
+
+**Default gain**: `tracks.gain` (nullable REAL, migration step 38 in `~/repos/digger/migrate.py`)
+round-trips through `GET /tracks/{id}/cuemark` (`CuemarkPayload.gain`) and `PATCH /tracks/{id}`
+(`setTrackGain()`). `DiggerQueue.svelte`'s `loadToDeck()` resets to the deck default (1.0) unless
+Digger supplies one, mirroring the bpm/downbeat pull; `DeckCard`'s gain slider pushes back via
+`onchange` (fires once on release, not per drag tick) when `deck.diggerTrackId` is set.
+
+**Session/play history**: turned out not to need a new "Sessions" endpoint — Digger already had
+one, unused by cuemark (`POST /plays/start`, `PATCH /plays/{id}/heartbeat`, `PATCH
+/plays/{id}/finish`, `context='cuemark'`), specced for exactly this in
+`~/repos/digger/docs/design/play-tracking.md`'s "Cuemark: standardize on the same log" section.
+`history.ts`'s existing per-deck load/play/pause state machine (deckId, diggerTrackId, startedAt,
+playedMs) now reports into it: `playStart` on load, `playHeartbeat` on pause and every 30s while
+playing, `playFinish` on track-change/unload/deck-removal — all fire-and-forget
+(`.catch(console.error)`), consistent with `pushMarker`'s pattern. A `diggerTrackId === null` load
+(local file, not from Digger) reports nothing.
+
+**"Transition points for auto-DJ training" — deliberately not built here.** Digger's own
+`mix_transitions` table already reserves `source='play_history'` for transitions *mined from* the
+plays log server-side, and its router docstring explicitly scopes that mining job as "out of scope
+for this router" (i.e., separate future work, not something a client asserts live). So the
+scoped-here piece is exactly the substrate that job will need — accurate `plays` rows with real
+start times and durations — not the mining itself. Follow-up, when wanted: a Digger-side batch job
+over `plays` (context='cuemark', ordered by started_at) that inserts `mix_transitions` rows for
+consecutive tracks. Not blocked on the Auto DJ toggle above, contrary to what this list previously
+assumed — real transitions get logged whenever tracks are actually played back-to-back, autoloaded
+or not.
 
 ## Beat grid + snap-to-beat + phase nudge — DONE (2026-07-05 through 2026-08-12)
 
