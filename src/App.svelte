@@ -24,7 +24,7 @@
   import AudioSettings from "./components/AudioSettings.svelte";
   import DiggerQueue from "./components/DiggerQueue.svelte";
   import { mainOutputDeviceIds, cueOutputDeviceId, cueGain } from "./lib/audio/audioSettings";
-  import { fontScale } from "./lib/settings/displaySettings";
+  import { fontScale, queueSidebarWidth } from "./lib/settings/displaySettings";
   import { CodecPlayer, type DemuxInfo } from "./lib/video/codecPlayer";
   import { videoPathOverrides, videoPathDefault, resolveVideoPath, setVideoPathOverride } from "./lib/video/videoPathSettings";
   import type { Deck, Session } from "./lib/state/types";
@@ -54,6 +54,26 @@
   let showAudioSettings = $state(false);
   let showDiggerQueue = $state(true);
   let showVisualizationPanel = $state(false);
+
+  const QUEUE_SIDEBAR_MIN_WIDTH = 220;
+  const QUEUE_SIDEBAR_MAX_WIDTH = 640;
+
+  function startQueueSidebarResize(e: PointerEvent) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = get(queueSidebarWidth);
+    function onMove(ev: PointerEvent) {
+      // Sidebar is right-of-content, so dragging left (negative dx) widens it.
+      const next = startWidth - (ev.clientX - startX);
+      queueSidebarWidth.set(Math.min(QUEUE_SIDEBAR_MAX_WIDTH, Math.max(QUEUE_SIDEBAR_MIN_WIDTH, next)));
+    }
+    function onUp() {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
 
   // --font-scale (app.css :root) is inherited into every component's scoped styles,
   // so setting it once here on documentElement is all that's needed to scale all UI text.
@@ -1744,7 +1764,14 @@
     </div>
 
     {#if showDiggerQueue}
-      <aside class="queue-sidebar">
+      <div
+        class="queue-sidebar-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize queue sidebar"
+        onpointerdown={startQueueSidebarResize}
+      ></div>
+      <aside class="queue-sidebar" style="width: {$queueSidebarWidth}px;">
         <DiggerQueue />
       </aside>
     {/if}

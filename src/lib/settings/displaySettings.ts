@@ -38,3 +38,9 @@ function persistentWritable<T>(key: string, defaultValue: T) {
  * everywhere else.
  */
 export const fontScale = persistentWritable<number>("cuemark:fontScale", 1.0);
+
+/**
+ * Width (px) of the Digger queue sidebar, dragged via the resize handle in
+ * App.svelte. Persisted per-machine like the other display settings above.
+ */
+export const queueSidebarWidth = persistentWritable<number>("cuemark:queueSidebarWidth", 320);
