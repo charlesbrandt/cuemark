@@ -134,6 +134,23 @@ export function seekDeck(deckId: string, time: number) {
   // Record seek target so the RAF loop can ignore stale pre-seek IPC responses.
   pendingSeekTarget.set(deckId, { time, setAtMs: performance.now() });
   audioSeek(deckId, time).catch(console.error);
+  bumpSeekVersion(deckId);
+}
+
+// Bumped on every direct seek (hot cue jump, CUE button, Digger marker jump, click-to-seek)
+// so paused-deck consumers can redraw once. WaveformCanvas's continuous-redraw effect only
+// re-runs on deck.playing/scratchingDecks changes — neither of which a plain seekDeck() call
+// touches — so without this a seek issued to an already-paused deck moved the position but
+// left the waveform playhead visibly frozen at the pre-seek spot (reported live 2026-08-12:
+// clicking a hot cue gave no visual confirmation the ~1s jump happened).
+export const seekVersions = writable<Map<string, number>>(new Map());
+
+function bumpSeekVersion(deckId: string): void {
+  seekVersions.update((m) => {
+    const next = new Map(m);
+    next.set(deckId, (next.get(deckId) ?? 0) + 1);
+    return next;
+  });
 }
 
 export function setDeckAudioTime(deckId: string, t: number): void {

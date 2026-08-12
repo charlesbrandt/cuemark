@@ -1,6 +1,6 @@
 <script lang="ts">
   import { analyzeFile, COLOR_UPCOMING, COLOR_PLAYED } from '../lib/audio/waveform';
-  import { seekDeck, getDeckTime, quantizeToGrid, scratchingDecks, beginScrub, updateScrub, endScrub, cancelScrub } from '../lib/renderer/seekBus';
+  import { seekDeck, getDeckTime, quantizeToGrid, scratchingDecks, seekVersions, beginScrub, updateScrub, endScrub, cancelScrub } from '../lib/renderer/seekBus';
   import { getDiggerFileUrl } from '../lib/digger/api';
   import { recordAuxLoop } from '../lib/audio/pollStats';
   import { noteScrubInput } from '../lib/audio/scrubStats';
@@ -16,7 +16,8 @@
     // Fired once per track load when analysis completes. gridOffset is a
     // beat-level anchor (a beat lies at gridOffset + k·60/bpm), or null when
     // the beat-grid fit failed and bpm is the integer fallback estimate.
-    onAnalyzed?: (result: { bpm: number | null; gridOffset: number | null }) => void;
+    // onsets are the detected kick times behind the fit (null alongside gridOffset).
+    onAnalyzed?: (result: { bpm: number | null; gridOffset: number | null; onsets: number[] | null }) => void;
   } = $props();
 
   let canvas = $state<HTMLCanvasElement | null>(null);
@@ -72,7 +73,7 @@
       if (analyzedPath === filePath) {
         peaks = result.peaks;
         loading = false;
-        onAnalyzed?.({ bpm: result.bpm, gridOffset: result.gridOffset });
+        onAnalyzed?.({ bpm: result.bpm, gridOffset: result.gridOffset, onsets: result.onsets });
       }
     }).catch((err) => {
       console.warn('[waveform] analysis failed:', err);
@@ -147,6 +148,12 @@
   $effect(() => {
     if (!canvas) return;
     const c = canvas;
+    // Tracked for its own sake, not its value: a seek issued to a paused deck (hot cue,
+    // CUE button, Digger jump) changes neither deck.playing nor $scratchingDecks, so
+    // without this the draw() below would use the stale pre-seek position until some
+    // unrelated reactive change happened to re-run this effect. See seekVersions' doc
+    // comment in seekBus.ts.
+    void $seekVersions.get(deck.id);
     draw(c);
     if (!deck.playing && !$scratchingDecks.has(deck.id)) return;
     let rafId: number;
