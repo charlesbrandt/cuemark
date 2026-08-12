@@ -7,6 +7,8 @@
   import { gridSave } from "../lib/audio/pipeline";
   import { pushMarker, setTrackBpm, setTrackGain } from "../lib/digger/api";
   import { markGridSaved } from "../lib/audio/gridSource";
+  import { getDeckOnsets } from "../lib/audio/onsetStore";
+  import { snapToNearestOnset } from "../lib/audio/bpm";
   import { recordAuxLoop } from "../lib/audio/pollStats";
   import { debugLog } from "../lib/debugLog";
   import { suppressPhaseText, suppressTimestampText } from "../lib/audio/perfArm";
@@ -543,20 +545,26 @@
       onclick={() => {
         const t = getDeckTime(deck.id);
         if (t !== null) {
-          updateDeck(deck.id, { downbeat: t });
+          // Correct for human button latency (~50-100ms) by snapping to the nearest
+          // detected kick, not to the existing grid — that would make SET BEAT unable
+          // to correct it. No onsets on record (fallback-BPM track, or analysis still
+          // running) just leaves the raw stamp alone.
+          const onsets = deck.source?.type === 'video' ? getDeckOnsets(deck.id, deck.source.filePath) : null;
+          const snapped = onsets ? snapToNearestOnset(t, onsets) : t;
+          updateDeck(deck.id, { downbeat: snapped });
           if (deck.bpm !== null && deck.source?.type === 'video') {
-            gridSave(deck.source.filePath, deck.bpm, t).catch(console.error);
+            gridSave(deck.source.filePath, deck.bpm, snapped).catch(console.error);
             markGridSaved(deck.id, deck.source.filePath);
             if (deck.diggerTrackId !== null) {
               // Best-effort — Digger being unreachable shouldn't block the local save.
-              pushMarker(deck.diggerTrackId, Math.round(t * 1000), 'downbeat').catch(console.error);
+              pushMarker(deck.diggerTrackId, Math.round(snapped * 1000), 'downbeat').catch(console.error);
               setTrackBpm(deck.diggerTrackId, deck.bpm).catch(console.error);
             }
           }
         }
       }}
       disabled={!deck.source}
-      title="Stamp current position as beat 1 (downbeat anchor for phase tracking)"
+      title="Stamp current position as beat 1 (downbeat anchor for phase tracking); snaps to the nearest detected kick"
     >
       SET BEAT
     </button>

@@ -12,6 +12,7 @@
     audioSetCueDevice, audioSetCueGain, gridGetSaved,
   } from "./lib/audio/pipeline";
   import { clearSavedGrid, markGridSaved, hasSavedGrid } from "./lib/audio/gridSource";
+  import { setDeckOnsets } from "./lib/audio/onsetStore";
   import { syncRate, syncGain, syncVolume, clearDeckAudioSync, averageRateOverWindow } from "./lib/audio/audioSync";
   import { startSessionSync } from "./lib/state/sessionRecovery";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -1163,7 +1164,21 @@
         // Brand-new file for this deck (fresh load, track swap, OR a deliberate reload of
         // the file already here — same filePath but a new loadSeq) — tear down whatever
         // backend was active for the OLD file (including its audio pipeline) first.
-        teardownVideoBackendFull(deckId);
+        //
+        // Skip teardown when pendingAdoption is set for this deck: this is the first sync
+        // pass after a freeze-watchdog recovery reload, backendState is empty simply
+        // because the page is fresh, and there is no stale frontend backend to clean up —
+        // only the live Rust pipeline that survived the freeze. teardownVideoBackendFull()
+        // calls audioUnload(), which drops that pipeline immediately (Drop tears the
+        // GStreamer pipeline to Null and detaches its mixer branches); ensureAudioLoaded()
+        // below then finds pendingAdoption still set and skips audioLoad(), believing it
+        // adopted a survivor that this call already destroyed. Confirmed live 2026-08-12:
+        // both decks came back marked "loaded" with no underlying pipeline, and every
+        // subsequent play() failed silently forever — see docs/design/freeze-watchdog.md
+        // "Adoption bugs".
+        if (!pendingAdoption.has(deckId)) {
+          teardownVideoBackendFull(deckId);
+        }
         const adopted = ensureAudioLoaded(deck, filePath);
         if (desired === 'webcodecs') {
           backendState.set(deckId, { filePath, kind: 'pending', adoptedPos: adopted?.positionSecs, loadSeq: deck.source.loadSeq });
@@ -1764,7 +1779,13 @@
                  override for bar identity, and only a manual SET BEAT persists locally /
                  pushes to Digger. null (grid fit failed, integer detectBpm fallback) still
                  clears any stale downbeat carried over from the previous track. -->
-            <WaveformCanvas {deck} onAnalyzed={({ bpm, gridOffset }) => {
+            <WaveformCanvas {deck} onAnalyzed={({ bpm, gridOffset, onsets }) => {
+              // Onsets feed SET BEAT's re-snap (onsetStore.ts) regardless of whether the
+              // auto-fit itself is trusted below — a saved grid can still be manually
+              // corrected, and that correction should snap to a real kick too.
+              if (deck.source?.type === 'video' && onsets) {
+                setDeckOnsets(deck.id, deck.source.filePath, onsets);
+              }
               // A saved grid (sidecar or Digger) always wins over the auto-fit — see the
               // race-ordering comment at the gridGetSaved() call site above.
               if (deck.source?.type === 'video' && !hasSavedGrid(deck.id, deck.source.filePath)) {
