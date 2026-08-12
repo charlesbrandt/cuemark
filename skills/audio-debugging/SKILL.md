@@ -1384,6 +1384,30 @@ fact rather than trying to pre-filter what's "interesting" live.
 
 ## VA-API hardware decode status (as of 2026-06-20)
 
+🔴 **Scoped to the 2012 MacBook Pro only — do not treat "H.264 hardware decode is
+enabled" as true of whatever machine you're currently on.** `CLAUDE.md` states plainly
+that the MacBook Pro has **no VA-API driver for any codec** — re-verified 2026-08-05 by
+checking for Intel `*_drv_video.so` under `/usr/lib/x86_64-linux-gnu/dri` (none; only
+d3d12/nouveau/r600/radeonsi/virtio_gpu), for `gstreamer1.0-vaapi` (not installed), and
+`gst-inspect-1.0 va` (`0 features`). Everything decodes in software *there*. The
+`GST_PLUGIN_FEATURE_RANK` demotion below is a **no-op** on that machine specifically —
+there's nothing for it to demote.
+
+🔴 **Confirmed false on `mele`, a second cuemark dev/test machine** (2026-08-12): `mele`
+has a fully working VA-API stack (`iHD_drv_video.so`, `gstreamer1.0-vaapi` installed,
+`gst-inspect-1.0 va` → 12 features including VP9 hardware decode). The "sandbox not being
+the same environment session to session" theory once floated here was wrong — it's not
+drift, it's two different physical machines, never distinguished in this doc before. See
+`docs/environment.md` for the full per-machine matrix and the (currently open) question
+of whether `main.rs`'s demotion list is correct on `mele`'s hardware.
+
+**Never explain a codec-specific cost/behavior difference by hardware decode without
+re-running those three checks first, on whichever machine you're actually on** — the
+paragraphs below describe a `mesa-va-drivers`/`webkit2gtk` state from 2026-06-20 on the
+MacBook Pro specifically. They're kept for historical/mechanism context (the
+avc-vs-annexb finding itself doesn't depend on which decoder was active), not as a
+current hardware-decode status for any given machine.
+
 `src-tauri/src/main.rs` sets `GST_PLUGIN_FEATURE_RANK` to demote specific VA-API decoders to rank 0,
 forcing software decode fallback for codecs where this GPU's DMA-BUF export was confirmed broken.
 **Current state: only AV1 (`vaav1dec`/`vaapiav1dec`) is demoted.** H.264 hardware decode was
@@ -1393,7 +1417,43 @@ symptom returns for H.264, or shows up freshly for AV1/VP9/HEVC, re-add the code
 `vaapi*dec` factory name to the rank string in `main.rs` — see the comment there and the
 2026-06-19/2026-06-20 journal entries for the full history before assuming it's fixed for good.
 
+## Verifying a GStreamer bug fix without the full app: replicate the pipeline logic standalone (2026-08-12)
+
+To confirm `pipeline.rs`'s `autoplug-select` video-decoder-skip actually protects a
+*different* machine's VA-API stack (`mele`, see `docs/environment.md`), a full app launch
+wasn't needed — a ~40-line standalone `python3-gi` + `Gst` script built the same
+`uridecodebin` + `autoplug-select` shape and pointed it at a real AV1 library file, with
+`fakesink` standing in for the real audio graph. This is faster to iterate and easier to
+read the result from (no log-grepping through app noise) than driving the real app for a
+pipeline-shape question — reuse this pattern for any "does this GStreamer element
+selection/caps/signal behavior hold on this machine" question that doesn't depend on the
+rest of the app. It also makes a clean A/B: running the *same* script with the skip logic
+deliberately broken reproduced the original bug's exact GStreamer error
+(`GstVaAV1Dec:vaav1dec0: no valid frames found`) as the control arm, which is stronger
+evidence than a single passing run alone.
+
+**Gotcha**: `Gst.ElementFactory`'s klass string (what `autoplug-select` checks — see
+`pipeline.rs`'s `is_video_decoder` comment) is not exposed as `factory.get_klass()` in
+the `python3-gi` bindings, despite that being the natural-looking method name and despite
+Rust's `gstreamer` crate exposing exactly that. It's `factory.get_metadata('klass')`.
+Calling the wrong one raises `AttributeError` from inside a signal handler, which
+GStreamer swallows silently and falls through to the *default* autoplug behavior (TRY,
+not SKIP) — so a broken skip filter doesn't error loudly, it just quietly stops skipping,
+and the result looks exactly like "the fix isn't there" rather than "the check crashed."
+Confirm any `autoplug-select`/signal-handler probe actually fires its intended branch
+(e.g. print inside both branches) before trusting a clean or a failing result from it.
+
 ## WebCodecs H.264 hardware decode requires `description` (avc), not annexb (2026-07-25)
+
+⚠️ **This section's root-cause narrative assumes `vah264dec` (hardware) was actually
+selected, which the 2026-08-05 re-verification says isn't possible on this machine (no
+VA-API driver at all — see the correction at the top of "VA-API hardware decode status"
+above).** The **fix still stands and is what shipped** (always build avc+`description`,
+never rely on annexb-without-description) — that recipe works regardless of which decoder
+is active, which is presumably why it was never noticed as wrong. What's stale is only the
+causal story ("`vah264dec` doesn't tolerate annexb-without-description, `avdec_h264` does")
+— treat it as an unconfirmed hypothesis from an environment state that may not have existed
+the way this section describes, not a settled explanation.
 
 **Symptom**: `VideoDecoder.configure({codec: 'avc1.PPCCLL'})` (no `description`) + `decode()` on
 real Annex-B chunks (start-code-delimited NALs, in-band SPS/PPS) — the WebCodecs-documented

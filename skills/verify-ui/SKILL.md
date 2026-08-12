@@ -26,9 +26,11 @@ this exact question:
    inspector attached *at process start* — neither attaches to an existing process.
 2. **Launching a fresh, separate, isolated instance and driving it** — this skill
    (`tauri-driver` + `Xvfb`) or the lightweight `python3-gi` + GDK-event-injection
-   probes below. This fully works on this machine (verified 2026-08-12: `Xvfb`,
-   `tauri-driver`, `WebKitWebDriver`, and the `python3-gi`/`gir1.2-webkit2-4.1` stack
-   are all installed) and is exactly what several scripts and probes already do
+   probes below. This fully works on `mele` (verified 2026-08-12: `Xvfb`, `tauri-driver`,
+   `WebKitWebDriver`, and the `python3-gi`/`gir1.2-webkit2-4.1` stack are all installed —
+   see `docs/environment.md` for the full per-machine tooling matrix, since cuemark is
+   developed/tested on more than one physical machine and package presence isn't
+   guaranteed to transfer) and is exactly what several scripts and probes already do
    successfully. It is not a live-session workaround — it's a real, separate cuemark
    process the driving session fully controls.
 
@@ -62,22 +64,26 @@ sudo apt-get install xvfb webkit2gtk-driver || sudo apt-get install xvfb webkitg
 cargo install tauri-driver
 ```
 **The WebKitWebDriver package name varies by distro release, and this is not cosmetic
-— checking the wrong one produces a false negative, not an error.** Confirmed on this
-machine (Ubuntu 24.04.4 LTS, 2026-08-12): the package is `webkit2gtk-driver` (`apt-cache
-policy webkitgtk-webdriver` shows no candidate at all — it isn't just uninstalled, apt
-doesn't know the name here). On Ubuntu 26.04 it flips: `webkitgtk-webdriver` is the real
-name (confirmed empirically 2026-08-04 — `webkit2gtk-driver` doesn't exist there, apt's
-error names the replacement directly).
+— checking the wrong one produces a false negative, not an error.** Confirmed on `mele`
+(Ubuntu 24.04.4 LTS, 2026-08-12): the package is `webkit2gtk-driver` (`apt-cache policy
+webkitgtk-webdriver` shows no candidate at all — it isn't just uninstalled, apt doesn't
+know the name here). Confirmed separately on the 2012 MacBook Pro while it was on Ubuntu
+26.04 (2026-08-04): `webkitgtk-webdriver` is the real name there, `webkit2gtk-driver`
+doesn't exist. **These are two different physical machines, not one machine's package
+name drifting over time** — see `docs/environment.md` for the full machine matrix. Don't
+assume either name is "current" without checking which machine and which distro release
+you're actually on.
 
-⚠️ **A `dpkg -L webkitgtk-webdriver` check silently reports "missing" on this exact
-machine, even though the driver is fully installed and working** — `dpkg -L` on a
-package name that was never installed just returns nothing (exit 1), with no error to
-flag that it's the wrong name rather than an absent tool. This was previously the
-skill's own literal verify step, and following it here produces exactly a false "stop,
-tell the user it's not installed" — a likely cause of prior sessions disagreeing about
-whether automation was available on the same machine. **Always verify by finding the
-`WebKitWebDriver` binary itself** (the `find`/`which` block above), never by checking
-one hardcoded package name.
+⚠️ **A `dpkg -L webkitgtk-webdriver` check silently reports "missing" on a 24.04 machine
+(e.g. `mele`), even though the driver is fully installed and working under a different
+package name** — `dpkg -L` on a package name that was never installed just returns
+nothing (exit 1), with no error to flag that it's the wrong name rather than an absent
+tool. This was previously the skill's own literal verify step, and following it on a
+24.04 machine produces exactly a false "stop, tell the user it's not installed" — a
+likely cause of prior sessions disagreeing about whether automation was available, since
+different sessions were sometimes on different machines/distro releases without saying
+so. **Always verify by finding the `WebKitWebDriver` binary itself** (the `find`/`which`
+block above), never by checking one hardcoded package name.
 
 **`which tauri-driver` can report missing when it's actually installed**: `cargo install`
 puts the binary at `~/.cargo/bin/tauri-driver`, which isn't always on this shell's `PATH`
@@ -111,6 +117,32 @@ Re-run after frontend or Rust changes — this binary is a separate build from
 whatever `cargo tauri dev` produced, so a stale one will not reflect recent edits.
 Sanity-check after launching a session: `GET /session/$SESSION/url` should report
 `tauri://localhost`, not `http://localhost:1420/`.
+
+**Shortcut when a `cargo tauri dev` instance is already running and serving Vite**
+(confirmed working on `mele`, 2026-08-12): `import.meta.env.DEV` is `true` under Vite
+regardless of `VITE_ENABLE_DEBUG_HOOK`, so `window.__cuemarkDebug` is already exposed —
+no separate `VITE_ENABLE_DEBUG_HOOK=1 cargo tauri build --debug --no-bundle` needed. Just
+point `tauri-driver` at the existing `target/debug/cuemark` binary (built by `cargo tauri
+dev`'s own auto-rebuild) with `BINARY` above; it loads `http://localhost:1420/` and
+connects to the live Vite server rather than `tauri://localhost` — expected here, not a
+bug, since nothing cleared `devUrl` for this binary. This spins up a **second**,
+independent cuemark instance/window alongside the one already running — cheap for a
+scripted check (state IPC, `execute/sync`), but see the pixel-verification caveat below
+before trusting a screenshot or canvas-pixel read from it.
+
+⚠️ **A pixel/frame-render check from this second-instance setup was inconclusive on
+`mele` (2026-08-12) and should not be trusted without further isolation.** Loading a
+video into a deck and reading `getCodecFramePts()`/canvas pixels came back
+null/all-black for two different codecs, even though the Rust-side demux
+(`video_demux_load`) returned correct metadata and an isolated single-purpose decode
+probe succeeded for the same files — i.e. the failure was specific to *this* driven
+instance's rendering, not the codec or the decoder. The likely cause was never isolated:
+the driven window ran with `document.hasFocus() === false` (check it — some rAF/paint
+paths can be quietly throttled for an unfocused window even while
+`visibilityState === 'visible'`), *and* a second, unrelated `cargo tauri dev` instance
+was live on the same machine at the same time, competing for the same GPU. **Before
+trusting a black canvas as a real bug, retry with exactly one cuemark instance running
+and confirm `document.hasFocus()` on the driven window** — neither was ruled out here.
 
 ## 2. Start the isolated display
 

@@ -312,10 +312,15 @@ support — it bails at container-pad-detection, before an `h264parse`/decoder e
 instantiated — so the AV1/VA-API corruption class of bug (`project_av1_vaapi_bug`) structurally
 cannot occur here, confirmed empirically, not just by design.
 
-**One real finding that changes the phase 2 plan**: the spike's "annexb, no `description`"
-recipe (`dec.configure({codec})`, raw Annex-B chunks) **does not work with H.264 hardware
-decode** (`vah264dec`, enabled in this app's env — see `audio-debugging` skill's "VA-API
-hardware decode status"). It decodes 0 frames and `flush()` rejects with `EncodingError:
+**One real finding that changes the phase 2 plan** (⚠️ read with the correction below —
+this paragraph's "hardware decode enabled" premise is contradicted by this same doc's own
+"Phase 7 results" section, and by CLAUDE.md's 2026-08-05 re-verification that this machine
+has no VA-API driver at all; the *fix* is still correct, only the *causal story* is stale,
+see `audio-debugging` skill for the fuller correction): the spike's "annexb, no
+`description`" recipe (`dec.configure({codec})`, raw Annex-B chunks) **does not work with
+H.264 hardware decode** (`vah264dec`, enabled in this app's env — see `audio-debugging`
+skill's "VA-API hardware decode status"). It decodes 0 frames and `flush()` rejects with
+`EncodingError:
 Decode error`. Re-running the spike's own probe script today reproduces this same failure —
 its recorded "60/60 decoded" pass only holds with `vah264dec`/`vaapih264dec` demoted to force
 software `avdec_h264`, which is not this app's actual configuration. Full root-cause writeup:
@@ -1063,6 +1068,16 @@ legacy `<video>` element *does* play AV1 (`aom av1dec` is installed and is what
 already took the 6 fps AV1 library file from 26 → 50–54 fps, which is why this is a
 tolerable place to leave it.
 
+🔴 **Stale as of the same day's later live verification — do not cite this paragraph's
+"the legacy `<video>` element does play AV1" claim.** A live ~7-minute play on the
+legacy path found **zero video frames decoded**, not just a low frame rate (`drew=0` on
+every logged tick; audio and cue worked fine). "Tolerable place to leave it" assumed
+some frames render, which is false. See `docs/design/legacy-video-fallback-cost.md`
+"2026-08-05 live verification — both remaining claims broke" for the full account and
+current status (also summarized in `CLAUDE.md`'s "Open findings" section). What stands
+from this section: VP9 ships on WebCodecs, AV1 WebCodecs decode is broken on this build
+— only the "so AV1 is fine on the fallback" conclusion is wrong.
+
 ### What shipped
 
 `src-tauri/src/video_demux.rs`:
@@ -1152,6 +1167,19 @@ package … is not installed` line that looks nothing like the real problem. Fix
 five to ask the PATH first and fall back to either package name, with an explicit
 not-found error.
 
+**"the binary now ships in `webkitgtk-webdriver`" above was itself a snapshot of one
+machine, not a permanent fact — don't treat it as current, and don't assume it was ever
+contradicted on the *same* box either.** This whole Phase 7 investigation was on the 2012
+MacBook Pro. `skills/verify-ui/SKILL.md` later (2026-08-12) found `webkit2gtk-driver`
+installed with no `webkitgtk-webdriver` candidate at all — but that check ran on **`mele`**,
+a second, separate machine cuemark is also developed/tested on (Intel N150, not the
+MacBook's Ivy Bridge), which this doc corpus had no prior record of at all. So this is not
+"the MacBook's package flipped back" — it may never have changed on the MacBook, and the
+apparent flip is two different machines' package managers agreeing with the *release* each
+happened to be on, not one machine drifting. See `docs/environment.md` for the actual
+per-machine matrix. The fix (PATH first, fall back to *either* name) is what actually
+matters regardless of which machine — don't shortcut it back down to one hardcoded name.
+
 ### The measurement: VP9 goes 26 → 55 fps
 
 Two clean launches, one arm each, `VITE_PERF_SWEEP=1 VITE_PERF_SWEEP_TRACK=<the VP9 file>`,
@@ -1202,17 +1230,19 @@ adding either**.
 - ✅ **Phase 7 candidate — RESOLVED 2026-08-05, see "Phase 7 results" above.** VP9 ships
   through the demux gate (26 → 55 fps on the worst library file); AV1 is refused because
   `VideoDecoder` cannot decode it on this WebKitGTK despite reporting that it can.
-- 🔴 **AV1 has no good path, only a tolerable one.** WebCodecs decodes zero AV1 frames here
-  (proved against a real file *and* against a GStreamer-encoded control), so AV1 stays on
-  the legacy `<video>` element, where `drawImage(video)` is expensive. What makes this
-  survivable rather than a live-set blocker is A2's frame-change gate
-  (`legacy-video-fallback-cost.md`), which took the 6 fps AV1 library file from 26 → 50–54
-  fps by drawing once per source frame. **A high-frame-rate AV1 file would still be bad** —
-  the gate's value is `min(rAF fps, source fps) / rAF fps`, and the library's AV1 happens
-  to be 6 fps. Re-check WebCodecs AV1 after any WebKitGTK upgrade
-  (`scripts/probes/webcodecs_vp9_av1_probe.py` answers it in a minute); if it starts
-  working, adding it to `video_demux.rs` is a two-line change plus an `av01.P.LLT.DD`
-  string built from `av1parse`'s already-reported `profile`/`level`/`tier` caps.
+- 🔴 **AV1 has no good path, not even a tolerable one — this bullet is stale, corrected
+  the same day.** It originally read "survivable" on the strength of A2's frame-change
+  gate (26 → 50–54 fps on the 6 fps library file). A live ~7-minute play the same evening
+  found the legacy `<video>` path renders **zero** AV1 frames, not a low frame rate — the
+  frame-change gate has nothing to gate when no frame ever arrives. WebCodecs decodes zero
+  AV1 frames too (proved against a real file *and* a GStreamer-encoded control). There is
+  currently no path that shows AV1 video at all; audio/cue still work. See
+  `legacy-video-fallback-cost.md` "2026-08-05 live verification" for the full account —
+  don't re-cite the "tolerable"/"survivable" framing from earlier the same day. Re-check
+  WebCodecs AV1 after any WebKitGTK upgrade (`scripts/probes/webcodecs_vp9_av1_probe.py`
+  answers it in a minute); if it starts working, adding it to `video_demux.rs` is a
+  two-line change plus an `av01.P.LLT.DD` string built from `av1parse`'s already-reported
+  `profile`/`level`/`tier` caps.
 - **VP8 and HEVC are unprobed.** `isConfigSupported` says `true` for both — and AV1 has
   just shown what that is worth. Probe a real decode before adding either.
 - ⚠️ **The 2026-08-05 watchdog trigger was *not* the `NetworkProcess` deadlock below**, despite

@@ -5,6 +5,20 @@ projector output, MIDI controller integration. Open source goal.
 
 Domain: cuemark.com (Charles Brandt's former DJ name)
 
+## Environment
+
+🔴 **Cuemark is developed and tested on at least two physically different machines**
+(a 2012 MacBook Pro, Ivy Bridge/Intel HD 4000, and `mele`, an Intel N150 box — possibly
+also a Framework laptop, unconfirmed) **with materially different GPU/driver stacks.**
+Most of this file's environment-specific claims below (VA-API absence, the Mesa `crocus`
+WebGL-readback bug, WebKitWebDriver's package name) were established on the MacBook Pro
+specifically and are **not** known to hold on `mele`, which does have a working VA-API
+stack (confirmed 2026-08-12) — the opposite of what "no VA-API driver" below states.
+**`docs/environment.md` is the canonical per-machine reference — check which machine
+you're on and read it before trusting any hardware/driver/tooling claim in this file.**
+This file still carries the full architectural reasoning for *why* each fact matters;
+`docs/environment.md` carries the *current status per machine* and the verify command.
+
 ## Tech stack
 
 - **Tauri** (Rust backend + WebKit frontend) — cross-platform, Wayland-native on Linux via GTK4
@@ -231,14 +245,23 @@ attributes rather than CSS. To debug compositing, temporarily give it a real siz
 that one change is what cracked the bug.
 Also demote broken VA-API decoders via `GST_PLUGIN_FEATURE_RANK` in `main.rs` — currently only
 `vaav1dec:0,vaapiav1dec:0`.
-⚠️ **This demotion is a no-op today, and "H.264 hardware decode is deliberately live" (claimed
-here on 2026-06-20) is stale: this machine has no VA-API driver for any codec.** Re-verified
-2026-08-05 — no Intel `*_drv_video.so` under `/usr/lib/x86_64-linux-gnu/dri` (only d3d12,
-nouveau, r600, radeonsi, virtio_gpu), no `gstreamer1.0-vaapi`, and `gst-inspect-1.0 va` registers
-`0 features`. **Everything decodes in software**, so never explain a codec-specific cost
-difference by hardware decode without re-running those three checks.
-See `audio-debugging` skill for the full VA-API investigation, debugging tips, and env-var override
-pitfalls.
+⚠️ **This demotion is a no-op today on the 2012 MacBook Pro, and "H.264 hardware decode is
+deliberately live" (claimed here on 2026-06-20) is stale for that machine: it has no
+VA-API driver for any codec.** Re-verified 2026-08-05 — no Intel `*_drv_video.so` under
+`/usr/lib/x86_64-linux-gnu/dri` (only d3d12, nouveau, r600, radeonsi, virtio_gpu), no
+`gstreamer1.0-vaapi`, and `gst-inspect-1.0 va` registers `0 features`. **Everything
+decodes in software on that machine**, so never explain a codec-specific cost difference
+by hardware decode there without re-running those three checks.
+
+🔴 **This does NOT hold on `mele`** (a second cuemark dev/test machine) — confirmed
+2026-08-12, `mele` has a fully working VA-API stack (`iHD_drv_video.so`,
+`gstreamer1.0-vaapi` installed, `gst-inspect-1.0 va` → 12 features including VP9 hardware
+decode). The demotion above is *not* a no-op there, and none of this project's VA-API bug
+history or hardware-decode cost numbers have been validated on that machine's stack. See
+`docs/environment.md` for the full per-machine matrix and open questions.
+
+See `audio-debugging` skill for the full VA-API investigation (MacBook-Pro-scoped),
+debugging tips, and env-var override pitfalls.
 
 **Waveform analysis uses `audio_analyze_file` Tauri command** (Rust/GStreamer, `analysis.rs`), not
 `decodeAudioData` — avoids VA-API corruption in the separate WebKitWebProcess. It returns
@@ -714,8 +737,11 @@ Several automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb
 | `scripts/probes/video_frame_signal_probe.py` | Which frame-change signal a legacy `<video>` element actually exposes here — `currentTime` (gates nothing), `requestVideoFrameCallback` (present, rate unmeasurable headlessly), `getVideoPlaybackQuality().totalVideoFrames` (tracks the source frame rate exactly). Run before writing any "has this video advanced a frame?" check. Seconds, needs a real media file. |
 | `scripts/probes/output_window_compositor_probe.py` | End-to-end check of the **real** `output.html`: posts a synthetic frame from a same-origin sender and reads the composited result back, including an orientation assertion. Run after touching `outputBus.ts`, `output.ts`, `outputProtocol.ts` or `fbo.ts`. Needs the Vite dev server and `LIBGL_ALWAYS_SOFTWARE=1`. |
 
-⚠️ **All GPU→CPU readback from WebGL is broken on this machine — it is a Mesa `crocus`
-(Intel HD 4000, gen7) driver bug, not a WebKit one.** `createImageBitmap`, `drawImage(glCanvas)`,
+⚠️ **All GPU→CPU readback from WebGL is broken on the 2012 MacBook Pro — it is a Mesa
+`crocus` (Intel HD 4000, gen7) driver bug, not a WebKit one.** Not re-verified on `mele`
+(different GPU/driver generation entirely — see `docs/environment.md`); don't assume this
+holds there before re-running `scripts/probes/webgl_readback_variants_probe.py`.
+`createImageBitmap`, `drawImage(glCanvas)`,
 `toDataURL` and *every* `readPixels` variant (default FB, complete `SAMPLES=0` user FBO, PBO,
 after `copyTexSubImage2D`) return transparent or `INVALID_OPERATION` + a zeroed buffer, while
 the canvas **displays** correctly. None of them throw. Under `LIBGL_ALWAYS_SOFTWARE=1` every

@@ -396,7 +396,13 @@ VITE_ENABLE_DEBUG_HOOK=1 cargo tauri build --debug --no-bundle
 
 # Isolated display + driver (does NOT touch the user's real :0/wayland-0 session)
 Xvfb :99 -screen 0 1280x900x24 &
-WEBKIT_DRIVER=$(dpkg -L webkit2gtk-driver | grep -E '/WebKitWebDriver$')
+# WebKitWebDriver's providing package name is not stable across sessions/distro
+# releases (seen as both webkit2gtk-driver and webkitgtk-webdriver on this same
+# project at different times) — resolve the binary, don't hardcode one package name,
+# see skills/verify-ui/SKILL.md "One-time setup" and the scripts/*-test.sh scripts.
+WEBKIT_DRIVER="$(command -v WebKitWebDriver \
+  || dpkg -L webkitgtk-webdriver 2>/dev/null | grep -E '/WebKitWebDriver$' \
+  || dpkg -L webkit2gtk-driver 2>/dev/null | grep -E '/WebKitWebDriver$')"
 DISPLAY=:99 tauri-driver --port 4444 --native-driver "$WEBKIT_DRIVER" &
 
 # Create a session (launches the app)

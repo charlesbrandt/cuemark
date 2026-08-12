@@ -12,8 +12,8 @@ description: Launch the cuemark Tauri dev app and monitor its output. Use when a
 - MIDI: Hercules Starlight absence at launch is normal — `[midi] Hercules Starlight not found` is not an error.
 - **Digger proxy errors are normal**: `[vite] http proxy error: /queue … ECONNREFUSED 127.0.0.1:8200` just means the Digger media library service isn't running. The app degrades gracefully — drag-and-drop and manual load still work.
 - **GTK theme warnings are harmless**: `Gtk-WARNING **: Theme parsing error: gtk.css:…` at launch is cosmetic, not a functional issue.
-- **No screenshot tool available**: grim, scrot, gnome-screenshot, spectacle are all absent. Verify the app is running by checking for `WebKitWebProcess` in `ps aux` and confirming log lines (see "Confirm it's up" below). The app window will appear on the user's desktop.
-- **`pactl` is not installed** — for any live PipeWire/audio-routing inspection (sink volumes, mute state, which client streams are actually active) use `wpctl status` or `pw-dump` instead. See "HMR cascade → orphaned PipeWire streams" below for a concrete use case.
+- **No screenshot tool available** on the machines checked so far (grim, scrot, gnome-screenshot, spectacle all absent — see `docs/environment.md` for which machines that covers). Verify the app is running by checking for `WebKitWebProcess` in `ps aux` and confirming log lines (see "Confirm it's up" below). The app window will appear on the user's desktop.
+- **`pactl` is not installed** on the machines checked so far — for any live PipeWire/audio-routing inspection (sink volumes, mute state, which client streams are actually active) use `wpctl status` or `pw-dump` instead. See "HMR cascade → orphaned PipeWire streams" below for a concrete use case.
 
 ## Prerequisites check
 
