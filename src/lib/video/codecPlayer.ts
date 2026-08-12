@@ -111,8 +111,13 @@ export class CodecPlayer {
   private destroyed = false;
   private loggedFirstFrame = false;
   private readonly maxHeldFrames: number;
+  /** Demuxed coded dimensions — DeckCard's resolution readout reads these directly. */
+  readonly codedWidth: number;
+  readonly codedHeight: number;
 
   constructor(readonly deckId: string, port: number, demux: DemuxInfo) {
+    this.codedWidth = demux.codedWidth;
+    this.codedHeight = demux.codedHeight;
     this.maxHeldFrames = heldFrameCapacity(
       demux.codedWidth,
       demux.codedHeight,

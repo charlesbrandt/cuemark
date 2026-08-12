@@ -325,10 +325,18 @@ readout reappears, check that the reset effect still fires before blaming the au
 filename label does, they are from different tracks — that arithmetic identifies the bug
 immediately (0:43 elapsed + 4:05 remaining = 4:48, against a 6:26 file).
 
-⚠️ **The `CODEC` badge in DeckCard does not clear on fallback** — a deck that failed demux and
-is running the legacy `<video>` path still shows `CODEC`. Cosmetic, still unfixed; do not use
-that badge to determine which video path a deck is actually on. Use the `[video-path]` log
-lines instead.
+🟢 **FIXED 2026-08-11: the badge is now `LEGACY`-only and reflects the actual resolved
+backend, not the desired override.** The old `CODEC`/`LEGACY` toggle read `resolveVideoPath()`
+(the override map), which never changes on a silent demux-failure fallback — a deck stuck on
+`legacy-fallback` kept showing `CODEC` forever. Fixed by adding `activeVideoBackend`
+(`src/lib/video/videoPathSettings.ts`), a reactive mirror of `App.svelte`'s `backendState`
+Map/`audioOnlyDecks` Set (both plain, non-reactive) updated via `syncActiveVideoBackend()` at
+every one of its 8 mutation sites. `DeckCard` now shows a badge only when the deck is actually
+on `legacy`/`legacy-fallback` (never for audio-only files) — the `[video-path]` log lines are
+still the ground truth if the badge and the log ever disagree. Same change added a resolution
+readout (`videoWidth×videoHeight` from `video.videoWidth`/`video.videoHeight` on the legacy
+path, `codec.codedWidth`/`codedHeight` — now exposed on `CodecPlayer`/`CodecPlayerHandle` — on
+webcodecs) next to the badge.
 
 ### HMR hazard: landing a call site before its import kills the rAF loop
 

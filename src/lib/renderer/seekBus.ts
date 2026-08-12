@@ -53,6 +53,8 @@ export interface CodecPlayerHandle {
   setLoop(bounds: { inPos: number; outPos: number } | null): void;
   notifyLoopWrap(loopInPos: number): void;
   destroy(): void;
+  readonly codedWidth: number;
+  readonly codedHeight: number;
 }
 const codecPlayers = new Map<string, CodecPlayerHandle>();
 

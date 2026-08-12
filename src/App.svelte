@@ -26,7 +26,7 @@
   import { mainOutputDeviceIds, cueOutputDeviceId, cueGain } from "./lib/audio/audioSettings";
   import { fontScale, queueSidebarWidth } from "./lib/settings/displaySettings";
   import { CodecPlayer, type DemuxInfo } from "./lib/video/codecPlayer";
-  import { videoPathOverrides, videoPathDefault, resolveVideoPath, setVideoPathOverride } from "./lib/video/videoPathSettings";
+  import { videoPathOverrides, videoPathDefault, resolveVideoPath, setVideoPathOverride, activeVideoBackend } from "./lib/video/videoPathSettings";
   import type { Deck, Session } from "./lib/state/types";
   import { audioGetPosition, sessionRestore } from "./lib/audio/pipeline";
   import { recordPollSample, maybePingIpc, recordFrameTiming } from "./lib/audio/pollStats";
@@ -291,6 +291,25 @@
   // mechanism"; skills/audio-debugging.md "UI frozen solid"), so a deck with no video to
   // sync should never call either. Cleared on teardown and on a fresh demux attempt.
   const audioOnlyDecks = new Set<string>();
+  // Pushes backendState/audioOnlyDecks (plain Maps/Sets, not stores) into the reactive
+  // activeVideoBackend store so DeckCard's LEGACY badge can reflect the actual resolved
+  // backend — including a demux-failure fallback to 'legacy-fallback' — instead of the
+  // desired override, which never clears on fallback. Call after every mutation of either.
+  function syncActiveVideoBackend(deckId: string) {
+    const state = backendState.get(deckId);
+    activeVideoBackend.update((m) => {
+      if (!state) {
+        if (!(deckId in m)) return m;
+        const next = { ...m };
+        delete next[deckId];
+        return next;
+      }
+      const audioOnly = audioOnlyDecks.has(deckId);
+      const cur = m[deckId];
+      if (cur && cur.kind === state.kind && cur.audioOnly === audioOnly) return m;
+      return { ...m, [deckId]: { kind: state.kind, audioOnly } };
+    });
+  }
   // Signature of the last composited frame's static inputs (deck id/source/opacity).
   // Used to skip the composite()+postFrame() GPU readback entirely when nothing visual
   // changed and nothing is animating — otherwise that full-resolution capture + cross-window
@@ -1035,6 +1054,7 @@
     playPromises.delete(deckId); lastAudioPlaying.delete(deckId); cancelAudioTransport(deckId);
     clearDeckAudioSync(deckId); contentPosTracker.delete(deckId); stallWatch.delete(deckId);
     audioLoadedFor.delete(deckId); backendState.delete(deckId); audioOnlyDecks.delete(deckId);
+    syncActiveVideoBackend(deckId);
     // audioUnload() above drops the Rust-side DeckAudioPipeline entirely (audio/mod.rs
     // audio_unload removes it from the pipelines map), so a subsequent load builds a brand
     // new one with cue_enabled defaulting to false (pipeline.rs). The cueEnabled $effect only
@@ -1076,6 +1096,7 @@
       registerCodecPlayer(deckId, player);
       backendState.set(deckId, { filePath, kind: 'webcodecs', loadSeq: cur.loadSeq });
       audioOnlyDecks.delete(deckId);
+      syncActiveVideoBackend(deckId);
       const curPlaying = get(session).decks.find((d) => d.id === deckId)?.playing;
       debugLog(`[video-path] ${deckId} entered webcodecs state: deck.playing=${curPlaying} lastAudioPlaying=${lastAudioPlaying.get(deckId)} adoptedPos=${adoptedPos}`);
       if (adoptedPos !== undefined) player.seek(adoptedPos);
@@ -1098,6 +1119,7 @@
       } else {
         audioOnlyDecks.delete(deckId);
       }
+      syncActiveVideoBackend(deckId);
     }
     // backendState is a plain Map, not a Svelte store — flipping `kind` above does not
     // re-trigger the $effect that schedules syncVideoElements. If a play/pause intent was
@@ -1119,6 +1141,7 @@
         playPromises.delete(id); lastAudioPlaying.delete(id); cancelAudioTransport(id);
         clearDeckAudioSync(id); contentPosTracker.delete(id); stallWatch.delete(id);
         audioLoadedFor.delete(id); backendState.delete(id); audioOnlyDecks.delete(id);
+        syncActiveVideoBackend(id);
         // See teardownVideoBackendFull's _prevCueStates comment — same stale-guard hazard
         // if this deck id is ever reused (deck removed then a new one added with the same id).
         _prevCueStates.delete(id);
@@ -1144,10 +1167,12 @@
         const adopted = ensureAudioLoaded(deck, filePath);
         if (desired === 'webcodecs') {
           backendState.set(deckId, { filePath, kind: 'pending', adoptedPos: adopted?.positionSecs, loadSeq: deck.source.loadSeq });
+          syncActiveVideoBackend(deckId);
           const fallbackUrl = deck.diggerFileId != null ? getDiggerFileUrl(deck.diggerFileId) : undefined;
           startCodecPath(deckId, filePath, adopted?.positionSecs, fallbackUrl);
         } else {
           backendState.set(deckId, { filePath, kind: 'legacy', adoptedPos: adopted?.positionSecs, loadSeq: deck.source.loadSeq });
+          syncActiveVideoBackend(deckId);
           createLegacyVideoEl(deck, filePath, adopted);
         }
         continue; // rest of this deck's sync resumes next rAF pass once state settles
@@ -1163,6 +1188,7 @@
         const v = videoEls.get(deckId);
         if (v) { v.pause(); v.remove(); unregisterVideoEl(deckId); videoEls.delete(deckId); lastUploadedTime.delete(deckId); }
         backendState.set(deckId, { filePath, kind: 'pending', loadSeq: state.loadSeq });
+        syncActiveVideoBackend(deckId);
         startCodecPath(deckId, filePath, resumeAt);
         continue;
       }
@@ -1170,6 +1196,8 @@
         const resumeAt = getDeckTime(deckId) ?? undefined;
         teardownCodecPlayerOnly(deckId);
         backendState.set(deckId, { filePath, kind: 'legacy', loadSeq: state.loadSeq });
+        audioOnlyDecks.delete(deckId);
+        syncActiveVideoBackend(deckId);
         createLegacyVideoEl(deck, filePath, resumeAt !== undefined ? { positionSecs: resumeAt, playing: deck.playing } : undefined);
         continue;
       }

@@ -58,6 +58,24 @@ export function setVideoPathOverride(deckId: string, path: VideoPath | null): vo
   });
 }
 
+export type ResolvedVideoBackend = "legacy" | "pending" | "webcodecs" | "legacy-fallback";
+
+export interface ActiveVideoBackendInfo {
+  kind: ResolvedVideoBackend;
+  /** True when the loaded file has no video stream at all (e.g. an audio file loaded onto
+   * a video-typed deck source) — the LEGACY/CODEC distinction is meaningless for these. */
+  audioOnly: boolean;
+}
+
+/**
+ * Per-deck *actual* resolved video backend, as opposed to `resolveVideoPath()`'s desired
+ * path — a reactive mirror of App.svelte's `backendState`/`audioOnlyDecks` (plain Maps, not
+ * stores) so DeckCard's badge can reflect a demux failure falling back to
+ * 'legacy-fallback' instead of just echoing the override the deck never actually reached.
+ * Not persisted — runtime-only, rebuilt from scratch every launch as decks load.
+ */
+export const activeVideoBackend = writable<Record<string, ActiveVideoBackendInfo>>({});
+
 /** Pure so it can be used from a reactive Svelte `$derived` as well as imperative code. */
 export function resolveVideoPath(
   deckId: string,

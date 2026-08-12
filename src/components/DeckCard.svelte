@@ -10,17 +10,29 @@
   import { recordAuxLoop } from "../lib/audio/pollStats";
   import { debugLog } from "../lib/debugLog";
   import { suppressPhaseText, suppressTimestampText } from "../lib/audio/perfArm";
-  import { videoPathOverrides, videoPathDefault, setVideoPathOverride, resolveVideoPath } from "../lib/video/videoPathSettings";
+  import { videoPathOverrides, videoPathDefault, setVideoPathOverride, resolveVideoPath, activeVideoBackend } from "../lib/video/videoPathSettings";
   import type { Deck } from "../lib/state/types";
 
   let { deck }: { deck: Deck } = $props();
   let masterBpm = $derived($session.bpm);
   let masterDeckId = $derived($session.masterDeckId);
   let resolvedVideoPath = $derived(resolveVideoPath(deck.id, $videoPathOverrides, $videoPathDefault));
+  // Actual resolved backend (vs. resolvedVideoPath's *desired* one) — this is what a demux
+  // failure flips to 'legacy-fallback' without the override ever changing, which is why the
+  // badge below reads this instead of resolvedVideoPath (see activeVideoBackend's doc comment).
+  let backendInfo = $derived($activeVideoBackend[deck.id]);
+  // Never for audio-only files (no video stream to have a "path" at all), and never while
+  // still probing ('pending') — only once the deck has actually landed on a real backend.
+  let showLegacyBadge = $derived(
+    !!backendInfo && !backendInfo.audioOnly &&
+      (backendInfo.kind === "legacy" || backendInfo.kind === "legacy-fallback"),
+  );
   let isDragOver = $state(false);
   let previewCanvas = $state<HTMLCanvasElement | null>(null);
   let currentTime = $state(0);
   let videoDuration = $state(0);
+  let videoWidth = $state(0);
+  let videoHeight = $state(0);
   let phase = $state<number | null>(null);
 
   // Reset the transport readout whenever the loaded file changes. Both values are written
@@ -38,6 +50,8 @@
     lastPublishedSec = -1;
     lastPhasePublishedAt = 0;
     videoDuration = deck.source?.type === "video" ? (deck.source.duration ?? 0) : 0;
+    videoWidth = 0;
+    videoHeight = 0;
   });
 
   // ── Text publication rate limits ────────────────────────────────────────────
@@ -238,11 +252,19 @@
         }
         if (publishTimeText) publishTime(video.currentTime);
         if (video.duration && isFinite(video.duration)) videoDuration = video.duration;
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          videoWidth = video.videoWidth;
+          videoHeight = video.videoHeight;
+        }
       } else if (codec) {
         // Codec-path deck: no <video> element to read from — pick the current frame from
         // the same audio clock the compositor's FBO upload uses, and drawImage() it (2D
         // canvas accepts a VideoFrame directly, no scratch-canvas detour needed here).
         const t = getDeckTime(deck.id);
+        if (codec.codedWidth > 0 && codec.codedHeight > 0) {
+          videoWidth = codec.codedWidth;
+          videoHeight = codec.codedHeight;
+        }
         if (t !== null) {
           if (publishTimeText) publishTime(t);
           const frame = codec.getFrameForTime(t);
@@ -344,15 +366,17 @@
   <div class="deck-header">
     <span class="deck-header-left">
       <span class="deck-id">{deck.id}</span>
-      {#if deck.source?.type === "video"}
+      {#if showLegacyBadge}
         <button
           class="video-path-btn"
-          class:webcodecs={resolvedVideoPath === "webcodecs"}
           onclick={() => setVideoPathOverride(deck.id, resolvedVideoPath === "webcodecs" ? "legacy" : "webcodecs")}
-          title="Video decode path for this deck — click to switch. Falls back to legacy automatically if the file isn't H.264 (docs/design/webcodecs-video-path.md)."
+          title="This deck is on the legacy <video> playback path, not WebCodecs — click to switch. Falls back to legacy automatically if the file isn't H.264 (docs/design/webcodecs-video-path.md)."
         >
-          {resolvedVideoPath === "webcodecs" ? "CODEC" : "LEGACY"}
+          LEGACY
         </button>
+      {/if}
+      {#if videoWidth > 0 && videoHeight > 0}
+        <span class="video-res" title="Decoded video resolution">{videoWidth}×{videoHeight}</span>
       {/if}
     </span>
     {#if deck.source?.type === "video"}

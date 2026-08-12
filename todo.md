@@ -140,8 +140,8 @@ recur. Full writeup, arithmetic and method: `docs/design/control-window-frame-bu
 
 Also open from the same session: arm 2 degrades monotonically within a run (13.2 → 8.8fps
 over 45s) with both `post-frame` legs flat, and its numbers predate the waveform fix so it
-should be re-measured before being investigated; and the `CODEC` badge in DeckCard does not
-clear when a deck falls back to the legacy `<video>` path.
+should be re-measured before being investigated. (The `CODEC` badge not clearing on fallback,
+also noted here originally, is fixed — see `skills/run-app/SKILL.md`.)
 
 
 ### Scratch feeder starves the sink in vinyl mode [open, 2026-08-03]

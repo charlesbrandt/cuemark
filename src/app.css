@@ -292,7 +292,12 @@ body {
   cursor: pointer;
 }
 .video-path-btn:hover { border-color: var(--accent); color: var(--accent); }
-.video-path-btn.webcodecs { border-color: #7ec8e3; color: #7ec8e3; }
+.video-res {
+  font-family: var(--font-heading);
+  font-size: calc(9px * var(--font-scale));
+  color: color-mix(in srgb, var(--text) 40%, transparent);
+  letter-spacing: 0.02em;
+}
 
 /* ── Stacked waveform area ────────────────────────────── */
 .waveform-stack {
