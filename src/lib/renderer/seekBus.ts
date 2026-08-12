@@ -151,7 +151,24 @@ export function getDeckTime(deckId: string): number | null {
   // Falls back to video.currentTime when not playing (paused/stopped).
   const at = audioTimes.get(deckId);
   if (at !== undefined) return at;
-  return els.get(deckId)?.currentTime ?? null;
+  const el = els.get(deckId);
+  if (el) return el.currentTime;
+  // Codec-path decks (webcodecs) register no <video> element, so they have no
+  // equivalent of the el.currentTime fallback above — which is what makes a legacy
+  // deck's seekDeck() safe to call right after audioTimes.delete(): el.currentTime
+  // already reads back the seek target immediately, before any IPC round-trip lands.
+  // Without it, this returned null and every caller does `?? 0`, which visibly snaps
+  // the waveform/playhead back to the start of the track for a frame or more. That
+  // window opens on every silent (playing-deck) scrub: endScrub() calls
+  // setDeckAudioTime(final) and then seekDeck(final) in the same tick, and seekDeck()
+  // unconditionally deletes audioTimes again right after. Reported live 2026-08-08
+  // ("dragging a playing track" briefly shows position back at the beginning, then
+  // resumes near where it was). pendingSeekTarget already tracks the in-flight seek for
+  // exactly this kind of staleness handling elsewhere in this file — reuse it as the
+  // last-resort answer instead of falling through to null.
+  const pending = pendingSeekTarget.get(deckId);
+  if (pending !== undefined) return pending.time;
+  return null;
 }
 
 // ── Scrub: direct-manipulation position control ────────────────────────────────────
