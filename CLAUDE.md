@@ -301,9 +301,40 @@ this device (`scripts/scratch-envelope.py <cap>.wav --channels 2,3`). The genera
 an instrument that cannot vary with the fault carries no information about it — is in the
 `audio-debugging` skill, "Capture the actual output and look at it".
 
-**Reverse scrub video is served from a retained ring of decoded frames** in
+**Scrub video is served from two windows.** First a retained ring of decoded frames in
 `codecPlayer.ts`, sized by a byte budget alone (`FRAME_RING_BYTES = 192MB`, capped at
-`MAX_HELD_FRAMES = 32`) — 17 frames at 4K, 32 at 1080p and below. A duration target
+`MAX_HELD_FRAMES = 32`) — 17 frames at 4K, 32 at 1080p and below — which costs no decode at
+all. Past its edge, **scrub GOP fill** (2026-08-13): on a *paused* deck, a third
+`VideoDecoder` in the worker decodes the GOP the gesture is in and returns an evenly-spaced
+subsample (~3fps across a ~10s GOP), walking GOP by GOP. ~250 frames of software decode per
+GOP of coverage — amortised, not avoided.
+
+🟢 **Live-verified 2026-08-13** in both directions with mid-gesture direction changes, audio
+clean. It took two runs; run 1's three defects are recorded in `codec-frame-cache.md` §7a
+because each is a repeatable mistake. Kill switch
+`localStorage['cuemark:codecReverseBackfill'] = '0'`; open items in §7b.
+
+⚠️ **The fill is deliberately direction-agnostic.** Built reverse-only, it left whichever
+direction the primary decoder happened to cover as the only one that worked — live, in both
+orders. **The primary decoder covers exactly one direction, forward from wherever it is
+parked, and during a gesture it does not move at all.** Reverse it cannot serve; forward it
+serves only while the ring is still around the gesture; forward away from a parked ring it
+can only catch up by decoding everything in between, which a hand outruns. Do not
+"simplify" this back to a reverse-only trigger.
+
+⚠️ It is **not** the reverse-seek change reverted on 2026-08-09: it never moves the primary
+decoder, runs once per GOP rather than once per scrub step, is paced, and is abandonable
+mid-GOP. If it is ever suspected of starving audio, the levers are `FILL_PACE_MS` and the
+trigger thresholds — never `BACKWARD_JUMP_SECONDS`.
+
+`CodecPlayer.settleAfterScrub()` (called from `endScrub`) is load-bearing alongside it:
+because the primary decoder does not move during a gesture, without one seek at gesture end a
+long scrub leaves the picture frozen after play is pressed.
+
+Per-gesture `[frame-cache/deck-N]` lines report **`stuck` first** — runs of ~130ms+ on one
+frame. ⚠️ Read that, not `hit` and not raw `frozen`: `hit` reported **100%** on live run 1 for
+a gesture the user watched stick, and ~58% of ticks legitimately repeat a frame at 60fps
+against 25fps content. A duration target
 (`RING_TARGET_SECONDS`) was tried on 2026-08-09 and **removed the same day**: it fixed 4K
 and simultaneously cut sub-4K content, i.e. most of the library, from 32 frames to 9. A
 larger ceiling fixes 4K without that cost. If a high-frame-rate file ever scrubs short, add

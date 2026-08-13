@@ -52,6 +52,15 @@ export interface CodecPlayerHandle {
   setClock(contentPos: number, playing: boolean): void;
   setLoop(bounds: { inPos: number; outPos: number } | null): void;
   notifyLoopWrap(loopInPos: number): void;
+  /**
+   * A scrub gesture ended on `pos`. Re-anchors the decoder when the gesture travelled out
+   * of its reach, and flushes the gesture's `[frame-cache]` counters. See
+   * codecPlayer.ts — this is where the reverse-scrub backfill's one permitted seek lives,
+   * deliberately outside the gesture.
+   */
+  settleAfterScrub(pos: number): void;
+  /** Gesture ended without needing a settle (silent path, or a press that never moved). */
+  noteScrubEnded(): void;
   destroy(): void;
   readonly codedWidth: number;
   readonly codedHeight: number;
@@ -349,9 +358,15 @@ export function endScrub(deckId: string): Promise<void> {
   lastSilentSeekMs.delete(deckId);
 
   if (wasSilent) {
+    // seekDeck() below already re-anchors the codec player, so this only flushes counters.
+    codecPlayers.get(deckId)?.noteScrubEnded();
     seekDeck(deckId, final);
     return Promise.resolve();
   }
+  // The audible path deliberately does *not* seek (stop_scratch resyncs the audio itself),
+  // so the codec player is the one thing that can still be left pointing somewhere the
+  // gesture walked away from — see CodecPlayer.settleAfterScrub().
+  codecPlayers.get(deckId)?.settleAfterScrub(final);
   setScratching(deckId, false);
   // stop_scratch() resyncs the normal branch to wherever the feeder's cursor landed, so
   // an extra seek is only needed when SNAP moved the landing position off the cursor.
@@ -375,6 +390,7 @@ export function cancelScrub(deckId: string): void {
   // A press that never moved recorded no samples, so this emits nothing — but it must still
   // run, or the gesture state would leak into the next one and inflate its input gaps.
   endScrubGesture(deckId);
+  codecPlayers.get(deckId)?.noteScrubEnded();
   const wasSilent = scrubSilent.has(deckId);
   scrubTargets.delete(deckId);
   scrubSilent.delete(deckId);

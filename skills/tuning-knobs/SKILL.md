@@ -39,16 +39,28 @@ else's. Whichever way you turn this, **check what the new value does to both a 4
 sub-1080p file** — the log line above tells you in one deck load each.
 Full write-up: `docs/design/codec-frame-cache.md` §5a.
 
-### 1b. Jog scale — a slow jog makes no *audible* sound (but the meters look fine)
+### 1b. Scrub GOP fill — scrub still freezes, just further out
 
 | | |
 |---|---|
-| **Symptom** | Turning the jog wheel slowly produces a burst at the start of the motion and then near-silence, while the wheel is still turning. Meters, `arrived%`, delivery counters all healthy. |
-| **Where** | **Settings → Jog scale** (`jogSecondsPerRev`, default 1.8s/rev = 33⅓ rpm). No rebuild, no restart — it is read per gesture. |
-| **What it actually is** | **Not a fault.** At 0.10–0.26x the audio is pitched ~2.7 octaves down: full level, sub-100 Hz, inaudible on most monitoring. `rms` cannot see this — it is blind to frequency. |
-| **Confirm before turning** | `[scratch-tel] … rate mean=` under ~0.35 across the gesture. Or capture it: `scripts/scratch-capture.sh` → verdict `PITCHED`. |
-| **The trade** | Lower s/rev = higher pitch for the same hand motion = **coarser positioning**, in exact proportion. There is no free value; this is a taste call, which is why it is a UI setting and not a constant. |
-| **🛑 Not the knob** | `VINYL_TICKS_PER_REV = 256` is a *measured hardware fact* (five calibration gestures, 243–276). Do not "tune" it to compensate for feel — that hides a wrong hardware value inside a preference and defeats every later calibration. |
+| **Symptom** | Scrub stays smooth for the ring's ~1s and *then* freezes; or freezes only after changing direction; or the opposite complaint — scrub works but something is glitching audio while cueing. |
+| **Where** | `FILL_*` constants in `src/lib/video/codecPlayer.ts` and `codecWorker.ts` |
+| **Log line** | `[frame-cache/deck-0] 4.2s \| stuck=0 (worst run 2) frozen=146 \| req=248 hit=246 (99%) ring=91 fill=155 stale=2 \| travelled 18.30s` then `fills req=2 done=2 frames=64 aus=498 decode=612ms held=61` |
+| **Read `stuck` FIRST** | 🔴 Neither `hit` nor raw `frozen` is evidence. `hit` read **100%** on live run 1 during a visible freeze; `frozen` is ~58% on a *healthy* gesture (60fps rAF over 25fps content). `stuck` counts runs of ~130ms+ on one frame — the only counter that matches what a user sees. |
+| **`fills req=` ≫ `done=`** | Replies are not coming back; this was the latch that killed the feature silently on live run 1. |
+| **`fills req=` in the hundreds** | The request loop is back — 179 in one 22s gesture was defect 2. |
+| **`fills req=0` on a long gesture** | Trigger never armed. Check `reasons:` and that the deck was **paused** (it never runs on a playing deck, by design). |
+| **Live overrides, no rebuild** | `localStorage['cuemark:codecReverseBackfill'] = '0'` (off) · `localStorage['cuemark:codecBackfillRing'] = '24'` (total retained fill frames). Keys keep their original names. Applied at next deck load. |
+| **Smoothness vs. span** | `fillPerGop()` (half of `MAX_FILL_FRAMES`) buys **smoothness across one GOP**, not more span: 32 → ~3.2fps. Raising it does not make a gesture reach further; only fetching the next GOP does. |
+| **If audio suffers** | Raise `FILL_PACE_MS` (4ms) or `FILL_TRIGGER_SECONDS` (0.35) first, then the kill switch. 🛑 **Not `BACKWARD_JUMP_SECONDS`** — see §5, different mechanism, its own reverted history. |
+| **🛑 Do not shorten `FILL_PROBE_LEAD_SECONDS`** | A GOP decodes from its keyframe *forward*, so in reverse travel the frames nearest the gesture arrive **last**. Too short a lead means scrubbing into a region still being decoded. |
+| **🛑 Do not make the trigger reverse-only** | The primary decoder covers exactly one direction (forward from where it is parked) and does not move during a gesture, so a reverse-only fill leaves the other direction frozen. Live symptom: "the first direction I scrub works, the other sticks", in both orders. |
+| **Refused outright** | `gop-too-long(N)`: the file's GOP exceeds `FILL_MAX_GOP_AUS = 600`. Deliberate — reaching any frame in a GOP costs decoding it from its keyframe, so a single-keyframe encode would be minutes of decode. |
+
+🟢 **Live-verified 2026-08-13** (run 2): both directions, direction changes mid-gesture, audio
+clean, decode down 28× per second of travel. Run 1 found three defects that all passing unit
+tests missed — defect record: `docs/design/codec-frame-cache.md` §7a. Healthy reference
+numbers for comparison: `fills req=15 done=15 aus=720 decode=1007ms` over 43.9s of travel.
 
 ### 2. Silent-scrub seek throttle — jog feels laggy/steppy on a *playing* deck
 
@@ -113,7 +125,7 @@ because `appsink` is not a `GstAudioBaseSink`.
 |---|---|
 | **Where** | `aheadSeconds()` in `src/lib/video/codecWorker.ts`, `BACKWARD_JUMP_SECONDS` in `codecPlayer.ts` |
 | **🛑 Known trap** | Lowering `BACKWARD_JUMP_SECONDS`, or making the `setClock` anchor accumulate backward travel, was built, unit-tested and **reverted as a live audio regression** (2026-08-09). Each seek re-decodes ~125 frames of 1080p in software (no VA-API on this machine), starving the main thread and the GStreamer audio threads. |
-| **Instead** | Widen the frame ring (§1). The cost is the seek itself, not the seek policy. |
+| **Instead** | Widen the frame ring (§1), or tune reverse backfill (§1b), which serves travel past the ring without ever moving the primary decoder. The cost is the seek itself, not the seek policy. |
 | **Load-bearing coupling** | Reverse motion stops the decoder feeding on its own as `clockPos` retreats — that is *why* the ring survives a backward gesture. Changing the gate can silently break the ring. |
 
 ---

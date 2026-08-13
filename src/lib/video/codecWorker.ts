@@ -13,6 +13,7 @@
  * are what WebCodecs wants, and there is no parameter-set NAL concept to hoist out of
  * them. `needsAvcRemux` is the single switch; everything else on this path is codec-blind.
  */
+import { gopContaining, isRefusal } from "./codecGop";
 import { annexBToAvc, buildAvcDescription, findSpsAndPps, parseAuFrames, splitAnnexBNals, type Au } from "./h264";
 
 interface InitMsg {
@@ -23,19 +24,53 @@ interface InitMsg {
   auCount: number;
   keyframes: { auIndex: number; ptsUs: number }[];
   fpsHint: number;
+  /** Track duration in µs — the high edge of the final GOP, which has no next keyframe. */
+  durationUs: number;
 }
 interface ClockMsg { type: "clock"; contentPos: number; playing: boolean }
 interface SeekMsg { type: "seek"; target: number }
 interface LoopMsg { type: "loop"; inPos: number; outPos: number }
 interface LoopClearMsg { type: "loopClear" }
 interface LoopWrapMsg { type: "loopWrap" }
+interface FillGopMsg { type: "fillGop"; atUs: number; capacity: number }
 interface DestroyMsg { type: "destroy" }
-type InMsg = InitMsg | ClockMsg | SeekMsg | LoopMsg | LoopClearMsg | LoopWrapMsg | DestroyMsg;
+type InMsg =
+  | InitMsg | ClockMsg | SeekMsg | LoopMsg | LoopClearMsg | LoopWrapMsg | FillGopMsg | DestroyMsg;
 
 const FETCH_BATCH = 90; // ~3s at 30fps; encoded AUs are cheap (~1MB/s/deck, see design doc)
 const QUEUE_HIGH_WATER = 8;
 const LOOP_PREFETCH_FRAMES = 6;
 const LOOP_LOOKAHEAD_SECONDS = 1.5;
+
+// --- Scrub GOP fill (docs/design/codec-frame-cache.md §3) --------------------------------
+//
+// Refuse a GOP longer than this many AUs. Every fill decodes its whole GOP from the keyframe
+// forward — that is the only way to reach any frame inside it — so the GOP length *is* the
+// CPU bill. This library's GOPs are ~250 frames (keyframe intervals of 8.34s and 10.0s
+// measured), so 600 passes every real file and still refuses a pathological single-keyframe
+// encode outright rather than spending minutes of decode on it. A refusal is reported, not
+// silent.
+const FILL_MAX_GOP_AUS = 600;
+// Pause between feed attempts once the decoder's queue is full. This is the whole throttle:
+// it caps how hard one fill can drive a core, and it yields to the worker's message queue so
+// a seek/destroy arriving mid-fill is acted on within a few ms rather than after the GOP.
+const FILL_PACE_MS = 4;
+// 🔴 Hard ceilings on how long one fill may wait, because **a fill that never finishes is a
+// fill that never replies, and codecPlayer.ts cannot request another until it does.** The
+// first live run (2026-08-13) ended with backfill silently dead for the rest of the deck's
+// life — 179 fills in one gesture, then zero for the next 54 seconds — and an unbounded wait
+// on a decoder that had stopped draining is the leading candidate. `VideoDecoder` recycles
+// from a bounded pool and this app now pins up to 96 frames across two collections, so
+// "the decoder stops draining" is a state that really can occur. Both waits below are
+// bounded, and both report the timeout rather than hanging.
+const FILL_QUEUE_WAIT_MS = 1500;
+const FILL_FLUSH_WAIT_MS = 1500;
+// AU pts are in decode order, which is not presentation order once B-frames are involved,
+// so a strict "stop feeding at the GOP's last AU" can cut off a frame that presents just
+// inside it. A third of a second of slack costs a handful of AUs.
+const FILL_PTS_SLACK_US = 333_000;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 let deckId = "";
 let port = 0;
@@ -43,6 +78,7 @@ let codec = "";
 let auCount = 0;
 let keyframes: { auIndex: number; ptsUs: number }[] = [];
 let fpsHint = 30;
+let durationUs = 0;
 let description: Uint8Array | null = null;
 // True only for `avc1.*`. Decides both "build a description from SPS/PPS at init" and
 // "re-mux every AU Annex-B -> length-prefixed before decode()". VP9 does neither.
@@ -88,6 +124,39 @@ let loopPrefetchStarted = false;
 // callback (fixed at construction) checks this to switch from "buffer for later" to
 // "behave like the primary decoder" without needing a new VideoDecoder instance.
 let loopIsNowPrimary = false;
+
+// Scrub GOP fill: a *third* decoder that decodes the GOP a scrub gesture is currently in
+// and keeps an evenly-spaced subsample of it, so a gesture that has travelled away from
+// what the primary decoder covers keeps getting pictures instead of freezing.
+//
+// Why a separate decoder rather than reusing the primary: the primary's position is what
+// makes forward playback resumable without a seek, and its already-transferred frames are
+// the ring itself. Resetting it mid-gesture is precisely the change that was built and
+// reverted on 2026-08-09 as a live audio regression.
+//
+// Why one whole GOP at a time: reaching *any* frame inside a GOP costs decoding from its
+// keyframe, so a 1s slice and the full 10s GOP cost the same. Amortising over the whole GOP
+// turns ~250 frames of decode per scrub step (the reverted design) into ~250 frames per GOP
+// of coverage.
+//
+// ⚠️ Why this is not direction-specific (changed 2026-08-13 after the first live run): the
+// primary decoder covers exactly one direction — forward from wherever it is parked — and
+// during a gesture it does not move at all. A reverse-only fill therefore left whichever
+// direction the primary did *not* cover permanently frozen, which live presented as "the
+// first direction I scrub in works and the other sticks", in both orders.
+let fillDecoder: VideoDecoder | null = null;
+// Bumped by every seek/loop-wrap/destroy and by each new request. A run whose generation no
+// longer matches drops its output and stops feeding — this is what makes an in-flight fill
+// abandonable within one `await` rather than at the end of its GOP.
+let fillGen = 0;
+let fillRunning = false;
+// Region and subsampling state for the run currently owning the decoder's output callback
+// (the callback is fixed at construction, so it reads these rather than a closure).
+let fillEndUs = 0;
+let fillKeepNextUs = 0;
+let fillStepUs = 0;
+let fillCapacity = 0;
+let fillKept = 0;
 
 function post(msg: unknown, transfer: Transferable[] = []) {
   (self as unknown as Worker).postMessage(msg, transfer);
@@ -179,6 +248,149 @@ function makeLoopDecoder(): VideoDecoder {
   });
 }
 
+function makeFillDecoder(): VideoDecoder {
+  return new VideoDecoder({
+    output: (frame) => {
+      // Everything here is a drop-and-close path except the last branch. A fill decodes far
+      // more frames than it keeps by construction (the whole GOP, of which an evenly-spaced
+      // subsample is retained), so closing promptly is what keeps this off the buffer pool.
+      if (!fillRunning || fillKept >= fillCapacity) { frame.close(); return; }
+      if (frame.timestamp >= fillEndUs) { frame.close(); return; }
+      if (frame.timestamp < fillKeepNextUs) { frame.close(); return; }
+      fillKeepNextUs = frame.timestamp + fillStepUs;
+      fillKept++;
+      post({ type: "fillFrame", frame }, [frame]);
+    },
+    error: (e) => post({ type: "error", message: `fill decoder: ${e}` }),
+  });
+}
+
+/** Abandon any in-flight fill. Cheap and idempotent; safe to call on every seek. */
+function cancelFill() {
+  fillGen++;
+  fillRunning = false;
+}
+
+/**
+ * Wait for `test()` with a deadline. Returns false on timeout.
+ *
+ * The deadline is the point: see FILL_QUEUE_WAIT_MS. An unbounded wait here means no
+ * `fillDone` reply, and no reply means codecPlayer.ts never requests another fill for the
+ * life of the deck — silently, with the only symptom being the freeze this feature exists
+ * to remove.
+ */
+async function waitUntil(test: () => boolean, deadlineMs: number): Promise<boolean> {
+  const until = performance.now() + deadlineMs;
+  while (!test()) {
+    if (performance.now() >= until) return false;
+    await sleep(FILL_PACE_MS);
+  }
+  return true;
+}
+
+/**
+ * Decode the GOP containing `atUs` and hand back up to `capacity` frames spread evenly
+ * across it. The first output kept is always the keyframe itself, so a run cancelled early
+ * or with room for only one frame still delivers *something* rather than nothing.
+ */
+async function handleFillGop(atUs: number, capacity: number) {
+  // ⚠️ Every path out of this function must post `fillDone` — including the timeout paths
+  // below. codecPlayer.ts will not request another fill until it sees a reply, so a silent
+  // return disables the whole feature for the deck's lifetime, with the only symptom being
+  // the freeze it exists to remove. That is not hypothetical: it is what the first live run
+  // did (2026-08-13), 179 fills in one gesture and then zero for the next 54 seconds.
+  const t0 = performance.now();
+  let fed = 0;
+  const reply = (reason: string, kept: number, startPtsUs = 0, endPtsUs = 0) =>
+    post({
+      type: "fillDone", atUs, startPtsUs, endPtsUs, kept, fed,
+      ms: Math.round(performance.now() - t0), reason,
+    });
+
+  // A fill is only ever requested for a paused deck (codecPlayer.ts gates it), but re-check:
+  // this is sustained software decode, and the one thing it must never compete with is a
+  // deck that is actually playing audio.
+  if (fillRunning) return reply("already-running", 0);
+  if (playing) return reply("playing", 0);
+  if (!codec || !decoder) return reply("not-initialised", 0);
+  if (capacity < 1) return reply("no-capacity", 0);
+
+  const gop = gopContaining(keyframes, auCount, durationUs, atUs, FILL_MAX_GOP_AUS);
+  if (isRefusal(gop)) return reply(gop.refused, 0);
+  const { startAu, endAu, startPtsUs, endPtsUs } = gop;
+
+  const gen = ++fillGen;
+  fillRunning = true;
+  fillEndUs = endPtsUs;
+  fillCapacity = capacity;
+  fillKept = 0;
+  fillKeepNextUs = startPtsUs; // always keep the keyframe
+  fillStepUs = Math.max(1, Math.floor((endPtsUs - startPtsUs) / capacity));
+
+  let reason = "ok";
+  try {
+    if (!fillDecoder) fillDecoder = makeFillDecoder();
+    // reset() before every run: the previous run left the decoder mid-GOP, and the next AU
+    // fed here is a keyframe from somewhere else entirely. Frames already transferred to the
+    // main thread are owned there and are not affected.
+    if (fillDecoder.state === "configured") fillDecoder.reset();
+    if (!configureDecoder(fillDecoder, decoderConfig(), "fill")) {
+      fillDecoder = null;
+      reason = "configure-failed";
+      return;
+    }
+    for (let i = startAu; i < endAu; i++) {
+      if (gen !== fillGen) { reason = "cancelled"; break; }
+      if (fillKept >= capacity) { reason = "capacity"; break; }
+      let au = auCache.get(i);
+      if (!au) au = await ensureAuFetched(i);
+      if (gen !== fillGen) { reason = "cancelled"; break; }
+      if (!au) { reason = "fetch-failed"; break; }
+      if (au.ptsUs >= endPtsUs + FILL_PTS_SLACK_US) { reason = "reached-end"; break; }
+      // Backpressure *and* throttle in one wait — see FILL_PACE_MS. Feeding faster than the
+      // decoder drains buys nothing (the frames are subsampled anyway) and is exactly how
+      // this would starve the audio threads. Bounded: a decoder that has stopped draining
+      // must end the run, not hang it.
+      const drained = await waitUntil(
+        () => gen !== fillGen || !fillDecoder || fillDecoder.state !== "configured" ||
+              fillDecoder.decodeQueueSize < QUEUE_HIGH_WATER,
+        FILL_QUEUE_WAIT_MS,
+      );
+      if (!drained) { reason = "queue-stalled"; break; }
+      if (gen !== fillGen) { reason = "cancelled"; break; }
+      if (!fillDecoder || fillDecoder.state !== "configured") { reason = "decoder-gone"; break; }
+      // Same empty-AU guard as pump() — an AU with no VCL NALs decodes to zero bytes and an
+      // empty chunk closes the decoder permanently.
+      const data = chunkData(au);
+      if (data.length > 0) {
+        fillDecoder.decode(new EncodedVideoChunk({
+          type: au.key ? "key" : "delta",
+          timestamp: au.ptsUs,
+          duration: au.durUs,
+          data,
+        }));
+        fed++;
+      }
+    }
+    // Without this the tail of the GOP sits in the decoder until the next run resets it
+    // away. Raced against a deadline for the same reason the queue wait is bounded — and
+    // deliberately *not* awaited past it: a flush that never settles must not hold the run.
+    if (gen === fillGen && fillDecoder?.state === "configured") {
+      const flushed = await Promise.race([
+        fillDecoder.flush().then(() => true).catch(() => true),
+        sleep(FILL_FLUSH_WAIT_MS).then(() => false),
+      ]);
+      if (!flushed && reason === "ok") reason = "flush-timeout";
+    }
+  } finally {
+    // Only this run's own counter is meaningful: a cancellation means a newer run has
+    // already taken the shared output state over, so report -1 rather than its numbers.
+    const kept = gen === fillGen ? fillKept : -1;
+    if (gen === fillGen) fillRunning = false;
+    reply(reason, kept, startPtsUs, endPtsUs);
+  }
+}
+
 let pumping = false;
 let warnedNeverConfigured = false;
 async function pump() {
@@ -216,6 +428,14 @@ async function pump() {
       // frames[0] — a frame from wherever the decoder had got to, seconds ahead.
       // Bounding on the clock in both states is also what makes a paused deck stop
       // decoding at all, which is what it should have been doing.
+      //
+      // ⚠️ Load-bearing for the retained frame ring in *both* directions
+      // (docs/design/codec-frame-cache.md §2.4). A retreating clock makes this gate fire
+      // immediately, which is why the primary decoder goes quiet during a reverse gesture
+      // and stops overwriting the ring — and why the backfill decoder below has the core
+      // more or less to itself while it runs. Loosening this gate would silently evict the
+      // ring mid-gesture and put two decoders in contention at the same time. Covered by
+      // codecPlayer.test.ts's "a backward clock does not evict the ring".
       if (nextFeedIndex > 0 && au.ptsUs / 1_000_000 - clockPos > aheadSeconds()) break;
       // decoder can be reset/closed by a concurrent seek/loop-wrap/destroy message while
       // this loop was suspended on the ensureAuFetched() await above (worker messages only
@@ -289,6 +509,7 @@ async function maybeStartLoopPrefetch() {
 
 function handleLoopWrap() {
   if (!loopBounds) return;
+  cancelFill(); // the main thread clears both rings here too — see handleSeek()
   if (loopDecoder && loopFramesReady.length > 0) {
     // Common case: the prefetch had time to run. Swap the primed decoder in as primary —
     // no seek, no re-decode from a keyframe, no mechanism-A-shaped trigger.
@@ -314,6 +535,10 @@ function handleLoopWrap() {
 function handleSeek(target: number) {
   // Same reasoning as maybeStartLoopPrefetch(): `description` is legitimately null on VP9.
   if (!decoder) return;
+  // The main thread drops both rings on a seek, so anything a running backfill is about to
+  // deliver belongs to a region that no longer exists. Abandoning it also frees the core
+  // for the ~125 frames this seek is about to spend.
+  cancelFill();
   eos = false;
   decoder.reset();
   if (!configureDecoder(decoder, decoderConfig(), "seek")) return;
@@ -330,6 +555,7 @@ async function handleInit(msg: InitMsg) {
   auCount = msg.auCount;
   keyframes = msg.keyframes;
   fpsHint = msg.fpsHint;
+  durationUs = msg.durationUs;
   needsAvcRemux = codec.startsWith("avc1");
   description = null;
 
@@ -350,10 +576,13 @@ async function handleInit(msg: InitMsg) {
 
 function teardown() {
   loopBounds = null;
+  cancelFill();
   decoder?.close();
   decoder = null;
   loopDecoder?.close();
   loopDecoder = null;
+  fillDecoder?.close();
+  fillDecoder = null;
   for (const f of loopFramesReady) f.close();
   loopFramesReady = [];
 }
@@ -397,6 +626,9 @@ self.onmessage = (e: MessageEvent<InMsg>) => {
       break;
     case "loopWrap":
       handleLoopWrap();
+      break;
+    case "fillGop":
+      handleFillGop(msg.atUs, msg.capacity);
       break;
     case "destroy":
       teardown();
