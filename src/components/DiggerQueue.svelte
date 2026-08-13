@@ -5,7 +5,7 @@
   import { session, updateDeck } from '../lib/state/session';
   import {
     search, randomTrack, getQueue, addToQueue, removeFromQueue, queueNext,
-    getCuemarkPayload, setDiggerBaseUrl, getDiggerBaseUrl, getDiggerWebUrl,
+    getCuemarkPayload, setDiggerBaseUrl, getDiggerBaseUrl, getDiggerBaseUrlHistory, getDiggerWebUrl,
     subscribeQueueChanges,
     type DiggerTrack, type DiggerQueueItem,
   } from '../lib/digger/api';
@@ -23,7 +23,32 @@
   let baseUrl = $state(getDiggerBaseUrl());
   let showUrlInput = $state(false);
 
+  // Named presets for the two places Digger's API actually runs (see
+  // docs/design/offline-crate.md's "cuemark needs zero changes" section, point 1):
+  // Home = the GPU box Digger normally runs on; Local = a Digger stack running on
+  // this same laptop for offline/travel use. Free-text input stays available below
+  // for anything else (e.g. a Tailscale address).
+  const DIGGER_PRESETS = {
+    Home: 'http://10.20.2.99:8200',
+    Local: 'http://localhost:8200',
+  } as const;
+
+  // Recently-used custom URLs (e.g. a Tailscale address) — excludes the two
+  // named presets above, which already have their own buttons.
+  let recentUrls = $state(
+    getDiggerBaseUrlHistory().filter((u) => u !== DIGGER_PRESETS.Home && u !== DIGGER_PRESETS.Local)
+  );
+
   const decks = $derived($session.decks);
+  const activePreset = $derived(
+    baseUrl === DIGGER_PRESETS.Home ? 'Home' :
+    baseUrl === DIGGER_PRESETS.Local ? 'Local' :
+    null
+  );
+
+  function shortLabel(url: string): string {
+    return url.replace(/^https?:\/\//, '');
+  }
 
   let unsubscribeQueue: (() => void) | undefined;
 
@@ -151,8 +176,10 @@
     openUrl(getDiggerWebUrl()).catch((e) => { error = String(e); });
   }
 
-  function applyBaseUrl() {
-    setDiggerBaseUrl(baseUrl || '/digger-api');
+  function applyBaseUrl(url?: string) {
+    setDiggerBaseUrl((url ?? baseUrl) || '/digger-api');
+    baseUrl = getDiggerBaseUrl();
+    recentUrls = getDiggerBaseUrlHistory().filter((u) => u !== DIGGER_PRESETS.Home && u !== DIGGER_PRESETS.Local);
     showUrlInput = false;
     refreshQueue();
     resubscribe();
@@ -178,6 +205,18 @@
 
   {#if showUrlInput}
     <div class="url-row">
+      <button
+        class="small-btn preset-btn"
+        class:active={activePreset === 'Home'}
+        onclick={() => applyBaseUrl(DIGGER_PRESETS.Home)}
+        title={DIGGER_PRESETS.Home}
+      >Home</button>
+      <button
+        class="small-btn preset-btn"
+        class:active={activePreset === 'Local'}
+        onclick={() => applyBaseUrl(DIGGER_PRESETS.Local)}
+        title={DIGGER_PRESETS.Local}
+      >Local</button>
       <input
         class="url-input"
         type="text"
@@ -185,8 +224,20 @@
         onkeydown={(e) => { if (e.key === 'Enter') applyBaseUrl(); }}
         placeholder="http://localhost:8200"
       />
-      <button class="small-btn" onclick={applyBaseUrl}>Apply</button>
+      <button class="small-btn" onclick={() => applyBaseUrl()}>Apply</button>
     </div>
+    {#if recentUrls.length > 0}
+      <div class="recent-row">
+        {#each recentUrls as url (url)}
+          <button
+            class="small-btn preset-btn recent-btn"
+            class:active={baseUrl === url}
+            onclick={() => applyBaseUrl(url)}
+            title={url}
+          >{shortLabel(url)}</button>
+        {/each}
+      </div>
+    {/if}
   {/if}
 
   {#if error}
@@ -352,6 +403,28 @@
     border-radius: var(--radius-sm);
   }
   .small-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  .preset-btn.active {
+    background: #3a5a3a;
+    border-color: #5a8a5a;
+    color: #cfc;
+  }
+  .preset-btn.active:hover { background: #446644; }
+
+  .recent-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 6px;
+    flex-shrink: 0;
+  }
+
+  .recent-btn {
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 
   .results-list,
   .queue-list {

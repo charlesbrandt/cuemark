@@ -32,6 +32,8 @@ export interface CuemarkPayload {
 }
 
 const STORAGE_KEY = 'cuemark:diggerBaseUrl';
+const HISTORY_KEY = 'cuemark:diggerBaseUrlHistory';
+const HISTORY_MAX = 5;
 
 // Load persisted URL; fall back to Vite proxy path for dev if nothing stored.
 let _baseUrl: string = (() => {
@@ -42,13 +44,35 @@ let _baseUrl: string = (() => {
   }
 })();
 
+function loadHistory(): string[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
 export function setDiggerBaseUrl(url: string) {
   _baseUrl = url.replace(/\/$/, '');
-  try { localStorage.setItem(STORAGE_KEY, _baseUrl); } catch {}
+  try {
+    localStorage.setItem(STORAGE_KEY, _baseUrl);
+    // MRU list, deduped, most-recent first — lets the settings panel offer
+    // one-click reconnect to any endpoint typed in previously (e.g. a
+    // Tailscale address), not just the two named presets.
+    const history = [_baseUrl, ...loadHistory().filter((u) => u !== _baseUrl)].slice(0, HISTORY_MAX);
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+  } catch {}
 }
 
 export function getDiggerBaseUrl(): string {
   return _baseUrl;
+}
+
+// MRU list of previously-used base URLs (most recent first), for a "recent
+// endpoints" quick-pick in the settings UI.
+export function getDiggerBaseUrlHistory(): string[] {
+  return loadHistory();
 }
 
 // Digger's docker-compose runs the API on :8200 and the Svelte UI on :5173
