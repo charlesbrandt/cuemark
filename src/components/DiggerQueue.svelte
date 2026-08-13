@@ -162,6 +162,9 @@
         hotCues: payload.hotCues ?? [],
         diggerTrackId: item.track_id,
         diggerFileId: payload.fileId ?? null,
+        // Reset to the deck default (1.0) unless Digger supplies one — mirrors the
+        // bpm/downbeat pull-on-load pattern above.
+        gain: payload.gain ?? 1.0,
         ...(hasGrid ? { bpm, downbeat } : {}),
       });
       // Synchronous with updateDeck above, so this lands before App.svelte's rAF-deferred

@@ -5,6 +5,20 @@ projector output, MIDI controller integration. Open source goal.
 
 Domain: cuemark.com (Charles Brandt's former DJ name)
 
+## Environment
+
+🔴 **Cuemark is developed and tested on at least two physically different machines**
+(a 2012 MacBook Pro, Ivy Bridge/Intel HD 4000, and `mele`, an Intel N150 box — possibly
+also a Framework laptop, unconfirmed) **with materially different GPU/driver stacks.**
+Most of this file's environment-specific claims below (VA-API absence, the Mesa `crocus`
+WebGL-readback bug, WebKitWebDriver's package name) were established on the MacBook Pro
+specifically and are **not** known to hold on `mele`, which does have a working VA-API
+stack (confirmed 2026-08-12) — the opposite of what "no VA-API driver" below states.
+**`docs/environment.md` is the canonical per-machine reference — check which machine
+you're on and read it before trusting any hardware/driver/tooling claim in this file.**
+This file still carries the full architectural reasoning for *why* each fact matters;
+`docs/environment.md` carries the *current status per machine* and the verify command.
+
 ## Tech stack
 
 - **Tauri** (Rust backend + WebKit frontend) — cross-platform, Wayland-native on Linux via GTK4
@@ -132,92 +146,52 @@ Consequences worth knowing:
   but leaves contents *undefined*, and an empty deck is still composited at its own opacity — so
   without the clear the projector blits uninitialised GPU memory.
 
-**`WEBKIT_DISABLE_DMABUF_RENDERER=1` is RETIRED as the default** (2026-08-02) — GPU compositing is now
-on. It was originally set in `main.rs` to prevent VA-API DMA-BUF canvas corruption via
-`drawImage(video)`, but that premise died in `f6b94ea` when WebCodecs became the default video path
-(`VideoDecoder` → `texImage2D(VideoFrame)`, no `<video>` element). Two independent measurements
-condemned it, both same-binary A/Bs with only this variable changed:
-- **Performance**: it forced WebKit to composite the whole page in software on the main thread —
-  55–59% of all main-thread samples in `libwebkit2gtk`'s software rasteriser; 87% → 62% main thread
-  for two decks, rAF stalls 6 → 0.
-- **Correctness**: it *corrupted the WebGL compositor canvas*, rendering growing horizontal bands of
-  uninitialised memory. This was the long-running "output window noise" — which was never an
-  output-window bug; that window faithfully mirrored an already-corrupt compositor canvas. Unset, the
-  canvas is clean. User-confirmed live.
+**`WEBKIT_DISABLE_DMABUF_RENDERER=1` is RETIRED as the default** (2026-08-02) — GPU compositing
+is now on. It was set in `main.rs` against VA-API DMA-BUF canvas corruption, a premise that died
+in `f6b94ea` when WebCodecs became the default video path. Two same-binary A/Bs condemned it: it
+forced WebKit to composite the whole page in software on the main thread, *and* it **corrupted
+the WebGL compositor canvas** with growing bands of uninitialised memory — the long-running
+"output window noise", which was never an output-window bug at all; that window faithfully
+mirrored an already-corrupt compositor canvas.
 
 Set `CUEMARK_DISABLE_DMABUF=1` to restore the old behaviour. If VA-API canvas corruption ever
 appears, fix it with a codec-specific `GST_PLUGIN_FEATURE_RANK` demotion, not by re-killing the
 renderer process-wide. See `docs/design/output-noise-and-track-reload-silence.md`,
 "ROOT-CAUSED 2026-08-02 (late)".
 
-🔴 **The previously-untested path — the legacy `<video>` fallback — was exercised live on
-2026-08-05 and it is unusable.** On that path `drawImage(video)` in `DeckCard`'s preview loop
-costs **86ms median / 300ms worst per call**, 61–68% of the control window's wall clock, taking a
-playing deck from 58fps to 5.6fps and starving the GStreamer audio threads into underruns. Cost is
-per-call and independent of resolution (640×480 VP9 measured 7× *more* expensive than 1080p AV1),
-so it is not decode and not pixel work. The failure is a stall, not the predicted corruption.
-**Root-caused 2026-08-05 in two parts, both measured:**
-- **The per-call cost is a property of the video codec feeding the `<video>` element**, not of
-  the legacy path and not of DMA-BUF. A single-variable pair (same frames, same container, same
-  640×480@25, only the codec re-encoded) cost **22–24ms on VP9 against 8ms on H.264**, with
-  *more* main-thread `busy%` at *less* process CPU — so the call is parked, not working. It is
-  inside WebKit's GStreamer media player and cuemark cannot fix it; the only lever is not to use
-  a `<video>` element for that codec (extend the WebCodecs demux gate). ❌ **`CUEMARK_DISABLE_DMABUF=1`
-  makes it strictly worse** (22–32 → 54ms/call, 17.2 → 9.1fps) — do not reach for it.
-- **The draw *frequency* was separately broken and is now fixed.** `video.currentTime` advances
-  continuously here, so the preview's `currentTime !== lastDrawnTime` change-check gated nothing
-  and every legacy deck drew on 100% of rAF ticks. It now compares
-  `getVideoPlaybackQuality().totalVideoFrames` (`legacyFrameChanged()` in `DeckCard.svelte`),
-  which the probe measured advancing at exactly the source frame rate. A 6fps file went
-  `drew=133/133` → `30/258` and **26.4 → 51.6fps**. ⚠️ **`requestVideoFrameCallback` is exposed
-  here but was deliberately not used** — its firing rate cannot be verified outside the app
-  (a bare webview has no display-refresh source at all), and a preview that never draws is worse
-  than one that draws too often.
+🔴 **The legacy `<video>` fallback is unusable for anything still on it.** `drawImage(video)`
+in `DeckCard`'s preview loop costs tens to hundreds of ms per call — enough to take a playing
+deck from 58fps to 5.6fps and starve the GStreamer audio threads into underruns. The cost is
+per-call, independent of resolution, and a single-variable arm pins it to the **video codec**
+feeding the element (22–24ms VP9 against 8ms H.264, same frames): the call is parked inside
+WebKit's GStreamer media player, not working, and cuemark cannot fix it. The only lever is to
+keep the codec off a `<video>` element at all. ❌ **`CUEMARK_DISABLE_DMABUF=1` makes it strictly
+worse** — do not reach for it.
 
-**Fixed 2026-08-05 for VP9, by not taking the path at all.** `video_demux.rs` now accepts
-**H.264 and VP9** (`CodecKind`, `vp9parse` with `alignment=super-frame`, a derived
-`vp09.PP.LL.DD` string); `codecWorker.ts`'s `needsAvcRemux` is the single switch — H.264 keeps
-its mandatory avc `description` + Annex-B→avc re-mux, VP9 gets neither and its AUs go to
-`decode()` untouched. The worst library file went **23.9–28.6 → 54.2–56.4fps**, per-call
-19–22ms → 0.0ms, `busy%` 49–52 → 9–10. ⚠️ **Process CPU is flat across that change** (61.0 →
-60.1%) — there is no VA-API on this machine so VP9 is software-decoded either way; what moved is
-*where*, from a main-thread block into a decode worker. Read the fps and CPU numbers together.
-
-✅ **The "VP9 decay" was a measurement artifact and does not exist (settled 2026-08-05
-evening).** A live 2-minute play appeared to go 58.6fps → a ~13fps plateau with `busy%` flat
-at 1–2%, which looked exactly like a paint-phase cost the sweep's metrics cannot see. A
-7-minute controlled arm refuted it: **the frame rate oscillates 9–57fps continuously**
-(n=182: min 8.7, p50 24.5, max 57.1) and recovers after every trough, so the "plateau" was a
-short window on one trough. All three candidate mechanisms are refuted by measurement — leak
-(webRSS spread 9MB across a full track, *under* the paused control's own 16MB sawtooth),
-thermal (178ms throttled in 420s, and fps **anti**-correlated with temperature: 100.0°C mean
-when fps>45 against 85.5°C when fps<20), and CPU starvation (`/proc/pressure/cpu full=0.00`;
-`webCPU` is *higher* in the fast state). ⚠️ **A window shorter than ~2 minutes cannot measure
-this machine's steady-state frame rate at all** — it samples a fraction of one oscillation
-cycle and reads as a clean monotonic trend in whichever direction it sits, which is what
-three separate "monotonic degradation" sightings were. Compare medians over multi-minute
-runs. Tooling: `scripts/decay-sample.sh` + `scripts/decay-join.py` (always run the paused
-idle control arm — it is what eliminated iowait and calibrated the leak threshold). Full
-write-up: `legacy-video-fallback-cost.md` "2026-08-05 (evening) — the decay arm ran".
-
-**Still on legacy `<video>`: AV1 — and live verification 2026-08-05 found it worse than
-documented: zero video frames, not just a low frame rate.** `VideoDecoder.isConfigSupported({codec:
-'av01.…'})` returns `true` here and then **decodes zero frames** — for a real file, in all four
-bitstream framings, with and without a `description`, and for a 320×240 stream GStreamer's own
-`av1enc` produced as a control. ⚠️ **Never trust `isConfigSupported` on this WebKitGTK; probe a
-real decode** (`scripts/probes/webcodecs_vp9_av1_probe.py`). This doc previously claimed AV1 was
-"survivable" at 26–54fps on the legacy `<video>` fallback — **that assumed some frames decode.**
-A live session playing a real AV1 library file (1920×1080, 6fps, on the legacy path) for ~7
-minutes logged `[aux-loop] preview/deck-N drew=0` on **every single tick, the entire time** —
-audio played and cue toggled normally, but no video frame was ever presented, in either the
-`DeckCard` preview or the output window. Immediately after, switching the same deck to a VP9
-file on the webcodecs path drew frames normally in the same session, which rules out a general
-rAF/preview-loop breakage. Root cause not yet confirmed — the Rust-side `WARNING: No decoder
-available for type 'video/x-av1…'` in the audio pipeline's `uridecodebin` is expected/harmless
-(it is deliberately skipping the video stream in the *audio-only* pipeline, see the log-pattern
-table below) and says nothing about WebKitGTK's own internal `<video>` decode, which this
-project cannot log into directly. See `legacy-video-fallback-cost.md` for the full writeup and
-open questions.
+- **H.264 and VP9 no longer take this path** (fixed 2026-08-05). `video_demux.rs` accepts both
+  (`CodecKind`, `vp9parse` with `alignment=super-frame`, a derived `vp09.PP.LL.DD` string) and
+  `codecWorker.ts`'s `needsAvcRemux` is the single switch — H.264 keeps its mandatory avc
+  `description` + Annex-B→avc re-mux, VP9 gets neither and its AUs go to `decode()` untouched.
+  ⚠️ That moved decode *off the main thread*; it did not reduce process CPU (no VA-API on the
+  MacBook Pro — software decode either way). Read fps and CPU numbers together.
+- **The preview's change-check compares `getVideoPlaybackQuality().totalVideoFrames`**
+  (`legacyFrameChanged()` in `DeckCard.svelte`), not `currentTime`, which advances continuously
+  here and gated nothing — every legacy deck used to draw on 100% of rAF ticks.
+  `requestVideoFrameCallback` is exposed here but deliberately unused: its firing rate cannot be
+  verified outside the app, and a preview that never draws is worse than one that draws too often.
+- 🔴 **AV1 is still on this path and renders *zero* video frames there** — live-verified
+  2026-08-05, `[aux-loop] … drew=0` on every tick of a ~7-minute play while audio and cue worked
+  normally. `VideoDecoder.isConfigSupported({codec:'av01.…'})` returns `true` here and then
+  decodes nothing, in every bitstream framing tried. ⚠️ **Never trust `isConfigSupported` on this
+  WebKitGTK; probe a real decode** (`scripts/probes/webcodecs_vp9_av1_probe.py`). Root cause
+  unconfirmed — this is the one open item in the doc.
+- ⚠️ **A window shorter than ~2 minutes cannot measure this machine's steady-state frame rate.**
+  It oscillates 9–57fps continuously and recovers after every trough, so a short sample reads as
+  a clean monotonic trend in whichever direction it happens to sit — which is what three separate
+  "monotonic degradation" sightings were, including a "VP9 decay" that does not exist (leak,
+  thermal and CPU-starvation all refuted by measurement). Compare medians over multi-minute runs;
+  tooling is `scripts/decay-sample.sh` + `scripts/decay-join.py`, always with the paused idle
+  control arm.
 
 See `docs/design/legacy-video-fallback-cost.md` and `webcodecs-video-path.md` "Phase 7" before
 touching `DeckCard`'s preview loop, `video_demux.rs`'s codec gate, `codecWorker.ts`'s
@@ -229,16 +203,14 @@ reason Bug A went unsolved for three sessions. Keep it laid out but visually neg
 opacity, off-screen). Its WebGL drawing buffer is 1920×1080 regardless, set by the `width`/`height`
 attributes rather than CSS. To debug compositing, temporarily give it a real size and a bright border —
 that one change is what cracked the bug.
-Also demote broken VA-API decoders via `GST_PLUGIN_FEATURE_RANK` in `main.rs` — currently only
-`vaav1dec:0,vaapiav1dec:0`.
-⚠️ **This demotion is a no-op today, and "H.264 hardware decode is deliberately live" (claimed
-here on 2026-06-20) is stale: this machine has no VA-API driver for any codec.** Re-verified
-2026-08-05 — no Intel `*_drv_video.so` under `/usr/lib/x86_64-linux-gnu/dri` (only d3d12,
-nouveau, r600, radeonsi, virtio_gpu), no `gstreamer1.0-vaapi`, and `gst-inspect-1.0 va` registers
-`0 features`. **Everything decodes in software**, so never explain a codec-specific cost
-difference by hardware decode without re-running those three checks.
-See `audio-debugging` skill for the full VA-API investigation, debugging tips, and env-var override
-pitfalls.
+
+Broken VA-API decoders are demoted via `GST_PLUGIN_FEATURE_RANK` in `main.rs` — currently only
+`vaav1dec:0,vaapiav1dec:0`. ⚠️ **Whether that demotion does anything is per-machine**: it is a
+no-op on the 2012 MacBook Pro, which has no VA-API driver for any codec and decodes everything
+in software, and is *not* a no-op on `mele`, which has a full VA-API stack. **`docs/environment.md`
+carries the per-machine matrix and the verify commands — check it before explaining any
+codec-specific cost difference by hardware decode.** The `audio-debugging` skill has the full
+VA-API investigation (MacBook-Pro-scoped), debugging tips and env-var override pitfalls.
 
 **Waveform analysis uses `audio_analyze_file` Tauri command** (Rust/GStreamer, `analysis.rs`), not
 `decodeAudioData` — avoids VA-API corruption in the separate WebKitWebProcess. It returns
@@ -246,6 +218,83 @@ pitfalls.
 to fit a fractional BPM and beat-level grid anchor, auto-populating `deck.bpm`/`deck.downbeat` on load.
 A saved grid (DeckCard SET BEAT button) beats the auto-fit — see `gridSource.ts`. `Session.snapToBeat`
 (SNAP toolbar toggle) routes seeks/hot-cues/loop points through `quantizeToGrid()` in `seekBus.ts`.
+
+**Direct manipulation (waveform drag, vinyl jog) drives the scratch feeder by absolute
+*position*, never by rate** — `scratch_to()` in `pipeline.rs`, the scrub bus in `seekBus.ts`.
+Both inputs are burst-delivered (USB MIDI ticks; rAF- and WebKit-coalesced pointer moves),
+which makes a velocity estimate unrecoverable: the inter-event interval it divides by is an
+artefact of delivery timing, coalescing a *rate* silently discards motion, and with no
+absolute reference the error accumulates for the whole gesture. A target has none of those
+failure modes and coalesces losslessly. Shuttle-mode jog deliberately stays on the velocity
+path (`scratch()`) — free-running between ticks is the point of that mode.
+One bounded exception (`HandTracker` in `pipeline.rs`, 2026-08-08): a slow hand delivers only
+**5–12 pointer events/s**, so the feeder coasts along an estimated hand speed between targets
+rather than converging and falling silent — but every real target re-anchors the cursor
+absolutely, so position is still the control variable and an estimate error can neither
+accumulate nor persist. Per-gesture delivery legs are instrumented by
+`src/lib/audio/scrubStats.ts` (`[scrub-deliver]`/`[scrub-sec]`) — read them before blaming the
+servo, which three sessions did by mistake.
+**Read `docs/design/waveform-scrub.md` before touching** `WaveformCanvas`'s pointer
+handlers, the scrub bus, `jog_nudge`'s vinyl branch, or the feeder's servo. `VINYL_SEC_PER_TICK`
+is calibrated (`1.8 / 256`; the Starlight encoder reports plain ±1 deltas, measured live —
+re-confirmed 2026-08-09 at 243 and 247 ticks/revolution).
+
+🟢 **"Slow-jog audio gates out" — FIXED 2026-08-11, live-confirmed.** The cue branch was
+chopped into ~80% digital silence during a scratch while main played normally — **GATED, not
+pitched**. Cause: **two `pulsesink`s on one PipeWire node.** Fix: **one `pulsesink` per device
+node**, fed by an `audiomixer` summing one live `appsrc` per deck branch, with deck pipelines
+terminating in `appsink`s (`audio/mixer.rs`'s `OutputGraph`). **Default since 2026-08-11**;
+`CUEMARK_SHARED_OUTPUT=0` falls back to the legacy per-branch sinks. A device is **one node per
+PCM, not per channel pair** — the Starlight's "Front"/"Rear" are channels 0–1 and 2–3 of a
+single 4-channel stream, which is why `front_and_rear_of_one_device_are_one_node` is a unit
+test. **Read `docs/design/shared-output-pipeline.md` before touching any of it**;
+`slow-jog-audio-inaudible.md` §10 holds the investigation, six refuted hypotheses not to
+re-run, and the dead `buffer-time`/quantum rung (§10.13 — `sink_buffer_times()` keeps its
+200ms default). The mechanism was never named; what was established is that one sink on the
+node is *sufficient*, so the fix reaches that configuration structurally.
+
+**Three things in the shared graph are load-bearing and silent when broken:**
+- **`is-live=true` on every output `appsrc`.** With it false the mixer emits **zero** buffers
+  for as long as any branch is idle — one paused deck silences the whole node. Measured:
+  `scripts/probes/shared_output_mixer_probe.py --not-live`.
+- **Deck pipelines `use_clock()` the graph's clock** — in practice `GstSystemClock`, with
+  `pulsesink` slaving its device to it rather than the device clock the design first assumed.
+  The log line says which.
+- **`position()` subtracts the graph's latency — measured 171.3ms.** An `appsink` reports the
+  last buffer handed off, not what the device is playing. Uncorrected, video leads audio by a
+  sixth of a second on every deck, constantly, and it reads exactly like "the video decoder is
+  early".
+
+Each node also carries a permanent silent `audiotestsrc` keepalive: an `audiomixer` with no
+pads cannot reach PLAYING, and a retained node with no live pad runs dry and never resumes.
+
+⚠️ **Two instruments changed meaning on this path, and neither is a regression.**
+`output_queue underrun` now fires continuously during ordinary playback (the appsink renders
+just-in-time) — info here, still a warning on the legacy path. And the scratch sink-alignment
+widening reports `SKIPPED(no property)` because `appsink` is not a `GstAudioBaseSink`.
+
+⚠️ **Before analysing any audio capture, ask which output the listener is actually on, and
+read `zero%` before dBFS.** A windowed RMS averages a duty cycle into a level, so gating and
+attenuation are indistinguishable in it; and one full session's verdict was wrong because it
+analysed channels 0,1 (main) while the user was on headphones — a different physical pair on
+this device (`scripts/scratch-envelope.py <cap>.wav --channels 2,3`). The generalisable rule —
+an instrument that cannot vary with the fault carries no information about it — is in the
+`audio-debugging` skill, "Capture the actual output and look at it".
+
+**Reverse scrub video is served from a retained ring of decoded frames** in
+`codecPlayer.ts`, sized by a byte budget alone (`FRAME_RING_BYTES = 192MB`, capped at
+`MAX_HELD_FRAMES = 32`) — 17 frames at 4K, 32 at 1080p and below. A duration target
+(`RING_TARGET_SECONDS`) was tried on 2026-08-09 and **removed the same day**: it fixed 4K
+and simultaneously cut sub-4K content, i.e. most of the library, from 32 frames to 9. A
+larger ceiling fixes 4K without that cost. If a high-frame-rate file ever scrubs short, add
+a duration *floor*, never a target that can shrink a window the ceiling would allow. Decode
+is forward-only and GOPs here are ~250 frames, so an out-of-order frame costs ~125 frames of
+software decode (no VA-API on this machine) and doing that per scrub step is a live **audio**
+regression, built and reverted 2026-08-09. 🛑 **Do not lower `BACKWARD_JUMP_SECONDS` or make
+the `setClock` anchor accumulate backward travel** — widen the ring instead. The design,
+the brittleness inventory and the directional-working-set roadmap (keyframe thumbnail cache,
+directional prefetch, hot-region pinning) are in `docs/design/codec-frame-cache.md`; the
+operational "which knob, what symptom" version is the `tuning-knobs` skill.
 
 **`deck.downbeat` is a beat-level phase anchor, NOT bar-beat-1** — every consumer
 (`getPhase`, `quantizeToGrid`, `nudgePhaseToMaster`) works mod one beat, and nothing detects
@@ -280,61 +329,12 @@ See "Rendering pipeline" above and `src/lib/renderer/outputProtocol.ts` for the 
 
 ### Data model
 
-```typescript
-type DeckSource =
-  | { type: 'video'; filePath: string; duration: number }
-  | null
-
-// Global visualization layer — NOT a DeckSource. Composited above all decks in the
-// output stage (see "Visualization layer" below), with its own opacity. Selecting a
-// visualization never touches deck state or audio.
-interface Visualization {
-  fragmentSrc: string
-  uniforms: Record<string, number>
-  name?: string
-}
-
-interface Deck {
-  id: string              // 'deck-0', 'deck-1', etc. — no hardcoded limit
-  source: DeckSource
-  playing: boolean
-  playbackRate: number    // 0.25–4.0
-  gain: number            // 0–1 pre-fader trim (normalize source level between tracks)
-  volume: number          // 0–1 post-fader level (driven by crossfader); effective audio = gain × volume × masterVolume
-  opacity: number         // 0–1 visual compositor weight
-  loop: boolean
-  cuePoint: number        // seconds
-  hotCues: number[]       // up to 4 time markers
-  bpm: number | null      // fractional (beat-grid fit) or tapped BPM for this deck
-  downbeat: number | null // beat-level grid anchor (seconds); auto-set from the grid fit on load
-  loopIn: number | null   // custom loop region start (seconds); null = full track
-  loopOut: number | null  // custom loop region end (seconds); null = full track
-  // When loop=true and both loopIn/loopOut are set, ontimeupdate seeks back to loopIn
-  // at loopOut (native video.loop is disabled in that case — App.svelte manages it).
-}
-
-interface Session {
-  decks: Deck[]           // ordered array; render back-to-front
-  masterVolume: number
-  bpm: number | null      // master/reference BPM; set via tap tempo or "Main Beat" button
-  crossfaderMapping: {    // which two decks the hardware crossfader controls
-    left: string          // deck id
-    right: string         // deck id
-  }
-  crossfaderValue: number              // 0.0 (full left) – 1.0 (full right)
-  crossfaderTargets: CrossfaderTarget[] // 'opacity' | 'volume' — what the fader drives
-  effects: Effect[]       // global post-process chain
-  visualization: Visualization | null   // global layer, composited above all decks
-  visualizationOpacity: number          // 0–1; default 0.5 so video stays visible underneath
-}
-
-interface AudioAnalysis {
-  bass: number            // 0–1 normalized
-  mid: number
-  high: number
-  waveform: Float32Array
-}
-```
+`src/lib/state/types.ts` is the source of truth for `Deck`, `Session`, `Visualization`,
+`AudioAnalysis` and related types — read it directly rather than trusting a copy here; its
+inline comments carry the same field-level rationale (units, ranges, invariants) this section
+used to duplicate, and duplicating it let this doc drift out of sync with real fields
+(`eq`, `cueEnabled`, `syncLocked`, `masterDeckId`, `midiMapping`, Digger integration, `loadSeq`
+reload-detection) more than once.
 
 ### MIDI architecture
 
@@ -383,71 +383,6 @@ uniforms declared on `Visualization.uniforms`.
 slider), toggled from a toolbar button in `App.svelte` — mirrors the existing `Audio`/`Queue`
 panel-toggle pattern. `DeckCard.svelte` no longer has any shader-picker UI.
 
-## Directory structure
-
-```
-cuemark/
-  src/                          # Frontend (TypeScript/Svelte 5)
-    main.ts                     # Svelte mount entry point
-    App.svelte                  # Root component — deck grid + toolbar
-    app.css                     # Global dark UI styles
-    lib/
-      state/
-        types.ts                # Deck, Session, AudioAnalysis interfaces
-        session.ts              # Svelte writable store + addDeck/updateDeck/setCrossfaderMapping/etc.
-      renderer/
-        fbo.ts                  # DeckFBO — WebGL texture + framebuffer; uploadVideoFrame/FromCodec/ImageBitmap
-        compositor.ts           # Compositor — syncDecks(), composite(); RUNS IN THE OUTPUT WINDOW
-        outputProtocol.ts       # Control<->output window message contract + why frames, not snapshots
-        outputBus.ts            # Sender side: per-deck VideoFrame/<video> -> ImageBitmap -> BroadcastChannel
-        seekBus.ts              # Module-level registry: video elements + audio clock cache; seekDeck() / getDeckTime() / setDeckAudioTime()
-      audio/
-        pipeline.ts             # Typed TS wrappers around all Rust audio Tauri commands (audioLoad, audioPlay, …)
-        analyzer.ts             # AudioAnalyzer — Web Audio API FFT (waveform analysis only; not used for playback)
-        waveform.ts             # analyzeFile() → calls audio_analyze_file Tauri command (Rust/GStreamer); computeWaveform() for AudioBuffer; amplitude color LUTs
-        bpm.ts                  # detectBeatGrid(envelope, rate) — fractional BPM + grid phase (comb fit); detectBpm() integer fallback; tapTempo()
-        gridSource.ts           # Per-deck (deckId → trusted filePath) map gating saved-grid vs auto-fit precedence; see "Grid persistence" gotcha above
-        audioSettings.ts        # Svelte stores: mainOutputDeviceIds, cueOutputDeviceId, cueGain
-      midi/
-        handler.ts              # Tauri IPC listener → session mutations
-    components/
-      DeckCard.svelte           # Per-deck controls: transport, hot cues, BPM/Main Beat/Sync, loop in/out + bar presets, sliders
-      Crossfader.svelte         # Hardware crossfader UI — deck selectors (left/right), slider, Visual/Audio toggles
-      WaveformCanvas.svelte     # Per-deck waveform: overview + zoom (16s window); loop region highlight; fires onBpmDetected callback
-      VisualizationPanel.svelte # Global visualization shader picker + opacity slider (toggled from toolbar)
-  src-tauri/                    # Rust backend (Tauri 2)
-    src/
-      main.rs                   # Binary entry point
-      lib.rs                    # Tauri builder + setup; registers all Tauri commands
-      midi.rs                   # midir listener → MidiAction events
-      audio/                    # GStreamer audio backend
-        mod.rs                  # AudioManager (Mutex-wrapped), AudioState type, all Tauri command handlers
-        pipeline.rs             # DeckAudioPipeline — per-deck GStreamer graph (uridecodebin→volume→sink)
-        mixer.rs                # MasterMix — stub for future shared audiomixer topology (not yet active)
-        devices.rs              # list_audio_devices() — PipeWire/PulseAudio sink enumeration
-        analysis.rs             # Audio analysis (FFT, peak detection)
-        record.rs               # RecordingSink — audio recording (Opus/FLAC)
-      grid_store.rs             # grid_get_saved/grid_save Tauri commands — local sidecar (grids.json) for saved bpm/downbeat
-    capabilities/
-      default.json              # Tauri 2 capability config
-    icons/                      # App icons (placeholder PNGs)
-    build.rs
-    Cargo.toml
-    tauri.conf.json
-  index.html
-  package.json
-  vite.config.ts
-  tsconfig.json
-  svelte.config.js
-  todo.md
-  journal.md
-  docs/
-    design/                     # Feature/architecture design docs (see below)
-    upstream/                   # Draft WebKitGTK bug reports (with evidence + reproducers)
-  scripts/
-    probes/                     # Headless WebKitGTK feature probes (python3-gi; see verify-ui skill)
-```
-
 ## Active architecture plan (2026-07-25)
 
 The WebKitGTK freeze mechanisms (see `skills/audio-debugging` "UI frozen solid" entry)
@@ -464,23 +399,33 @@ playback, the drift-resync path, or anything freeze-related:
 
 ## Open findings from the 2026-08-05 live set
 
-Two distinct faults were root-caused from a single ~3-hour session's log. **Both are open again
-as of a same-day live verification pass** (see below) — neither should be cited as closed.
+Statuses below were refreshed 2026-08-12. Each doc carries its own Status line — read that
+rather than trusting a summary here.
 
-- `docs/design/legacy-video-fallback-cost.md` — 🔴 **REOPENED 2026-08-05 (late), by the live
-  verification the doc itself called for.** A1/A2/A4 (codec-linked cost, the draw-frequency
-  fix, moving VP9 to WebCodecs) all still stand and are not in question. What broke on
-  live verification: (1) the **55fps VP9 number does not hold** — a real ~2-minute play of the
-  same worst-library-file decayed 58.6 → ~13fps while `busy%` stayed 1–2%, the signature of a
-  paint-phase cost the automated sweep's metrics cannot see; (2) **AV1 on the legacy path
-  renders zero video frames**, not just a low frame rate — audio and cue worked, `drew=0` for
-  a full ~7-minute play, worse than the doc's prior "survivable at 26–54fps" claim. Do not
-  re-run the DMA-BUF arm (it made things worse in the earlier investigation) — neither new
-  finding points at DMA-BUF. See the doc's "2026-08-05 live verification" section.
-- `docs/design/audio-dropout-mid-playback.md` — 10.8s of silence mid-track with the pipeline in
-  `Playing` and the frame rate healthy, ~21s after headphone cue was enabled on a USB controller
-  carrying both the main and cue sinks. No reproducer yet. Fix the 6:1 false-positive rate in
-  `instrument_sink_flow()` first or the soak will be unreadable.
+- `docs/design/legacy-video-fallback-cost.md` — 🟡 **one open item: AV1 renders zero frames on
+  the legacy `<video>` path.** A1/A2/A4 (codec-linked cost, the draw-frequency fix, moving VP9
+  to WebCodecs) all stand. The "VP9 decay" that briefly reopened this doc was a measurement
+  artifact and does not exist — see "Rendering pipeline" above. Do not re-run the DMA-BUF arm;
+  it made things worse and nothing here points at DMA-BUF.
+- `docs/design/audio-dropout-mid-playback.md` — 🔴 **still open, never reproduced on demand.**
+  10.8s of silence mid-track with the pipeline in `Playing` and the frame rate healthy, ~21s
+  after headphone cue was enabled. Its leading hypothesis H1 (main and cue `pulsesink`s
+  contending on one USB node) had its precondition **structurally removed** by the shared-output
+  default flip on 2026-08-11 — but the doc deliberately declines to call itself fixed on that
+  basis: it is a different fault, there is no reproducer, and ⚠️ **nothing in this pipeline can
+  see *clipping*** (the gap warning needs >1s of silence, `underrun` needs starvation), so **"the
+  log is clean" and "the artifact is gone" are very nearly independent statements**. Closing it
+  needs the 6:1 false-positive rate in `instrument_sink_flow()` fixed first, then a soak on the
+  shared path long enough to cover the original event's ~20-minute scale.
+- `docs/design/scratch-audio-downstream-delivery.md` — 🟢 **CLOSED 2026-08-08**, in two stages,
+  both user-confirmed live: `GstAudioBaseSink` resyncing its ringbuffer write pointer ~253ms
+  *backwards* after `discont-wait` expired (fixed by widening the sink's alignment tolerance for
+  the duration of a gesture), then the servo's designed `arrived ⇒ silence` firing in the gaps
+  between sparse pointer events (fixed by coasting — see "Direct manipulation" above). Keep the
+  doc's three standing cautions: a **sustained negative delivery margin during a scratch is the
+  fix working**, not a fault; `output_queue underrun` fires once per chunk by construction here
+  and adjudicates nothing; and both `arrived%` on a decelerating hand and `snaps` on a coarse
+  drag are silence **by design** — ask for slow, smooth, zoomed gestures when requesting a repro.
 
 ## Development phases
 
@@ -579,6 +524,13 @@ distinguishes the dev binary from the launcher one, and old log files keep their
 so a report from last week still identifies its code. Check this line before diagnosing
 anything from a log.
 
+⚠️ **`built=` is when `build.rs` last ran, not when the binary was last linked.** Cargo reruns
+`build.rs` on its own trigger conditions, so an ordinary source edit can recompile and relink
+while the stamp stays put — observed 2026-08-08 with the stamp 8s behind the exe's mtime. The
+SHA and dirty flag are still right, which is what usually matters. To settle "is this binary
+the current source", the reliable check is `cargo build` reporting `Finished` with no
+`Compiling` line.
+
 **First-time / new machine setup** (in addition to Rust + Node toolchains):
 ```bash
 # GStreamer dev headers — runtime packages alone aren't enough
@@ -611,80 +563,9 @@ the exact window being diagnosed, including the build-provenance line this file 
 first. Rotated files are date-stamped, so a report from last week is still readable. If a log looks
 suspiciously short, check whether it rotated before theorizing about what is missing.
 
-### Standing performance instrumentation
-
-`src/lib/audio/pollStats.ts` emits one percentile line per bucket every 5s while a deck plays.
-Threshold-only logging was deliberately abandoned here: `if (ms > 300)` shows the tail and hides
-the distribution, which is what made a slow baseline look like an outlier problem.
-
-```
-[poll-stats] deck-0[/scratch] n=… | total … | toRust … | inRust … (lock …, query …) | toJs …
-[raf]        n=… (~Nfps) | gap … | frame-dur … | busy …%
-[aux-loop]   preview/deck-0 | waveform[/zoom]/deck-0@<W>x<H>   n=… drew=… | dur … | busy …%
-[post-frame] n=… bitmaps=… | sync … | to-postMessage …
-[ipc-ping]   noop n=… | total … | toRust … | toJs …
-```
-
-How to read them (full derivation in `docs/design/control-window-frame-budget.md`):
-
-- A synchronous `#[tauri::command]` runs on the GTK main thread, so an IPC round trip splits into
-  `toRust` (dispatch) / `inRust` (the actual work) / `toJs` (the reply reaching the JS callback).
-  Only `inRust` is the backend. Epoch ms is the **only** clock the Rust process and the webview
-  share — `performance.now()` and `Instant` have per-process origins and cannot be differenced.
-- **`[ipc-ping]` is the control arm.** If a command that does nothing is as slow as the one you
-  are blaming, the callee is exonerated — no leg arithmetic required. During a scratch you get a
-  second free control: `position()` returns the feeder's atomic cursor and never touches GStreamer.
-- **A position poll can never resolve faster than one main-loop turn** — but a main-loop turn
-  is **not** an rAF turn. When the thread is saturated the two track each other and `toJs` is a
-  fair proxy for the frame period; when rAF is throttled while the thread is idle they diverge
-  hard (13ms poll against a 41ms gap, 2026-08-03). **Check `busy%` before reading `toJs` as the
-  frame budget.**
-- **`frame-dur` covers only `App.svelte`'s `frame()`.** Two more rAF loops run per playing deck
-  — `DeckCard`'s preview `draw()` and `WaveformCanvas`'s playhead `loop()` — in the same rAF
-  turn. They report into `[aux-loop]`. `busy%` (share of wall-clock time) is the field that
-  settles attribution: sum it across every loop and subtract from 100 to see what is
-  *unaccounted*, which is how the residual was shown to be outside JS entirely.
-- ⚠️ **Only compare windows with a deck playing.** Idle windows contain no polls at all, so an
-  idle `62fps / frame-dur=0` line is not a control for a playing one. Reading them as comparable
-  produced a wrong conclusion on the first pass.
-- ⚠️ **`busy%` measures the JS that *records* canvas drawing, not the paint that follows it.**
-  WebKit's canvas 2D builds a display list and rasterizes it after the JS call returns, in a
-  phase no JS timer can observe. Symptoms of being in this regime: `busy%` low while
-  `WebKitWebProcess` CPU is high, and fps that does not respond to removing JS work. **Never
-  conclude "this canvas is cheap" from `busy%` alone — confirm with fps.** Fewer, cheaper draw
-  *calls* is the lever; the number of primitives per draw matters more than how often you draw.
-- ⚠️ **The converse bites just as hard: a change can take `busy%` to zero and move ~1fps.**
-  Caching `WaveformCanvas`'s overview bars cut per-draw JS 13–15ms → ≤1ms and `busy%` 8–9% → 0%
-  for **+1.0fps**, because the real limit was a half-vsync rAF throttle behind it
-  (`docs/design/control-window-frame-budget.md` §4). Worth keeping for the tail — gap p90
-  −13ms, max −140ms — but **report both numbers**; either one alone tells a false story.
-- ⚠️ **Bar count scales with canvas width, so record the width.** Two runs of the same file in
-  the same mode disagreed by 2× until the `[aux-loop]` label carried `@<W>x<H>`. Never A/B a
-  canvas cost across runs whose dimensions were not captured — and prefer A/Bing in one
-  session with only the code path switched.
-- ⚠️ **A DOM text mutation is expensive here; a canvas redraw is not.** Measured 2026-08-04:
-  rewriting one small `<span>` in a deck card costs **~20ms of `WebKitWebProcess` CPU per
-  mutation**, while `WaveformCanvas` redrawing a 2496×144 surface ~6×/s costs nothing
-  measurable. Publishing a per-frame readout at 60Hz held a playing deck at ~21fps; gating
-  both writes to the resolution they actually render at restored a flat ~61fps
-  (`docs/design/control-window-frame-budget.md` §6–§7). **Never write a `$state` that feeds
-  text on every rAF tick — gate it on the rendered string changing.** Throttling helps far
-  less than it should: the cost saturates between 1Hz and 5Hz, and `contain` / `will-change`
-  do not help at all (both measured; `will-change` was worse).
-- ⚠️ **`ps %cpu` is a lifetime average, not current load.** On a 2-hour-old process it read 7%
-  while the process was actually at 64%. Use `top -b -n 2 -d 3 -p <pid>` and take the *second*
-  sample. **Pair it with `busy%` always** — `busy%` low + CPU high is the signature of cost in
-  the paint phase, and it is the only way to see work `busy%` structurally cannot report.
-- ⚠️ **An IPC leg is a load gauge, not a cost.** `toJs` on the *no-op* ping reads 0ms on an
-  idle thread and 8ms on a busy one, and the position poll's `total` moves 2–3ms → 9ms across
-  the same switch, with nothing about the transport changed. A slow leg says "the main thread
-  is late getting back to callbacks", never "the callee is slow" — only an arm that changes
-  the callee can say that.
-- ⚠️ **Validate that an arm is really playing before believing its numbers.** A wedged
-  GStreamer pipeline produces a flawless-looking 62fps window: `deck.playing` is true, rAF is
-  full rate, and nothing errors. The tells are `[poll-stats] total` p50 ≈2ms instead of ≈9ms,
-  `[aux-loop] … drew=0`, and a `play` IPC retry storm every ~203ms in the log. Re-loading the
-  track (fresh `audio_load`) unwedges it; a bare play does not.
+See the `perf-log-reading` skill for the standing performance-log line formats
+([poll-stats], [raf], [aux-loop], [deliver-tel], [scrub-deliver]/[scrub-sec]) and how to read them —
+load it when investigating a performance regression, not every session.
 
 ## Skills
 
@@ -698,6 +579,8 @@ needed — don't load them on every session.
 | `verify-ui` | Screenshot/click/inspect the real webview headlessly via tauri-driver + Xvfb |
 | `midi` | Hercules Starlight channel layout, full control map, adding or re-calibrating a controller |
 | `digger-integration` | Digger API endpoints, WebSocket queue updates, cuemark/Digger boundary rules |
+| `perf-log-reading` | Investigating a performance regression or reading a `[poll-stats]`/`[deliver-tel]`/`[scrub-deliver]` log dump |
+| `tuning-knobs` | A feature is running and correct but *feels* wrong live, or a shipped fix reads as "not working" — which constant to reach for, its live symptom, and which ones are known traps |
 
 Several automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb +
 `VITE_ENABLE_DEBUG_HOOK=1`):
@@ -710,15 +593,22 @@ Several automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb
 | `scripts/watchdog-test.sh <video>` | `docs/design/freeze-watchdog.md` phase 3 gate — tiered recovery (`kill -STOP`/`freezeMainThread(0)`/`kill -KILL`) plus a 15s false-positive smoke check. Run after touching `watchdog.rs` or the recovery/adoption path. |
 | `scripts/watchdog-soak-test.sh <video> [seconds]` | The design doc's full 10-minute false-positive soak (default 600s) — looped playback + a MIDI-rate burst every 60s, asserts zero watchdog triggers. Run before relying on recovery in prod, not on every change. |
 | `scripts/check-launcher-staleness.sh [path]` | Is `~/.local/bin/cuemark` behind the code? Exit 0 fresh / 1 stale / 2 not built. No toolchain or running app needed. Run before diagnosing anything against a non-dev launch. |
+| `scripts/scratch-capture.sh` + `scripts/scratch-envelope.py` | **Any audio symptom the in-pipeline probes call healthy.** Captures the PipeWire device monitor — downstream of everything — and reports a per-window envelope (`rms`, `hp200`, zero-crossing rate) with `[scratch-tel]` joined inline, separating **GATED / PITCHED / CLEAN**. `rms` is blind to frequency, so this sees the whole class of faults the pipeline's own instruments structurally cannot. Ended a four-session investigation in one pass. See the `audio-debugging` skill for the traps (the stub recorder, the wrong-node capture, UTC vs local). |
+| `scripts/probes/shared_output_mixer_probe.py` | **Before changing the shared output graph** (`audio/mixer.rs`) — one `audiomixer` into one `pulsesink`, fed by live `appsrc` branches: does an idle pad stall the aggregator, does the 4-channel matrix chain negotiate, can a branch attach to a PLAYING mixer. Always run `--not-live` too: it is the control arm that proves the idle-pad check can fail, and it fails *hard* (zero buffers at the sink for as long as one branch is idle). Seconds, no app; stop cuemark first if using the real device. |
+| `scripts/probes/shared_node_stream_diff.py` | **Why does the same two-sink topology gate on one device and not another?** Samples `pw-top` (xruns, quantum, rate, wait/busy) and `pw-dump` (negotiated format, node state) for cuemark's own streams during a jog gesture, joined by the private `cuemark.branch` key — both streams present as `NAME = cuemark` and pw-top alone cannot tell main from cue. `--compare A.json B.json` diffs a failing arm against a working one. Capture **both** arms the same way; the comparison is the whole value. Pre-flight refuses on an idle/suspended stream, which reports `ERR 0` forever and reads exactly like a healthy one. |
 | `scripts/probes/offscreencanvas_webgl_capture_probe.py` | Can pixels be read back out of a WebGL canvas on this WebKitGTK? Run **before designing anything that moves rendered content between windows or processes**, and before trusting any pixel assertion against WebGL output. Seconds, no app, no Xvfb. |
 | `scripts/probes/webgl_readback_variants_probe.py` | Route matrix for the same question — attachment formats, explicit `readBuffer`, PBO + `getBufferSubData`, `copyTexSubImage2D` — with a `LIBGL_ALWAYS_SOFTWARE=1` control arm that separates driver faults from WebKit faults. Run this before concluding anything about readback. |
 | `scripts/probes/webgl_readpixels_diag_probe.py` | Why a readback failed: reports the returned bytes *and* the GL error, `getError()` sanity, framebuffer completeness, and the implementation's preferred read format. |
 | `scripts/probes/imagebitmap_upload_probe.py` | `ImageBitmap`/`VideoFrame` upload semantics — does `createImageBitmap(VideoFrame)` carry real pixels, and which flip mechanism actually applies. Run before touching the output path's orientation handling. Needs `LIBGL_ALWAYS_SOFTWARE=1` for pixel verdicts. |
+| `scripts/probes/pointer_events_probe.py` | Does this WebKitGTK deliver **Pointer Events** for real mouse input on a `<canvas>`? Pushes GDK button/motion events through the same platform→DOM path an X11 mouse takes, with a mouse-event control arm — API presence alone proves nothing here. Also answers **is `event.timeStamp` usable as an event-queueing delay** (`stale` arm: backdate one `GdkEvent.time` by 250ms, see whether the DOM stamp moves with it — it does, so the stamp is platform-derived, but its origin is offset from `performance.now()` by a per-page-load constant). Run before building any drag/pointer gesture or timing one. Seconds, no app, no media. |
 | `scripts/probes/video_frame_signal_probe.py` | Which frame-change signal a legacy `<video>` element actually exposes here — `currentTime` (gates nothing), `requestVideoFrameCallback` (present, rate unmeasurable headlessly), `getVideoPlaybackQuality().totalVideoFrames` (tracks the source frame rate exactly). Run before writing any "has this video advanced a frame?" check. Seconds, needs a real media file. |
 | `scripts/probes/output_window_compositor_probe.py` | End-to-end check of the **real** `output.html`: posts a synthetic frame from a same-origin sender and reads the composited result back, including an orientation assertion. Run after touching `outputBus.ts`, `output.ts`, `outputProtocol.ts` or `fbo.ts`. Needs the Vite dev server and `LIBGL_ALWAYS_SOFTWARE=1`. |
 
-⚠️ **All GPU→CPU readback from WebGL is broken on this machine — it is a Mesa `crocus`
-(Intel HD 4000, gen7) driver bug, not a WebKit one.** `createImageBitmap`, `drawImage(glCanvas)`,
+⚠️ **All GPU→CPU readback from WebGL is broken on the 2012 MacBook Pro — it is a Mesa
+`crocus` (Intel HD 4000, gen7) driver bug, not a WebKit one.** Not re-verified on `mele`
+(different GPU/driver generation entirely — see `docs/environment.md`); don't assume this
+holds there before re-running `scripts/probes/webgl_readback_variants_probe.py`.
+`createImageBitmap`, `drawImage(glCanvas)`,
 `toDataURL` and *every* `readPixels` variant (default FB, complete `SAMPLES=0` user FBO, PBO,
 after `copyTexSubImage2D`) return transparent or `INVALID_OPERATION` + a zeroed buffer, while
 the canvas **displays** correctly. None of them throw. Under `LIBGL_ALWAYS_SOFTWARE=1` every

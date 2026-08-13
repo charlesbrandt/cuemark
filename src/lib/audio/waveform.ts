@@ -64,6 +64,7 @@ export interface AnalysisResult {
   peaks: Float32Array;
   bpm: number | null;        // fractional when the beat-grid fit succeeds, integer fallback otherwise
   gridOffset: number | null; // seconds; a beat lies at gridOffset + k·(60/bpm). null = no grid fit
+  onsets: number[] | null;   // detected kick onset times, seconds. null = no grid fit (fallback path)
 }
 
 export async function analyzeFile(filePath: string, fallbackUrl?: string): Promise<AnalysisResult> {
@@ -75,7 +76,7 @@ export async function analyzeFile(filePath: string, fallbackUrl?: string): Promi
   const envelope = new Float32Array(raw.envelope);
   const { detectBeatGrid, detectBpm } = await import('./bpm');
   const grid = detectBeatGrid(envelope, ENVELOPE_RATE);
-  if (grid) return { peaks, bpm: grid.bpm, gridOffset: grid.gridOffset };
-  // Fallback: coarse integer BPM from the display peaks, no grid phase.
-  return { peaks, bpm: detectBpm(peaks, PEAKS_PER_SECOND), gridOffset: null };
+  if (grid) return { peaks, bpm: grid.bpm, gridOffset: grid.gridOffset, onsets: grid.onsets };
+  // Fallback: coarse integer BPM from the display peaks, no grid phase, no onsets.
+  return { peaks, bpm: detectBpm(peaks, PEAKS_PER_SECOND), gridOffset: null, onsets: null };
 }

@@ -571,6 +571,20 @@ resolved `WebKitWebDriver` through `dpkg -L webkit2gtk-driver`, a package that n
 exists here (it is `webkitgtk-webdriver` now). Under `set -e` each aborted immediately with
 a bare `dpkg-query` error. Fixed in all five.
 
+**Correction, 2026-08-12: "it is `webkitgtk-webdriver` now" did not flip back on this
+machine — a *different* machine was checked and got misattributed here.** This whole doc's
+investigation was on the 2012 MacBook Pro. The 2026-08-12 re-check
+(`skills/verify-ui/SKILL.md`) actually ran on **`mele`** (Intel N150), a second cuemark
+dev/test machine this doc corpus otherwise never mentions — it found `webkit2gtk-driver`
+installed with `webkitgtk-webdriver` absent from apt entirely, which was written here as if
+it re-confirmed the MacBook Pro's own package state. It didn't; the MacBook Pro's current
+package name (as of any date after 2026-08-05) isn't actually known from this correction.
+See `docs/environment.md` for the real per-machine matrix. What still holds regardless:
+the package name isn't a durable fact on any single machine, so resolve the
+`WebKitWebDriver` binary itself (PATH, then either package name as fallback) rather than
+hardcoding one — that's what the "Fixed in all five" fix above actually does; don't undo it
+by "simplifying" back to a single name.
+
 ---
 
 ## The plan

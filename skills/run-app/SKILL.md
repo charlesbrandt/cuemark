@@ -12,8 +12,8 @@ description: Launch the cuemark Tauri dev app and monitor its output. Use when a
 - MIDI: Hercules Starlight absence at launch is normal — `[midi] Hercules Starlight not found` is not an error.
 - **Digger proxy errors are normal**: `[vite] http proxy error: /queue … ECONNREFUSED 127.0.0.1:8200` just means the Digger media library service isn't running. The app degrades gracefully — drag-and-drop and manual load still work.
 - **GTK theme warnings are harmless**: `Gtk-WARNING **: Theme parsing error: gtk.css:…` at launch is cosmetic, not a functional issue.
-- **No screenshot tool available**: grim, scrot, gnome-screenshot, spectacle are all absent. Verify the app is running by checking for `WebKitWebProcess` in `ps aux` and confirming log lines (see "Confirm it's up" below). The app window will appear on the user's desktop.
-- **`pactl` is not installed** — for any live PipeWire/audio-routing inspection (sink volumes, mute state, which client streams are actually active) use `wpctl status` or `pw-dump` instead. See "HMR cascade → orphaned PipeWire streams" below for a concrete use case.
+- **No screenshot tool available** on the machines checked so far (grim, scrot, gnome-screenshot, spectacle all absent — see `docs/environment.md` for which machines that covers). Verify the app is running by checking for `WebKitWebProcess` in `ps aux` and confirming log lines (see "Confirm it's up" below). The app window will appear on the user's desktop.
+- **`pactl` is not installed** on the machines checked so far — for any live PipeWire/audio-routing inspection (sink volumes, mute state, which client streams are actually active) use `wpctl status` or `pw-dump` instead. See "HMR cascade → orphaned PipeWire streams" below for a concrete use case.
 
 ## Prerequisites check
 
@@ -111,6 +111,32 @@ Use `Monitor` tool with `persistent: true` and `timeout_ms: 3600000`.
 
 ```bash
 kill $(cat /tmp/cuemark-dev.pid) 2>/dev/null; rm -f /tmp/cuemark-dev.pid
+```
+
+🔴 **That kills `cargo tauri dev` but NOT the Vite server it spawned, and the next launch then
+silently runs against the stale one.** Caught 2026-08-09: the relaunch logged
+`error when starting dev server: Port 1420 is already in use` and
+`The "beforeDevCommand" terminated with a non-zero status code`, then **started the app
+anyway**, serving the frontend from the previous session's Vite. The codec worker failed to
+import (`[codecPlayer:deck-0] worker.onerror: undefined (undefined:undefined)`) and the user
+lost video entirely — reported as a regression in the Rust change that had just been made,
+which it was not. This is the "Vite serves a stale transform" hazard in CLAUDE.md with a
+louder failure mode.
+
+Kill both, and **scope the pattern to this repo** — there are unrelated Vite servers on this
+machine (ports 5173/5175, `/app/node_modules/...`) that a bare `pkill -f vite` would take out:
+
+```bash
+kill $(cat /tmp/cuemark-dev.pid) 2>/dev/null
+pkill -f "node /home/account/repos/cuemark/node_modules/.bin/vite"
+sleep 2
+pgrep -af "repos/cuemark.*vite|target/debug/cuemark" | grep -v "bash -c" || echo "all stopped"
+```
+
+Then after relaunching, confirm the *new* server actually started before trusting anything:
+
+```bash
+grep -E "VITE.*ready|already in use" /tmp/cuemark-dev.log   # want the first, never the second
 ```
 
 **Always stop before making Rust changes** (`src-tauri/`). After editing Rust code: stop, make the edit, restart. `cargo tauri dev` auto-detects frontend changes and hot-reloads them without a restart.
@@ -299,10 +325,18 @@ readout reappears, check that the reset effect still fires before blaming the au
 filename label does, they are from different tracks — that arithmetic identifies the bug
 immediately (0:43 elapsed + 4:05 remaining = 4:48, against a 6:26 file).
 
-⚠️ **The `CODEC` badge in DeckCard does not clear on fallback** — a deck that failed demux and
-is running the legacy `<video>` path still shows `CODEC`. Cosmetic, still unfixed; do not use
-that badge to determine which video path a deck is actually on. Use the `[video-path]` log
-lines instead.
+🟢 **FIXED 2026-08-11: the badge is now `LEGACY`-only and reflects the actual resolved
+backend, not the desired override.** The old `CODEC`/`LEGACY` toggle read `resolveVideoPath()`
+(the override map), which never changes on a silent demux-failure fallback — a deck stuck on
+`legacy-fallback` kept showing `CODEC` forever. Fixed by adding `activeVideoBackend`
+(`src/lib/video/videoPathSettings.ts`), a reactive mirror of `App.svelte`'s `backendState`
+Map/`audioOnlyDecks` Set (both plain, non-reactive) updated via `syncActiveVideoBackend()` at
+every one of its 8 mutation sites. `DeckCard` now shows a badge only when the deck is actually
+on `legacy`/`legacy-fallback` (never for audio-only files) — the `[video-path]` log lines are
+still the ground truth if the badge and the log ever disagree. Same change added a resolution
+readout (`videoWidth×videoHeight` from `video.videoWidth`/`video.videoHeight` on the legacy
+path, `codec.codedWidth`/`codedHeight` — now exposed on `CodecPlayer`/`CodecPlayerHandle` — on
+webcodecs) next to the badge.
 
 ### HMR hazard: landing a call site before its import kills the rAF loop
 

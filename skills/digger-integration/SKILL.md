@@ -16,15 +16,21 @@ FastAPI REST at `http://localhost:8200` by default:
 |---|---|
 | `GET /queue/next` | Weighted-random track suggestion to push to the cuemark queue |
 | `GET /search?q=` | Quick track search from the cuemark toolbar |
-| `GET /tracks/{id}/cuemark` | Deck-ready payload: `filePath`, `cuePoint`, `hotCues[]` |
+| `GET /tracks/{id}/cuemark` | Deck-ready payload: `filePath`, `cuePoint`, `hotCues[]`, `gain` |
 | `POST /tracks/{id}/markers` | Write cue/hot-cue positions back after editing in cuemark |
+| `PATCH /tracks/{id}` | Generic scalar-field patch — `bpm` (SET BEAT) and `gain` (gain slider) both go through this, `{k: v}` body |
+| `POST /plays/start`, `PATCH /plays/{id}/heartbeat`, `PATCH /plays/{id}/finish` | Session/play-history reporting — see below |
 | `GET /queue/ws` | WebSocket — pushes `{"type": "queue_changed"}` after any queue mutation in Digger (add/remove/clear/consume/source-disable) |
 
 The `/cuemark` payload maps directly to cuemark's `Deck` source interface:
 ```json
 { "filePath": "/media/charles/music/artist/track.mp4", "fileId": 16167, "cuePoint": 4.2,
-  "hotCues": [32.0, 128.5], "bpm": 123.4, "downbeat": 0.812 }
+  "hotCues": [32.0, 128.5], "bpm": 123.4, "downbeat": 0.812, "gain": 1.5 }
 ```
+`gain` (added 2026-08-12) is a per-track pre-fader trim default (0–4): `loadToDeck()` resets the
+deck to 1.0 unless Digger supplies a value, mirroring the bpm/downbeat pull; `DeckCard`'s gain
+slider pushes changes back via `setTrackGain()` on the range input's `change` event (fires once on
+release, not per drag tick like `oninput` does) when `deck.diggerTrackId` is set.
 File preference in Digger: video > audio > any. Marker mapping: first `cue` → `cuePoint`, first 3
 `hot_cue` → `hotCues[]`. `bpm`/`downbeat` round-trip the trusted beat grid (see cuemark's
 `gridSource.ts` gotcha in the top-level `CLAUDE.md`).
@@ -83,6 +89,42 @@ the value touches any `!== null` guard. **Any new consumer of Digger JSON should
 optional fields the same way at the point they enter cuemark** — don't trust the TS interface to
 guarantee the runtime shape.
 
+## Session/play history reporting (added 2026-08-12)
+
+**Before inventing a new endpoint for anything session/history-shaped, check
+`~/repos/digger/docs/design/play-tracking.md` first** — Digger's `plays` table
+(`context='cuemark'`) was already specced for exactly this ("Cuemark: standardize on the same
+log" section) and just sat unused by cuemark for weeks. Building a parallel "Sessions" concept
+would have been a second wheel. `history.ts`'s existing per-deck load/play/pause state machine
+(it already tracks `deckId`, `diggerTrackId`, `startedAt`, `playedMs` locally) now also reports
+into it: `playStart(trackId, deckId)` on load, `playHeartbeat()` on pause and every 30s while
+playing, `playFinish()` on track-change/unload/deck-removal — all fire-and-forget
+(`.catch(console.error)`), same convention as `pushMarker`. A `diggerTrackId === null` load
+(local file, not from Digger) reports nothing.
+
+⚠️ **`mix_transitions.source='play_history'` is not something cuemark should ever POST directly.**
+That table's router docstring (`routers/mix_transitions.py` in the digger repo) explicitly
+reserves `'play_history'` for a transition-mining job that reads the `plays` log server-side —
+"out of scope for this router," i.e. separate future work, not a live client assertion. What
+cuemark owns is making sure `plays` rows are accurate (real start times, real durations) so that
+job has good raw material later — not deriving transitions itself.
+
+## Digger-side schema changes (added 2026-08-12)
+
+Adding a column to Digger's schema for cuemark to read/write (like `tracks.gain`) needs **two**
+edits in the digger repo, not one — `CREATE TABLE IF NOT EXISTS` in `db.py` only affects a
+brand-new database:
+1. Add the column to the relevant `CREATE TABLE` in `db.py` (for fresh installs).
+2. Add a new idempotent `step_add_..._column` function in `migrate.py`, registered as the next
+   numbered step in `run()` (grep the file for `step_add_track_beat_anchor_column` for the
+   pattern to copy). This is what actually reaches the **live** `digger.db`.
+
+The live db is only patched by *running* the migration: `docker compose exec api python
+migrate.py --dry-run` first (prints what it would do; matched against `_columns()`, safe to
+run repeatedly), then without `--dry-run` to apply. The `api` service isn't always up —
+`docker compose ps` to check, `docker compose up -d api` to start it (host port **8200**, maps
+to the container's 8000; `docker compose logs api` to confirm it's serving before hitting it).
+
 ## Queue panel live updates
 
 `DiggerQueue.svelte` opens once via `subscribeQueueChanges()` (`src/lib/digger/api.ts`) on mount
@@ -99,10 +141,12 @@ sidebar.
 ## What cuemark owns
 
 - Current play queue — ordered list of upcoming loads; may be populated from Digger or manually
-- Session playback history [done, 2026-07-26] — `src/lib/state/history.ts` + `HistoryPanel.svelte`;
-  derived from the `session` store rather than instrumenting every play/pause call site. Title/artist
-  come from `setPendingTrackMeta()` (called by `loadToDeck()` before the new source lands) since `Deck`
-  itself has no title/artist fields; local-file loads fall back to the filename.
+- Session playback history [done, 2026-07-26; Digger reporting added 2026-08-12] —
+  `src/lib/state/history.ts` + `HistoryPanel.svelte`; derived from the `session` store rather than
+  instrumenting every play/pause call site. Title/artist come from `setPendingTrackMeta()` (called
+  by `loadToDeck()` before the new source lands) since `Deck` itself has no title/artist fields;
+  local-file loads fall back to the filename. Same store now also reports into Digger's `plays`
+  API — see "Session/play history reporting" above.
 - Runtime cue/hot-cue state; persisting them across sessions = push back to Digger markers API.
   `pushMarker(trackId, positionMs, type)` is called for `'cue'` (DeckCard SET button), `'hot_cue'`
   (DeckCard hot cue buttons), and `'downbeat'` (SET BEAT) — all best-effort/fire-and-forget, all

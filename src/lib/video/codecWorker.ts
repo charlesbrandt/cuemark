@@ -202,9 +202,21 @@ async function pump() {
         if (!au) break; // fetch failed; next clock/init call will retry
       }
       // Decode-ahead gate: only keep decoding while within aheadSeconds() of the audio
-      // clock. Skipped while paused or for the very first AU, so a frame is ready the
-      // instant playback starts / right after init.
-      if (playing && nextFeedIndex > 0 && au.ptsUs / 1_000_000 - clockPos > aheadSeconds()) break;
+      // clock. Skipped for the very first AU, so a frame is ready the instant playback
+      // starts / right after init.
+      //
+      // ⚠️ This used to be gated on `playing` as well, which made a *paused* deck decode
+      // with no clock bound at all — the only limit was decodeQueueSize, and pump() is
+      // re-entered on every `clock` message. That was harmless while nothing drove the
+      // clock on a paused deck, and became the "video jumps ahead dramatically" bug the
+      // moment scrubbing did (a paused scratch polls position at rAF rate; see the
+      // scratch branch in App.svelte's frame()). nextFeedIndex simply ran away through
+      // the file, and since CodecPlayer holds only HELD_FRAMES=2 newest frames,
+      // getFrameForTime() found nothing at or before the scrub position and fell back to
+      // frames[0] — a frame from wherever the decoder had got to, seconds ahead.
+      // Bounding on the clock in both states is also what makes a paused deck stop
+      // decoding at all, which is what it should have been doing.
+      if (nextFeedIndex > 0 && au.ptsUs / 1_000_000 - clockPos > aheadSeconds()) break;
       // decoder can be reset/closed by a concurrent seek/loop-wrap/destroy message while
       // this loop was suspended on the ensureAuFetched() await above (worker messages only
       // run between awaits, but that's exactly where this checks back in) — re-check state

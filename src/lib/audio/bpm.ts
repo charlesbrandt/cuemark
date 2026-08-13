@@ -35,6 +35,16 @@ export interface BeatGrid {
   bpm: number;        // fractional, rounded to 0.01
   gridOffset: number; // seconds in [0, 60/bpm): a beat lies at gridOffset + k·(60/bpm)
   confidence: number; // |S|/Σw in [0, 1] — 1.0 = every onset exactly on the grid
+  onsets: number[];   // seconds, sub-sample refined — the raw detections behind the fit,
+                       // kept for SET BEAT re-snapping (snapToNearestOnset below)
+}
+
+// Internal fit result before the onset list is attached — refineGrid doesn't need it,
+// only detectBeatGrid's final return does.
+interface FitResult {
+  bpm: number;
+  gridOffset: number;
+  confidence: number;
 }
 
 interface Onsets {
@@ -139,7 +149,7 @@ function coarseGridBpm(onsets: Onsets): number | null {
 
 // Comb/Fourier refinement around the coarse candidate. Returns fractional BPM,
 // grid phase, and a normalized alignment confidence.
-function refineGrid(onsets: Onsets, coarseBpm: number): BeatGrid | null {
+function refineGrid(onsets: Onsets, coarseBpm: number): FitResult | null {
   const { times, weights } = onsets;
   const span = times[times.length - 1] - times[0];
   const f0 = coarseBpm / 60;
@@ -224,11 +234,35 @@ export function detectBeatGrid(
   // (every other gridline empty), making 2× confidence spuriously equal.
   const candidates = [Math.round(coarse / 2), coarse, coarse * 2]
     .filter((b) => b >= MIN_BPM && b <= MAX_BPM);
-  let best: BeatGrid | null = null;
+  let best: FitResult | null = null;
   for (const cand of candidates) { // ascending BPM order
     const grid = refineGrid(onsets, cand);
     if (grid && (best === null || grid.confidence > best.confidence * 1.05)) {
       best = grid;
+    }
+  }
+  return best && { ...best, onsets: onsets.times };
+}
+
+// ~50–100ms: the human button-latency range SET BEAT re-snapping exists to correct.
+// A stamp further from any onset than this is more likely a deliberate off-beat mark
+// than a mistimed button press, so it's left alone rather than silently relocated.
+const SET_BEAT_SNAP_TOLERANCE = 0.1;
+
+/**
+ * Snap a manually-stamped SET BEAT time to the nearest detected kick onset, if one lies
+ * within SET_BEAT_SNAP_TOLERANCE. Returns `t` unchanged when `onsets` is empty or nothing
+ * is close enough — never snaps to the existing beat grid (that would make SET BEAT unable
+ * to correct it).
+ */
+export function snapToNearestOnset(t: number, onsets: number[]): number {
+  let best = t;
+  let bestDist = SET_BEAT_SNAP_TOLERANCE;
+  for (const onset of onsets) {
+    const dist = Math.abs(onset - t);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = onset;
     }
   }
   return best;

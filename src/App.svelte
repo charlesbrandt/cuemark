@@ -12,6 +12,7 @@
     audioSetCueDevice, audioSetCueGain, gridGetSaved,
   } from "./lib/audio/pipeline";
   import { clearSavedGrid, markGridSaved, hasSavedGrid } from "./lib/audio/gridSource";
+  import { setDeckOnsets } from "./lib/audio/onsetStore";
   import { syncRate, syncGain, syncVolume, clearDeckAudioSync, averageRateOverWindow } from "./lib/audio/audioSync";
   import { startSessionSync } from "./lib/state/sessionRecovery";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -24,9 +25,9 @@
   import AudioSettings from "./components/AudioSettings.svelte";
   import DiggerQueue from "./components/DiggerQueue.svelte";
   import { mainOutputDeviceIds, cueOutputDeviceId, cueGain } from "./lib/audio/audioSettings";
-  import { fontScale } from "./lib/settings/displaySettings";
+  import { fontScale, queueSidebarWidth } from "./lib/settings/displaySettings";
   import { CodecPlayer, type DemuxInfo } from "./lib/video/codecPlayer";
-  import { videoPathOverrides, videoPathDefault, resolveVideoPath, setVideoPathOverride } from "./lib/video/videoPathSettings";
+  import { videoPathOverrides, videoPathDefault, resolveVideoPath, setVideoPathOverride, activeVideoBackend } from "./lib/video/videoPathSettings";
   import type { Deck, Session } from "./lib/state/types";
   import { audioGetPosition, sessionRestore } from "./lib/audio/pipeline";
   import { recordPollSample, maybePingIpc, recordFrameTiming } from "./lib/audio/pollStats";
@@ -54,6 +55,26 @@
   let showAudioSettings = $state(false);
   let showDiggerQueue = $state(true);
   let showVisualizationPanel = $state(false);
+
+  const QUEUE_SIDEBAR_MIN_WIDTH = 220;
+  const QUEUE_SIDEBAR_MAX_WIDTH = 640;
+
+  function startQueueSidebarResize(e: PointerEvent) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = get(queueSidebarWidth);
+    function onMove(ev: PointerEvent) {
+      // Sidebar is right-of-content, so dragging left (negative dx) widens it.
+      const next = startWidth - (ev.clientX - startX);
+      queueSidebarWidth.set(Math.min(QUEUE_SIDEBAR_MAX_WIDTH, Math.max(QUEUE_SIDEBAR_MIN_WIDTH, next)));
+    }
+    function onUp() {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
 
   // --font-scale (app.css :root) is inherited into every component's scoped styles,
   // so setting it once here on documentElement is all that's needed to scale all UI text.
@@ -271,6 +292,25 @@
   // mechanism"; skills/audio-debugging.md "UI frozen solid"), so a deck with no video to
   // sync should never call either. Cleared on teardown and on a fresh demux attempt.
   const audioOnlyDecks = new Set<string>();
+  // Pushes backendState/audioOnlyDecks (plain Maps/Sets, not stores) into the reactive
+  // activeVideoBackend store so DeckCard's LEGACY badge can reflect the actual resolved
+  // backend — including a demux-failure fallback to 'legacy-fallback' — instead of the
+  // desired override, which never clears on fallback. Call after every mutation of either.
+  function syncActiveVideoBackend(deckId: string) {
+    const state = backendState.get(deckId);
+    activeVideoBackend.update((m) => {
+      if (!state) {
+        if (!(deckId in m)) return m;
+        const next = { ...m };
+        delete next[deckId];
+        return next;
+      }
+      const audioOnly = audioOnlyDecks.has(deckId);
+      const cur = m[deckId];
+      if (cur && cur.kind === state.kind && cur.audioOnly === audioOnly) return m;
+      return { ...m, [deckId]: { kind: state.kind, audioOnly } };
+    });
+  }
   // Signature of the last composited frame's static inputs (deck id/source/opacity).
   // Used to skip the composite()+postFrame() GPU readback entirely when nothing visual
   // changed and nothing is animating — otherwise that full-resolution capture + cross-window
@@ -322,10 +362,19 @@
     audioSetMainDevices($mainOutputDeviceIds).catch(console.error);
   });
 
-  // Sync headphone output device to Rust audio pipeline
+  // Sync headphone output device to Rust audio pipeline.
+  // '' (the "— none —" option) must be sent like any other value: it is what tears the
+  // cue pulsesink down and swaps in the fakesink. Guarding on truthiness left the backend
+  // holding the previous device forever — the UI read "— none —" while the pipeline still
+  // had a live cue sink on it (found 2026-08-08, mid-A/B: it silently turned arm A4 into
+  // A3). Change-guarded because set_cue_device() rebuilds the pipeline unconditionally.
+  let _lastCueDevice: string | undefined;
   $effect(() => {
     const deviceId = $cueOutputDeviceId;
-    if (deviceId) audioSetCueDevice(deviceId).catch(console.error);
+    if (deviceId !== _lastCueDevice) {
+      _lastCueDevice = deviceId;
+      audioSetCueDevice(deviceId).catch(console.error);
+    }
   });
 
   // Sync headphone cue gain to Rust audio pipeline
@@ -919,15 +968,29 @@
       // matters when that stat fails, e.g. no local NAS mount, Digger reachable instead.
       const fallbackUrl = deck.diggerFileId != null ? getDiggerFileUrl(deck.diggerFileId) : undefined;
       audioLoad(deckId, filePath, fallbackUrl).then((duration) => {
-        // A new DeckAudioPipeline is created with default gain/rate/volume=1.0. Re-apply
-        // current session values so saved MIDI state (or UI slider changes made before
-        // this track was loaded) take effect on the fresh pipeline.
+        // A new DeckAudioPipeline is created with default gain/rate/volume=1.0 and
+        // cue_enabled=false (pipeline.rs). Re-apply current session values so saved MIDI
+        // state (or UI slider/cue-button state set before this track was loaded) takes
+        // effect on the fresh pipeline.
         const d = get(session).decks.find((d) => d.id === deckId);
         if (d) {
           clearDeckAudioSync(deckId);
           syncGain(deckId, d.gain);
           syncRate(deckId, d.playbackRate);
           syncVolume(deckId, d.volume);
+          // Cue is guarded separately by _prevCueStates (see the cueEnabled $effect
+          // above) rather than audioSync.ts's module maps. teardownVideoBackendFull
+          // clears this deck's entry so the guard doesn't look "unchanged" against a
+          // pipeline that no longer exists, but clearing a plain Map is not a store
+          // mutation, so the reactive $effect never reruns on its own to notice — it
+          // only fires again on some *unrelated* future session change (a fader nudge,
+          // MIDI event, etc). Without this explicit re-send, a deck reloaded while cue
+          // was already on shows the button lit while the fresh pipeline's cue_valve is
+          // silently closed, until something else happens to touch the store. Send
+          // directly and mark the guard consistent, exactly like the MIDI direct-call
+          // path bypasses the store for rate/gain/volume.
+          _prevCueStates.set(deckId, d.cueEnabled);
+          audioSetCue(deckId, d.cueEnabled).catch(console.error);
         }
         const s = get(session).decks.find((d) => d.id === deckId)?.source;
         if (duration && s?.type === "video" && s.filePath === filePath && (!s.duration || !Number.isFinite(s.duration))) {
@@ -992,6 +1055,7 @@
     playPromises.delete(deckId); lastAudioPlaying.delete(deckId); cancelAudioTransport(deckId);
     clearDeckAudioSync(deckId); contentPosTracker.delete(deckId); stallWatch.delete(deckId);
     audioLoadedFor.delete(deckId); backendState.delete(deckId); audioOnlyDecks.delete(deckId);
+    syncActiveVideoBackend(deckId);
     // audioUnload() above drops the Rust-side DeckAudioPipeline entirely (audio/mod.rs
     // audio_unload removes it from the pipelines map), so a subsequent load builds a brand
     // new one with cue_enabled defaulting to false (pipeline.rs). The cueEnabled $effect only
@@ -1033,6 +1097,7 @@
       registerCodecPlayer(deckId, player);
       backendState.set(deckId, { filePath, kind: 'webcodecs', loadSeq: cur.loadSeq });
       audioOnlyDecks.delete(deckId);
+      syncActiveVideoBackend(deckId);
       const curPlaying = get(session).decks.find((d) => d.id === deckId)?.playing;
       debugLog(`[video-path] ${deckId} entered webcodecs state: deck.playing=${curPlaying} lastAudioPlaying=${lastAudioPlaying.get(deckId)} adoptedPos=${adoptedPos}`);
       if (adoptedPos !== undefined) player.seek(adoptedPos);
@@ -1055,6 +1120,7 @@
       } else {
         audioOnlyDecks.delete(deckId);
       }
+      syncActiveVideoBackend(deckId);
     }
     // backendState is a plain Map, not a Svelte store — flipping `kind` above does not
     // re-trigger the $effect that schedules syncVideoElements. If a play/pause intent was
@@ -1076,6 +1142,7 @@
         playPromises.delete(id); lastAudioPlaying.delete(id); cancelAudioTransport(id);
         clearDeckAudioSync(id); contentPosTracker.delete(id); stallWatch.delete(id);
         audioLoadedFor.delete(id); backendState.delete(id); audioOnlyDecks.delete(id);
+        syncActiveVideoBackend(id);
         // See teardownVideoBackendFull's _prevCueStates comment — same stale-guard hazard
         // if this deck id is ever reused (deck removed then a new one added with the same id).
         _prevCueStates.delete(id);
@@ -1097,14 +1164,30 @@
         // Brand-new file for this deck (fresh load, track swap, OR a deliberate reload of
         // the file already here — same filePath but a new loadSeq) — tear down whatever
         // backend was active for the OLD file (including its audio pipeline) first.
-        teardownVideoBackendFull(deckId);
+        //
+        // Skip teardown when pendingAdoption is set for this deck: this is the first sync
+        // pass after a freeze-watchdog recovery reload, backendState is empty simply
+        // because the page is fresh, and there is no stale frontend backend to clean up —
+        // only the live Rust pipeline that survived the freeze. teardownVideoBackendFull()
+        // calls audioUnload(), which drops that pipeline immediately (Drop tears the
+        // GStreamer pipeline to Null and detaches its mixer branches); ensureAudioLoaded()
+        // below then finds pendingAdoption still set and skips audioLoad(), believing it
+        // adopted a survivor that this call already destroyed. Confirmed live 2026-08-12:
+        // both decks came back marked "loaded" with no underlying pipeline, and every
+        // subsequent play() failed silently forever — see docs/design/freeze-watchdog.md
+        // "Adoption bugs".
+        if (!pendingAdoption.has(deckId)) {
+          teardownVideoBackendFull(deckId);
+        }
         const adopted = ensureAudioLoaded(deck, filePath);
         if (desired === 'webcodecs') {
           backendState.set(deckId, { filePath, kind: 'pending', adoptedPos: adopted?.positionSecs, loadSeq: deck.source.loadSeq });
+          syncActiveVideoBackend(deckId);
           const fallbackUrl = deck.diggerFileId != null ? getDiggerFileUrl(deck.diggerFileId) : undefined;
           startCodecPath(deckId, filePath, adopted?.positionSecs, fallbackUrl);
         } else {
           backendState.set(deckId, { filePath, kind: 'legacy', adoptedPos: adopted?.positionSecs, loadSeq: deck.source.loadSeq });
+          syncActiveVideoBackend(deckId);
           createLegacyVideoEl(deck, filePath, adopted);
         }
         continue; // rest of this deck's sync resumes next rAF pass once state settles
@@ -1120,6 +1203,7 @@
         const v = videoEls.get(deckId);
         if (v) { v.pause(); v.remove(); unregisterVideoEl(deckId); videoEls.delete(deckId); lastUploadedTime.delete(deckId); }
         backendState.set(deckId, { filePath, kind: 'pending', loadSeq: state.loadSeq });
+        syncActiveVideoBackend(deckId);
         startCodecPath(deckId, filePath, resumeAt);
         continue;
       }
@@ -1127,6 +1211,8 @@
         const resumeAt = getDeckTime(deckId) ?? undefined;
         teardownCodecPlayerOnly(deckId);
         backendState.set(deckId, { filePath, kind: 'legacy', loadSeq: state.loadSeq });
+        audioOnlyDecks.delete(deckId);
+        syncActiveVideoBackend(deckId);
         createLegacyVideoEl(deck, filePath, resumeAt !== undefined ? { positionSecs: resumeAt, playing: deck.playing } : undefined);
         continue;
       }
@@ -1693,7 +1779,13 @@
                  override for bar identity, and only a manual SET BEAT persists locally /
                  pushes to Digger. null (grid fit failed, integer detectBpm fallback) still
                  clears any stale downbeat carried over from the previous track. -->
-            <WaveformCanvas {deck} onAnalyzed={({ bpm, gridOffset }) => {
+            <WaveformCanvas {deck} onAnalyzed={({ bpm, gridOffset, onsets }) => {
+              // Onsets feed SET BEAT's re-snap (onsetStore.ts) regardless of whether the
+              // auto-fit itself is trusted below — a saved grid can still be manually
+              // corrected, and that correction should snap to a real kick too.
+              if (deck.source?.type === 'video' && onsets) {
+                setDeckOnsets(deck.id, deck.source.filePath, onsets);
+              }
               // A saved grid (sidecar or Digger) always wins over the auto-fit — see the
               // race-ordering comment at the gridGetSaved() call site above.
               if (deck.source?.type === 'video' && !hasSavedGrid(deck.id, deck.source.filePath)) {
@@ -1721,7 +1813,14 @@
     </div>
 
     {#if showDiggerQueue}
-      <aside class="queue-sidebar">
+      <div
+        class="queue-sidebar-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize queue sidebar"
+        onpointerdown={startQueueSidebarResize}
+      ></div>
+      <aside class="queue-sidebar" style="width: {$queueSidebarWidth}px;">
         <DiggerQueue />
       </aside>
     {/if}

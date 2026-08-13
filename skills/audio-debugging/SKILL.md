@@ -29,10 +29,46 @@ Then read `journal.md` for the most recent session notes.
 
 ## Current pipeline topology
 
+**There are two output topologies**, selected by `CUEMARK_SHARED_OUTPUT` at deck-load time —
+**defaults to the shared-output path since 2026-08-11**; set `CUEMARK_SHARED_OUTPUT=0` to get
+the legacy one. Everything upstream of the `tee` is identical in both; only where the branches
+terminate differs. Check which one you are debugging *before* reading any sink-side instrument
+— several of them mean different things on each path (see the two warnings at the end of this
+section).
+
+Shared per deck, both paths:
+
 ```
 uridecodebin → queue(max-buffers=2) → audioconvert → audioresample
-  → capsfilter(rate=48000) → pitch(tempo) → output_queue(100ms) → volume → pipewiresink
+  → capsfilter(48000/F32LE/2ch) → pitch(tempo) → [spectrum] → input_selector
+  → output_queue(100ms) → tee ├─ volume₀ …
+                              ├─ volume₁ …
+                              └─ cue_valve → cue_volume → cue_queue …
 ```
+
+**Legacy path (`CUEMARK_SHARED_OUTPUT=0`)** — each branch ends in its own `pulsesink`, so one
+deck opens up to four, and main+cue on one device is *two sinks on one node*:
+
+```
+  … volume₀ → [mix-matrix → caps] → pulsesink₀
+  … cue_queue → [mix-matrix → caps] → pulsesink_cue
+```
+
+**Shared-output path (default since 2026-08-11)** — each branch ends in an `appsink` that
+hands buffers to a per-node output pipeline, which sums them into **one** `pulsesink`:
+
+```
+  … volume₀   → appsink ─┐  push_buffer
+  … cue_queue → appsink ─┴─► appsrc(is-live) → queue(30ms) → mix-matrix → caps ─┐
+                             appsrc(is-live) → queue(30ms) → mix-matrix → caps ─┼→ audiomixer
+                             audiotestsrc(silence, keepalive) ─────────────────┘      ↓
+                                                            master volume → pulsesink (N ch)
+```
+
+This is the fix for the cue-gating bug (`docs/design/slow-jog-audio-inaudible.md` §10.14);
+`docs/design/shared-output-pipeline.md` is the design of record. **Read it before changing
+`audio/mixer.rs`**, and run `scripts/probes/shared_output_mixer_probe.py` with its
+`--not-live` control arm.
 
 **`pitch` element** (soundtouch, `gst-plugins-bad`) — sets playback tempo without pitch change via the
 `tempo` property. Set at any time; no seek, no flush, no pipeline state transition. Range: 0.1–10.0.
@@ -194,6 +230,73 @@ in ERROR until the user re-loads the track.
 
 ---
 
+## Capture the actual output and look at it (2026-08-10) — the instrument of last resort, and it should be reached for sooner
+
+**Reach for this the moment the pipeline's own instruments read healthy and the user still
+reports a fault.** Not after the fifth hypothesis. Every probe in this file is a *level*, a
+*count*, or a *state* — none of them is the signal, and a fault that changes none of those is
+invisible to all of them at once.
+
+```bash
+scripts/scratch-capture.sh                      # pre-flights the pw-link, refuses on the wrong node
+scripts/scratch-envelope.py /tmp/cuemark-scratch-<ts>.wav \
+    --start-epoch "$(cat /tmp/cuemark-scratch-<ts>.epoch)" --log /tmp/cuemark-dev.log
+```
+
+It taps the **PipeWire device monitor**, downstream of everything including the
+two-`pulsesink`s-on-one-device topology, so a fault anywhere in the chain lands in it. The
+analyser prints a per-window envelope (`rms`, `hp200`, zero-crossing rate), joins
+`[scratch-tel]` lines inline against wall clock, and separates the three outcomes the log
+cannot:
+
+| verdict | means | where to look next |
+|---|---|---|
+| `GATED` | interior silence ≥150ms reached the device | join the gap start against `[scratch-tel]`; `arrived`/`ramps`/`snaps` say whether the feeder muted |
+| `PITCHED` | level holds, energy collapses below 200 Hz | nothing is muted — the content is shifted down by a low cursor speed. No gate constant will fix it |
+| `CLEAN` | both hold | the loss is downstream of the tap: analog, routing, the controller's mixer |
+
+**Why this earns its own section**: it broke a stalled investigation open
+(`slow-jog-audio-inaudible.md`) after five mechanisms had been proposed and refuted against
+instruments that were structurally incapable of varying with the fault.
+**`rms` is blind to frequency *and* blind to duty cycle**, so the feeder's own `rms` field
+read healthy throughout and *could never have shown either* candidate.
+
+> An instrument that cannot vary with the fault carries no information about it. A clean
+> reading from one is not weak evidence — it is no evidence.
+
+⚠️ **The verdict this section used to report — `PITCHED` — was measured correctly and
+answered the wrong question, and that is the more useful lesson.** The analysis ran on
+channels 0,1 (**main**) while the user was monitoring on **headphones**, a different physical
+channel pair on that device. The pitch arithmetic is real (a slow jog runs the cursor at
+0.10–0.26x, ~2.7 octaves down, full level, inaudible on most monitoring) and `Jog scale` is a
+genuine taste lever — but it was never what the user was hearing, and the same capture had
+digitally-silent headphone channels nobody had looked at. **Ask which output the listener is
+actually on before analysing any capture, and read both pairs**
+(`--channels 2,3`). The real answer was `GATED`, and the cause was two `pulsesink`s on one
+PipeWire node — fixed 2026-08-11 by the shared output graph (§10.14).
+
+### Three traps, all of which fired on first use
+
+- 🔴 **`audio_record_start/stop` is a stub.** `src-tauri/src/audio/record.rs` logs, returns
+  `Ok`, and writes nothing (the encoder chain is "step 8"). The design doc that prescribed it
+  did not know that. Use the capture script.
+- 🔴 **A capture reading ~−53 dBFS and flat is the wrong node, not a quiet take.**
+  `pw-record` silently falls back to the default source — here the H1n mic — producing a
+  perfectly plausible "clean" envelope of the room. It was caught only because it matched an
+  idle control take to within 0.7 dB. The analyser now checks this *first* and refuses to
+  interpret anything below it; `scratch-capture.sh` pre-flights the link.
+- 🔴 **Trim lead-in silence before judging a gap.** The deck sits paused before the gesture
+  starts, so a capture opens with true digital silence. Scored over the whole file that reads
+  as one long gate — and because `GATED` is checked before `PITCHED`, it *masked* the correct
+  verdict on the very take that settled the bug. Now measured over the interior only.
+
+### Timezone
+
+⚠️ **Log stamps are UTC; `date`, the capture filename and the `.epoch` file are local.** The
+`--log` join parsed them as local until 2026-08-10 and therefore matched nothing, **silently**
+— no warning, just an envelope with no telemetry beside it. Check `date -u` against the log's
+last line before concluding a join found nothing.
+
 ## "Audio is choppy" / "audio is silent" — read `output_queue` first (2026-08-02)
 
 **Start here for any audio symptom**, before touching buffer sizes or tempo code. Reaching
@@ -208,7 +311,16 @@ Two probes in `audio/pipeline.rs` close that gap:
 [audio/deck-0] output_queue underrun (total=N) — ...          # instrument_queue_flow()
 [audio/deck-0] main sink 0: first buffer reached the sink     # instrument_sink_flow()
 [audio/deck-0] main sink 0: buffer flow resumed after a 3.2s gap
+[audio/deck-0] cue sink: first buffer reached the sink        # cue branch, since 2026-08-08
+[deliver-tel/deck-0] vol0=…/s(min …) margin …(min …) | sink0=… | cuevol=… | cuesink=…
 ```
+
+⚠️ **Check what these can and cannot see before concluding anything from a clean log.** The
+gap warning needs **>1s** of no buffers; `underrun` needs upstream starvation. **Brief
+clipping, glitching or distortion is below the resolution of every instrument in this
+pipeline** — so for those symptoms "the log is clean" is close to no information at all, and
+must never be reported as "the fault is gone". `[deliver-tel]`'s `margin(min …)` is the nearest
+thing available, and it measures *slack*, not audible artifacts.
 
 | Log | Meaning | Where to look |
 |---|---|---|
@@ -252,6 +364,49 @@ to hide the problem, while a USB device doing 48k→44.1k resampling does not.
 both. If one branch is clean and the other jitters, every upstream cause (CPU, decode,
 soundtouch) is excluded by construction — they cannot affect one branch and spare its sibling.
 That single observation is what cracked this.
+
+### Gating a "flow stopped" probe: a level check is never enough (learned twice)
+
+Any probe that reports "no buffers arrived for N seconds" will also fire on every span where
+**no buffers were supposed to arrive**. This project has now built that bug twice and fixed it
+the same way both times, so treat the pattern as settled:
+
+| Legitimate silence | What forges a dropout |
+|---|---|
+| Preroll → play | The gap between the single preroll buffer and the first play buffer |
+| Pause → resume | The last pre-pause buffer's timestamp surviving the pause |
+| Headphone cue off (`cue_valve` drops everything) | The last pre-close buffer's timestamp surviving the cue-off span |
+| A sink reopening after resume | The first measured second after play, which is device-open latency |
+
+**The fix is always two-sided, and the second side is the one people miss:**
+
+1. **Gate** the check on a relaxed `AtomicBool` (never a `current_state()` query — that takes
+   `GST_OBJECT_LOCK` on a streaming thread; see the `pipewiresink` deadlock history). Multiple
+   conditions compose as a conjunction: the cue sink gates on `at_playing` **and** `cue_open`.
+2. **Invalidate** the stored last-buffer timestamp when the gate closes, *from the side that
+   closes it* — the bus thread on any transition out of `Playing`, `set_cue_enabled()` on cue
+   off. The gate alone leaves a stale timestamp from just before the silence began.
+
+⚠️ **Step 2 is not optional and the cue case shows why most starkly**: the valve drops buffers
+*upstream* of the probed pad, so unlike the pause case **no later buffer ever arrives to clear
+the stale value** — the probe cannot self-heal, and the next cue-on reports the entire cue-off
+span as a dropout. Clear the flag *first*, then the timestamp, so a buffer already in flight
+cannot re-stamp it.
+
+**Always ship a positive control arm with the gate.** The cheapest way to pass "no false
+positives" is to break the diagnostic entirely, and a suppressed real dropout is strictly worse
+than the noise it replaced. Both guards here are two-arm tests — toggle everything and assert
+silence, then stall the pad for 2.5s inside a legitimately-open span and assert the warning
+still fires:
+
+```bash
+cargo test sink_flow_gap_gating -- --ignored --nocapture       # main sinks (D2)
+CUEMARK_CUE_DEVICE='…@RL,RR!FL,FR,RL,RR' \
+  cargo test cue_sink_flow_gap_gating -- --ignored --nocapture # cue sink
+```
+
+Both need a real device and the synthetic soak media (regenerate via the `gst-launch-1.0`
+command in `SOAK_A`'s doc comment — it is ~70MB and not committed).
 
 ### Occasional brief gap/click that does NOT interrupt playback — multi-device clock drift
 
@@ -843,6 +998,97 @@ a plausible-looking "5 HMR reloads ≈ 5x duplicate seeks" coincidence turned ou
 herring once a Rust-side `audio_seek` call counter proved the real ratio (238 IPC calls for 92
 logged events) was fully explained by the log throttle, not by stacked event listeners.
 
+## Burst delivery: never derive a rate from inter-event timing (2026-08-08)
+
+The same fact that makes the log throttle misleading has a second, worse consequence. USB
+MIDI does not deliver ticks evenly — several land in one JS macrotask, then a gap. So the
+inter-event interval is an artefact of *delivery*, not of how fast the user moved, and any
+control that divides by it is measuring the wrong thing.
+
+Vinyl-mode jog was built that way and it made the position jump around erratically. Three
+compounding failures, all traceable to the same root:
+
+1. `queueScratchRate`-style rAF coalescing **overwrites**, so a burst collapses to one
+   update and the rest of the wheel motion is discarded outright. Coalescing a *rate* is
+   lossy; coalescing a *position* is not.
+2. The divisor collapses onto its floor (`SCRATCH_MIN_DT_MS`), saturating the computed rate
+   at the mode cap. An EMA smooths this but cannot remove it — a hard rolling window was
+   tried first and was worse, and both attempts are documented at length in `handler.ts`.
+3. With no absolute reference, every over- and undershoot accumulates for the whole gesture.
+
+**The fix is structural, not a tuning problem**: for anything driven by direct
+manipulation, accumulate events into an **absolute target position** and servo to it
+(`scratch_to()` in `pipeline.rs`, the scrub bus in `seekBus.ts`). N ticks then move the
+track by exactly N ticks of travel whenever they arrive. Velocity remains correct for
+controls that are *supposed* to free-run between events — shuttle-mode jog deliberately
+keeps it.
+
+Reach for this whenever a continuous control feels erratic rather than merely mis-scaled:
+mis-scaled is a constant, erratic is usually timing dependence. Full write-up:
+`docs/design/waveform-scrub.md` (`VINYL_SEC_PER_TICK` is calibrated — `1.8 / 256`; the
+Starlight encoder reports plain ±1 deltas, measured, so accumulation is exact).
+
+⚠️ **One bounded exception, added 2026-08-08 — read it before citing the rule above at a
+velocity estimate.** `HandTracker` in `pipeline.rs` *does* derive a hand speed from
+inter-event intervals, and it is correct to. What makes it safe is not the estimator but
+its role: velocity is **not the control variable** there, position still is. Every real
+target re-anchors the cursor absolutely, so an estimate error cannot accumulate, and its
+only effect is a bounded extrapolation (300ms, capped at 50ms of content) that the next
+event corrects. The rule is really "never let a burst-derived rate be the thing that
+*determines* position" — an unbounded, uncorrected integration. A bounded, self-correcting
+one is a different animal.
+
+---
+
+## A scrub/scratch that drops out: distinguish *absence* of input from *late* input first
+
+Root-caused 2026-08-08 (`docs/design/scratch-audio-downstream-delivery.md`). Three sessions
+were spent fixing this in the feeder, the servo and the scrub bus — all wrong, because the
+only available measurement was the gap between calls *arriving in Rust*, which cannot tell
+"no event fired" from "an event fired and took 800ms to get here". **Those have opposite
+fixes**, so measure the frontend legs before touching either end:
+
+```
+device ──evQueue──► JS handler ──rafWait──► bus flush ──dispatchLag──► invoke ──ipc──► resolved
+```
+
+`src/lib/audio/scrubStats.ts` reports all of them, one burst of lines per gesture
+(`[scrub-deliver/…]`, `[scrub-sec/…]`). Read them against the Rust `[scratch-tel/…]` line —
+same cadence, and `sent/s` there is the same quantity as `targets N/s` here.
+
+| Shape | Cause |
+|---|---|
+| `gap` large, `evQueue` large | events queued behind a blocked main thread |
+| `gap` large, `evQueue` ≈ 0 | **no events were produced** — nothing downstream can fix it |
+| `gap` small, `rafWait` large | the scrub bus's own rAF coalescing |
+| `gap`/`rafWait` small, `ipc` large | IPC backpressure — check `[ipc-ping]` |
+| all small, but Rust-side `gap max` large | between `invoke()` and GTK dispatch (`toRust`) |
+
+What it actually was, and the finding worth carrying forward: **a slowly-moving hand does
+not produce a steady event stream.** At 16s over 1224px the gentle drag moved 13–27 px/s and
+the DOM delivered **5–12 events/s** (~2.3px each) with gaps to 1180ms, while `rafWait` was
+13ms and `evQueue` on the gap-ending event was 4ms — freshly stamped, not late. The servo
+then converged inside its epsilon and faded **by design**, so `arrived%` tracked hand speed
+inversely and exactly: 15–45% muted below 0.35×, 0% above 0.96×.
+
+🔴 **Burstiness mutes a position servo, not sparseness** — measured, and it inverts the
+intuition. A *uniform* 300ms cadence never converges (each jump is large, closing it takes
+about as long as the period) and measures 0% silent. A **burst** ends with a small jump the
+servo closes in ~150ms, and then nothing arrives for the rest of the period. Live delivery
+is bursty (`gap p50=18ms` with `gapMax` 376–1180ms), which is why "11–45 updates/s" reads as
+survivable on paper and is not.
+
+Fix shipped: coast, don't mute (`HandTracker`, above). A platter has mass; when the hand
+stops feeding it motion it doesn't stop dead. Window deliberately too short (300ms) to bridge
+the 1180ms outlier — covering that makes it a flywheel, and a hand that crosses no pixel for
+1.2s has genuinely stopped, where a held record *is* silent. User-confirmed live: "the audio
+stays playing the whole time that an action is happening, in both directions", with mild
+residual wobble — the dead-reckoning overshoot, accepted.
+
+⚠️ **Two designed silences will masquerade as this bug** and cost a session if you forget:
+`arrived%` on a hand slowing to a stop, and `snaps` on a coarse overview drag that saturates
+`SCRATCH_TARGET_MAX_RATE`. Ask for **slow, smooth, zoomed** gestures when requesting a repro.
+
 ---
 
 ## CPU profiling a live "chokes up" freeze — `pidstat` + `perf`
@@ -993,6 +1239,30 @@ had gone from making things *better* to *reliably worse*, which prompted
 looking for what the fix itself was causing (see next section) rather than
 concluding the earlier root-cause diagnosis was wrong.
 
+**The same rule applies to a unit test, and it is cheaper there — run the test with the fix
+disabled and confirm it fails.** A test written from a correct diagnosis can still fail to
+discriminate, and then it silently certifies nothing forever. Two instances in this project,
+both in the same feature:
+
+- `scratch_to_smoke` passed throughout the "scrubbing plays no audio" bug and would pass again
+  on the broken code: it asserts the cursor *arrives*, and it did — in one chunk, then sat
+  silent. The defect was the *shape* of the motion, a whole-gesture statistical property.
+- The first schedule written for `sparse_slow_hand_stays_audible` (2026-08-08) measured 1.5%
+  silent with the coast disabled, comfortably under its own 5% threshold. Only the disabled-fix
+  arm exposed that; re-pointed at a 400ms burst period it reads **19.7% disabled / 0.0%
+  enabled**.
+
+The disabled-fix arm also caught a **harness** fault the same session: `replay_sampled` was
+counting the chunks before the target had ever moved, where `arrived` is correct, which made
+one arm read "7.5% silent" no matter what the servo did. The tell was that the number did not
+move *at all* across the A/B. A metric that is identical in both arms is either measuring
+nothing or measuring the harness.
+
+For a behaviour with two failure directions, write **two opposed tests** so a wrong constant
+fails one of them — `sparse_slow_hand_stays_audible` (sound where there should be sound) and
+`long_input_gap_still_comes_to_rest` (silence where there should be silence, failing with "the
+coast has become a flywheel" if the window is too long).
+
 ## GStreamer gotcha: narrowing a live `queue`'s `max-size-*` cap while it's over
 ## the new limit re-applies backpressure immediately, not once it "catches up"
 
@@ -1114,6 +1384,30 @@ fact rather than trying to pre-filter what's "interesting" live.
 
 ## VA-API hardware decode status (as of 2026-06-20)
 
+🔴 **Scoped to the 2012 MacBook Pro only — do not treat "H.264 hardware decode is
+enabled" as true of whatever machine you're currently on.** `CLAUDE.md` states plainly
+that the MacBook Pro has **no VA-API driver for any codec** — re-verified 2026-08-05 by
+checking for Intel `*_drv_video.so` under `/usr/lib/x86_64-linux-gnu/dri` (none; only
+d3d12/nouveau/r600/radeonsi/virtio_gpu), for `gstreamer1.0-vaapi` (not installed), and
+`gst-inspect-1.0 va` (`0 features`). Everything decodes in software *there*. The
+`GST_PLUGIN_FEATURE_RANK` demotion below is a **no-op** on that machine specifically —
+there's nothing for it to demote.
+
+🔴 **Confirmed false on `mele`, a second cuemark dev/test machine** (2026-08-12): `mele`
+has a fully working VA-API stack (`iHD_drv_video.so`, `gstreamer1.0-vaapi` installed,
+`gst-inspect-1.0 va` → 12 features including VP9 hardware decode). The "sandbox not being
+the same environment session to session" theory once floated here was wrong — it's not
+drift, it's two different physical machines, never distinguished in this doc before. See
+`docs/environment.md` for the full per-machine matrix and the (currently open) question
+of whether `main.rs`'s demotion list is correct on `mele`'s hardware.
+
+**Never explain a codec-specific cost/behavior difference by hardware decode without
+re-running those three checks first, on whichever machine you're actually on** — the
+paragraphs below describe a `mesa-va-drivers`/`webkit2gtk` state from 2026-06-20 on the
+MacBook Pro specifically. They're kept for historical/mechanism context (the
+avc-vs-annexb finding itself doesn't depend on which decoder was active), not as a
+current hardware-decode status for any given machine.
+
 `src-tauri/src/main.rs` sets `GST_PLUGIN_FEATURE_RANK` to demote specific VA-API decoders to rank 0,
 forcing software decode fallback for codecs where this GPU's DMA-BUF export was confirmed broken.
 **Current state: only AV1 (`vaav1dec`/`vaapiav1dec`) is demoted.** H.264 hardware decode was
@@ -1123,7 +1417,43 @@ symptom returns for H.264, or shows up freshly for AV1/VP9/HEVC, re-add the code
 `vaapi*dec` factory name to the rank string in `main.rs` — see the comment there and the
 2026-06-19/2026-06-20 journal entries for the full history before assuming it's fixed for good.
 
+## Verifying a GStreamer bug fix without the full app: replicate the pipeline logic standalone (2026-08-12)
+
+To confirm `pipeline.rs`'s `autoplug-select` video-decoder-skip actually protects a
+*different* machine's VA-API stack (`mele`, see `docs/environment.md`), a full app launch
+wasn't needed — a ~40-line standalone `python3-gi` + `Gst` script built the same
+`uridecodebin` + `autoplug-select` shape and pointed it at a real AV1 library file, with
+`fakesink` standing in for the real audio graph. This is faster to iterate and easier to
+read the result from (no log-grepping through app noise) than driving the real app for a
+pipeline-shape question — reuse this pattern for any "does this GStreamer element
+selection/caps/signal behavior hold on this machine" question that doesn't depend on the
+rest of the app. It also makes a clean A/B: running the *same* script with the skip logic
+deliberately broken reproduced the original bug's exact GStreamer error
+(`GstVaAV1Dec:vaav1dec0: no valid frames found`) as the control arm, which is stronger
+evidence than a single passing run alone.
+
+**Gotcha**: `Gst.ElementFactory`'s klass string (what `autoplug-select` checks — see
+`pipeline.rs`'s `is_video_decoder` comment) is not exposed as `factory.get_klass()` in
+the `python3-gi` bindings, despite that being the natural-looking method name and despite
+Rust's `gstreamer` crate exposing exactly that. It's `factory.get_metadata('klass')`.
+Calling the wrong one raises `AttributeError` from inside a signal handler, which
+GStreamer swallows silently and falls through to the *default* autoplug behavior (TRY,
+not SKIP) — so a broken skip filter doesn't error loudly, it just quietly stops skipping,
+and the result looks exactly like "the fix isn't there" rather than "the check crashed."
+Confirm any `autoplug-select`/signal-handler probe actually fires its intended branch
+(e.g. print inside both branches) before trusting a clean or a failing result from it.
+
 ## WebCodecs H.264 hardware decode requires `description` (avc), not annexb (2026-07-25)
+
+⚠️ **This section's root-cause narrative assumes `vah264dec` (hardware) was actually
+selected, which the 2026-08-05 re-verification says isn't possible on this machine (no
+VA-API driver at all — see the correction at the top of "VA-API hardware decode status"
+above).** The **fix still stands and is what shipped** (always build avc+`description`,
+never rely on annexb-without-description) — that recipe works regardless of which decoder
+is active, which is presumably why it was never noticed as wrong. What's stale is only the
+causal story ("`vah264dec` doesn't tolerate annexb-without-description, `avdec_h264` does")
+— treat it as an unconfirmed hypothesis from an environment state that may not have existed
+the way this section describes, not a settled explanation.
 
 **Symptom**: `VideoDecoder.configure({codec: 'avc1.PPCCLL'})` (no `description`) + `decode()` on
 real Annex-B chunks (start-code-delimited NALs, in-band SPS/PPS) — the WebCodecs-documented
@@ -1186,10 +1516,15 @@ on why `toDataURL()` was used instead of WebDriver's `/screenshot` endpoint).
 **Symptom**: output sounds clipped or distorted even when per-deck volume and gain sliders are
 turned down. Master volume slider appears to have no effect.
 
-**Root cause confirmed 2026-06-28**: `MasterMix.set_master_volume()` (`mixer.rs`) is a stub — it
-stores the value but never applies it to GStreamer. `MasterMix` is scaffolding for a future
-shared-audiomixer topology; its `_main_pipeline` is always `None`. The actual master volume is now
-implemented in `AudioManager` directly (see below).
+**Root cause confirmed 2026-06-28**: `MasterMix.set_master_volume()` (`mixer.rs`) was a stub —
+it stored the value but never applied it to GStreamer. The actual master volume is implemented
+in `AudioManager` directly (see below).
+
+> ⚠️ **Updated 2026-08-11: `MasterMix` is gone.** `mixer.rs` now holds `OutputGraph`, the real
+> one-`pulsesink`-per-node topology, and on the shared-output path master volume is applied by
+> a `volume` element per node after the mixer — the stage it always belonged in. The per-deck
+> factor below is still applied as well, so switching the flag off mid-session cannot silently
+> lose master attenuation; both are linear gains and the deck-side one is 1.0 unless moved.
 
 **Gain chain per deck** (as of 2026-06-28):
 
@@ -1204,11 +1539,15 @@ GStreamer volume element = gain × vol × master_volume
 `master_volume` is stored in `AudioManager.master_volume` and propagated to all active deck
 pipelines via `set_master_volume_factor()`. New pipelines inherit it at `audio_load` time.
 
-**PipeWire summing**: each `DeckAudioPipeline` has its own `pipewiresink`; PipeWire sums all
-streams at hardware level. With N decks at gain=1, vol=1, master=1 you can get up to N× summed
+**Summing**: on the legacy path each branch has its own `pulsesink` and PipeWire sums the
+streams at hardware level; on the shared-output path an `audiomixer` sums them per node before
+the single sink. Either way the arithmetic below is the same. With N decks at gain=1, vol=1, master=1 you can get up to N× summed
 amplitude. Reduce master volume if two fully-loaded decks clip: pulling to ~0.6 gives ~4 dB of
 headroom for two simultaneous sources.
 
-**What is still a stub** (2026-06-28):
-- `MasterMix` in `mixer.rs` — the shared audiomixer topology hasn't been built
+**What is still a stub**:
 - `set_eq()` in `pipeline.rs` — EQ sliders show in the UI but do nothing to GStreamer
+- `record.rs` — `audio_record_start/stop` returns `Ok` and writes nothing. The shared output
+  graph is the natural place to tap for this (one node, one mix, post-master) and did not
+  exist when the stub was written.
+- ~~`MasterMix`~~ — built 2026-08-11 as `OutputGraph`; see the topology section above.

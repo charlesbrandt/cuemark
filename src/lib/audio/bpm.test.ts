@@ -7,7 +7,7 @@
  * are deliberately tight. Run with `npm test`.
  */
 import { describe, expect, it } from 'vitest';
-import { detectBeatGrid, detectBpm, tapTempo } from './bpm';
+import { detectBeatGrid, detectBpm, snapToNearestOnset, tapTempo } from './bpm';
 
 const RATE = 210; // envelope samples/sec — must match ENVELOPE_RATE in waveform.ts
 
@@ -84,6 +84,23 @@ describe('detectBeatGrid', () => {
     expect(grid!.confidence).toBeGreaterThan(0.5);
   });
 
+  it('returns the onset list the fit was computed from, close to the true click times', () => {
+    const truth = { bpm: 127.53, offset: 0.31 };
+    const env = clickEnvelope({ ...truth, duration: 120 });
+    const grid = detectBeatGrid(env, RATE);
+    expect(grid).not.toBeNull();
+    expect(grid!.onsets.length).toBeGreaterThan(200); // ~254 beats over 120s at this tempo
+    // Every synthetic click should have a detected onset nearby — loose enough to tolerate
+    // the exponential-decay click shape's effect on sub-sample peak refinement, tight enough
+    // to prove these are real per-click detections and not, say, one onset per several beats.
+    const period = 60 / truth.bpm;
+    for (let k = 0; k < 20; k++) {
+      const t = truth.offset + k * period;
+      const nearest = Math.min(...grid!.onsets.map((o) => Math.abs(o - t)));
+      expect(nearest).toBeLessThan(0.1);
+    }
+  });
+
   it('stays accurate with dropped beats and amplitude jitter', () => {
     const truth = { bpm: 93.87, offset: 1.02 };
     const env = clickEnvelope({
@@ -122,6 +139,29 @@ describe('detectBeatGrid', () => {
   it('returns null when the track is too short to fit a grid', () => {
     const env = clickEnvelope({ bpm: 120, offset: 0.1, duration: 5 });
     expect(detectBeatGrid(env, RATE)).toBeNull();
+  });
+});
+
+describe('snapToNearestOnset', () => {
+  it('snaps to the nearest onset within tolerance', () => {
+    const onsets = [1.0, 2.0, 3.5];
+    expect(snapToNearestOnset(2.06, onsets)).toBe(2.0);
+    expect(snapToNearestOnset(0.95, onsets)).toBe(1.0);
+  });
+
+  it('picks the closer of two onsets both within tolerance', () => {
+    const onsets = [1.0, 1.08];
+    expect(snapToNearestOnset(1.03, onsets)).toBe(1.0);
+    expect(snapToNearestOnset(1.05, onsets)).toBe(1.08);
+  });
+
+  it('leaves the stamp unchanged when no onset is within tolerance', () => {
+    const onsets = [1.0, 5.0];
+    expect(snapToNearestOnset(2.5, onsets)).toBe(2.5);
+  });
+
+  it('leaves the stamp unchanged for an empty onset list', () => {
+    expect(snapToNearestOnset(2.5, [])).toBe(2.5);
   });
 });
 

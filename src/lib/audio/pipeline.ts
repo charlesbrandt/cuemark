@@ -71,6 +71,24 @@ export function audioScratch(deckId: string, rate: number, holdMs: number): Prom
   return invoke("audio_scratch", { deckId, rate, holdMs });
 }
 
+/**
+ * Position-mode scratch: tell the feeder *where to be* (absolute content seconds) rather
+ * than *how fast to go*. Sounds identical to audioScratch — the feeder still walks the
+ * PCM buffer, so pitch still bends with speed — but the rate is derived from the distance
+ * left to cover, which makes the gesture drift-free and makes coalescing lossless (the
+ * newest target simply supersedes the older ones; no motion is discarded).
+ *
+ * Use this for anything driven by direct manipulation — the waveform drag, vinyl-mode jog
+ * — and audioScratch for shuttle-style free-running. Switching a live gesture between the
+ * two is safe; neither restarts the feeder.
+ *
+ * `targetSecs` is content time: the same domain as the waveform, cue points and hot cues.
+ * Still worth throttling to once per rAF, since it is an IPC round trip either way.
+ */
+export function audioScratchTo(deckId: string, targetSecs: number, holdMs: number): Promise<void> {
+  return invoke("audio_scratch_to", { deckId, targetSecs, holdMs });
+}
+
 /** Stops scratch playback and returns to Paused. The next audioPlay() resyncs to the position the scratch cursor reached. */
 export function audioStopScratch(deckId: string): Promise<void> {
   return invoke("audio_stop_scratch", { deckId });

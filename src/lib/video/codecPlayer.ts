@@ -1,8 +1,9 @@
 /**
  * codecPlayer.ts — main-thread half of the WebCodecs video path
  * (docs/design/webcodecs-video-path.md phase 2). One instance per codec-path deck:
- * spawns codecWorker.ts, holds the <=2 most recently transferred VideoFrames, and
- * exposes getFrameForTime() for App.svelte's render loop and DeckCard's preview canvas.
+ * spawns codecWorker.ts, retains a short ring of the most recently transferred
+ * VideoFrames, and exposes getFrameForTime() for App.svelte's render loop and DeckCard's
+ * preview canvas.
  *
  * Rate changes need nothing here: the audio clock (contentPos, fed via setClock) already
  * advances at the deck's rate — there's no v.playbackRate-equivalent on this path.
@@ -19,9 +20,88 @@ export interface DemuxInfo {
   duration: number;
 }
 
-const HELD_FRAMES = 2;
+// Why retain more than the 2 this used to keep: decode is forward-only (a frame earlier
+// than the decoder's position can only be reached by resetting and re-decoding from the
+// nearest keyframe, and this library's GOPs are ~250 frames — see
+// docs/design/waveform-scrub.md), so the *only* affordable way to show an earlier frame
+// during a reverse scrub is to still have it. Frames arrive pts-ascending and eviction is
+// oldest-first, so the ring is exactly the recent past a backward gesture moves into.
+// This costs no decode work at all; it is purely "stop closing frames so eagerly".
+//
+// ⚠️ Sized by a **byte budget alone**, deliberately, and *not* by a target number of
+// seconds (settled 2026-08-09 evening after three measured arms — codec-frame-cache.md
+// §5a). The history is worth keeping because the obvious-looking fix was tried and made
+// things worse on most of the library:
+//
+//   content            48MB budget      0.75s target     0.35s target    192MB budget
+//   3840x2026 @25      4 / 0.16s        17 / 0.68s       9  / 0.36s      17 / 0.68s
+//   1280x720  @25      32 / 1.28s       19 / 0.76s       9  / 0.36s      32 / 1.28s
+//
+// The original 48MB budget's real fault was being too small for 4K (0.16s served no
+// gesture at all and the feature read as "not working" live), not being expressed in
+// bytes. A duration target fixed 4K and simultaneously *took the window away from cheap
+// frames*, which the byte budget had been handing out for free — a 3.5x regression on
+// sub-4K content, i.e. most of the library. Raising the ceiling to 192MB fixes 4K without
+// that cost: strictly better than either duration arm on both content types, with one
+// constant instead of two.
+//
+// Known and accepted: frame rate is ignored, so a 6fps file gets a very long window and a
+// 60fps file a short one. That window is free either way — the ring costs no decode, only
+// retained buffers — which is what made byte-only sizing defensible to begin with. If a
+// high-frame-rate file ever *does* scrub short, the answer is a duration **floor** on top
+// of this, never a target that can shrink a window the ceiling would have allowed.
+//
+// Per *deck*, so budget for it twice on a two-deck set.
+const FRAME_RING_BYTES = 192 * 1024 * 1024;
+const MIN_HELD_FRAMES = 2; // the historical value — never retain less than this
+// Deliberately conservative: a VideoFrame pins a decoder buffer until close() and
+// VideoDecoder recycles from a bounded pool, so the failure mode of raising this is
+// decode stalling outright, not memory growth. See waveform-scrub.md.
+const MAX_HELD_FRAMES = 32;
+// localStorage override for live A/B without a rebuild: an HMR edit to this module
+// invalidates App.svelte and remounts it, which tears the deck down and pauses playback
+// (CLAUDE.md, "Dev server lifecycle"), making edit-driven tuning of this number expensive.
+const RING_OVERRIDE_KEY = "cuemark:codecFrameRing";
+
+/**
+ * Frames to retain for `w`×`h`: as many as fit in `FRAME_RING_BYTES`, within the bounds
+ * and honouring the override. No frame-rate term — see the note above the constants.
+ */
+export function heldFrameCapacity(
+  w: number,
+  h: number,
+  override?: number | null,
+): number {
+  if (override !== undefined && override !== null && Number.isFinite(override) && override >= MIN_HELD_FRAMES) {
+    return Math.floor(override);
+  }
+  // I420/NV12 — 1.5 bytes per pixel. An estimate is fine: this only sizes a budget, and
+  // VideoFrame.allocationSize() is not worth trusting on this WebKitGTK for a value that
+  // would then have to be recomputed per frame anyway.
+  const bytesPerFrame = Math.max(1, w * h * 1.5);
+  const byCeiling = Math.floor(FRAME_RING_BYTES / bytesPerFrame);
+  return Math.min(MAX_HELD_FRAMES, Math.max(MIN_HELD_FRAMES, byCeiling));
+}
+
+function ringOverride(): number | null {
+  try {
+    const raw = globalThis.localStorage?.getItem(RING_OVERRIDE_KEY);
+    return raw === null || raw === undefined ? null : Number(raw);
+  } catch {
+    return null; // localStorage can throw (disabled/partitioned); never block deck load on it
+  }
+}
+
 // Mirrors App.svelte's contentPosTracker seek-detection heuristic (a delta this large
 // between consecutive clock updates is not real playback advancing, it's a seek/restart).
+//
+// ⚠️ Do NOT lower this to try to make reverse scrub track more finely, and do not make the
+// anchor below accumulate backward travel so that it fires within a gesture. Both were
+// tried together on 2026-08-09 and are a live *audio* regression — each seek re-decodes
+// ~125 frames of 1080p in software (no VA-API on this machine), which starves the main
+// thread and the GStreamer audio threads until the scratch servo goes silent. The frame
+// ring above is the affordable way to serve backward motion. See
+// docs/design/waveform-scrub.md, "Reverse scrub video".
 const BACKWARD_JUMP_SECONDS = 0.5;
 
 export class CodecPlayer {
@@ -30,8 +110,26 @@ export class CodecPlayer {
   private lastClockPos = 0;
   private destroyed = false;
   private loggedFirstFrame = false;
+  private readonly maxHeldFrames: number;
+  /** Demuxed coded dimensions — DeckCard's resolution readout reads these directly. */
+  readonly codedWidth: number;
+  readonly codedHeight: number;
 
   constructor(readonly deckId: string, port: number, demux: DemuxInfo) {
+    this.codedWidth = demux.codedWidth;
+    this.codedHeight = demux.codedHeight;
+    this.maxHeldFrames = heldFrameCapacity(
+      demux.codedWidth,
+      demux.codedHeight,
+      ringOverride(),
+    );
+    // The seconds figure is the point of this line: bytes are what the ring is billed in,
+    // seconds are what a gesture spends, and a wrong window is only obvious in seconds.
+    debugLog(
+      `[codecPlayer:${deckId}] frame ring: ${this.maxHeldFrames} frames ` +
+      `(${demux.codedWidth}x${demux.codedHeight}, ~${(demux.codedWidth * demux.codedHeight * 1.5 * this.maxHeldFrames / 1048576).toFixed(1)}MB, ` +
+      `~${demux.fpsHint > 0 ? (this.maxHeldFrames / demux.fpsHint).toFixed(2) : "?"}s of reverse scrub)`,
+    );
     this.worker = new Worker(new URL("./codecWorker.ts", import.meta.url), { type: "module" });
     this.worker.onmessage = (e: MessageEvent) => this.handleMessage(e.data);
     // Worker construction failures / uncaught synchronous throws at the worker's top level
@@ -64,7 +162,10 @@ export class CodecPlayer {
       }
       this.frames.push(msg.frame);
       this.frames.sort((a, b) => a.timestamp - b.timestamp);
-      while (this.frames.length > HELD_FRAMES) this.frames.shift()!.close();
+      // Oldest-first eviction: frames arrive pts-ascending, so what survives is the most
+      // recent window — which is what a backward scrub reaches into. Evicted frames must
+      // be close()d or the decoder's buffer pool leaks.
+      while (this.frames.length > this.maxHeldFrames) this.frames.shift()!.close();
     } else if (msg.type === "error") {
       debugLog(`[codecPlayer:${this.deckId}] worker error: ${msg.message}`);
       console.error(`[codecPlayer:${this.deckId}] worker error:`, msg.message);
@@ -78,9 +179,12 @@ export class CodecPlayer {
     for (const f of this.frames) {
       if (f.timestamp <= targetUs && (!best || f.timestamp > best.timestamp)) best = f;
     }
-    // Before the first frame's pts (e.g. right after a forward seek, still filling): show
-    // the earliest held frame rather than nothing, same "don't leave a black hole" spirit
-    // as uploadVideoFrame's readyState guard on the legacy path.
+    // Before the earliest held frame's pts — right after a forward seek while still
+    // filling, or a backward scrub that has travelled past the whole ring — show the
+    // earliest held frame rather than nothing, same "don't leave a black hole" spirit as
+    // uploadVideoFrame's readyState guard on the legacy path. Staleness here is bounded by
+    // the ring's duration, and it is the ring growing that shrinks how often this is hit
+    // at all during a reverse gesture.
     return best ?? this.frames[0] ?? null;
   }
 

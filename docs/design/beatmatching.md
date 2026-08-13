@@ -382,6 +382,22 @@ propagates automatically. The commit that introduced it names the original motiv
 
 ---
 
+## Known limitations (by design — don't "fix" these)
+
+Carried over from the beat-grid handoff spec (`todo.md`) once all five of its steps shipped.
+
+- Constant-tempo model: one bpm + one offset per track. Right for electronic / dance
+  material; live-drummer recordings will drift regardless — the NUDGE workflow is the
+  answer there, not a variable beat map.
+- Beat-level anchor, not bar-level. Phrase-aligned mixing would need bar detection or a
+  SET BEAT convention; nothing currently consumes bar identity (see "Bar-level downbeat
+  detection" above).
+- Tempo prior centered at 120 BPM (σ 0.4 log) resolves octave ties toward danceable tempo;
+  genuinely ambiguous material (sparse 64 BPM downtempo) may come back as 128 — harmless
+  for sync if both decks get consistent treatment.
+
+---
+
 ## Suggested order
 
 1. **Live-confirm root cause #1's fix.** Everything below assumes a trustworthy anchor;

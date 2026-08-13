@@ -19,6 +19,20 @@ produced it was invalid.
 
 First time cuemark has been run on this machine:
 
+⚠️ **The Ubuntu version below (26.04) doesn't match every later-dated doc, which mostly say
+24.04** (`webcodecs-video-path.md`'s Phase 1, `pcm-buffer-playback.md`, `audio-debugging`
+skill). The hardware description here (2012 MacBook Pro, Intel HD 4000 + Nvidia GK107M)
+does match the rest of this doc's own cluster (this doc + `webcodecs-video-not-rendering.md`,
+same 2026-08-02 session) and other MacBook-Pro-hardware docs elsewhere, so this reads as the
+same physical box moving between OS versions over time (24.04 before 08-02 → 26.04 on 08-02,
+reason not documented → 24.04 again from 08-05 onward per `legacy-video-fallback-cost.md`) —
+**not confirmed why**, could be a real reinstall, could be something else; re-run the
+identify commands in `docs/environment.md` rather than trusting a version number by date.
+Separately: cuemark is also developed/tested on at least one other physical machine
+(`mele`, an Intel N150 box unrelated to this MacBook Pro) — see `docs/environment.md` for
+the full machine matrix. Treat any specific package/version number in this doc as dated
+2026-08-02 and re-check on whichever machine you're actually on before trusting it.
+
 - 2012 MacBook Pro (MacBookPro9,1/10,1-class), dual-GPU (Intel HD 4000 + Nvidia GK107M).
   Nvidia GPU disabled via `nouveau` blacklist (see `~/mbpr/gpu-thermal-notes.md`) — but
   its HDA audio function still enumerates as ALSA card 0 (`HDA NVidia`), separate from

@@ -10,28 +10,80 @@ virtual display, so screenshots reflect actual WebGL/canvas rendering. It does n
 replace `run-app` for normal dev-loop testing — use this specifically when you need
 a screenshot or DOM-level assertion and don't want to touch the user's live session.
 
+## "No GUI automation" and "driving the UI" are answers to two different questions
+
+Don't say "no GUI automation is available" without saying *which* of these you mean —
+conflating them is the single biggest source of sessions contradicting each other on
+this exact question:
+
+1. **Driving the user's live, already-open window** (`:0`/`wayland-0`, whatever
+   `cargo tauri dev` currently has up). This really is impossible in this environment:
+   `xdotool`/`wmctrl`/`ydotool`/`wtype` and every screenshot tool (`grim`, `scrot`,
+   `gnome-screenshot`, `spectacle`, `import`) are all absent, and cuemark is a native
+   Wayland client with no XWayland presence, so even installing X11 tools would give
+   them nothing to attach to. See `project_no_gui_automation_this_session` memory.
+   The only way into a window that's already running is WebDriver or the WebKit
+   inspector attached *at process start* — neither attaches to an existing process.
+2. **Launching a fresh, separate, isolated instance and driving it** — this skill
+   (`tauri-driver` + `Xvfb`) or the lightweight `python3-gi` + GDK-event-injection
+   probes below. This fully works on `mele` (verified 2026-08-12: `Xvfb`, `tauri-driver`,
+   `WebKitWebDriver`, and the `python3-gi`/`gir1.2-webkit2-4.1` stack are all installed —
+   see `docs/environment.md` for the full per-machine tooling matrix, since cuemark is
+   developed/tested on more than one physical machine and package presence isn't
+   guaranteed to transfer) and is exactly what several scripts and probes already do
+   successfully. It is not a live-session workaround — it's a real, separate cuemark
+   process the driving session fully controls.
+
+If a task needs #1 and can't get it, say so and ask the user to do the manual step —
+don't silently fall back to #2 and call it the same thing, and don't let a failure at
+#1 read as "GUI automation doesn't work here" when #2 is what most verification tasks
+actually need.
+
 ## One-time setup
 
-Requires `sudo` — the user runs this themselves (see `README.md`). `sudo` in this
-environment needs a real interactive terminal (fails with "A terminal is required
-to authenticate" over a non-interactive shell, `!`-prefixed or otherwise) — ask the
-user to run the `apt-get` line in their own terminal; `cargo install tauri-driver`
-itself needs no sudo and can be run directly:
+**Check what's actually present before assuming anything is missing or telling the
+user to install something** — package names for the WebKit driver vary by distro
+release (below), and a check gated on the wrong name reports "missing" even when
+everything needed is installed and working:
 ```sh
-sudo apt-get install xvfb webkitgtk-webdriver
+which Xvfb 2>/dev/null
+which tauri-driver 2>/dev/null || ls ~/.cargo/bin/tauri-driver 2>/dev/null
+find /usr/bin /usr/lib -iname 'WebKitWebDriver' 2>/dev/null
+```
+If all three resolve to a real path, automation is fully available — proceed, don't
+report it as unavailable.
+
+If something is genuinely missing, install it. Requires `sudo` for the apt packages —
+the user runs that line themselves (see `README.md`); `sudo` in this environment needs
+a real interactive terminal (fails with "A terminal is required to authenticate" over a
+non-interactive shell, `!`-prefixed or otherwise) — ask the user to run the `apt-get`
+line in their own terminal. `cargo install tauri-driver` itself needs no sudo and can be
+run directly:
+```sh
+sudo apt-get install xvfb webkit2gtk-driver || sudo apt-get install xvfb webkitgtk-webdriver
 cargo install tauri-driver
 ```
-**Package name varies by distro release**: it's `webkitgtk-webdriver` on Ubuntu
-26.04 (confirmed empirically 2026-08-04 — `webkit2gtk-driver` doesn't exist there;
-apt's error names the replacement directly). Older releases may still use
-`webkit2gtk-driver`.
+**The WebKitWebDriver package name varies by distro release, and this is not cosmetic
+— checking the wrong one produces a false negative, not an error.** Confirmed on `mele`
+(Ubuntu 24.04.4 LTS, 2026-08-12): the package is `webkit2gtk-driver` (`apt-cache policy
+webkitgtk-webdriver` shows no candidate at all — it isn't just uninstalled, apt doesn't
+know the name here). Confirmed separately on the 2012 MacBook Pro while it was on Ubuntu
+26.04 (2026-08-04): `webkitgtk-webdriver` is the real name there, `webkit2gtk-driver`
+doesn't exist. **These are two different physical machines, not one machine's package
+name drifting over time** — see `docs/environment.md` for the full machine matrix. Don't
+assume either name is "current" without checking which machine and which distro release
+you're actually on.
 
-Verify before starting a session:
-```sh
-which Xvfb tauri-driver
-dpkg -L webkitgtk-webdriver | grep -E '/WebKitWebDriver$'
-```
-If any of these are missing, stop and tell the user — don't try to work around it.
+⚠️ **A `dpkg -L webkitgtk-webdriver` check silently reports "missing" on a 24.04 machine
+(e.g. `mele`), even though the driver is fully installed and working under a different
+package name** — `dpkg -L` on a package name that was never installed just returns
+nothing (exit 1), with no error to flag that it's the wrong name rather than an absent
+tool. This was previously the skill's own literal verify step, and following it on a
+24.04 machine produces exactly a false "stop, tell the user it's not installed" — a
+likely cause of prior sessions disagreeing about whether automation was available, since
+different sessions were sometimes on different machines/distro releases without saying
+so. **Always verify by finding the `WebKitWebDriver` binary itself** (the `find`/`which`
+block above), never by checking one hardcoded package name.
 
 **`which tauri-driver` can report missing when it's actually installed**: `cargo install`
 puts the binary at `~/.cargo/bin/tauri-driver`, which isn't always on this shell's `PATH`
@@ -66,6 +118,32 @@ whatever `cargo tauri dev` produced, so a stale one will not reflect recent edit
 Sanity-check after launching a session: `GET /session/$SESSION/url` should report
 `tauri://localhost`, not `http://localhost:1420/`.
 
+**Shortcut when a `cargo tauri dev` instance is already running and serving Vite**
+(confirmed working on `mele`, 2026-08-12): `import.meta.env.DEV` is `true` under Vite
+regardless of `VITE_ENABLE_DEBUG_HOOK`, so `window.__cuemarkDebug` is already exposed —
+no separate `VITE_ENABLE_DEBUG_HOOK=1 cargo tauri build --debug --no-bundle` needed. Just
+point `tauri-driver` at the existing `target/debug/cuemark` binary (built by `cargo tauri
+dev`'s own auto-rebuild) with `BINARY` above; it loads `http://localhost:1420/` and
+connects to the live Vite server rather than `tauri://localhost` — expected here, not a
+bug, since nothing cleared `devUrl` for this binary. This spins up a **second**,
+independent cuemark instance/window alongside the one already running — cheap for a
+scripted check (state IPC, `execute/sync`), but see the pixel-verification caveat below
+before trusting a screenshot or canvas-pixel read from it.
+
+⚠️ **A pixel/frame-render check from this second-instance setup was inconclusive on
+`mele` (2026-08-12) and should not be trusted without further isolation.** Loading a
+video into a deck and reading `getCodecFramePts()`/canvas pixels came back
+null/all-black for two different codecs, even though the Rust-side demux
+(`video_demux_load`) returned correct metadata and an isolated single-purpose decode
+probe succeeded for the same files — i.e. the failure was specific to *this* driven
+instance's rendering, not the codec or the decoder. The likely cause was never isolated:
+the driven window ran with `document.hasFocus() === false` (check it — some rAF/paint
+paths can be quietly throttled for an unfocused window even while
+`visibilityState === 'visible'`), *and* a second, unrelated `cargo tauri dev` instance
+was live on the same machine at the same time, competing for the same GPU. **Before
+trusting a black canvas as a real bug, retry with exactly one cuemark instance running
+and confirm `document.hasFocus()` on the driven window** — neither was ruled out here.
+
 ## 2. Start the isolated display
 
 Use a display number that is **not** `:0` / `wayland-0` (the user's real session):
@@ -77,7 +155,7 @@ echo $! > /tmp/xvfb.pid
 ## 3. Start tauri-driver on that display
 
 ```sh
-WEBKIT_DRIVER=$(dpkg -L webkitgtk-webdriver | grep -E '/WebKitWebDriver$')
+WEBKIT_DRIVER=$(find /usr/bin /usr/lib -iname 'WebKitWebDriver' 2>/dev/null | head -1)
 DISPLAY=:99 tauri-driver --port 4444 --native-driver "$WEBKIT_DRIVER" > /tmp/tauri-driver.log 2>&1 &
 echo $! > /tmp/tauri-driver.pid
 sleep 1
@@ -191,6 +269,73 @@ kill $(cat /tmp/tauri-driver.pid) 2>/dev/null; rm -f /tmp/tauri-driver.pid
 kill $(cat /tmp/xvfb.pid) 2>/dev/null; rm -f /tmp/xvfb.pid
 ```
 
+## Real-hardware audio E2E (WebDriver on the real display + pw-record)
+
+For testing that needs **real audio on real hardware** — device routing, multi-deck
+mixing, scratch gestures — not just DOM/screenshot assertions. Proven end-to-end
+2026-08-11 testing `docs/design/shared-output-pipeline.md` stage 4: it found and
+verified the fix for a real bug (a deck silently, permanently stuck `Paused` after a
+device rebuild) that log telemetry alone did not catch. Reuse this pattern rather than
+re-deriving it.
+
+**Difference from the standard flow above**: launch `tauri-driver` with
+`DISPLAY=:0` (the user's real session), not Xvfb `:99`. PipeWire is system-wide, so
+audio reaches real hardware either way — the real display just lets the user watch
+and listen alongside you, and is required if you want them to confirm anything by
+ear. Tell the user before doing this: it replaces whatever `cargo tauri dev` window
+they had open with a driven instance, and every device-list change is audible.
+
+1. Build with **both** `VITE_ENABLE_DEBUG_HOOK=1` (for `window.__cuemarkDebug`, see
+   above) **and** any runtime env the test needs (e.g. `CUEMARK_SHARED_OUTPUT=1`) —
+   the latter must also be exported when launching `tauri-driver`, since it spawns
+   the binary inheriting its own environment, not the build environment's.
+2. **Drive real UI controls, never bypass the Svelte store with a direct
+   `window.__TAURI__.core.invoke(...)` call for anything the store also owns** (device
+   selection, most settings). Confirmed the hard way: calling `audio_set_main_devices`
+   directly left the frontend's persisted `mainOutputDeviceIds` store unchanged: ~18s
+   later something re-ran the UI's own device-sync effect with the stale value and
+   silently reverted the device — a real, audible, unplanned click the user heard and
+   reported mid-session. Click the actual checkbox/button instead:
+   ```js
+   const labels=[...document.querySelectorAll(".device-check")];
+   const l=labels.find(x=>x.textContent.trim()==="DJControl Starlight — Front");
+   l.querySelector("input").click();
+   ```
+   This keeps frontend and backend state in sync by construction and is what a real
+   user's click does, so nothing fights it later.
+3. **Simulate a scratch gesture from inside the page**, not via repeated WebDriver
+   round-trips (too slow/jittery to look like a real gesture) — `execute/async` with a
+   `setTimeout` chain calling `invoke('audio_scratch_to', {deckId, targetSecs, holdMs})`
+   at a steady interval, computing `targetSecs` from a slow rate (0.10–0.3x) to match
+   real slow-jog gestures (`docs/design/waveform-scrub.md`). Extend the session's
+   script timeout first (`POST /session/$SESSION/timeouts {"script": 20000}`) or a
+   multi-second async script gets killed mid-gesture.
+4. **Capture real audio, don't trust delivery telemetry alone.** `deliver-tel`'s
+   `lag=0 drop=0` only proves buffers *left* the deck's appsink — it says nothing
+   about whether the shared sink is actually Playing. Use `scripts/scratch-capture.sh`
+   (built-in pre-flight confirms the recorder attached to the right monitor ports —
+   `pw-record --target` resolves against source names and silently falls back to the
+   default source, i.e. a live mic, on any mismatch) or a one-off:
+   ```sh
+   timeout 5 pw-record -P '{ stream.capture.sink=true }' \
+     --target '<node-name>' --rate 48000 --channels <N> /tmp/check.wav
+   ```
+   then check RMS per channel (near `-240 dBFS` is real digital silence, not "quiet").
+   Analyze a scratch capture with `scripts/scratch-envelope.py` — reads `zero%`, not
+   just dBFS, which is what actually distinguishes gating from attenuation.
+5. **A deck reaching natural EOS mid-test is expected, not a bug** — `playing` flips
+   to `false`, the pipeline pauses, and that deck goes correctly silent. Check
+   `__cuemarkDebug.getSession().decks` for `playing`/`getAudioTime` before treating any
+   silence as a fault; a frozen `getAudioTime` on a deck whose `playing` still reads
+   `true`, though, is the real tell — that's a stuck pipeline, not an ended track (this
+   is exactly the signature the stage-4 bug above left, and how it was caught: a
+   `getAudioTime` value that stopped advancing while `deck.playing` still said `true`,
+   confirmed by a silent real capture, confirmed further by a manual `audio_play()`
+   call unsticking it).
+6. **Tear down and relaunch the user's normal `cargo tauri dev` session afterward** —
+   don't leave them on a debug-hook-enabled driven instance. Same commands as
+   "Tear down" above, then relaunch per the `run-app` skill.
+
 ## Lightweight webview probes without the app (python3-gi)
 
 For "does this machine's WebKitGTK support/do X?" questions — feature detection,
@@ -250,6 +395,59 @@ Pattern (full working examples in `scripts/probes/`):
   as the pattern for any new compositor pixel check. Note the inversion of this project's usual
   rule: llvmpipe results are normally the suspect ones, but for *compositing semantics and
   orientation* — which are WebKit-level, not driver-level — the software arm is authoritative.
+
+### Input APIs: presence is not behaviour — inject real platform events (2026-08-08)
+
+`typeof PointerEvent === 'function'` answers a different question than "will a drag
+gesture work". This build's whole catalogue of hazards is APIs that are *present* and
+silently do nothing (`UNPACK_FLIP_Y_WEBGL` for `ImageBitmap`, `imageOrientation` for
+`VideoFrame`, `isConfigSupported` returning true for AV1 before decoding zero frames), and
+`dispatchEvent(new PointerEvent(...))` does not close the gap either — it proves your
+listeners are wired, nothing about whether the platform ever produces the event.
+
+Push **GDK events into the WebView** instead, which is the same platform→DOM path an X11
+mouse takes (`scripts/probes/pointer_events_probe.py`, which cleared Pointer Events for the
+waveform drag-scrub gesture):
+
+```python
+ev = Gdk.Event.new(Gdk.EventType.BUTTON_PRESS)
+ev.button.window = view.get_window()
+ev.button.x, ev.button.y = float(x), float(y)
+ev.button.button = 1
+ev.button.set_device(Gdk.Display.get_default().get_default_seat().get_pointer())
+ev.set_screen(Gdk.Screen.get_default())
+Gtk.main_do_event(ev)          # → WebKit → DOM
+```
+
+Notes that transfer to any input probe here:
+
+- **`xdotool` is not installed on this machine.** GDK injection is the available route; do
+  not plan around synthesizing X input externally.
+- **Carry a control arm at a different API level.** That probe counts `mouse*` alongside
+  `pointer*`, so "the platform delivered nothing" and "the platform delivered mouse but not
+  pointer" are distinguishable — and the second is the answer that would force a rewrite.
+  A probe that only counts the API you hope works cannot tell those apart.
+- **WebKit coalesces motion events** — three injected moves arrived as two. Design gestures
+  so a dropped intermediate position is harmless (absolute targets supersede; accumulated
+  deltas silently under-travel). This is the same property that makes rAF coalescing safe
+  for the scrub bus, see `docs/design/waveform-scrub.md`.
+- Give WebKit's event queue time to drain (a few hundred ms) before asking the page what it
+  saw; results are not available synchronously after `Gtk.main_do_event`.
+- **Set a realistic `GdkEvent.time`, not `Gdk.CURRENT_TIME`.** `CURRENT_TIME` is 0, which is
+  fine for testing delivery and useless for testing anything *derived* from the event's time:
+  a DOM stamp computed from 0 is indistinguishable from one taken off a different clock. Real
+  X11 events carry a monotonic millisecond stamp, so inject
+  `(GLib.get_monotonic_time() // 1000) & 0xFFFFFFFF`.
+- **To ask whether a derived value is real, perturb its input and check it moves.** The
+  question "does `event.timeStamp` carry the platform event's time, or the dispatch time?"
+  has opposite consequences — only the first can express a queueing delay — and no amount of
+  reading plausible-looking values settles it. The probe's `stale` arm backdates one event's
+  `GdkEvent.time` by 250ms; the DOM stamp moved with it by exactly +250ms, so it is
+  platform-derived (2026-08-08).
+- ⚠️ **`event.timeStamp` sits on an origin offset from `performance.now()` by a constant that
+  differs per page load** (−44ms and −466ms in two runs of the same probe). Absolute values are
+  meaningless; only variation above a running minimum is a delay. Whatever consumes it must
+  calibrate — see `src/lib/audio/scrubStats.ts`.
 
 ### Two rules these probes were shipped without, and paid for (2026-08-03)
 
@@ -367,12 +565,13 @@ post-reload state:
   — never kill a process whose `DISPLAY=:0` (or `wayland-0`), that's the user's real
   desktop session, potentially their own legitimate `cargo tauri dev` instance.
 
-- **`dpkg -L webkitgtk-webdriver | grep WebKitWebDriver` matches two lines**, not one — the
-  binary (`/usr/bin/WebKitWebDriver`) and its man page (`/usr/share/man/man1/
-  WebKitWebDriver.1.gz`, which also contains the string). `$WEBKIT_DRIVER` then holds both
-  paths newline-joined, and `tauri-driver --native-driver "$WEBKIT_DRIVER"` fails immediately
-  with `can not find the supplied binary path /usr/bin/WebKitWebDriver\n/usr/share/man/...`.
-  Anchor the pattern: `grep -E '/WebKitWebDriver$'`.
+- **Historical, now moot**: `dpkg -L <package> | grep WebKitWebDriver` used to match two
+  lines — the binary and its man page — leaving `$WEBKIT_DRIVER` holding both paths
+  newline-joined and `tauri-driver --native-driver "$WEBKIT_DRIVER"` failing immediately.
+  The current setup steps use `find /usr/bin /usr/lib -iname WebKitWebDriver | head -1`
+  instead, which sidesteps this (and the man-page path lives under `/usr/share/man`
+  anyway, outside the searched dirs) as well as the package-name-varies-by-distro problem
+  below — don't reintroduce a `dpkg -L <specific-package-name>` check.
 - **Sampling CPU% for a perf comparison**: use `pidstat -p <pid> 1 <seconds>`, not `ps -p
   <pid> -o %cpu` — `ps`'s `%cpu` is averaged over the process's entire lifetime, so it drifts
   toward whatever the load was right after launch and takes a long time to reflect a change
@@ -387,9 +586,11 @@ post-reload state:
   binary directly from a terminal instead (see `run-app` skill / `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS`).
 - **Port 4444 already bound**: a previous `tauri-driver` didn't get killed —
   `fuser -k 4444/tcp` before starting a new one.
-- **`WebKitWebDriver` version mismatch**: `webkitgtk-webdriver` must match the
-  installed `libwebkit2gtk-4.1-0` version or the driver handshake fails immediately.
-  `apt-get upgrade webkitgtk-webdriver` if cuemark's WebKit dependency is bumped.
+- **`WebKitWebDriver` version mismatch**: whichever package provides it
+  (`webkit2gtk-driver` or `webkitgtk-webdriver` — see "One-time setup" for which one
+  this distro uses) must match the installed `libwebkit2gtk-4.1-0` version or the
+  driver handshake fails immediately. `sudo apt-get upgrade` that package if cuemark's
+  WebKit dependency is bumped.
 - **One session at a time**: `tauri-driver` does not multiplex; creating a second
   session before deleting the first will hang or error.
 - **A test script's `cleanup()` must kill the launched app binary itself, not just

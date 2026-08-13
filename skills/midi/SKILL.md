@@ -54,7 +54,7 @@ to implement different ranges — the rescaling lives in `handler.ts` `deck_play
 | Volume fader R | `(0xB2, 0)` | DeckGain deck-1 |
 | Tempo fader L | `(0xB1, 8)` MSB + `(0xB1, 40)` LSB | DeckPlaybackRate deck-0 (14-bit combined; center 8192→1.0×; higher=slower) |
 | Tempo fader R | `(0xB2, 8)` MSB + `(0xB2, 40)` LSB | DeckPlaybackRate deck-1 |
-| Jog wheel L | `(0xB1, 10)` | JogNudge deck-0 — while playing: relative ±1 step → ±2% rate offset from a saved base (see gotcha below), resets after 150ms idle; while paused: scrubs track position (±0.015s/step, rAF-throttled seek) for finding a beat. Paused scrubbing is currently silent — see `docs/design/jog-scratch-audio.md` for the (not yet implemented) bidirectional scratch-audio design. |
+| Jog wheel L | `(0xB1, 10)` | JogNudge deck-0 — while playing: relative step → ±2% rate offset from a saved base (see gotcha below), resets after 150ms idle. While paused: audible bidirectional scratch through the PCM feeder branch (`docs/design/pcm-buffer-playback.md`), in one of two modes set by `scratchMode` (default `vinyl`). **Vinyl** accumulates ticks into an absolute position and the feeder servos to it — 1:1 with the hand, silent when the wheel is still (`docs/design/waveform-scrub.md`). **Shuttle** derives a rate from tick velocity (EMA) and free-runs between ticks, for fast searching. ⚠️ `VINYL_SEC_PER_TICK` is uncalibrated — see below. |
 | Jog wheel R | `(0xB2, 10)` | JogNudge deck-1 (same dual behavior) |
 | Crossfader | `(0xB0, 0)` | Crossfader (deck-0 ↔ deck-1 opacity) |
 | Master volume | `(0xB0, 3)` | MasterVolume |
@@ -106,3 +106,32 @@ and how to get a real count instead.
 5. Add entries to `hercules_starlight_map()` (or a new `foo_map()` function) using `(msg[0], d1)` as
    the key.
 6. Remove the debug print when done.
+
+## ⚠️ Open: calibrate `VINYL_SEC_PER_TICK` (needs the controller)
+
+Vinyl-mode jog now maps encoder ticks to an absolute position rather than to a rate
+(`handler.ts` `jog_nudge` → the scrub bus in `seekBus.ts` → `scratch_to()` in
+`pipeline.rs`; rationale in `docs/design/waveform-scrub.md`). The scale constant
+`VINYL_SEC_PER_TICK` in `handler.ts` is currently a **placeholder** (`0.0045`).
+
+The measurement also has to settle a correctness question, not just pick a number. A
+comment on `SCRATCH_MODE_PARAMS.shuttle` suspects the Starlight encoder "reports larger
+step values, not just ±1, as physical speed increases." If those values are deltas
+accumulated since the previous message (standard for relative CC encoders) accumulation is
+exact and the design is right as built; if they are genuinely speed-scaled, a single scale
+constant cannot be correct.
+
+Procedure — **plug the controller in before launching the app**, `midir` enumerates at
+startup:
+
+1. Log raw `JogNudge` values (`a.value`) from the vinyl branch of `jog_nudge`.
+2. Rotate one jog wheel exactly one full revolution **slowly**; sum `|value|`.
+3. Repeat the same revolution **quickly**; sum again.
+4. **Equal totals** → accumulation is exact; set `VINYL_SEC_PER_TICK = 1.8 / total`
+   (33⅓rpm = 1.8s per revolution).
+   **Unequal totals** → the constant alone cannot be right; revisit
+   `docs/design/waveform-scrub.md` before shipping the jog change.
+
+Then check by ear: slow cue-hunting should track the wheel 1:1, go silent when the wheel
+stops, and never jump — including across pauses longer than `SCRATCH_IDLE_MS` (500ms),
+which is the teardown/restart path `last_scratch_frame` now covers.

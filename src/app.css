@@ -73,13 +73,25 @@ body {
 }
 
 .queue-sidebar {
-  width: 320px;
   flex-shrink: 0;
   border-left: 1px solid var(--divider);
   overflow-y: auto;
   background: var(--surface);
   --accent: var(--accent-queue);
   --accent-soft: var(--accent-soft-queue);
+}
+
+.queue-sidebar-resizer {
+  flex-shrink: 0;
+  width: 5px;
+  cursor: col-resize;
+  background: transparent;
+  touch-action: none;
+}
+.queue-sidebar-resizer:hover,
+.queue-sidebar-resizer:active {
+  background: var(--accent-queue);
+  opacity: 0.5;
 }
 
 /* ── Toolbar (nav — coral accent) ──────────────────────── */
@@ -280,7 +292,12 @@ body {
   cursor: pointer;
 }
 .video-path-btn:hover { border-color: var(--accent); color: var(--accent); }
-.video-path-btn.webcodecs { border-color: #7ec8e3; color: #7ec8e3; }
+.video-res {
+  font-family: var(--font-heading);
+  font-size: calc(9px * var(--font-scale));
+  color: color-mix(in srgb, var(--text) 40%, transparent);
+  letter-spacing: 0.02em;
+}
 
 /* ── Stacked waveform area ────────────────────────────── */
 .waveform-stack {

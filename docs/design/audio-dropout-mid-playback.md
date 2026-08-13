@@ -7,7 +7,10 @@ while reading back a live set (the "Cassius 1999" session). Distinct from — an
 by — `legacy-video-fallback-cost.md`: this happened on the fast path, with the frame rate
 healthy.
 
-D2 (the 6:1 false-positive rate in the sink-gap warning) is **shipped and verified**.
+D2 (the 6:1 false-positive rate in the sink-gap warning) is **shipped and verified**. As of
+2026-08-08 the **cue branch is instrumented** (it previously carried no probes at all) and the
+delivery counters are read during ordinary playback as `[deliver-tel]` — so a wild occurrence
+is now readable rather than ambiguous. See "Where to pick up".
 
 **One-line version**: at `01:38:31` the deck-0 `output_queue` ran dry and **no buffer reached
 the output sink for 10.8 seconds**, with no state transition, no bus error, no seek and no
@@ -86,6 +89,27 @@ does not begin until `01:39:30`.
 | A wedged GStreamer pipeline | CLAUDE.md's wedged signature is `poll-stats total p50 ≈2ms` **plus** `[aux-loop] … drew=0` **plus** a play-IPC retry storm. Only the first is present, and `waveform/deck-0 drew=36–38` per window says the playhead kept advancing. `p50=2ms` here is just an unloaded main thread — that leg is a load gauge (`control-window-frame-budget.md`). |
 
 ## The leading hypothesis
+
+> 🟢 **2026-08-11 — H1's mechanism is now established as real, by a different bug.**
+> `slow-jog-audio-inaudible.md` §10.9 ran a two-arm device test on this exact topology and
+> confirmed that **two `pulsesink`s on one PipeWire node** cause audio loss: the cue branch was
+> chopped into ~80% digital silence during scratch gestures (21% audible against main's 94%),
+> and moving *either* branch off the shared node — cue elsewhere, or main elsewhere with cue
+> left untouched on the same device, pair and profile — eliminated it entirely.
+>
+> ⚠️ **That does not close *this* doc.** What is established is that the shared-node topology
+> can lose audio, not that it produced *this* 10.8 s stall. The two differ in signature: there
+> the loss is buffers arriving full of silence with delivery counters at full rate; here
+> `output_queue` ran dry and `underrun` fired, which points upstream. Reconciling that tension
+> is still most of the work (see the paragraph below, which predates the confirmation and
+> still stands). What has changed is that H1 is no longer speculative about its mechanism —
+> and that the fix ladder in §10.10 there (one sink per node; ultimately one output pipeline
+> per node shared by all decks, `audio/mixer.rs`'s `MasterMix`) removes this configuration
+> from the product, which would settle H1 by construction rather than by measurement.
+>
+> Relevant here specifically: **two decks playing to one device is already two `pulsesink`s on
+> one node before cue is involved**, which is why the "up to four `pulsesink`s" note below is
+> the load-bearing sentence in this section.
 
 **H1 — the headphone cue branch on the same physical USB device.** Cue was switched on at
 `01:38:10`, 21 s before the stall, and off at `01:39:43`. Enabling it opens a second
@@ -374,6 +398,159 @@ the two.
 
 ## Where to pick up
 
+🟢 **2026-08-08 (night): the cue branch is instrumented at last, and a short clean run on the
+live topology is on record. D1 is still open and still waiting to be caught in the wild — but
+a wild occurrence is now readable instead of ambiguous.**
+
+### The instrumentation that was missing
+
+Until now the cue sink carried **no probes of any kind** — not `instrument_sink_flow()`, not
+`instrument_delivery()`. Both were attached inside `load()`'s `for dev in main_devs` loop and
+nothing outside it. So the one branch H1 blames was the one branch that could not be measured,
+and a live occurrence would have produced exactly the 2026-08-05 log again. Now shipped:
+
+- **`instrument_sink_flow()` on the cue sink**, so "did anything ever reach the headphones"
+  and "did the cue sink stall while Playing" are answerable per-branch. Its gate is now a
+  **conjunction** (`gates: Vec<Arc<AtomicBool>>`): main sinks pass `at_playing`, the cue sink
+  passes `at_playing` **and** a new `cue_open`.
+- **`instrument_delivery()` on `cue_volume`'s src and the cue sink's pad**, bracketing the cue
+  branch's last stage the same way the main branch is bracketed.
+- Both skipped when cue falls back to `fakesink`. That pad still sees buffers, but `sync=false`
+  makes its margin meaningless — a reading that looks like evidence and is not.
+
+⚠️ **D2's trap recurs here in a nastier form, and the fix is again two-sided.** `cue_valve`
+drops every buffer while cue is off, so a cue-off span forges a dropout perfectly. The gate
+alone does not fix it: the last buffer before the valve closes is recorded with both flags
+true, and — unlike the pause case — **no later buffer ever arrives to clear the stale
+timestamp**, because the valve drops them upstream of the probed pad. So `set_cue_enabled()`
+invalidates `last` itself, clearing `cue_open` *first* so a buffer already in flight cannot
+re-stamp it. Guarded by `cue_sink_flow_gap_gating` (`#[ignore]`d, needs a real cue device),
+which mirrors its D2 sibling's two-arm shape — arm 1 asserts toggling is silent, arm 2 stalls
+the cue sink pad for 2.5s and asserts the warning still fires, because the cheapest way to
+pass arm 1 is to break the probe.
+
+Both arms verified on the real Starlight, 2026-08-08:
+```text
+CUEMARK_CUE_DEVICE='alsa_output.usb-Guillemot_Corporation_DJControl_Starlight-00.analog-surround-40@RL,RR!FL,FR,RL,RR' \
+  cargo test cue_sink_flow_gap_gating -- --ignored --nocapture
+```
+```
+[audio/…] cue sink: first buffer reached the sink — audio is being delivered to the device
+[arm-1] OK — a 6s cue-off span and a 4s pause produced zero cue gap warnings
+[WARN] [audio/…] cue sink: buffer flow resumed after a 2.5s gap (began 01:07:15.302) — …
+```
+Note the test media is not committed (~70MB of synthetic pink noise); regenerate it with the
+`gst-launch-1.0` command in `SOAK_A`'s doc comment.
+
+### `[deliver-tel]` — the counters are finally read during ordinary playback
+
+`DeliveryProbe`'s counters existed since 2026-08-08 but were read **only by the scratch
+feeder's telemetry loop**, which lives for the duration of a gesture. During ordinary playback
+— the entire scenario this doc is about — nothing read them at all. `spawn_delivery_reporter()`
+now logs them while the deck is playing:
+
+Real output, from `cue_sink_flow_gap_gating` on the Starlight (cue open, healthy):
+
+```
+[deliver-tel/cue-gate-test] vol0=15/s(min 15) margin +142ms(min +142ms) | sink0=15/s(min 15) margin +142ms(min +142ms)
+                          | cuevol=9/s(min 0) margin +89ms(min +82ms)  | cuesink=9/s(min 0) margin +89ms(min +82ms)
+```
+
+**Sampled every 1s, emitted every 5s.** The 5s cadence matches the rest of the standing
+instrumentation; the 1s sampling is what preserves resolution, because the fault is a
+second-scale stall that a 5s mean averages into nothing. **`min` is the field to read** — a
+healthy branch reports a min within a buffer or two of its mean, and `min 0/s` means a full
+second delivered nothing, which is D1's signature and is invisible in the mean. `margin`'s
+minimum is the H5 field: steadily negative means buffers arrive already late and the sink has
+no slack, whether or not any gap grows long enough to trip `instrument_sink_flow()`.
+
+This directly answers the question the 2026-08-05 evidence could not settle — *did the sink
+keep receiving buffers during the 10.8s gap?* — and it answers it per-branch.
+
+**Three things to know before reading a `min 0/s`, all observed while building this:**
+
+1. ⚠️ **A cue row reads `0/s` whenever the valve is closed, by construction** — that is
+   `cue_valve` doing its job, not a fault. Both `cuevol=9/s(min 0)` values in the sample above
+   are windows the test toggled cue off inside. Same class as the scratch doc's standing
+   caution that `arrived%` and `snaps` are silence *by design*: check `cue ON`/`cue OFF` in the
+   surrounding lines before treating a cue zero as evidence.
+2. ⚠️ **The two branches' rates are not comparable to each other** — 15/s main against 9/s cue
+   above, because the cue branch is a 4-channel remap with different buffer sizing. Compare a
+   branch against *itself* over time, never against its sibling.
+3. **The first two ticks after a resume are baselined, not measured** (`RESUME_SKIP_TICKS`).
+   One skip was not enough: the first tick's delta straddles the pause and the *second* second
+   is where `pulsesink` reopening the device lands, which produced a legitimate-but-uninteresting
+   `min 0/s` on every play press in the first run of the test. That is D2's cry-wolf problem
+   arriving in the one field this doc tells people to read, so it is gated at the source.
+
+### A clean 80s on the live H1 topology — and why that settles nothing
+
+The user reported no longer being able to hear the clipping and asked for a log review. The
+run (`2026-08-09 00:04–00:06` UTC, build `dfdb0e0`) was on the real H1 configuration:
+`main sink 0` and the cue sink both `pulsesink` on
+`…DJControl_Starlight-00.analog-surround-40`, cue remapped to `RL,RR`. Play at `00:04:50`,
+cue ON at `00:04:57`, paused at `00:06:10` — **80s of playback, ~72s with cue open.** In that
+window:
+
+- **zero** `output_queue underrun`
+- **zero** sink-flow gaps
+- **zero** bus `ERROR`, no unexpected state transition, no play-IPC retry storm
+- rAF flat at 58–60fps, `inRust` p50 0ms
+
+⚠️ **Do not read this as a fix.** Three reasons, in order:
+
+1. **80 seconds proves nothing at this fault's rate.** The 2026-08-05 attempt ran ~40 minutes
+   across four arms on this same controller and also found zero gaps. A clean short run *is*
+   the established baseline, not new information.
+2. **One deck, two sinks.** The live set's H1 topology is up to **four** `pulsesink`s (2 decks
+   × main+cue) on one USB node. This run carried half that.
+3. 🔴 **Nothing currently logged can see clipping at all.** `instrument_sink_flow()` fires only
+   on a >1s gap; `output_queue underrun` fires on starvation. Brief glitching or distortion —
+   the symptom actually being reported — is below the resolution of every instrument in this
+   pipeline. **"The log is clean" and "the clipping is gone" are very nearly independent
+   statements**, and conflating them is the fastest way to close this wrongly. `[deliver-tel]`'s
+   `margin(min …)` is the first field that gets anywhere near it, and even that measures
+   *slack*, not audible artifacts.
+
+Nothing in the scratch work that landed earlier the same day plausibly changed steady-state
+playback with cue open: the sink alignment-tolerance widening is scoped to the duration of a
+gesture, and `HandTracker` only affects the servo. **There is no known mechanism by which this
+would have been fixed** — so treat the absence as unexplained, not as progress.
+
+### The prior state of this section
+
+🔴 **2026-08-08 (evening): the hoped-for shared reproducer did NOT pan out. D1 is still
+blocked on catching this in the wild.**
+
+Earlier the same day it looked like `docs/design/scratch-audio-downstream-delivery.md`
+might have handed D1 an on-demand reproducer: scratch audio dying within a second or two,
+every gesture, on a deck configured exactly as H1 describes (three `pulsesink`s, two on one
+USB device). That doc then **ran its device-routing A/B to completion**, and the result
+removes the connection:
+
+- Arm **A4** — a single `pulsesink`, on the onboard PCM2902C, cue on a `fakesink`, the USB
+  controller carrying no audio at all — **still dies**. H1's configuration is absent and
+  the fault is unchanged.
+- New pad probes there count **67 buffers/s reaching the sink's own sink pad, unbroken,
+  through the silence**. That fault is not a delivery stall at all; it is inside the sink's
+  render stage or below it.
+
+So the scratch fault is **not** the device-contention mechanism D1 is about, and its
+reproducer does not transfer. Everything in "Where D1 goes next" below stands unchanged.
+
+🟢 **What *does* transfer is the instrument.** `DeliveryProbe` (`pipeline.rs`) is not
+scratch-specific — it counts buffers and measures clock margin at `volume`'s src pad and
+each `pulsesink`'s sink pad. Wired into a non-scratch log line it would answer D1's central
+question directly ("did the sink keep receiving buffers during the 10.8 s gap?"), which is
+the one thing the 2026-08-05 evidence could not settle. **That is the cheapest useful thing
+to do here before the next long set**, and it makes a wild occurrence readable instead of
+ambiguous.
+
+0. ~~Instrument the cue branch and read the delivery counters during ordinary playback.~~
+   Done 2026-08-08 (see the top of this section). **This was the "cheapest useful thing to do
+   before the next long set" and it is now done** — the next wild occurrence should be
+   readable. What to grep for, in order: `cue sink: buffer flow resumed`, then
+   `[deliver-tel]` lines around the timestamp, reading `min` on the branch that went quiet.
 1. ~~Ship **D2** first.~~ Done 2026-08-05. The gap warning is now trustworthy and carries an
    onset timestamp; `cargo test sink_flow_gap_gating -- --ignored` is its regression guard.
 2. **Start from "2026-08-05 reproducer attempt" → "Where D1 goes next"**, not from a blank
@@ -390,7 +567,7 @@ the two.
 
 | File | Why |
 |---|---|
-| `src-tauri/src/audio/pipeline.rs` | `instrument_sink_flow()` (D2, shipped), `instrument_queue_flow()` as its model, `sink_buffer_times()` for the 2026-08-02 history, the 2-buffer `queue` sizing in `load()` for H2 — and the two `#[ignore]`d tests `sink_flow_gap_gating` (D2 regression guard) and `cue_dropout_soak` (D1 harness) at the bottom |
+| `src-tauri/src/audio/pipeline.rs` | `instrument_sink_flow()` (D2, shipped; gate is now a `Vec` conjunction so the cue sink can add `cue_open`), `instrument_queue_flow()` as its model, `instrument_delivery()`/`DeliveryProbe` and `spawn_delivery_reporter()` (`[deliver-tel]`), `set_cue_enabled()` for the cue probe's two-sided invalidation, `sink_buffer_times()` for the 2026-08-02 history, the 2-buffer `queue` sizing in `load()` for H2 — and the three `#[ignore]`d tests `sink_flow_gap_gating` (D2 guard), `cue_sink_flow_gap_gating` (cue-gate guard) and `cue_dropout_soak` (D1 harness) at the bottom |
 | `src-tauri/src/audio/mod.rs` | `audio_set_master_volume` iteration, for H3 |
 | `scripts/watchdog-soak-test.sh` | the closest existing soak harness to extend |
 
@@ -403,3 +580,27 @@ the two.
 - `legacy-video-fallback-cost.md` — the same session's other, larger finding.
 - `control-window-frame-budget.md` — how to read `[poll-stats]`, and why `total p50=2ms` is
   ambiguous rather than diagnostic.
+
+## H1 and the shared output pipeline (2026-08-11)
+
+H1 — contention between the main and cue `pulsesink`s on one USB node — is **structurally
+removed** by the shared output graph (`docs/design/shared-output-pipeline.md`,
+`CUEMARK_SHARED_OUTPUT=1`): one `pulsesink` per device node, however many decks and branches
+are live. That is the same hazard this document blames, and the same fix that closed the
+cue-gating fault in `slow-jog-audio-inaudible.md` §10.14.
+
+⚠️ **Do not mark this document fixed on that basis.** Three reasons:
+
+1. **It is a different fault.** This one is 10.8s of silence mid-track with no scratch
+   involved and `output_queue` dry (pointing *upstream*); the gating fault was interior
+   silence on the cue branch only, with delivery counters at full rate throughout. Sharing a
+   suspected cause is not sharing a diagnosis.
+2. **It has never been reproduced on demand**, so there is no arm to run. The shared graph
+   changes the topology it was hypothesised against; it does not produce evidence.
+3. **Nothing here can see clipping**, and the gap warning needs >1s of silence — so a clean
+   run remains very nearly independent of "the artifact is gone" (the standing caution in this
+   file, unchanged).
+
+What would actually close it: a soak on the shared path long enough to cover the original
+event's ~20-minute scale, with the false-positive rate in `instrument_sink_flow()` fixed first
+— which is still this document's stated prerequisite and is still not done.
