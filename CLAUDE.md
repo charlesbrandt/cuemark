@@ -266,7 +266,7 @@ re-run, and the dead `buffer-time`/quantum rung (§10.13 — `sink_buffer_times(
 200ms default). The mechanism was never named; what was established is that one sink on the
 node is *sufficient*, so the fix reaches that configuration structurally.
 
-**Three things in the shared graph are load-bearing and silent when broken:**
+**Four things in the shared graph are load-bearing and silent when broken:**
 - **`is-live=true` on every output `appsrc`.** With it false the mixer emits **zero** buffers
   for as long as any branch is idle — one paused deck silences the whole node. Measured:
   `scripts/probes/shared_output_mixer_probe.py --not-live`.
@@ -277,6 +277,13 @@ node is *sufficient*, so the fix reaches that configuration structurally.
   last buffer handed off, not what the device is playing. Uncorrected, video leads audio by a
   sixth of a second on every deck, constantly, and it reads exactly like "the video decoder is
   early".
+- **Master volume belongs to the node's `volume` and nowhere else.** The deck side is held at
+  1.0 by `deck_master_factor()`; applying it in both places squares it (−9 dB at the usual
+  ~0.35, uniformly, forever). Invisible to every deck-side probe — they all sit upstream of
+  the node stage — so it surfaces only as "audio works on one output device and not another",
+  when a second attenuation on one device pushes the sum below audibility. Fixed 2026-08-13;
+  `shared-output-pipeline.md` "Gain staging" and the `audio-debugging` skill have the full
+  diagnostic, including why `pw-record` cannot capture the 4-channel evidence.
 
 Each node also carries a permanent silent `audiotestsrc` keepalive: an `audiomixer` with no
 pads cannot reach PLAYING, and a retained node with no live pad runs dry and never resumes.

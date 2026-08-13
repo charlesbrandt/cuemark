@@ -433,3 +433,48 @@ case of an instrument silently changing meaning under a refactor:
 3. The shared clock is `GstSystemClock`, not the device clock this doc's clock section
    assumed — see "1. Rate" above, which has been corrected. Rate agreement still holds,
    via `pulsesink`'s own slaving.
+
+## Gain staging: master volume has exactly one home (fixed 2026-08-13)
+
+🔴 **The node's `volume` after the mixer is the *only* master stage on this path.** The deck
+side must contribute unity, which is what `DeckAudioPipeline::deck_master_factor()` now
+enforces (`shared_output_enabled() && output_graph.is_some() → 1.0`).
+
+From the default flip (2026-08-11) until 2026-08-13 both stages applied it and the factor was
+**squared**: at the usual master of ~0.35 that is an extra −9 dB on every output, all the
+time. Three things made it hard to see, and they generalise:
+
+- **Every deck-side probe is upstream of the second stage.** `[level] main vol0 (reference)`,
+  `[deliver-tel]`, the sink-flow gates — all of them read perfectly healthy, because the
+  attenuation happens after the last one of them. The pipeline cannot see its own output.
+- **It is uniform.** Every deck, every branch, both paths — so nothing stands out by
+  comparison *inside* the app. There is no A/B arm within the log.
+- **−9 dB is not silence.** It only crosses the audibility floor when something else is also
+  low, so it presents as *"audio works on this device but not that one"* and sends the
+  investigation into device routing, which was never wrong.
+
+The live report was exactly that: a Starlight producing nothing while a USB CODEC on the same
+deck worked. The device difference turned out to be wireplumber's untouched `default-volume`
+(0.064 = 0.4³, −23.75 dB) on a card with no saved route, against 1.0 on the CODEC — the two
+attenuations stacking to −33 dB. **Neither was a routing fault.** A 4-channel monitor capture
+showed main on FL/FR and cue on RL/RR, at level, the front pair bit-identical to the working
+device's stream.
+
+Held by `master_volume_squares_across_the_shared_graph` and its two siblings in
+`pipeline.rs`. Note what they assert: the *factor*, not a decibel level — there is no
+in-process instrument that can see the product of the two stages, which is the whole problem.
+
+⚠️ **Measuring this needs a real 4-channel capture, and the obvious tool does not give one.**
+`pw-record --target <sink> --channels 4` (with or without `--channel-map`) creates a capture
+node with only `input_FL`/`input_FR`; PipeWire upmixes stereo→4ch and the rear pair arrives as
+**exact digital zero** — indistinguishable from a dead branch, and it produced a confident
+false verdict before the port count was checked. Use:
+
+```bash
+gst-launch-1.0 pipewiresrc target-object=<object.serial> \
+  ! "audio/x-raw,format=F32LE,channels=4,rate=48000" ! wavenc ! filesink location=out.wav
+```
+
+(`object.serial` from `pw-dump <node-id>`, not the node id.) Then verify the capture node's
+ports before believing any per-channel number — see the `audio-debugging` skill's "an
+instrument that cannot vary with the fault carries no information about it".

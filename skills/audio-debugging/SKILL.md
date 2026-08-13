@@ -1,6 +1,6 @@
 ---
 name: audio-debugging
-description: Debug GStreamer audio issues in cuemark — bus errors, pitch element, device routing, WebKit video stream. Load this when the audio pipeline misbehaves.
+description: Debug GStreamer audio issues in cuemark — bus errors, pitch element, device routing, gain staging, capturing the real device output, WebKit video stream. Load this when the audio pipeline misbehaves, including "it works on one output device but not another".
 ---
 
 # Cuemark Audio Debugging
@@ -275,7 +275,7 @@ actually on before analysing any capture, and read both pairs**
 (`--channels 2,3`). The real answer was `GATED`, and the cause was two `pulsesink`s on one
 PipeWire node — fixed 2026-08-11 by the shared output graph (§10.14).
 
-### Three traps, all of which fired on first use
+### Four traps, all of which fired on first use
 
 - 🔴 **`audio_record_start/stop` is a stub.** `src-tauri/src/audio/record.rs` logs, returns
   `Ok`, and writes nothing (the encoder chain is "step 8"). The design doc that prescribed it
@@ -289,6 +289,26 @@ PipeWire node — fixed 2026-08-11 by the shared output graph (§10.14).
   starts, so a capture opens with true digital silence. Scored over the whole file that reads
   as one long gate — and because `GATED` is checked before `PITCHED`, it *masked* the correct
   verdict on the very take that settled the bug. Now measured over the interior only.
+- 🔴 **`pw-record` cannot capture more than two channels — and it fails by fabricating
+  silence** (2026-08-13). `pw-record --target <4ch sink> --channels 4`, with or without
+  `--channel-map FL,FR,RL,RR`, creates a capture node carrying only `input_FL`/`input_FR`.
+  PipeWire upmixes stereo→4ch, so **ch2/ch3 arrive as exact digital zero** with no warning and
+  a correct-looking 4-channel WAV header. On the Starlight that is the entire headphone pair,
+  and it produced a confident "the cue branch is delivering silence to the rear" verdict that
+  was simply false — the rear pair was carrying music at full level the whole time. Use
+  `pipewiresrc` instead, and **check the port count before believing any per-channel number**:
+
+  ```bash
+  SER=$(pw-dump <node-id> | python3 -c "import json,sys; print([o['info']['props']['object.serial'] for o in json.load(sys.stdin) if o.get('type')=='PipeWire:Interface:Node'][0])")
+  gst-launch-1.0 pipewiresrc target-object=$SER \
+    ! "audio/x-raw,format=F32LE,channels=4,rate=48000" ! wavenc ! filesink location=out.wav
+  # verify the capture node really has 4 input ports, mid-capture:
+  pw-dump | python3 -c "import json,sys; d=json.load(sys.stdin); ids={o['id'] for o in d if o.get('type')=='PipeWire:Interface:Node' and o.get('info',{}).get('props',{}).get('node.name')=='pipewiresrc0'}; print([o['info']['props'].get('port.name') for o in d if o.get('type')=='PipeWire:Interface:Port' and o['info']['props'].get('node.id') in ids])"
+  ```
+
+  Note `object.serial`, **not** the node id — `target-object` takes the serial and silently
+  fails to link with anything else. This is the same lesson as the wrong-node trap above,
+  one layer in: the capture succeeded, the file was well-formed, and the numbers were fiction.
 
 ### Timezone
 
@@ -1522,14 +1542,24 @@ in `AudioManager` directly (see below).
 
 > ⚠️ **Updated 2026-08-11: `MasterMix` is gone.** `mixer.rs` now holds `OutputGraph`, the real
 > one-`pulsesink`-per-node topology, and on the shared-output path master volume is applied by
-> a `volume` element per node after the mixer — the stage it always belonged in. The per-deck
-> factor below is still applied as well, so switching the flag off mid-session cannot silently
-> lose master attenuation; both are linear gains and the deck-side one is 1.0 unless moved.
+> a `volume` element per node after the mixer — the stage it always belonged in.
+>
+> 🔴 **Corrected 2026-08-13.** The sentence that used to follow said the per-deck factor was
+> applied as well and that "the deck-side one is 1.0 unless moved". That was **wrong in the
+> code and wrong here**: `apply_volume()` multiplied by `master_volume` unconditionally, so on
+> the shared path the factor was **squared** — an extra −9 dB at the usual ~0.35, on every
+> output, from the default flip until it was fixed. The deck side is now gated by
+> `DeckAudioPipeline::deck_master_factor()`, which returns 1.0 whenever the shared graph is in
+> use. See "Master volume applied twice" below.
 
-**Gain chain per deck** (as of 2026-06-28):
+**Gain chain per deck** (as of 2026-08-13):
 
 ```
-GStreamer volume element = gain × vol × master_volume
+deck volume element = gain × vol × deck_master_factor()
+    deck_master_factor() = 1.0                       on the shared-output path (default)
+                         = master_volume             on the legacy path, or with no graph
+
+node volume element = master_volume                  once per output node, after the mixer
 ```
 
 - `gain` — pre-fader trim (0–4, default 1.0); UI slider in DeckCard
@@ -1544,6 +1574,65 @@ streams at hardware level; on the shared-output path an `audiomixer` sums them p
 the single sink. Either way the arithmetic below is the same. With N decks at gain=1, vol=1, master=1 you can get up to N× summed
 amplitude. Reduce master volume if two fully-loaded decks clip: pulling to ~0.6 gives ~4 dB of
 headroom for two simultaneous sources.
+
+### "Audio works on one device but not the other" — suspect gain staging before routing (2026-08-13)
+
+**Symptom**: a deck plays fine on one main output and is silent on another (the Starlight,
+main *and* headphones), with every in-pipeline instrument green — `[level] main vol0`,
+`[deliver-tel]` at full rate, `lag=0 drop=0`, the right `[audio/remap] idx=[0,1]`/`[2,3]`
+lines, both nodes attached, no bus error.
+
+**It presented as a routing regression and was two independent attenuations stacking.** The
+device difference was never in the app:
+
+| | contribution | where |
+|---|---|---|
+| master volume applied twice | −9 dB, **both** devices | `apply_volume()` × node master stage |
+| wireplumber's untouched default volume | −23.75 dB, Starlight only | `default-volume = 0.064` (= 0.4³) |
+
+−9 dB alone is quiet-but-working, which is why the CODEC still played; the Starlight had both
+and landed 33 dB down, i.e. inaudible. **The device-to-device difference is what makes this
+look like routing, and it is exactly the part the app does not control.**
+
+**The order that actually resolves it:**
+
+1. **Compare the two devices at the PipeWire layer before reading any app code.** One command
+   settles whether the app is even involved:
+   ```bash
+   pw-dump | python3 -c "import json,sys;[print(o['id'], o['info']['props'].get('node.name'), [p.get('channelVolumes') for p in o['info']['params'].get('Props',[]) if 'channelVolumes' in p]) for o in json.load(sys.stdin) if o.get('type')=='PipeWire:Interface:Node' and o.get('info',{}).get('props',{}).get('media.class')=='Audio/Sink']"
+   ```
+   A sink at `[0.064 × N]` with `softVolumes` at 1.0 is **wireplumber's untouched default,
+   realised in hardware** — the card has no entry in `~/.local/state/wireplumber/default-routes`
+   and comes up at 40% (cubic) on every plug. Cross-check with
+   `amixer -c <card> sget PCM`; −23.75 dB is that value exactly.
+2. **Capture both device monitors and compare the digital signal.** If the failing device's
+   stream is *bit-identical* to the working one (`max abs diff = 0.0`), the app's routing is
+   correct and everything downstream of the monitor tap is suspect — hardware volume, the
+   controller's own mixer, cabling. That comparison is the fastest way to end the routing
+   theory, and it needs the 4-channel capture above, not `pw-record`.
+3. **Only then read the gain chain** — and read it *end to end*, because the app cannot.
+
+⚠️ **`wpctl set-volume <id> 1.0` returned exit 0 and did nothing** on this card (still read
+`Volume: 0.40` after). `amixer -c Starlight sset PCM 400` took immediately, and wireplumber
+then wrote the route so it persists. Verify the readback; do not trust the exit code.
+
+### Master volume applied twice — why no probe could see it
+
+Every deck-side instrument sits **upstream of the node's master stage**, so all of them read
+correct while the output was 9 dB down. There is no in-process instrument that can see the
+product of the two stages — which is why the regression test asserts the *factor*
+(`deck_master_factor() == 1.0`) rather than a level.
+
+Generalise this before adding the next gain stage:
+
+> A gain applied in two places is invisible to any probe that sits between them, and uniform
+> attenuation has no A/B arm inside the app — nothing stands out by comparison. The only
+> instrument that can see it is a capture of the device output compared against the level the
+> app *believes* it is sending.
+
+The tell, if you have both numbers: `[level/deck-N] main vol0 (reference)` against the device
+monitor's RMS. They differed by 10.1 dB where they should have matched to within the level
+element's windowing; 20·log₁₀(0.346) = −9.2 dB named the culprit immediately.
 
 **What is still a stub**:
 - `set_eq()` in `pipeline.rs` — EQ sliders show in the UI but do nothing to GStreamer

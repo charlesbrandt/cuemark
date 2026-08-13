@@ -196,9 +196,15 @@ impl OutputGraph {
 
     /// Master volume, applied once per node after the mixer.
     ///
-    /// This is where a master belongs. Applying it per deck (as `apply_volume` still does
-    /// for the deck-side `volume` elements) was always a workaround for not having a master
-    /// stage; with the shared graph in use the deck-side factor is left at 1.0.
+    /// This is where a master belongs. Applying it per deck was always a workaround for not
+    /// having a master stage; with the shared graph in use the deck-side factor is left at
+    /// 1.0 by `DeckAudioPipeline::deck_master_factor()`.
+    ///
+    /// ⚠️ That sentence was written here on 2026-08-11 as a description of intent and was
+    /// **false in the code until 2026-08-13** — the deck side applied the factor too, so the
+    /// two multiplied. If this claim is ever load-bearing again, check `deck_master_factor()`
+    /// rather than trusting this comment; `master_volume_squares_across_the_shared_graph`
+    /// in pipeline.rs is the test that now holds it.
     pub fn set_master_volume(&mut self, volume: f32) {
         self.master_volume = volume.clamp(0.0, 1.0);
         for node in self.nodes.values() {

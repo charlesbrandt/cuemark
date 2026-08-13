@@ -1226,6 +1226,85 @@ fn make_remap_chain(
 }
 
 #[cfg(test)]
+mod master_volume_tests {
+    use super::*;
+
+    /// Serialises the `CUEMARK_SHARED_OUTPUT` mutations below — `cargo test` runs these in
+    /// one process, and the env is global.
+    static ENV: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard(Option<String>);
+    impl EnvGuard {
+        fn set(value: &str) -> Self {
+            let prev = std::env::var("CUEMARK_SHARED_OUTPUT").ok();
+            std::env::set_var("CUEMARK_SHARED_OUTPUT", value);
+            Self(prev)
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("CUEMARK_SHARED_OUTPUT", v),
+                None => std::env::remove_var("CUEMARK_SHARED_OUTPUT"),
+            }
+        }
+    }
+
+    /// **The 2026-08-13 regression, as an invariant.** Master volume has two possible
+    /// homes — the deck's own `volume` elements and the shared graph's per-node master
+    /// stage — and on the shared path only the second one may apply it. Applying both
+    /// squares the factor: 0.35 becomes 0.12, a silent −9 dB that no deck-side probe can
+    /// see because every one of them sits upstream of the node's master stage.
+    ///
+    /// It surfaced as "audio works on one device but not the other", because the extra
+    /// attenuation only crosses the audibility floor on a device whose hardware volume is
+    /// also low. Nothing in the app was wrong with that device's *routing*.
+    #[test]
+    fn master_volume_squares_across_the_shared_graph() {
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set("1");
+
+        let mut deck = DeckAudioPipeline::new("master-test");
+        deck.set_output_graph(Arc::new(Mutex::new(OutputGraph::new())));
+        deck.master_volume = 0.35;
+
+        assert_eq!(
+            deck.deck_master_factor(),
+            1.0,
+            "the shared graph owns the master stage; the deck side must contribute unity"
+        );
+    }
+
+    /// The legacy per-branch path has no master stage of its own, so the deck side is the
+    /// only place it can be applied. `CUEMARK_SHARED_OUTPUT=0` must not lose it.
+    #[test]
+    fn legacy_path_still_applies_master_on_the_deck() {
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set("0");
+
+        let mut deck = DeckAudioPipeline::new("master-test");
+        deck.set_output_graph(Arc::new(Mutex::new(OutputGraph::new())));
+        deck.master_volume = 0.35;
+
+        assert_eq!(deck.deck_master_factor(), 0.35);
+    }
+
+    /// A deck that was never handed a graph is on the legacy path whatever the env says —
+    /// `load()` makes the same `shared_output_enabled() && output_graph.is_some()` decision,
+    /// and the two must not disagree or the master factor lands on neither stage.
+    #[test]
+    fn a_deck_without_a_graph_applies_master_itself() {
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set("1");
+
+        let mut deck = DeckAudioPipeline::new("master-test");
+        deck.master_volume = 0.35;
+
+        assert_eq!(deck.deck_master_factor(), 0.35);
+    }
+}
+
+#[cfg(test)]
 mod channel_remap_tests {
     use super::{compute_channel_remap, parse_device_remap};
 
@@ -2311,11 +2390,17 @@ impl DeckAudioPipeline {
         // below where `master_volume` alone put it, and nothing in the log could say whether
         // that was a cue_gain setting or a duty cycle. Two candidate explanations, no way to
         // separate them after the fact. Log the input, not just the outcome.
+        // `deck_master_factor()`, not `master_volume` — on the shared path the master stage
+        // lives once per output node and this side must stay at 1.0. Both are logged: the
+        // user-facing setting and the factor this branch actually applies, because when they
+        // differ the reason is structural and a log showing only one of them cannot say so.
+        let deck_master = self.deck_master_factor();
         log::info!(
-            "[audio/{}] load(): applying gain={:.3} vol={:.3} master_volume={:.3} -> volume={:.3} to {} main sink(s); cue_gain={:.3} -> cue_volume={:.3}",
-            self.deck_id, self.gain, self.vol, self.master_volume,
-            self.gain * self.vol * self.master_volume, volume_els.len(),
-            self.cue_gain, self.gain * self.cue_gain * self.master_volume
+            "[audio/{}] load(): applying gain={:.3} vol={:.3} master_volume={:.3} (deck-side factor {:.3}{}) -> volume={:.3} to {} main sink(s); cue_gain={:.3} -> cue_volume={:.3}",
+            self.deck_id, self.gain, self.vol, self.master_volume, deck_master,
+            if shared_output { ", master applied per output node" } else { "" },
+            self.gain * self.vol * deck_master, volume_els.len(),
+            self.cue_gain, self.gain * self.cue_gain * deck_master
         );
         for vol in &volume_els {
             // Bug fix: this omitted master_volume (unlike apply_volume(), the canonical
@@ -2323,7 +2408,7 @@ impl DeckAudioPipeline {
             // rebuild here always used to reset each sink's volume back to gain*vol alone,
             // silently dropping whatever master-volume attenuation was in effect until the
             // next explicit master-volume change nudged apply_volume() again.
-            vol.set_property("volume", (self.gain * self.vol * self.master_volume) as f64);
+            vol.set_property("volume", (self.gain * self.vol * deck_master) as f64);
         }
         pitch.set_property("tempo", self.rate as f32);
         queue.set_property("max-size-buffers", 2u32);
@@ -2344,7 +2429,7 @@ impl DeckAudioPipeline {
 
         cue_valve.set_property("drop", !self.cue_enabled);
         make_eos_passthrough_valve(&cue_valve);
-        cue_volume.set_property("volume", (self.gain * self.cue_gain * self.master_volume) as f64);
+        cue_volume.set_property("volume", (self.gain * self.cue_gain * deck_master) as f64);
         cue_queue.set_property("max-size-buffers", 2u32);
         cue_queue.set_property("max-size-bytes", 0u32);
         cue_queue.set_property("max-size-time", 0u64);
@@ -2741,12 +2826,36 @@ impl DeckAudioPipeline {
         Ok(())
     }
 
+    /// The master-volume factor that belongs on the **deck-side** `volume` elements.
+    ///
+    /// ⚠️ **1.0 on the shared-output path, and that is not an omission.** There the real
+    /// master stage is one `volume` per output node, applied after the node's `audiomixer`
+    /// (`OutputGraph::set_master_volume`). Applying `master_volume` here as well squares it:
+    /// at the usual 0.35 that is a silent extra −9 dB on every output, which is enough to
+    /// take a device whose hardware volume is also low (a controller sitting at
+    /// wireplumber's untouched 0.064 default, say) from quiet to inaudible while a device at
+    /// unity still plays. That is exactly how it presented on 2026-08-13: "audio works on
+    /// one device and not the other", with every in-pipeline instrument reading healthy —
+    /// because the deck's own probes are *upstream* of the second stage and cannot see it.
+    /// Measured then: `main vol0 (reference)` −22.3 dBFS against −32.4 dBFS at the device.
+    ///
+    /// Read live rather than cached at load: the tests flip `CUEMARK_SHARED_OUTPUT`
+    /// in-process, and `set_master_volume_factor` must land correctly on both paths.
+    fn deck_master_factor(&self) -> f32 {
+        if shared_output_enabled() && self.output_graph.is_some() {
+            1.0
+        } else {
+            self.master_volume
+        }
+    }
+
     fn apply_volume(&self) {
         if let Some(inner) = &self.inner {
+            let master = self.deck_master_factor();
             for vol in &inner.volume_els {
-                vol.set_property("volume", (self.gain * self.vol * self.master_volume) as f64);
+                vol.set_property("volume", (self.gain * self.vol * master) as f64);
             }
-            inner.cue_volume_el.set_property("volume", (self.gain * self.cue_gain * self.master_volume) as f64);
+            inner.cue_volume_el.set_property("volume", (self.gain * self.cue_gain * master) as f64);
         }
     }
 

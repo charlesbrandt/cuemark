@@ -400,11 +400,15 @@ pub fn audio_set_master_volume(state: State<'_, AudioState>, volume: f32) -> Res
     let mut mgr = state.lock().unwrap();
     let factor = volume.clamp(0.0, 1.0);
     mgr.master_volume = factor;
-    // Applied in both places on purpose. On the shared path the graph's per-node master
-    // stage is the real one; the per-deck factor stays in place so switching
-    // CUEMARK_SHARED_OUTPUT off mid-session does not silently lose master attenuation.
-    // Both are linear gains and the deck-side one is 1.0 unless the user moved it, so
-    // there is no double-attenuation to reason about.
+    // Pushed to both places on purpose, but only **one of them applies it**: each deck
+    // gates its own factor through `deck_master_factor()`, which is 1.0 whenever the shared
+    // graph is in use because the graph's per-node master stage is the real one there.
+    // Every deck still stores the factor, so falling back to the legacy per-branch path
+    // (CUEMARK_SHARED_OUTPUT=0) does not silently lose master attenuation.
+    //
+    // ⚠️ Until 2026-08-13 the deck side applied it unconditionally and the two multiplied:
+    // a silent extra −9 dB at the usual setting, invisible to every deck-side probe because
+    // they all sit upstream of the node's master stage. See `deck_master_factor()`.
     mgr.output_graph.lock().unwrap().set_master_volume(factor);
     for pipeline in mgr.pipelines.values_mut() {
         pipeline.set_master_volume_factor(factor);
