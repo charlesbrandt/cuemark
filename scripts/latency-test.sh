@@ -39,8 +39,39 @@ DISPLAY_NUM=99
 XVFB_PID=""
 DRIVER_PID=""
 SESSION=""
+# deck-0's cuemark:videoPathOverride as it was BEFORE this run, so the restore below can put
+# it back. A JSON scalar: "legacy", "webcodecs", or null (no override). Empty string means
+# "not captured yet" — the run aborted before step 1b and there is nothing to restore.
+PRIOR_OVERRIDE=""
+
+# Put deck-0's video-path override back to PRIOR_OVERRIDE. Safe to call more than once.
+#
+# 🔴 This is not tidiness — it is the whole reason this script cannot be run casually
+# otherwise. cuemark:videoPathOverride is a persistentWritable (WebKit localStorage, keyed
+# by ORIGIN), and every cuemark instance — this Xvfb one and the user's real desktop app —
+# is the same origin `tauri://localhost` and shares one storage DB. So step 1b's
+# setVideoPathOverride('deck-0', 'legacy') does not stay inside the test: it pins deck-0 of
+# the user's actual app to the legacy <video> backend, permanently, across app restarts.
+# That is exactly what happened on 2026-08-13 — a green 10/10 run of this script left the
+# user's deck-0 on the legacy path, where it rendered colourful noise instead of video
+# (the VA-API DMA-BUF drawImage(video) corruption documented at the top of
+# src-tauri/src/main.rs, which the legacy path has never been checked against since GPU
+# compositing became the default on 2026-08-02). It read as "the refactor broke video
+# playback"; the refactor was innocent and the tests themselves were the cause.
+restore_override() {
+  [ -n "$SESSION" ] || return 0
+  [ -n "$PRIOR_OVERRIDE" ] || return 0
+  js_sync "window.__cuemarkDebug.setVideoPathOverride('deck-0', $PRIOR_OVERRIDE);" >/dev/null 2>&1 || true
+  # Say so out loud. A silent restore is indistinguishable from no restore at all, which is
+  # the failure mode this whole function exists to prevent — and on the abort path there is
+  # no assertion to catch it (Step 10 never runs).
+  echo "  [restore] deck-0 video-path override -> $PRIOR_OVERRIDE"
+}
 
 cleanup() {
+  # Before the session is torn down — restore needs a live session to run JS in. Covers the
+  # abort paths (a failed check, ^C, `set -e`); the happy path asserts it explicitly below.
+  restore_override
   [ -n "$SESSION" ] && curl -s -X DELETE "http://localhost:$DRIVER_PORT/session/$SESSION" >/dev/null 2>&1 || true
   [ -n "$DRIVER_PID" ] && kill "$DRIVER_PID" >/dev/null 2>&1 || true
   [ -n "$XVFB_PID" ] && kill "$XVFB_PID" >/dev/null 2>&1 || true
@@ -203,6 +234,13 @@ echo "=== Step 1b: force deck-0 to the ${BACKEND} backend ==="
 # (found live running phase 4 of docs/design/webcodecs-video-path.md — steps 4/7 "failed"
 # with position stuck at 0 because getVideoTime() correctly returns null/0 for a deck with
 # no <video> element at all, not because legacy playback was actually broken).
+#
+# Capture what the override was first, so restore_override() can put it back. This store is
+# shared with the user's real app (see restore_override's comment) — leaving a `legacy`
+# override behind here is a user-visible breakage, not a test artifact.
+PRIOR_OVERRIDE=$(js_sync "const o=JSON.parse(localStorage.getItem('cuemark:videoPathOverride')||'{}'); return JSON.stringify(o['deck-0'] ?? null);")
+[ -n "$PRIOR_OVERRIDE" ] || PRIOR_OVERRIDE="null"
+echo "  prior deck-0 override: $PRIOR_OVERRIDE (will be restored on exit)"
 js_sync "window.__cuemarkDebug.setVideoPathOverride('deck-0', '$BACKEND');" >/dev/null
 echo "  override set (docs/design/webcodecs-video-path.md phase 2 A/B toggle)"
 
@@ -396,6 +434,20 @@ if [ "$BACKEND" = "webcodecs" ]; then
   check_eq "legacy play/pause calls == 0" "$PP" "0"
   check_eq "no <video> element registered" "$HV" "false"
 fi
+
+echo
+echo "=== Step 10: harness leaves no persisted state behind ==="
+# Regression gate for the 2026-08-13 incident described on restore_override() above: this
+# script's own step 1b writes deck-0's video-path override into localStorage, which is
+# shared by origin with the user's real app, and used to leave it there. A green run that
+# silently repins the user's deck to the legacy <video> backend is not a passing run.
+#
+# cleanup() also calls restore_override() for the abort paths, but a trap cannot be asserted
+# on — so do the restore here, while checks can still fail, and verify it actually landed.
+restore_override
+AFTER=$(js_sync "const o=JSON.parse(localStorage.getItem('cuemark:videoPathOverride')||'{}'); return JSON.stringify(o['deck-0'] ?? null);")
+echo "  deck-0 override: prior=$PRIOR_OVERRIDE  now=$AFTER"
+check_eq "deck-0 video-path override restored to its pre-run value" "$AFTER" "$PRIOR_OVERRIDE"
 
 echo
 echo "========================================"

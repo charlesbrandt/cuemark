@@ -168,6 +168,19 @@ WebKit's GStreamer media player, not working, and cuemark cannot fix it. The onl
 keep the codec off a `<video>` element at all. ❌ **`CUEMARK_DISABLE_DMABUF=1` makes it strictly
 worse** — do not reach for it.
 
+🔴 **Since 2026-08-02 it is not just slow, it is display-broken on a VA-API machine**: with GPU
+compositing on (the default now), a deck on this path renders *colourful noise* instead of
+video in both the preview and the output window, because `drawImage(video)` cannot read a
+VA-API DMA-BUF surface — the failure `main.rs`'s opening comment describes, on the one path
+that comment says was never re-checked after the default flipped. Audio/waveform/position stay
+healthy throughout, so it presents as "video stopped working" with every other instrument
+green. ⚠️ **A deck can land here silently via a persisted per-deck override**
+(`cuemark:videoPathOverride` in localStorage) — which is shared by origin with *every* cuemark
+instance including headless test ones, so a test harness can pin a real deck here without
+anyone touching the UI (that is how it was found; `skills/verify-ui/SKILL.md` has the rule).
+Check the DeckCard `LEGACY` badge before believing a video regression. Open item, with the
+options and the "don't just demote VA-API globally" warning, in `todo.md` "Known issues".
+
 - **H.264 and VP9 no longer take this path** (fixed 2026-08-05). `video_demux.rs` accepts both
   (`CodecKind`, `vp9parse` with `alignment=super-frame`, a derived `vp09.PP.LL.DD` string) and
   `codecWorker.ts`'s `needsAvcRemux` is the single switch — H.264 keeps its mandatory avc

@@ -192,12 +192,20 @@ if [ -n "$VIDEO_FILE" ]; then
   # No <video> element for this deck at all — decode runs in codecWorker.ts's Worker, off
   # the WebKitWebProcess main thread, so a regression here would show up as elevated CPU
   # from FBO-upload/compositor work, not video-element decode.
+  # cuemark:videoPathOverride is a persistentWritable in localStorage, keyed by origin — and
+  # every cuemark instance (this Xvfb one, the user's real desktop app) is the same origin
+  # `tauri://localhost` and shares one storage DB. So this write escapes the test and repins
+  # the user's own deck-0 until something puts it back. Capture the prior value rather than
+  # clearing to null, so a deliberate user override survives the run too. See
+  # scripts/latency-test.sh restore_override() for the incident that made this a rule.
+  PRIOR_OVERRIDE=$(js "const o=JSON.parse(localStorage.getItem('cuemark:videoPathOverride')||'{}'); return JSON.stringify(o['deck-0'] ?? null);")
+  [ -n "$PRIOR_OVERRIDE" ] || PRIOR_OVERRIDE="null"
   js "window.__cuemarkDebug.setVideoPathOverride('deck-0', 'webcodecs'); window.__cuemarkDebug.updateDeck('deck-0', {source: {type:'video', filePath: '$VIDEO_FILE', duration: 0}, playing: false});" >/dev/null
   sleep 2 # let video_demux_load + CodecPlayer init settle
   js "window.__cuemarkDebug.updateDeck('deck-0', {playing: true});" >/dev/null
   sleep 2
   run_scenario "webcodecs-deck-playing"
-  js "window.__cuemarkDebug.updateDeck('deck-0', {source: null, playing: false}); window.__cuemarkDebug.setVideoPathOverride('deck-0', null);" >/dev/null
+  js "window.__cuemarkDebug.updateDeck('deck-0', {source: null, playing: false}); window.__cuemarkDebug.setVideoPathOverride('deck-0', $PRIOR_OVERRIDE);" >/dev/null
 else
   echo "(no video file given — skipping video-deck scenarios; pass one as \$1 to include them)"
 fi

@@ -265,6 +265,39 @@ VITE_ENABLE_DEBUG_HOOK=1 cargo tauri build --debug --no-bundle
 Sanity-check before trusting a test run: `grep -q '__cuemarkDebug' dist/assets/*.js`
 should match.
 
+### 🔴 This "isolated" instance shares localStorage with the user's real app
+
+The isolation is of the *display and process*, not of storage. Every cuemark instance —
+this Xvfb one and whatever is running on the user's desktop — loads the same origin
+`tauri://localhost` and therefore shares one WebKit localStorage DB under
+`~/.local/share/com.cuemark.app/`. **Every `cuemark:`-prefixed `persistentWritable`
+written through the debug hook escapes the test and changes the user's actual app**,
+permanently, across restarts: `cuemark:videoPathOverride` (per-deck legacy/webcodecs),
+`cuemark:videoPathDefault`, and the audio-settings stores.
+
+This is not hypothetical. On 2026-08-13 a **green 10/10** `latency-test.sh` run left
+`{"deck-0":"legacy"}` behind — the script forces deck-0 onto the legacy backend in its
+step 1b and, until that day, never put it back. The user's deck-0 then rendered colourful
+noise instead of video in both the preview and the output window (the VA-API DMA-BUF
+`drawImage(video)` corruption documented at the top of `src-tauri/src/main.rs`, which the
+legacy path has never been checked against since GPU compositing became the default on
+2026-08-02). It read as "the recent refactor broke video playback"; the refactor was
+innocent — the passing test suite was the cause.
+
+**So: capture any `cuemark:` value before you overwrite it and restore it on exit,
+including the abort path.** `latency-test.sh`'s `restore_override()` + its Step 10
+assertion is the pattern; `perf-idle-test.sh` does the same around its webcodecs
+scenario. A trap alone is not enough to trust — assert the restore where a check can
+still fail, and log it on the paths where none can.
+
+⚠️ **A backgrounded script does not run its `EXIT` trap on `kill -INT`** — bash background
+jobs ignore SIGINT, so a run started with `&` and interrupted that way leaks the override
+anyway (this is what re-broke the key midway through verifying the fix, and it briefly
+looked like storage contention from the user's live app — it wasn't). Use `kill -TERM`, or
+^C an interactive foreground run. Either way, verify a restore by its **`[restore]` log
+line**, not by reading the key back afterwards: the readback cannot tell "never restored"
+from "restored, then re-broken by the next thing you ran".
+
 Two scripts use this hook as their test driver:
 
 - **`scripts/perf-idle-test.sh [video]`** — CPU regression. Mutates session state (load/play/pause

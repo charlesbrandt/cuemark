@@ -147,6 +147,52 @@ VU/scope) — see `src/lib/renderer/compositor.ts` and `src/App.svelte`'s shader
 
 ## Known issues
 
+### Legacy `<video>` path renders colourful noise since GPU compositing became default [open, 2026-08-13]
+
+🔴 **Any deck that lands on the legacy `<video>` backend shows colourful static instead of
+video — in both the deck preview and the output window.** Audio, waveform and the position
+clock are unaffected (separate GStreamer pipeline), so it reads as "video playback stopped"
+while everything else looks healthy.
+
+**This is the exact failure `src-tauri/src/main.rs`'s opening comment describes** — "DMA-BUF
+surfaces from VA-API video decoding don't transfer to 2D canvas pixel reads in WebKitGTK —
+`drawImage(video)` produces colorful noise" — and the same comment already flags the gap that
+lets it happen now: the legacy fallback "has never been checked with the DMA-BUF renderer
+enabled", which became the default on 2026-08-02 (`WEBKIT_DISABLE_DMABUF_RENDERER` retired).
+`mele` has a full VA-API stack, so H.264 decodes through `vah264dec` into a DMA-BUF surface,
+and both the preview and `outputBus.ts`'s scratch canvas `drawImage()` that same element.
+
+**Status of the evidence**: the mechanism is inference from main.rs + the machine matrix in
+`docs/environment.md`, corroborated by a live sighting on 2026-08-13 (deck-0 pinned to legacy,
+`1280×720` badge showing — so metadata and a real video track — with noise in the preview).
+It has **not** been measured. It cannot be reproduced headlessly: under Xvfb the legacy path
+either needs `CUEMARK_DISABLE_DMABUF=1` for rAF to fire at all (which removes the very
+condition under test), and a pixel check there wouldn't exercise VA-API anyway. **Reproduce on
+a real display**: force a deck to legacy via the DeckCard badge, load an H.264 file, look at
+the preview.
+
+**Do not "fix" this by demoting VA-API H.264 globally without measuring first.** The obvious
+patch — adding `vah264dec:0,vaapih264dec:0` to the `GST_PLUGIN_FEATURE_RANK` line in main.rs,
+which is what that file prescribes for exactly this symptom — also forces software H.264
+decode on the **default WebCodecs path**, since WebKitGTK's `VideoDecoder` is backed by the
+same GStreamer registry. On a machine where VA-API works that is a real CPU regression on the
+path 99% of playback actually uses, traded for a path that is only a fallback. Options worth
+weighing before picking one:
+- Scope the demotion to the legacy path only — needs a per-process or per-pipeline rank
+  mechanism that may not exist; check before assuming.
+- Leave ranks alone and accept the legacy path is display-broken here, i.e. treat it as
+  audio-only fallback and say so in the UI (the badge already exists).
+- Retire the legacy path outright via H.264 proxy transcode at ingest — already the
+  alternative under consideration for the AV1 item below, and this makes the case stronger.
+
+⚠️ **Related trap, fixed 2026-08-13**: `scripts/latency-test.sh` used to leave
+`cuemark:videoPathOverride` set to `legacy` for deck-0 after every run. localStorage is keyed
+by origin and every cuemark instance is `tauri://localhost`, so a *passing* test run silently
+pinned the user's real app onto this broken path — and it read as a regression from the
+then-current refactor, which was innocent. The script now saves/restores the override and
+asserts it in Step 10; see `skills/verify-ui/SKILL.md` for the general rule about shared
+localStorage.
+
 ### AV1 renders zero video frames on the legacy `<video>` path [open, 2026-08-05]
 
 🔴 **The only genuinely open item here.** A live ~7-minute play of a real AV1 library file
