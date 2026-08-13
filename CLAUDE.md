@@ -315,7 +315,18 @@ state (re-apply `imageSmoothingQuality` after every resize).
 discipline, why MIDI-driven `syncVideoElements` must be rAF-throttled, the 14-bit fader tolerance fix,
 and the `audioSync.ts` Svelte-store-bypass pattern for continuous MIDI controls:
 `docs/design/av-sync-architecture.md`. **Read it before touching** the render loop (`App.svelte`
-`frame()`), `WaveformCanvas`, grid persistence, or the MIDI handler's continuous controls.
+`frame()`/`stepDeck()`), `WaveformCanvas`, grid persistence, or the MIDI handler's continuous
+controls.
+
+**Where the control-window logic lives** — split out of `App.svelte` on 2026-08-13 as pure
+moves, so a pointer in an older doc that says "in `App.svelte`" now means one of these:
+`lib/audio/positionPoll.ts` (the master-clock poll and its content-position math),
+`lib/audio/transport.ts` (play/pause reconciliation + retry), `lib/video/legacyVideo.ts` (the
+`<video>` element's whole lifecycle: creation, per-pass property sync, mechanism-B stall
+self-heal), `lib/video/backendRegistry.ts` (per-deck legacy/webcodecs resolution),
+`lib/state/bootRestore.ts` (recovery rehydration + MIDI control restore), `lib/debug/debugHook.ts`
+(`window.__cuemarkDebug`, dev/test builds only). `App.svelte` keeps the store `$effect`s, the
+deck-sync orchestration (`syncVideoElements`) and the rAF loop.
 
 ### Dual output
 
