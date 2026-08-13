@@ -1452,6 +1452,36 @@ pub(super) fn make_sink(device: &str, deck_id: &str) -> Result<gst::Element, Str
     Ok(sink)
 }
 
+/// The main output branches: one `volume` → (optional channel matrix) → sink chain per
+/// configured device. Returned as a unit because the three vectors are index-parallel and
+/// every consumer walks them together.
+struct MainBranches {
+    volume_els: Vec<gst::Element>,
+    sinks: Vec<gst::Element>,
+    /// Per-device channel remap. `None` = route the plain stereo stream straight at the
+    /// node (a genuinely stereo device, a device id whose suffix failed to parse, or the
+    /// shared-output path, where the matrix lives in the output graph).
+    channel_remaps: Vec<Option<(gst::Element, gst::Element)>>,
+}
+
+/// The cue (headphone) branch's sink end, plus the state `set_cue_enabled()` needs later.
+struct CueBranch {
+    sink: gst::Element,
+    channel_remap: Option<(gst::Element, gst::Element)>,
+    /// Mirrors the cue valve's open/closed state for the sink's flow probe.
+    open: Arc<AtomicBool>,
+    /// `None` when cue is on the fakesink fallback (deliberately uninstrumented).
+    flow: Option<SinkFlowState>,
+}
+
+/// What `attach_output_graph()` handed back from the shared output graph. Empty/zero on
+/// the legacy (one-pulsesink-per-branch) path.
+struct OutputAttachment {
+    branches: Vec<BranchKey>,
+    handoffs: Vec<(String, Arc<HandoffCounters>)>,
+    latency_ns: u64,
+}
+
 struct PipelineInner {
     pipeline: gst::Pipeline,
     /// One volume element per main output device (gain × vol applied to all).
@@ -1630,6 +1660,436 @@ impl DeckAudioPipeline {
         self.app = Some(app);
     }
 
+    /// Build one `volume` + sink (+ channel matrix) chain per configured main output
+    /// device, instrumenting each. Elements are created and configured but not yet added
+    /// to the pipeline or linked — `load()` does that for the whole graph at once.
+    ///
+    /// `sink_flow_states`/`delivery_probes`/`pending_handoffs` stay owned by the caller:
+    /// the cue branch appends to the same three lists right after this returns.
+    fn build_main_branches(
+        &self,
+        shared_output: bool,
+        at_playing: &Arc<AtomicBool>,
+        sink_flow_states: &mut Vec<SinkFlowState>,
+        delivery_probes: &mut Vec<Arc<DeliveryProbe>>,
+        pending_handoffs: &mut Vec<(gst::Element, String, String)>,
+    ) -> Result<MainBranches, String> {
+        // One (volume, sink) pair per main output device. Empty devices list = single default.
+        let main_devs: Vec<String> = if self.devices.is_empty() {
+            vec![String::new()]
+        } else {
+            self.devices.clone()
+        };
+        let mut volume_els: Vec<gst::Element> = Vec::with_capacity(main_devs.len());
+        let mut main_sinks: Vec<gst::Element> = Vec::with_capacity(main_devs.len());
+        // Per-device channel remap, parallel to volume_els/main_sinks. `None` = route the
+        // plain stereo stream straight at the node (a genuinely stereo device, or a device id
+        // whose suffix failed to parse — see below).
+        let mut main_channel_remaps: Vec<Option<(gst::Element, gst::Element)>> =
+            Vec::with_capacity(main_devs.len());
+
+        for (i, dev) in main_devs.iter().enumerate() {
+            let vol = make_el("volume")?;
+            let snk = if shared_output {
+                let el = make_appsink(&format!("{}/{}", self.deck_id, i))?;
+                pending_handoffs.push((el.clone(), dev.clone(), format!("main{i}")));
+                el
+            } else {
+                make_sink(dev, &format!("{}/{}", self.deck_id, i))?
+            };
+            // Main branches carry the same N-channel mix-matrix the cue branch has, as of
+            // 2026-08-11. Before that `make_sink()` stripped the `@pair!layout` suffix and
+            // nothing else looked at it, so picking "— Rear" as a *main* device silently did
+            // nothing, and main and cue presented **different channel layouts** on one node.
+            // See compute_channel_remap's doc comment and slow-jog-audio-inaudible.md §10.10.
+            //
+            // Unlike the cue branch, a parse failure here does NOT fall back to fakesink:
+            // silently muting the master output mid-set is worse than a routing error, and a
+            // plain stereo sink is exactly what this branch did unconditionally before, so it
+            // is not a new risk. It is logged at error level because it is not recoverable
+            // without re-selecting the device.
+            let main_remap = match parse_device_remap(dev) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!(
+                        "[audio/{}/{}] main device id {:?} failed to parse ({e}) — falling back \
+                         to a plain stereo sink on the bare node, so this output may land on the \
+                         wrong channel pair. Re-select the device in Settings to clear the \
+                         stale/corrupted id.",
+                        self.deck_id, i, dev
+                    );
+                    None
+                }
+            };
+            // On the shared path the matrix belongs to the output graph — one per branch,
+            // summed by the node's `audiomixer`. Building it here as well would map stereo
+            // into N channels twice and the second matrix would find only its own first pair
+            // populated, silencing every branch that does not target the front pair.
+            let main_remap = match (&main_remap, shared_output) {
+                (_, true) => None,
+                (Some(r), false) => Some(make_remap_chain(r, &format!("main{i}"), &self.deck_id)?),
+                (None, false) => None,
+            };
+            // Only the primary sink (i=0) participates in preroll — it controls the
+            // pipeline's READY→PAUSED state transition. Secondary sinks use async=false
+            // so they don't block preroll; they join at PLAYING time using the primary's clock.
+            if i > 0 {
+                snk.set_property("async", false);
+            }
+            sink_flow_states.extend(instrument_sink_flow(
+                &snk,
+                &self.deck_id,
+                &format!("main sink {i}"),
+                vec![at_playing.clone()],
+            ));
+            // Bracket the last stage: what leaves `volume` against what the sink accepts.
+            // Both, not just the sink — a count that matches at `volume` and not at the
+            // sink narrows the fault to one link, and a count that advances at both while
+            // the room is silent moves the whole question past delivery. See DeliveryProbe.
+            delivery_probes.extend(instrument_delivery(&vol, "src", &format!("vol{i}")));
+            delivery_probes.extend(instrument_delivery(&snk, "sink", &format!("sink{i}")));
+            volume_els.push(vol);
+            main_sinks.push(snk);
+            main_channel_remaps.push(main_remap);
+        }
+        Ok(MainBranches { volume_els, sinks: main_sinks, channel_remaps: main_channel_remaps })
+    }
+
+    /// Pick the cue branch's sink (real device, shared-graph appsink, or the fakesink
+    /// fallback) and instrument it. `cue_volume` is passed in because the delivery probe
+    /// brackets that stage against the sink's own pad.
+    fn build_cue_branch(
+        &self,
+        shared_output: bool,
+        cue_volume: &gst::Element,
+        at_playing: &Arc<AtomicBool>,
+        sink_flow_states: &mut Vec<SinkFlowState>,
+        delivery_probes: &mut Vec<Arc<DeliveryProbe>>,
+        pending_handoffs: &mut Vec<(gst::Element, String, String)>,
+    ) -> Result<CueBranch, String> {
+        // Decide the cue routing *before* building any sink: a device id that requests
+        // a non-default channel pair but fails to parse must never fall through to a
+        // plain sink targeting the shared node (see compute_channel_remap's doc comment —
+        // that exact failure mode deadlocked PipeWire system-wide on 2026-08-02).
+        //
+        // Device ID format: `node@target!full_layout` e.g. `alsa_out...@RL,RR!FL,FR,RL,RR`
+        let cue_remap_outcome: Result<Option<ChannelRemap>, String> =
+            parse_device_remap(&self.cue_device);
+
+        // Use a real sink only when a device is configured and (for multi-channel
+        // targets) its channel remap parsed cleanly; fakesink otherwise so the
+        // pipeline loads cleanly and never risks two sinks colliding on one node.
+        let (cue_sink, cue_channel_remap): (gst::Element, Option<(gst::Element, gst::Element)>) =
+            match &cue_remap_outcome {
+                _ if self.cue_device.is_empty() => {
+                    log::warn!("[audio/{}-cue] no device set — cue output routed to fakesink", self.deck_id);
+                    let fs = make_el("fakesink")?;
+                    fs.set_property("sync", false);
+                    (fs, None)
+                }
+                Err(e) => {
+                    log::error!(
+                        "[audio/{}-cue] cue device id {:?} failed to parse ({e}) — routing to \
+                         fakesink instead of risking a same-channel collision with another sink \
+                         on the shared node (see compute_channel_remap's doc comment). Re-select \
+                         the cue device in Settings to clear the stale/corrupted id.",
+                        self.deck_id, self.cue_device
+                    );
+                    let fs = make_el("fakesink")?;
+                    fs.set_property("sync", false);
+                    (fs, None)
+                }
+                Ok(_) if shared_output => {
+                    let el = make_appsink(&format!("{}-cue", self.deck_id))?;
+                    pending_handoffs.push((
+                        el.clone(),
+                        self.cue_device.clone(),
+                        "cue".to_string(),
+                    ));
+                    // Matrix lives in the output graph on this path — see the main branch.
+                    (el, None)
+                }
+                Ok(remap) => {
+                    let sink = make_sink(&self.cue_device, &format!("{}-cue", self.deck_id))?;
+                    let channel_remap = match remap {
+                        Some(r) => Some(make_remap_chain(r, "cue", &self.deck_id)?),
+                        None => None,
+                    };
+                    (sink, channel_remap)
+                }
+            };
+        // The cue branch is a monitoring output. async=false means it never participates in
+        // pipeline preroll, so the valve dropping all buffers (cue off) doesn't block the
+        // pipeline from completing PAUSED — only the main sink controls preroll timing.
+        cue_sink.set_property("async", false);
+
+        // ── Cue-branch instrumentation ────────────────────────────────────────────
+        // Added 2026-08-08 for docs/design/audio-dropout-mid-playback.md H1, which blames
+        // contention between the main and cue `pulsesink`s on one USB node — and which
+        // until now was the *only* branch in this pipeline carrying no probes at all. A
+        // live occurrence therefore produced a log that could not speak to the hypothesis
+        // it was supposed to test.
+        //
+        // Only instrumented when the cue sink is real. On the fakesink fallback the pad
+        // still sees buffers, but `sync=false` means its clock margin is meaningless and
+        // its delivery count measures nothing about any device — a reading that looks
+        // like evidence and is not.
+        let cue_is_real = !self.cue_device.is_empty() && cue_remap_outcome.is_ok();
+        // Second gate for the cue sink's flow probe: `cue_valve` drops every buffer while
+        // cue is off, so without this each cue-off span forges a dropout. Seeded from the
+        // deck's retained intent because a device rebuild re-enters load() mid-set with
+        // cue already open. See instrument_sink_flow()'s doc comment.
+        let cue_open = Arc::new(AtomicBool::new(self.cue_enabled));
+        let cue_sink_flow: Option<SinkFlowState> = if cue_is_real {
+            let st = instrument_sink_flow(
+                &cue_sink,
+                &self.deck_id,
+                "cue sink",
+                vec![at_playing.clone(), cue_open.clone()],
+            );
+            // Also registered with the bus thread, so a transition out of Playing
+            // invalidates it alongside the main sinks.
+            sink_flow_states.extend(st.clone());
+            // Bracket the cue branch's last stage the same way the main branch is
+            // bracketed: `cue_volume`'s src against the sink's own pad. A count that
+            // advances at `cuevol` and not at `cuesink` isolates the fault to that link;
+            // both advancing while the headphones are silent moves it past delivery.
+            delivery_probes.extend(instrument_delivery(&cue_volume, "src", "cuevol"));
+            delivery_probes.extend(instrument_delivery(&cue_sink, "sink", "cuesink"));
+            st
+        } else {
+            None
+        };
+
+        Ok(CueBranch { sink: cue_sink, channel_remap: cue_channel_remap, open: cue_open, flow: cue_sink_flow })
+    }
+
+    /// Spawn this pipeline's bus monitor thread and return the `(at_eos, at_error)` flags
+    /// it sets. The thread exits when `bus.set_flushing(true)` is called on teardown.
+    fn spawn_bus_watch(
+        bus: &gst::Bus,
+        pipeline: &gst::Pipeline,
+        deck_id: &str,
+        eos_cb: Option<EosCallback>,
+        app: Option<tauri::AppHandle>,
+        at_playing: &Arc<AtomicBool>,
+        sink_flow_states: &[SinkFlowState],
+    ) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+        let at_eos = Arc::new(AtomicBool::new(false));
+        let at_eos_thread = at_eos.clone();
+        let at_error = Arc::new(AtomicBool::new(false));
+        let at_error_thread = at_error.clone();
+        // Logs the first received spectrum message so we can confirm the signal path.
+        let fft_logged = Arc::new(AtomicBool::new(false));
+        let fft_logged_thread = fft_logged.clone();
+        let at_playing_thread = at_playing.clone();
+        let sink_flow_thread = sink_flow_states.to_vec();
+        let bus_thread = bus.clone();
+        let deck_id_log = deck_id.to_string();
+        let app_handle = app;
+        let pipeline_eos = pipeline.clone();
+
+        std::thread::spawn(move || {
+            for msg in bus_thread.iter_timed(None) {
+                match msg.view() {
+                    gst::MessageView::Eos(_) => {
+                        log::info!("[bus/{}] EOS", deck_id_log);
+                        at_eos_thread.store(true, Ordering::Relaxed);
+                        // Pause the pipeline ourselves right here instead of relying on the
+                        // frontend to react to the eos_callback below and call audio_pause().
+                        // GStreamer does NOT stop a pipeline's clock on EOS — PLAYING state
+                        // keeps running with nothing left to render, so query_position keeps
+                        // climbing indefinitely at wall-clock speed forever if nothing pauses
+                        // it. Previously this depended entirely on the frontend's 'deck-eos'
+                        // Tauri-event handler calling audio_pause() — live-tested (2026-07-25)
+                        // and found that round trip does not reliably land in time (or at all)
+                        // in every scenario, leaving audio playing forever with a waveform
+                        // position that never stops growing (silently unbounded past the
+                        // track's real duration). Pausing directly here makes the pipeline
+                        // self-correct regardless of frontend timing/behavior.
+                        if let Err(e) = pipeline_eos.set_state(gst::State::Paused) {
+                            log::warn!("[bus/{}] EOS: failed to pause pipeline: {}", deck_id_log, e);
+                        }
+                        if let Some(cb) = &eos_cb { cb(); }
+                    }
+                    gst::MessageView::Error(e) => {
+                        log::error!("[bus/{}] ERROR: {} (debug: {:?})", deck_id_log, e.error(), e.debug());
+                        at_error_thread.store(true, Ordering::Relaxed);
+                    }
+                    gst::MessageView::Warning(w) => {
+                        log::warn!("[bus/{}] WARNING: {} (debug: {:?})", deck_id_log, w.error(), w.debug());
+                    }
+                    gst::MessageView::AsyncDone(_) => {
+                        let pos_ms = msg.src()
+                            .and_then(|e| e.downcast_ref::<gst::Pipeline>())
+                            .and_then(|p| p.query_position::<gst::ClockTime>())
+                            .map(|t| t.mseconds())
+                            .unwrap_or(0);
+                        log::info!("[bus/{}] async-done  pos={}ms", deck_id_log, pos_ms);
+                    }
+                    gst::MessageView::StateChanged(s) => {
+                        let src = msg.src().map(|e| e.name().to_string()).unwrap_or_default();
+                        if src.starts_with("pipeline") {
+                            log::info!("[bus/{}] pipeline: {:?} → {:?} (pending {:?})",
+                                deck_id_log, s.old(), s.current(), s.pending());
+                            // Gates the output_queue underrun/overrun diagnostics so they
+                            // don't fire on the legitimately-empty queue during preroll or
+                            // after EOS — see instrument_queue_flow().
+                            let now_playing = s.current() == gst::State::Playing;
+                            at_playing_thread.store(now_playing, Ordering::Relaxed);
+                            if !now_playing {
+                                // Invalidate every sink's last-buffer time so the span
+                                // across this pause/preroll/EOS can never be reported as a
+                                // dropout. Doing it here as well as in the probe closes the
+                                // race where the resume's first buffer beats this message's
+                                // sibling on the way back to Playing — see
+                                // instrument_sink_flow(). Safe from this thread: the probe
+                                // holds no other lock under this one.
+                                for st in &sink_flow_thread {
+                                    st.lock().unwrap().last = None;
+                                }
+                            }
+                        }
+                    }
+                    gst::MessageView::Element(_) => {
+                        let Some(structure) = msg.structure() else { continue };
+                        if structure.name() != "spectrum" { continue; }
+                        let Some(ref app) = app_handle else { continue };
+
+                        // magnitude is a GstValueList (gst::List) of gfloat values in dBFS.
+                        // Note: GstValueList != GstValueArray — gst::Array would silently fail here.
+                        let Ok(magnitude) = structure.get::<gst::List>("magnitude") else {
+                            log::warn!("[bus/{}] spectrum: no magnitude field; structure={}", deck_id_log, structure);
+                            continue
+                        };
+                        let bands: Vec<f32> = magnitude
+                            .as_slice()
+                            .iter()
+                            .filter_map(|v| v.get::<f32>().ok())
+                            .collect();
+
+                        let n = bands.len();
+                        if n < 4 { continue; }
+
+                        // Map dBFS (-80..0) to linear 0..1
+                        let to_linear = |db: f32| ((db + 80.0) / 80.0).clamp(0.0, 1.0);
+                        // With 32 bands at 48 kHz, each band ≈ 750 Hz.
+                        // Bass 0–1500 Hz: bands 0–1; Mid 1500–7500 Hz: bands 2–9; High: rest.
+                        let bass_end = (n * 2 / 32).max(1);
+                        let mid_end = (n * 10 / 32).max(bass_end + 1);
+                        let avg = |slice: &[f32]| -> f32 {
+                            if slice.is_empty() { return 0.0; }
+                            slice.iter().copied().map(to_linear).sum::<f32>() / slice.len() as f32
+                        };
+
+                        let bass  = avg(&bands[..bass_end]);
+                        let mid   = avg(&bands[bass_end..mid_end]);
+                        let high  = avg(&bands[mid_end..]);
+
+                        if !fft_logged_thread.swap(true, Ordering::Relaxed) {
+                            log::info!(
+                                "[bus/{}] first audio-fft: {} bands  bass={:.3} mid={:.3} high={:.3}",
+                                deck_id_log, n, bass, mid, high
+                            );
+                        }
+
+                        let _ = app.emit("audio-fft", analysis::AudioFftEvent {
+                            deck_id: deck_id_log.clone(),
+                            bass,
+                            mid,
+                            high,
+                            bands: bands.iter().copied().map(to_linear).collect(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            log::info!("[bus/{}] monitor thread exiting", deck_id_log);
+        });
+
+        (at_eos, at_error)
+    }
+
+    /// Hand every appsink branch to the shared output graph and adopt the graph's clock.
+    ///
+    /// No-op (and all-empty) on the legacy path, where `pending_handoffs` is empty.
+    fn attach_output_graph(
+        &self,
+        pipeline: &gst::Pipeline,
+        pending_handoffs: &[(gst::Element, String, String)],
+    ) -> Result<OutputAttachment, String> {
+        // ── Shared output graph: attach every branch, then adopt its clock ────────
+        // Both steps must happen before the first state change. Attaching later would let
+        // the appsink's callback fire with no appsrc to push into; adopting the clock later
+        // would let the pipeline preroll against the system clock and then have it swapped
+        // underneath, which GStreamer handles by re-basing — but only after the drift has
+        // already been baked into the first buffers.
+        let mut output_branches: Vec<BranchKey> = Vec::new();
+        let mut handoffs: Vec<(String, Arc<HandoffCounters>)> = Vec::new();
+        let mut output_latency_ns: u64 = 0;
+        if !pending_handoffs.is_empty() {
+            let graph = self.output_graph.clone().expect("shared_output implies a graph");
+            let mut g = graph.lock().unwrap();
+            for (idx, (el, device, branch)) in pending_handoffs.iter().enumerate() {
+                let key: BranchKey = (self.deck_id.clone(), branch.clone());
+                let label = format!("{}/{}", self.deck_id, branch);
+                match g.attach(device, key.clone(), &label) {
+                    Ok(appsrc) => {
+                        let appsink = el
+                            .downcast_ref::<AppSink>()
+                            .ok_or_else(|| format!("[{}] appsink downcast failed", label))?;
+                        handoffs.push((branch.clone(), wire_handoff(appsink, appsrc, label)));
+                        output_branches.push(key);
+                        // The main branch's node decides the position correction. Branch 0 is
+                        // always a main branch (the cue entry is pushed last), and cue is a
+                        // monitoring output whose latency nothing reads.
+                        if idx == 0 {
+                            output_latency_ns = g.latency_ns(device);
+                        }
+                    }
+                    Err(e) => {
+                        // Same asymmetry as the legacy path, for the same reason: a cue
+                        // branch that cannot be routed goes quiet, a main branch must not.
+                        // Here an unattached appsink simply swallows buffers — the tee keeps
+                        // flowing, nothing blocks, and that branch is silent.
+                        if branch == "cue" {
+                            log::error!(
+                                "[audio/{label}] could not attach cue to the shared output \
+                                 graph ({e}) — cue is silent. Re-select the cue device."
+                            );
+                        } else {
+                            log::error!(
+                                "[audio/{label}] could not attach main output to the shared \
+                                 output graph ({e}) — THIS OUTPUT IS SILENT. Re-select the \
+                                 device in Settings, or unset CUEMARK_SHARED_OUTPUT to fall \
+                                 back to the legacy per-branch sinks."
+                            );
+                        }
+                    }
+                }
+            }
+            match g.shared_clock() {
+                Some(clock) => {
+                    // Without this the deck runs on GstSystemClock while the device consumes
+                    // at its own rate, and the handoff slowly over- or underflows forever.
+                    // See OutputGraph::shared_clock.
+                    pipeline.use_clock(Some(&clock));
+                    log::info!(
+                        "[audio/{}] using shared output clock {} (output latency {:.0}ms \
+                         subtracted from reported position)",
+                        self.deck_id, clock.name(), output_latency_ns as f64 / 1e6
+                    );
+                }
+                None => log::warn!(
+                    "[audio/{}] shared output graph provided no clock — this deck will drift \
+                     against the device. See OutputGraph::shared_clock.",
+                    self.deck_id
+                ),
+            }
+        }
+        Ok(OutputAttachment { branches: output_branches, handoffs, latency_ns: output_latency_ns })
+    }
+
     pub fn load(&mut self, file_path: &str) -> Result<Option<f64>, String> {
         // Skip the (potentially slow, full-file) PCM re-decode when reloading the same
         // file — set_devices()/set_cue_device() call load() again on every device switch.
@@ -1752,19 +2212,8 @@ impl DeckAudioPipeline {
         let at_playing = Arc::new(AtomicBool::new(false));
         let mut sink_flow_states: Vec<SinkFlowState> = Vec::new();
 
-        // One (volume, sink) pair per main output device. Empty devices list = single default.
-        let main_devs: Vec<String> = if self.devices.is_empty() {
-            vec![String::new()]
-        } else {
-            self.devices.clone()
-        };
-        let mut volume_els: Vec<gst::Element> = Vec::with_capacity(main_devs.len());
-        let mut main_sinks: Vec<gst::Element> = Vec::with_capacity(main_devs.len());
-        // Per-device channel remap, parallel to volume_els/main_sinks. `None` = route the
-        // plain stereo stream straight at the node (a genuinely stereo device, or a device id
-        // whose suffix failed to parse — see below).
-        let mut main_channel_remaps: Vec<Option<(gst::Element, gst::Element)>> =
-            Vec::with_capacity(main_devs.len());
+        // Filled by build_main_branches()/build_cue_branch() below, then consumed by the
+        // add/link section and handed to the per-second delivery reporter at the end.
         let mut delivery_probes: Vec<Arc<DeliveryProbe>> = Vec::new();
         // With the shared output graph in use, every branch here terminates in an appsink;
         // the channel matrix and the one real `pulsesink` live in the per-node output
@@ -1784,70 +2233,14 @@ impl DeckAudioPipeline {
         // mixer pad pointing at a half-constructed branch.
         let mut pending_handoffs: Vec<(gst::Element, String, String)> = Vec::new();
 
-        for (i, dev) in main_devs.iter().enumerate() {
-            let vol = make_el("volume")?;
-            let snk = if shared_output {
-                let el = make_appsink(&format!("{}/{}", self.deck_id, i))?;
-                pending_handoffs.push((el.clone(), dev.clone(), format!("main{i}")));
-                el
-            } else {
-                make_sink(dev, &format!("{}/{}", self.deck_id, i))?
-            };
-            // Main branches carry the same N-channel mix-matrix the cue branch has, as of
-            // 2026-08-11. Before that `make_sink()` stripped the `@pair!layout` suffix and
-            // nothing else looked at it, so picking "— Rear" as a *main* device silently did
-            // nothing, and main and cue presented **different channel layouts** on one node.
-            // See compute_channel_remap's doc comment and slow-jog-audio-inaudible.md §10.10.
-            //
-            // Unlike the cue branch, a parse failure here does NOT fall back to fakesink:
-            // silently muting the master output mid-set is worse than a routing error, and a
-            // plain stereo sink is exactly what this branch did unconditionally before, so it
-            // is not a new risk. It is logged at error level because it is not recoverable
-            // without re-selecting the device.
-            let main_remap = match parse_device_remap(dev) {
-                Ok(r) => r,
-                Err(e) => {
-                    log::error!(
-                        "[audio/{}/{}] main device id {:?} failed to parse ({e}) — falling back \
-                         to a plain stereo sink on the bare node, so this output may land on the \
-                         wrong channel pair. Re-select the device in Settings to clear the \
-                         stale/corrupted id.",
-                        self.deck_id, i, dev
-                    );
-                    None
-                }
-            };
-            // On the shared path the matrix belongs to the output graph — one per branch,
-            // summed by the node's `audiomixer`. Building it here as well would map stereo
-            // into N channels twice and the second matrix would find only its own first pair
-            // populated, silencing every branch that does not target the front pair.
-            let main_remap = match (&main_remap, shared_output) {
-                (_, true) => None,
-                (Some(r), false) => Some(make_remap_chain(r, &format!("main{i}"), &self.deck_id)?),
-                (None, false) => None,
-            };
-            // Only the primary sink (i=0) participates in preroll — it controls the
-            // pipeline's READY→PAUSED state transition. Secondary sinks use async=false
-            // so they don't block preroll; they join at PLAYING time using the primary's clock.
-            if i > 0 {
-                snk.set_property("async", false);
-            }
-            sink_flow_states.extend(instrument_sink_flow(
-                &snk,
-                &self.deck_id,
-                &format!("main sink {i}"),
-                vec![at_playing.clone()],
-            ));
-            // Bracket the last stage: what leaves `volume` against what the sink accepts.
-            // Both, not just the sink — a count that matches at `volume` and not at the
-            // sink narrows the fault to one link, and a count that advances at both while
-            // the room is silent moves the whole question past delivery. See DeliveryProbe.
-            delivery_probes.extend(instrument_delivery(&vol, "src", &format!("vol{i}")));
-            delivery_probes.extend(instrument_delivery(&snk, "sink", &format!("sink{i}")));
-            volume_els.push(vol);
-            main_sinks.push(snk);
-            main_channel_remaps.push(main_remap);
-        }
+        let MainBranches { volume_els, sinks: main_sinks, channel_remaps: main_channel_remaps } =
+            self.build_main_branches(
+                shared_output,
+                &at_playing,
+                &mut sink_flow_states,
+                &mut delivery_probes,
+                &mut pending_handoffs,
+            )?;
 
         // ── Cue branch ────────────────────────────────────────────────────────────
         // tee splits post-pitch audio into main and cue branches.
@@ -1858,99 +2251,15 @@ impl DeckAudioPipeline {
         let cue_volume = make_el("volume")?;
         // Small queue so pipewiresink's pull callback always finds data when cue is active.
         let cue_queue  = make_el("queue")?;
-        // Decide the cue routing *before* building any sink: a device id that requests
-        // a non-default channel pair but fails to parse must never fall through to a
-        // plain sink targeting the shared node (see compute_channel_remap's doc comment —
-        // that exact failure mode deadlocked PipeWire system-wide on 2026-08-02).
-        //
-        // Device ID format: `node@target!full_layout` e.g. `alsa_out...@RL,RR!FL,FR,RL,RR`
-        let cue_remap_outcome: Result<Option<ChannelRemap>, String> =
-            parse_device_remap(&self.cue_device);
-
-        // Use a real sink only when a device is configured and (for multi-channel
-        // targets) its channel remap parsed cleanly; fakesink otherwise so the
-        // pipeline loads cleanly and never risks two sinks colliding on one node.
-        let (cue_sink, cue_channel_remap): (gst::Element, Option<(gst::Element, gst::Element)>) =
-            match &cue_remap_outcome {
-                _ if self.cue_device.is_empty() => {
-                    log::warn!("[audio/{}-cue] no device set — cue output routed to fakesink", self.deck_id);
-                    let fs = make_el("fakesink")?;
-                    fs.set_property("sync", false);
-                    (fs, None)
-                }
-                Err(e) => {
-                    log::error!(
-                        "[audio/{}-cue] cue device id {:?} failed to parse ({e}) — routing to \
-                         fakesink instead of risking a same-channel collision with another sink \
-                         on the shared node (see compute_channel_remap's doc comment). Re-select \
-                         the cue device in Settings to clear the stale/corrupted id.",
-                        self.deck_id, self.cue_device
-                    );
-                    let fs = make_el("fakesink")?;
-                    fs.set_property("sync", false);
-                    (fs, None)
-                }
-                Ok(_) if shared_output => {
-                    let el = make_appsink(&format!("{}-cue", self.deck_id))?;
-                    pending_handoffs.push((
-                        el.clone(),
-                        self.cue_device.clone(),
-                        "cue".to_string(),
-                    ));
-                    // Matrix lives in the output graph on this path — see the main branch.
-                    (el, None)
-                }
-                Ok(remap) => {
-                    let sink = make_sink(&self.cue_device, &format!("{}-cue", self.deck_id))?;
-                    let channel_remap = match remap {
-                        Some(r) => Some(make_remap_chain(r, "cue", &self.deck_id)?),
-                        None => None,
-                    };
-                    (sink, channel_remap)
-                }
-            };
-        // The cue branch is a monitoring output. async=false means it never participates in
-        // pipeline preroll, so the valve dropping all buffers (cue off) doesn't block the
-        // pipeline from completing PAUSED — only the main sink controls preroll timing.
-        cue_sink.set_property("async", false);
-
-        // ── Cue-branch instrumentation ────────────────────────────────────────────
-        // Added 2026-08-08 for docs/design/audio-dropout-mid-playback.md H1, which blames
-        // contention between the main and cue `pulsesink`s on one USB node — and which
-        // until now was the *only* branch in this pipeline carrying no probes at all. A
-        // live occurrence therefore produced a log that could not speak to the hypothesis
-        // it was supposed to test.
-        //
-        // Only instrumented when the cue sink is real. On the fakesink fallback the pad
-        // still sees buffers, but `sync=false` means its clock margin is meaningless and
-        // its delivery count measures nothing about any device — a reading that looks
-        // like evidence and is not.
-        let cue_is_real = !self.cue_device.is_empty() && cue_remap_outcome.is_ok();
-        // Second gate for the cue sink's flow probe: `cue_valve` drops every buffer while
-        // cue is off, so without this each cue-off span forges a dropout. Seeded from the
-        // deck's retained intent because a device rebuild re-enters load() mid-set with
-        // cue already open. See instrument_sink_flow()'s doc comment.
-        let cue_open = Arc::new(AtomicBool::new(self.cue_enabled));
-        let cue_sink_flow: Option<SinkFlowState> = if cue_is_real {
-            let st = instrument_sink_flow(
-                &cue_sink,
-                &self.deck_id,
-                "cue sink",
-                vec![at_playing.clone(), cue_open.clone()],
-            );
-            // Also registered with the bus thread, so a transition out of Playing
-            // invalidates it alongside the main sinks.
-            sink_flow_states.extend(st.clone());
-            // Bracket the cue branch's last stage the same way the main branch is
-            // bracketed: `cue_volume`'s src against the sink's own pad. A count that
-            // advances at `cuevol` and not at `cuesink` isolates the fault to that link;
-            // both advancing while the headphones are silent moves it past delivery.
-            delivery_probes.extend(instrument_delivery(&cue_volume, "src", "cuevol"));
-            delivery_probes.extend(instrument_delivery(&cue_sink, "sink", "cuesink"));
-            st
-        } else {
-            None
-        };
+        let CueBranch { sink: cue_sink, channel_remap: cue_channel_remap, open: cue_open, flow: cue_sink_flow } =
+            self.build_cue_branch(
+                shared_output,
+                &cue_volume,
+                &at_playing,
+                &mut sink_flow_states,
+                &mut delivery_probes,
+                &mut pending_handoffs,
+            )?;
 
         // ⚠️ **Fully specified on purpose, and it must stay that way.** This filter sits on
         // *both* of input_selector's inputs — `rate_caps` on the normal branch and
@@ -2182,208 +2491,18 @@ impl DeckAudioPipeline {
 
         let bus = pipeline.bus().ok_or_else(|| format!("[{}] no bus", self.deck_id))?;
 
-        let at_eos = Arc::new(AtomicBool::new(false));
-        let at_eos_thread = at_eos.clone();
-        let at_error = Arc::new(AtomicBool::new(false));
-        let at_error_thread = at_error.clone();
-        // Logs the first received spectrum message so we can confirm the signal path.
-        let fft_logged = Arc::new(AtomicBool::new(false));
-        let fft_logged_thread = fft_logged.clone();
-        let at_playing_thread = at_playing.clone();
-        let sink_flow_thread = sink_flow_states.clone();
-        let bus_thread = bus.clone();
-        let deck_id_log = self.deck_id.clone();
-        let eos_cb = self.eos_callback.clone();
-        let app_handle = self.app.clone();
-        let pipeline_eos = pipeline.clone();
+        let (at_eos, at_error) = Self::spawn_bus_watch(
+            &bus,
+            &pipeline,
+            &self.deck_id,
+            self.eos_callback.clone(),
+            self.app.clone(),
+            &at_playing,
+            &sink_flow_states,
+        );
 
-        std::thread::spawn(move || {
-            for msg in bus_thread.iter_timed(None) {
-                match msg.view() {
-                    gst::MessageView::Eos(_) => {
-                        log::info!("[bus/{}] EOS", deck_id_log);
-                        at_eos_thread.store(true, Ordering::Relaxed);
-                        // Pause the pipeline ourselves right here instead of relying on the
-                        // frontend to react to the eos_callback below and call audio_pause().
-                        // GStreamer does NOT stop a pipeline's clock on EOS — PLAYING state
-                        // keeps running with nothing left to render, so query_position keeps
-                        // climbing indefinitely at wall-clock speed forever if nothing pauses
-                        // it. Previously this depended entirely on the frontend's 'deck-eos'
-                        // Tauri-event handler calling audio_pause() — live-tested (2026-07-25)
-                        // and found that round trip does not reliably land in time (or at all)
-                        // in every scenario, leaving audio playing forever with a waveform
-                        // position that never stops growing (silently unbounded past the
-                        // track's real duration). Pausing directly here makes the pipeline
-                        // self-correct regardless of frontend timing/behavior.
-                        if let Err(e) = pipeline_eos.set_state(gst::State::Paused) {
-                            log::warn!("[bus/{}] EOS: failed to pause pipeline: {}", deck_id_log, e);
-                        }
-                        if let Some(cb) = &eos_cb { cb(); }
-                    }
-                    gst::MessageView::Error(e) => {
-                        log::error!("[bus/{}] ERROR: {} (debug: {:?})", deck_id_log, e.error(), e.debug());
-                        at_error_thread.store(true, Ordering::Relaxed);
-                    }
-                    gst::MessageView::Warning(w) => {
-                        log::warn!("[bus/{}] WARNING: {} (debug: {:?})", deck_id_log, w.error(), w.debug());
-                    }
-                    gst::MessageView::AsyncDone(_) => {
-                        let pos_ms = msg.src()
-                            .and_then(|e| e.downcast_ref::<gst::Pipeline>())
-                            .and_then(|p| p.query_position::<gst::ClockTime>())
-                            .map(|t| t.mseconds())
-                            .unwrap_or(0);
-                        log::info!("[bus/{}] async-done  pos={}ms", deck_id_log, pos_ms);
-                    }
-                    gst::MessageView::StateChanged(s) => {
-                        let src = msg.src().map(|e| e.name().to_string()).unwrap_or_default();
-                        if src.starts_with("pipeline") {
-                            log::info!("[bus/{}] pipeline: {:?} → {:?} (pending {:?})",
-                                deck_id_log, s.old(), s.current(), s.pending());
-                            // Gates the output_queue underrun/overrun diagnostics so they
-                            // don't fire on the legitimately-empty queue during preroll or
-                            // after EOS — see instrument_queue_flow().
-                            let now_playing = s.current() == gst::State::Playing;
-                            at_playing_thread.store(now_playing, Ordering::Relaxed);
-                            if !now_playing {
-                                // Invalidate every sink's last-buffer time so the span
-                                // across this pause/preroll/EOS can never be reported as a
-                                // dropout. Doing it here as well as in the probe closes the
-                                // race where the resume's first buffer beats this message's
-                                // sibling on the way back to Playing — see
-                                // instrument_sink_flow(). Safe from this thread: the probe
-                                // holds no other lock under this one.
-                                for st in &sink_flow_thread {
-                                    st.lock().unwrap().last = None;
-                                }
-                            }
-                        }
-                    }
-                    gst::MessageView::Element(_) => {
-                        let Some(structure) = msg.structure() else { continue };
-                        if structure.name() != "spectrum" { continue; }
-                        let Some(ref app) = app_handle else { continue };
-
-                        // magnitude is a GstValueList (gst::List) of gfloat values in dBFS.
-                        // Note: GstValueList != GstValueArray — gst::Array would silently fail here.
-                        let Ok(magnitude) = structure.get::<gst::List>("magnitude") else {
-                            log::warn!("[bus/{}] spectrum: no magnitude field; structure={}", deck_id_log, structure);
-                            continue
-                        };
-                        let bands: Vec<f32> = magnitude
-                            .as_slice()
-                            .iter()
-                            .filter_map(|v| v.get::<f32>().ok())
-                            .collect();
-
-                        let n = bands.len();
-                        if n < 4 { continue; }
-
-                        // Map dBFS (-80..0) to linear 0..1
-                        let to_linear = |db: f32| ((db + 80.0) / 80.0).clamp(0.0, 1.0);
-                        // With 32 bands at 48 kHz, each band ≈ 750 Hz.
-                        // Bass 0–1500 Hz: bands 0–1; Mid 1500–7500 Hz: bands 2–9; High: rest.
-                        let bass_end = (n * 2 / 32).max(1);
-                        let mid_end = (n * 10 / 32).max(bass_end + 1);
-                        let avg = |slice: &[f32]| -> f32 {
-                            if slice.is_empty() { return 0.0; }
-                            slice.iter().copied().map(to_linear).sum::<f32>() / slice.len() as f32
-                        };
-
-                        let bass  = avg(&bands[..bass_end]);
-                        let mid   = avg(&bands[bass_end..mid_end]);
-                        let high  = avg(&bands[mid_end..]);
-
-                        if !fft_logged_thread.swap(true, Ordering::Relaxed) {
-                            log::info!(
-                                "[bus/{}] first audio-fft: {} bands  bass={:.3} mid={:.3} high={:.3}",
-                                deck_id_log, n, bass, mid, high
-                            );
-                        }
-
-                        let _ = app.emit("audio-fft", analysis::AudioFftEvent {
-                            deck_id: deck_id_log.clone(),
-                            bass,
-                            mid,
-                            high,
-                            bands: bands.iter().copied().map(to_linear).collect(),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            log::info!("[bus/{}] monitor thread exiting", deck_id_log);
-        });
-
-        // ── Shared output graph: attach every branch, then adopt its clock ────────
-        // Both steps must happen before the first state change. Attaching later would let
-        // the appsink's callback fire with no appsrc to push into; adopting the clock later
-        // would let the pipeline preroll against the system clock and then have it swapped
-        // underneath, which GStreamer handles by re-basing — but only after the drift has
-        // already been baked into the first buffers.
-        let mut output_branches: Vec<BranchKey> = Vec::new();
-        let mut handoffs: Vec<(String, Arc<HandoffCounters>)> = Vec::new();
-        let mut output_latency_ns: u64 = 0;
-        if !pending_handoffs.is_empty() {
-            let graph = self.output_graph.clone().expect("shared_output implies a graph");
-            let mut g = graph.lock().unwrap();
-            for (idx, (el, device, branch)) in pending_handoffs.iter().enumerate() {
-                let key: BranchKey = (self.deck_id.clone(), branch.clone());
-                let label = format!("{}/{}", self.deck_id, branch);
-                match g.attach(device, key.clone(), &label) {
-                    Ok(appsrc) => {
-                        let appsink = el
-                            .downcast_ref::<AppSink>()
-                            .ok_or_else(|| format!("[{}] appsink downcast failed", label))?;
-                        handoffs.push((branch.clone(), wire_handoff(appsink, appsrc, label)));
-                        output_branches.push(key);
-                        // The main branch's node decides the position correction. Branch 0 is
-                        // always a main branch (the cue entry is pushed last), and cue is a
-                        // monitoring output whose latency nothing reads.
-                        if idx == 0 {
-                            output_latency_ns = g.latency_ns(device);
-                        }
-                    }
-                    Err(e) => {
-                        // Same asymmetry as the legacy path, for the same reason: a cue
-                        // branch that cannot be routed goes quiet, a main branch must not.
-                        // Here an unattached appsink simply swallows buffers — the tee keeps
-                        // flowing, nothing blocks, and that branch is silent.
-                        if branch == "cue" {
-                            log::error!(
-                                "[audio/{label}] could not attach cue to the shared output \
-                                 graph ({e}) — cue is silent. Re-select the cue device."
-                            );
-                        } else {
-                            log::error!(
-                                "[audio/{label}] could not attach main output to the shared \
-                                 output graph ({e}) — THIS OUTPUT IS SILENT. Re-select the \
-                                 device in Settings, or unset CUEMARK_SHARED_OUTPUT to fall \
-                                 back to the legacy per-branch sinks."
-                            );
-                        }
-                    }
-                }
-            }
-            match g.shared_clock() {
-                Some(clock) => {
-                    // Without this the deck runs on GstSystemClock while the device consumes
-                    // at its own rate, and the handoff slowly over- or underflows forever.
-                    // See OutputGraph::shared_clock.
-                    pipeline.use_clock(Some(&clock));
-                    log::info!(
-                        "[audio/{}] using shared output clock {} (output latency {:.0}ms \
-                         subtracted from reported position)",
-                        self.deck_id, clock.name(), output_latency_ns as f64 / 1e6
-                    );
-                }
-                None => log::warn!(
-                    "[audio/{}] shared output graph provided no clock — this deck will drift \
-                     against the device. See OutputGraph::shared_clock.",
-                    self.deck_id
-                ),
-            }
-        }
+        let OutputAttachment { branches: output_branches, handoffs, latency_ns: output_latency_ns } =
+            self.attach_output_graph(&pipeline, &pending_handoffs)?;
 
         pipeline
             .set_state(gst::State::Paused)
