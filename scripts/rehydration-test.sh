@@ -134,7 +134,7 @@ echo "=== Step 3: capture pre-reload state ==="
 PRE_BPM=$(js_sync "const d = window.__cuemarkDebug.getSession().decks.find(d=>d.id==='deck-0'); return d?.bpm ?? 'null'")
 PRE_DOWNBEAT=$(js_sync "const d = window.__cuemarkDebug.getSession().decks.find(d=>d.id==='deck-0'); return d?.downbeat ?? 'null'")
 PRE_PLAYING=$(js_sync "const d = window.__cuemarkDebug.getSession().decks.find(d=>d.id==='deck-0'); return d?.playing")
-PRE_AUDIO_POS=$(js_sync "return window.__TAURI__.core.invoke('audio_get_position', {deckId:'deck-0'})")
+PRE_AUDIO_POS=$(js_sync "return window.__TAURI__.core.invoke('audio_get_position', {deckId:'deck-0'}).then(p=>p.pos ?? 0)")
 PRE_VIDEO_T=$(js_sync "return window.__cuemarkDebug.getVideoTime('deck-0') ?? 0")
 PRE_WALLCLOCK=$(date +%s.%N)
 echo "  bpm=$PRE_BPM downbeat=$PRE_DOWNBEAT playing=$PRE_PLAYING audioPos=$PRE_AUDIO_POS videoT=$PRE_VIDEO_T"
@@ -198,7 +198,7 @@ check_eq "deck-0 still playing" "$POST_PLAYING" "true"
 
 echo
 echo "=== Step 8: verify audio position is continuous (not reset, not glitched) ==="
-POST_AUDIO_POS=$(js_sync "return window.__TAURI__.core.invoke('audio_get_position', {deckId:'deck-0'})")
+POST_AUDIO_POS=$(js_sync "return window.__TAURI__.core.invoke('audio_get_position', {deckId:'deck-0'}).then(p=>p.pos ?? 0)")
 ELAPSED=$(awk "BEGIN{printf \"%.2f\", $POST_WALLCLOCK - $PRE_WALLCLOCK}")
 EXPECTED_POS=$(awk "BEGIN{printf \"%.2f\", $PRE_AUDIO_POS + $ELAPSED}")
 echo "  preAudioPos=$PRE_AUDIO_POS postAudioPos=$POST_AUDIO_POS elapsedWallclock=${ELAPSED}s expected~=${EXPECTED_POS}"

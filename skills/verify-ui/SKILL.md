@@ -636,6 +636,17 @@ post-reload state:
   to construct the body — `jq --arg` always produces valid JSON regardless of quotes or
   backslashes in the value. This applies to any shell WebDriver helper that takes a script
   string as a variable.
+- **`audio_get_position` returns a `PositionSample` struct (`{pos, entryMs, lockMs,
+  queryMs, exitMs}`), not a plain number** — a `js_sync` call that does
+  `return window.__TAURI__.core.invoke('audio_get_position', {deckId})` hands shell
+  arithmetic (`awk`/`bc`) the whole JSON blob, which fails as `awk: syntax error at or
+  near {`. `rehydration-test.sh` had this bug for weeks (introduced when the position
+  command grew mutex-contention/query-time telemetry fields, `[[project_ipc_latency_baseline]]`)
+  because nothing exercised that code path — found and fixed 2026-08-13. Extract the
+  field explicitly: `return window.__TAURI__.core.invoke('audio_get_position',
+  {deckId}).then(p=>p.pos ?? 0)`. Any new script reading position via raw `invoke` (not
+  `__cuemarkDebug.getAudioTime`/`getVideoTime`, which already return plain numbers) needs
+  this `.then(p=>p.pos)` unwrap.
 - **`/execute/async` Promise chains must include `.catch()`** — if the Promise rejects
   (e.g. `audio_set_rate` fails because no pipeline exists) and the `.then()` handler never
   calls `arguments[0](result)`, WebDriver waits until its script timeout (30 s default)
