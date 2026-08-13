@@ -1657,3 +1657,15 @@ Consequences worth knowing if you touch the feeder loop:
   like. Guarded by `scratch_to_smoke`.
 
 Full rationale and the frontend side: `docs/design/waveform-scrub.md`.
+
+## Play pressed inside the gesture's idle window — 2026-08-13
+
+Two teardown defects, found by log forensics and fixed the same day: `stop_scratch()` paused
+unconditionally over the top of a `play()` that had landed mid-gesture, and
+`query_position()` stays inflated after every resync seek (by the pipeline's accumulated
+stream time) until the next Paused→Playing. Together they presented as "video plays back at
+a very fast rate with no audio after a scratch, fixed by pause/play".
+
+`docs/design/scratch-play-race.md` has the evidence, the arithmetic and the reproduction
+steps. Read it before touching `stop_scratch`, `position()`'s `last_scratch_frame` branch, or
+adding any new play/pause affordance to the UI.

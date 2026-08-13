@@ -3064,13 +3064,34 @@ impl DeckAudioPipeline {
         Ok(())
     }
 
-    /// Stops scratch playback and returns to Paused. Resyncs the normal branch to
-    /// wherever the scratch cursor landed (see stop_scratch_feeder) — the normal
-    /// (uridecodebin) branch never advances during scratch, so its own position is
-    /// stale until this runs.
+    /// Stops scratch playback and returns to Paused — or to Playing, if a `play()` landed
+    /// during the gesture. Resyncs the normal branch to wherever the scratch cursor landed
+    /// (see stop_scratch_feeder) — the normal (uridecodebin) branch never advances during
+    /// scratch, so its own position is stale until this runs.
+    ///
+    /// ⚠️ **The `resume` branch is not optional bookkeeping — it fixes a silent transport
+    /// loss.** A `play()` arriving mid-gesture (the user pressing play before the
+    /// frontend's `SCRATCH_IDLE_MS` timer has fired — 165ms before it, in the
+    /// 2026-08-13 20:45 log event) can set `self.playing` but cannot act on the pipeline:
+    /// scratch already has it in PLAYING, so `set_state(Playing)` is a no-op, and `play()`
+    /// deliberately does not tear the feeder down. Pausing unconditionally here then
+    /// discarded that intent with nothing logged — the deck sat PAUSED while the frontend
+    /// went on believing it was playing, and only a manual pause/play recovered it.
+    ///
+    /// The pause→play *cycle* is deliberate, rather than simply skipping the pause: it is
+    /// also what resets the pipeline's `base_time`, which is what stops `query_position()`
+    /// reporting the inflated value the resync seek leaves behind (see `position()`).
+    /// Leaving the pipeline in PLAYING would fix the transport and keep the bad clock —
+    /// the worse of the two failures, since a playing deck is polled every frame.
     pub fn stop_scratch(&mut self) -> Result<(), String> {
+        let resume = self.playing;
         self.stop_scratch_feeder();
-        self.pause()
+        self.pause()?;
+        if resume {
+            log::info!("[scratch/{}] play landed during the gesture — resuming playback", self.deck_id);
+            self.play()?;
+        }
+        Ok(())
     }
 
     /// Joins the feeder thread (if any) and switches the topology back to the normal
@@ -3234,6 +3255,35 @@ impl DeckAudioPipeline {
             if let Some(pcm) = &self.pcm_buffer {
                 let frame = f64::from_bits(feeder.cursor_frames_bits.load(Ordering::Relaxed));
                 return Some((frame / pcm.rate as f64).max(0.0));
+            }
+        }
+
+        // ⚠️ The gesture is over, but `query_position()` is not yet trustworthy: after the
+        // resync seek it reports the seek target *plus* the stream time the pipeline had
+        // already accumulated, and it stays that way until the pipeline next goes
+        // Paused→Playing (which resets base_time). Measured 2026-08-13 20:45:11.874:
+        // `async-done pos=130006ms` against a true content position of 61.355s — exactly
+        // 61.355 + 43.671 (pipeline position before the gesture) + 24.976 (the gesture's
+        // own playing time). A second instance on 2026-08-11 21:32:05 reads 6040ms against
+        // 3.425s. Both were live-visible as the deck's position jumping tens of seconds
+        // ahead the moment the frontend read it.
+        //
+        // Normally nothing reads it — a deck is paused after a gesture and the frontend
+        // only polls a playing deck — so this stayed latent. It is not harmless: a
+        // device-switch pipeline rebuild restores from `position()`, and `audio_status`
+        // feeds the freeze-watchdog's session-of-record. Answer from the cursor we
+        // ourselves wrote instead; it is the same value the resync seek targeted, and the
+        // same reason `begin_or_update_scratch()` prefers it over asking GStreamer.
+        // `play()`, `seek_output_domain()` and `load()` all clear it, so normal playback
+        // is never served from here.
+        //
+        // Returned in the **seek/output domain** (divided by rate), not content time,
+        // because that is the domain every non-scratch caller of `position()` reads — the
+        // frontend's poll multiplies by rate to recover content time. Same conversion
+        // `stop_scratch_feeder()`'s resync seek applies to this exact frame.
+        if let Some(frame) = self.last_scratch_frame {
+            if let Some(pcm) = &self.pcm_buffer {
+                return Some(((frame / pcm.rate as f64) / self.rate).max(0.0));
             }
         }
 

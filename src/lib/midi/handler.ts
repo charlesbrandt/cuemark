@@ -379,6 +379,31 @@ function stopScratch(deckId: string) {
   audioStopScratch(deckId).then(settled).catch(console.error);
 }
 
+/**
+ * End an in-flight scratch gesture right now, ahead of a transport change that must not
+ * race it. Call before flipping `deck.playing`, from every play/pause affordance.
+ *
+ * The race this closes is not theoretical — it is the 2026-08-13 20:45 log event. A
+ * gesture holds the pipeline in PLAYING and only relinquishes it when `SCRATCH_IDLE_MS`
+ * expires; a play pressed inside that window reached Rust 165ms *before* `stop_scratch`
+ * did, and `stop_scratch()` then paused the deck back down over the top of it. The user
+ * saw the video race tens of seconds ahead (the position poll reading the pipeline's
+ * post-resync position, see `DeckAudioPipeline::position()`) with no audio, until a
+ * manual pause/play put it right. Rust now survives that ordering on its own — this keeps
+ * the ordering correct in the first place, which is cheaper and also stops the feeder
+ * driving output for an extra fraction of a second.
+ *
+ * Both IPCs are dispatched synchronously from here (`endScrub`/`audioStopScratch` issue
+ * theirs before returning their promise), so a `updateDeck({ playing })` on the next line
+ * is guaranteed to reach Rust behind the stop.
+ */
+export function flushScratch(deckId: string): void {
+  if (!isScratching(deckId)) return;
+  clearTimeout(scratchIdleTimers[deckId]);
+  delete scratchIdleTimers[deckId];
+  stopScratch(deckId);
+}
+
 export async function startMidiListener(): Promise<() => void> {
   const unlisten = await listen<MidiAction>("midi-action", ({ payload: a }) => {
     const deckId = midiDeckId(a.deck_id);
@@ -387,17 +412,13 @@ export async function startMidiListener(): Promise<() => void> {
         if (!deckId) break;
         const d = getDeck(deckId);
         if (d) {
-          // Defensive: the Rust side only tears down the scratch feeder branch on
-          // pause()/stop_scratch(), not play() — so if scratch is somehow still active
-          // (its own 150ms idle timer hasn't fired yet) when play is pressed, audio_play
-          // would leave the feeder thread still driving output instead of switching back
-          // to the normal branch. In practice the idle timer will have already fired by
-          // the time a discrete play-button press lands, but this closes the race
-          // unconditionally.
-          if (!d.playing && isScratching(deckId)) {
-            clearTimeout(scratchIdleTimers[deckId]);
-            stopScratch(deckId);
-          }
+          // The Rust side only tears down the scratch feeder branch on
+          // pause()/stop_scratch(), not play() — so if scratch is still active (its idle
+          // timer hasn't fired yet) when play is pressed, audio_play would leave the
+          // feeder thread still driving output instead of switching back to the normal
+          // branch. Not defensive and not rare: the UI's own play button lacked this and
+          // lost a play outright on 2026-08-13 — see flushScratch().
+          if (!d.playing) flushScratch(deckId);
           updateDeck(d.id, { playing: !d.playing });
         }
         break;

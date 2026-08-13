@@ -10,6 +10,9 @@
   import { getDeckOnsets } from "../lib/audio/onsetStore";
   import { snapToNearestOnset } from "../lib/audio/bpm";
   import { recordAuxLoop } from "../lib/audio/pollStats";
+  // Scratch gesture lifecycle lives in the MIDI handler for both input routes (jog wheel
+  // and, via the scrub bus, waveform drag) — so the play button has to go through it too.
+  import { flushScratch } from "../lib/midi/handler";
   import { debugLog } from "../lib/debugLog";
   import { suppressPhaseText, suppressTimestampText } from "../lib/audio/perfArm";
   import { videoPathOverrides, videoPathDefault, setVideoPathOverride, resolveVideoPath, activeVideoBackend } from "../lib/video/videoPathSettings";
@@ -429,7 +432,7 @@
   <div class="transport">
     <button
       class="play-btn"
-      onclick={() => updateDeck(deck.id, { playing: !deck.playing })}
+      onclick={() => { if (!deck.playing) flushScratch(deck.id); updateDeck(deck.id, { playing: !deck.playing }); }}
       disabled={!deck.source}
     >
       {deck.playing ? "⏸" : "▶"}

@@ -997,7 +997,66 @@ section, which now lists this as a separate "runtime plugins" install step from 
 | `ERROR` | Fatal pipeline error. Log names the element and GStreamer flow return. Sets `at_error`. |
 | `WARNING` | Non-fatal. Usually codec quirks. |
 | `StateChanged` (pipeline-level) | Shows NULL→READY→PAUSED→PLAYING lifecycle. An unexpected drop to PAUSED mid-playback is a sign of a seek interaction problem. |
-| `AsyncDone` | Seek completed (user-initiated seek or EOS restart). Logs position. |
+| `AsyncDone` | Seek completed (user-initiated seek or EOS restart). Logs position — **raw `query_position()`, not `DeckAudioPipeline::position()`**: no output-graph latency subtracted, no `last_scratch_frame` correction. That is exactly what makes it the right instrument for diagnosing the position pipeline itself, and the wrong one for "what does the frontend see". |
+
+---
+
+## Reconstructing an IPC-ordering race from the log alone (2026-08-13)
+
+A user report of the form "I did X and Y happened, then I did Z and it fixed itself" is often
+a *race*, and this log has enough in it to prove the ordering without a reproducer. The
+2026-08-13 "video played back very fast after a scratch" event was root-caused this way in
+one pass, with no live repro at any point (`docs/design/scratch-play-race.md`).
+
+**The three log families that interleave into a timeline.** All are millisecond-stamped from
+the same clock, so they can be read as one sequence:
+
+| Line | What it pins down |
+|---|---|
+| `[frontend] [video-path] … calling audioPlay/audioPause (was=…)` | the frontend *decided* to change transport, and what it believed the previous state was |
+| `[audio/<deck>] detached-pipeline IPC received: <op>` | that IPC *arrived in Rust* — this is the ordering ground truth, and `op` names it |
+| `[bus/<deck>] pipeline: A → B` | the pipeline actually changed state |
+
+The gap between line 2 and line 3 is the whole game. **A `detached-pipeline IPC received:
+play` with no `Paused → Playing` after it means the play was accepted and had no effect.**
+Nothing logs an error for that — `play()` returning `Ok` and `play()` doing something are
+different statements, and only the bus distinguishes them.
+
+**Search all the rotated logs for a second instance before believing the mechanism.** One
+occurrence is a story; two independent ones with the same signature is a mechanism. Scan for
+the *pair* within a time window rather than for either line alone:
+
+```python
+# play arriving before stop_scratch = the race. Run over cuemark*.log, not just cuemark.log.
+if e == 'IPC received: play':
+    for t2, e2 in later_events_within(2.0):
+        if e2 == 'IPC received: stop_scratch':
+            report(f'play {ms(t2-t)}ms ahead of stop_scratch')
+```
+
+That found a second instance two days earlier that nobody had reported, which is what turned
+"a weird thing happened once" into a fix.
+
+**The user's own corrective action is telemetry.** "I pressed pause/play and it fixed itself"
+appears in the log as a `pause` then `play` a few seconds after the fault — a marker for
+where the user *noticed* something wrong. In both instances the corrective pair sat 3s after
+the racing pair. Searching for an unexplained manual pause/play is a way to find faults that
+were never reported at all, and the fact that it recovers the deck is itself a strong clue:
+it says the fault is in state that a `Paused → Playing` transition rebuilds.
+
+**Position errors: check additive before multiplicative.** The bad position here was 130.006s
+against a true 61.355s. The ratio is 2.12 — a completely plausible tempo, and this codebase
+has a real, documented, previously-shipped *multiplicative* position bug to pattern-match
+against (`rate-position-drift.md`, "seek-domain scaling"). It was not that. The decomposition
+that actually fit was additive, to 4ms:
+
+```
+130.006 = 61.355 (content) + 43.671 (pipeline position before the gesture) + 24.976 (gesture playing time)
+```
+
+Rate was 1.0 the whole time, which the log proves independently: the pre-gesture
+`async-done pos=43671ms` after exactly 43.63s of playback. **Get the rate from an independent
+line before reading any ratio as a rate.**
 
 ---
 
