@@ -20,32 +20,31 @@ todo format.
    option" from the play-queue section below (auto-load `GET /queue/next` when a deck's clip
    ends) exposed as a toggle instead of two buttons nobody uses. Scope: UI swap plus wiring
    actual auto-advance logic — medium.
-2. **Codebase review/refactor for maintainability.** Real concern, but not a scoped task as
-   written — needs its own short audit (likely candidates: `App.svelte`'s size, the audio
-   pipeline's accumulated complexity reflected in how much of CLAUDE.md it now occupies)
-   before it's actionable. Flagging rather than scoping blind.
+2. **Codebase maintainability refactor — mostly DONE 2026-08-13.** Both scoped halves
+   shipped as pure moves; see the two commit messages for what moved where and how each was
+   verified.
+   - `src/App.svelte` 1828 → 914 lines. Six new modules: `lib/audio/transport.ts`,
+     `lib/audio/positionPoll.ts`, `lib/video/legacyVideo.ts`, `lib/video/backendRegistry.ts`,
+     `lib/state/bootRestore.ts`, `lib/debug/debugHook.ts`. Two consistency fixes fell out of
+     deduplicating the three copies of "destroy a `<video>` element" (stale
+     `lastPlaybackRate`/`playPromises` across a legacy↔webcodecs toggle) and one write-only
+     map (`audioLoadedFor`) is gone.
+   - `DeckAudioPipeline::load()` 819 → 466 lines: `build_main_branches()`,
+     `build_cue_branch()`, `spawn_bus_watch()`, `attach_output_graph()`. `pipeline.rs` is
+     still the largest file in either tree — the extraction was about that one function, not
+     about splitting the file.
+   - **Still open, deliberately deferred**: `spawn_scratch_feeder()` (352 lines) and
+     `make_appsink()` (242). Both sit on the scratch/handoff hot path where the reasoning is
+     about thread timing rather than structure, and this repo has no cheap way to prove a
+     timing-neutral refactor of them — a live jog-gesture session is the only real test.
+     Worth doing *while* someone is already testing scratch live, not on its own.
+   - CLAUDE.md's length is *not* itself the problem — it's a symptom of the pipeline's
+     accumulated subtlety, each footgun already captured in its own `docs/design/*.md` and
+     cross-referenced, which is the right pattern.
 
 (Resizable Digger Queue column shipped — `DiggerQueue.svelte`'s drag handle,
 2026-08-11 — and dropped from this list. Default gain sync and session-history reporting
 shipped 2026-08-12 — see "Digger sync: gain + play history" below.)
-
-## Digger sync: gain + play history — DONE (2026-08-12)
-
-**Default gain**: `tracks.gain` (nullable REAL, migration step 38 in `~/repos/digger/migrate.py`)
-round-trips through `GET /tracks/{id}/cuemark` (`CuemarkPayload.gain`) and `PATCH /tracks/{id}`
-(`setTrackGain()`). `DiggerQueue.svelte`'s `loadToDeck()` resets to the deck default (1.0) unless
-Digger supplies one, mirroring the bpm/downbeat pull; `DeckCard`'s gain slider pushes back via
-`onchange` (fires once on release, not per drag tick) when `deck.diggerTrackId` is set.
-
-**Session/play history**: turned out not to need a new "Sessions" endpoint — Digger already had
-one, unused by cuemark (`POST /plays/start`, `PATCH /plays/{id}/heartbeat`, `PATCH
-/plays/{id}/finish`, `context='cuemark'`), specced for exactly this in
-`~/repos/digger/docs/design/play-tracking.md`'s "Cuemark: standardize on the same log" section.
-`history.ts`'s existing per-deck load/play/pause state machine (deckId, diggerTrackId, startedAt,
-playedMs) now reports into it: `playStart` on load, `playHeartbeat` on pause and every 30s while
-playing, `playFinish` on track-change/unload/deck-removal — all fire-and-forget
-(`.catch(console.error)`), consistent with `pushMarker`'s pattern. A `diggerTrackId === null` load
-(local file, not from Digger) reports nothing.
 
 **"Transition points for auto-DJ training" — deliberately not built here.** Digger's own
 `mix_transitions` table already reserves `source='play_history'` for transitions *mined from* the
@@ -75,101 +74,6 @@ kick, and confirming the ♩ indicator lands on the kick rather than the raw pre
 
 ---
 
-## Batch C — Audio routing [done]
-
-### EQ per deck [done]
-- Three biquad filter nodes per deck: lowShelf(250Hz) → midPeak(1kHz,Q=1) → highShelf(4kHz)
-- `DeckEQ { low, mid, high }` in Deck type; ±12 dB sliders + reset in DeckCard
-- `AudioAnalyzer.setDeckEQ(deckId, low, mid, high)`; synced via `$effect`
-- MIDI: Bass/Filter toggle `(0x90, 1)` still unmapped — would need dedicated EQ knob CCs
-
-### audio output device selection [done]
-- `src/lib/audio/devices.ts`: `listAudioOutputs()`, `sinkIdSupported()`
-- `AudioAnalyzer.setOutputDevice(deviceId)` via `setSinkId()`
-- "Audio" toolbar button toggles settings bar; graceful fallback if setSinkId unsupported
-- `src/lib/audio/audioSettings.ts`: module-level stores for device IDs and cue gain
-
-### crossfader curve selection [done]
-- Three curves per target (visual / audio independently): linear, equal-power (cos/sin), cut
-- Equal-power default for audio so volume stays constant across sweep; linear default for visual
-- Gain clamp extended to 4.0 (~+12 dB) for quiet track boosting
-
-### headphone cue / pre-listen [done]
-- Second `AudioContext` (cue ctx) on headphone device via `setSinkId()`
-- Bridge: `highShelf → MediaStreamDest` (main ctx) → `MediaStreamSource` (cue ctx)
-- `setCueDeck(deckId, enabled)`, `setCueOutputDevice(deviceId)`, `setCueVolume(v)`
-- CUE button per deck in transport row; cue gain slider in Audio settings bar
-- MIDI: `(0x91/0x92, 12)` → `HeadphoneCue` action → toggles `deck.cueEnabled`
-- Split-cue mode (left=cue, right=main) not yet implemented
-
----
-
-## Batch D — Shader visuals (Phase 2)
-
-The global visualization layer (moved off per-deck `DeckSource` onto a single
-`Session.visualization` slot, and why) is documented in CLAUDE.md's "Visualization layer"
-section — don't re-read that history here. Also done and not carried further here:
-audio-reactive uniforms (`u_bass`/`u_mid`/`u_high` from a GStreamer `spectrum` element,
-32 bands ~30fps) and the built-in shader library (Plasma, Tunnel, Particles, Feedback,
-VU/scope) — see `src/lib/renderer/compositor.ts` and `src/App.svelte`'s shader picker.
-
-### shader overlays on video
-- Per-deck effect chain: array of shader passes applied after video texture upload
-- Blend mode selection per overlay (additive, multiply, screen, etc.)
-
----
-
-## Batch E — Queue, history, and Digger integration
-
-Media library management lives in `~/repos/digger` (FastAPI + SQLite, `http://localhost:8000`).
-Cuemark does not embed a file browser — Digger feeds cuemark.
-
-### play queue
-- Sidebar panel: ordered list of upcoming tracks [done] — shown by default now
-  (`showDiggerQueue` defaults `true`; window widened 1280→1600 to compensate)
-- Items can be added from: Digger `GET /queue/next` suggestion, Digger search results, or
-  OS drag-and-drop into the queue (not into a deck directly)
-- Load to deck: clicking an item calls `GET /tracks/{id}/cuemark` → loads filePath +
-  cuePoint + hotCues[] onto the target deck
-- Live updates when the queue changes from Digger's own UI [done, 2026-06-22] — added
-  `GET /queue/ws` to Digger (`api.py`); cuemark's `DiggerQueue.svelte` subscribes via
-  `subscribeQueueChanges()` instead of polling; see CLAUDE.md "Integration: Digger"
-- Drag-to-reorder; remove items from queue
-- Auto-advance option: when a deck's clip ends, auto-load next queue item to that deck
-
-### session playback history [done, 2026-07-26]
-`src/lib/state/history.ts` (derived from the `session` store, not instrumented call
-sites) + `src/components/HistoryPanel.svelte` (toolbar toggle, same sidebar slot as
-Queue) + Digger marker pushes on cue/hot-cue set. Rationale and the fixed
-`diggerTrackId`-not-cleared bug it uncovered: commit `5bc537d`.
-
-### Digger connection
-- Quick search widget in toolbar: text input → `GET /search?q=` → mini dropdown of results →
-  click to add to queue
-- Settings: configurable Digger base URL (default `http://localhost:8000`)
-- Graceful degradation: if Digger is unreachable, show a notice; drag-and-drop and
-  manual load still work unaffected
-
-### evaluate: stream media through Digger directly (vs. local mount)
-- Right now cuemark requires the file to already be locally readable (mount, e.g. the
-  `t7` CIFS share — see journal.md 2026-06-19 entry) since GStreamer/WebKit read straight
-  from the filesystem path Digger returns; Digger itself never serves the media bytes
-  — see `CLAUDE.md`'s boundary rule "Cuemark calls Digger; Digger never calls cuemark"
-- Open question: should Digger proxy/stream media content itself (e.g. an
-  `GET /tracks/{id}/stream` endpoint) so cuemark doesn't need direct filesystem/CIFS
-  access to the library at all?
-- Concern: this adds a network round-trip per frame/seek on top of the home-network CIFS
-  mount cuemark already depends on — likely too fragile away from home network (the
-  exact scenario CIFS already struggles with), so may not be worth the implementation
-  cost vs. just keeping the mount-based approach
-- Alternative worth evaluating instead/alongside: a "Pack Crate" feature — explicitly
-  select a set of upcoming tracks (e.g. a planned setlist) and download+cache them
-  locally ahead of a gig, so cuemark doesn't need any network/mount access during a
-  performance away from home
-  - Needs to track which tracks were *also* loaded ad-hoc while offline/away from home
-    (e.g. dragged in directly, not from a Pack), so they can be reconciled back into
-    Digger's library/markers once back on the home network
-- Not started — no code yet; flagged here for a future build/no-build decision
 
 ## Batch F — MIDI expansion
 
@@ -203,16 +107,6 @@ Queue) + Digger marker pushes on cue/hot-cue set. Rationale and the fixed
   (currently user manually moves window to projector)
 - Fullscreen-on-open option (skip manual `F` press)
 
-### project save / load
-- Serialize session to JSON: deck sources, cue points, hot cues, BPMs, crossfader mapping
-- Load: restore state, re-open video sources from stored paths
-- Auto-save on exit; manual save/load via file picker
-
-### pitch lock
-- Preserve audio pitch when `playbackRate ≠ 1.0` (avoids chipmunk / slow-motion pitch shift)
-- `video.preservesPitch = true` (already the browser default; verify in WebKitGTK)
-- For extreme rates, AudioWorklet pitch correction may be needed
-
 ### key detection
 - Detect musical key from audio on load (FFT-based chroma analysis or call ffprobe)
 - Display key in Camelot/Open Key notation in DeckCard
@@ -231,6 +125,21 @@ Queue) + Digger marker pushes on cue/hot-cue set. Rationale and the fixed
 - Screenshot shortcut (capture current frame)
 
 
+
+---
+
+## Shader visuals 
+
+The global visualization layer (moved off per-deck `DeckSource` onto a single
+`Session.visualization` slot, and why) is documented in CLAUDE.md's "Visualization layer"
+section — don't re-read that history here. Also done and not carried further here:
+audio-reactive uniforms (`u_bass`/`u_mid`/`u_high` from a GStreamer `spectrum` element,
+32 bands ~30fps) and the built-in shader library (Plasma, Tunnel, Particles, Feedback,
+VU/scope) — see `src/lib/renderer/compositor.ts` and `src/App.svelte`'s shader picker.
+
+### shader overlays on video
+- Per-deck effect chain: array of shader passes applied after video texture upload
+- Blend mode selection per overlay (additive, multiply, screen, etc.)
 
 
 

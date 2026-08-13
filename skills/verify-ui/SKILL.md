@@ -166,6 +166,25 @@ on `:99`, not the real screen.
 
 ## 4. Create a session (this launches the app)
 
+🔴 **On `mele`, export `CUEMARK_DISABLE_DMABUF=1` before starting `tauri-driver`** —
+otherwise `requestAnimationFrame` fires **zero** times under Xvfb and the app silently
+does nothing useful: no deck ever gets a video backend, `audio_load` is never called,
+every position reads 0, and the log has no `[raf]` lines at all. It looks exactly like a
+broken frontend. `latency-test.sh`/`perf-idle-test.sh` now abort with this hint (they arm
+a rAF counter first); if you're driving a session by hand, check it yourself:
+```sh
+# after the session exists — expect ~60, not 0
+curl -s -X POST http://localhost:4444/session/$SESSION/execute/sync \
+  -H 'Content-Type: application/json' \
+  -d '{"script":"window.__n=0;const t=()=>{window.__n++;requestAnimationFrame(t)};requestAnimationFrame(t);return 1","args":[]}' >/dev/null
+sleep 1
+curl -s -X POST http://localhost:4444/session/$SESSION/execute/sync \
+  -H 'Content-Type: application/json' -d '{"script":"return window.__n","args":[]}'
+```
+The variable forces software page compositing, so CPU/fps numbers measured under it are
+not comparable to a live desktop run — set it on *both* arms of any A/B. Confirmed
+2026-08-13; see `docs/environment.md`.
+
 ```sh
 BINARY=/home/account/repos/cuemark/src-tauri/target/debug/cuemark
 SESSION=$(curl -s -X POST http://localhost:4444/session \

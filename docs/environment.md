@@ -155,13 +155,36 @@ down with probes directly on `mele`. Full session details in each bullet; summar
   motivated the fix is real on this machine too, and the fix (codec-agnostic, klass-based,
   not a per-codec list) protects it here without modification.
 
+🔴 **Headless (Xvfb) runs need `CUEMARK_DISABLE_DMABUF=1` or `requestAnimationFrame`
+never fires — confirmed 2026-08-13.** With GPU compositing on (the default since
+2026-08-02), rAF ticks **0 times per second** under Xvfb here; with
+`CUEMARK_DISABLE_DMABUF=1` it runs at ~60/s. Nothing announces this. The app boots
+normally, `onMount` runs to completion, `__cuemarkDebug` answers every call, and the
+session store updates — but `syncVideoElements` is scheduled *inside* a rAF callback, so
+no deck ever gets a video backend, `audio_load` is never called, and every position read
+stays 0. What that looks like from the outside is a broken frontend: "no audio pipeline
+for deck 'deck-0'", `getVideoBackend()` → `null`, a black preview canvas, and no
+`[raf]`/`[poll-stats]` lines in the log at all. It cost most of a session to attribute,
+and it is almost certainly what the "live-app rendering check did not complete cleanly"
+bullet below was actually seeing.
+
+`scripts/latency-test.sh` and `scripts/perf-idle-test.sh` now refuse to run in this
+state — they arm a rAF counter right after session start and abort with this hint if it
+reads 0. **Note that the variable changes what you are measuring**: it forces software
+page compositing, so CPU numbers taken under it are not comparable to a live desktop run.
+Both arms of an A/B must set it.
+
 Still open:
 - **`main.rs`'s `GST_PLUGIN_FEATURE_RANK` demotion list (`vaav1dec:0,vaapiav1dec:0`
   only) is unverified against `mele`'s VA-API stack for the codecs it does NOT demote**
   (H.264, VP9 hardware decode through WebKit's own `<video>`-element/DMA-BUF path,
   as opposed to the WebCodecs path tested above). Not exercised this session.
 - **A live-app rendering check did not complete cleanly and should not be read either
-  way.** Loaded both a VP9 and an H.264 file into deck-0 of a real running instance
+  way** — and as of 2026-08-13 the most likely explanation is the rAF stall above, not
+  focus or a second instance: an all-black preview with `getCodecFramePts()` stuck at
+  `null` while `video_demux_load` returns correct metadata is exactly its signature.
+  Re-run with `CUEMARK_DISABLE_DMABUF=1` before treating any of it as a rendering
+  finding. Original note follows. Loaded both a VP9 and an H.264 file into deck-0 of a real running instance
   (`tauri-driver` + Xvfb `:99`, debug hook) and the deck preview canvas stayed all-black
   for both (`getCodecFramePts('deck-0')` stayed `null`), even though `video_demux_load`
   itself returned correct metadata (10479 AUs, keyframe index) and the isolated decode

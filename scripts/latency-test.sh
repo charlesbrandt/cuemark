@@ -137,6 +137,31 @@ video_pos() {
   fi
 }
 
+
+# ── rAF liveness preflight ───────────────────────────────────────────────────
+# Every check below depends on the app's rAF loop running: it drives
+# syncVideoElements (which creates the video backend and calls audio_load) and
+# the position poll. If rAF never fires, the app still boots, onMount still
+# completes and the debug hook still answers — the deck just never gets a
+# backend, never loads audio, and every position read stays 0. That reads like a
+# broken frontend and is not one.
+#
+# Confirmed on `mele` 2026-08-13: under Xvfb, with GPU compositing enabled (the
+# default since 2026-08-02), requestAnimationFrame fires ZERO times. Setting
+# CUEMARK_DISABLE_DMABUF=1 restores it (~89 ticks/s). See docs/environment.md.
+raf_ticks() {
+  js_sync "window.__rafProbe=0; const t=()=>{window.__rafProbe++; requestAnimationFrame(t);}; requestAnimationFrame(t); return 'armed'" >/dev/null
+  sleep 1
+  js_sync "return window.__rafProbe"
+}
+RAF_N=$(raf_ticks)
+if [ -z "$RAF_N" ] || [ "$RAF_N" = "0" ]; then
+  echo "ABORT: requestAnimationFrame fired 0 times in 1s — nothing this script measures can run." >&2
+  echo "  Re-run with CUEMARK_DISABLE_DMABUF=1 (known-needed under Xvfb on mele; see docs/environment.md)." >&2
+  exit 1
+fi
+echo "  rAF preflight: ${RAF_N} ticks/s"
+
 PASS=0
 FAIL=0
 
