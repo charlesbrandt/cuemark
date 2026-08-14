@@ -605,6 +605,20 @@ curl -s http://localhost:1420/src/lib/renderer/outputBus.ts | head -20   # what 
 `touch`ing the file forces a re-transform. The built artifact is the thing under test, and this
 project's failure modes are overwhelmingly silent — see the "silent-ignore" note in `journal.md`.
 
+⚠️ **That check proves the dev server is current; it says nothing about the webview.** HMR can
+silently skip a component edit — 2026-08-14, a new Settings row was correct on disk, correct in
+`curl`, no Vite error, and simply absent from the running window, because the `.svelte` edit
+landed after the last full page load and the panel was not mounted at the time. **A plain
+webview reload fixed it; no rebuild, no dev-server restart.** So when a frontend change seems
+absent, walk it in order — disk → served artifact → **reload the window** — and only then start
+theorising. The timeline check that settles it in one command is the edited files' mtimes
+against the last `[build]` stamp in the log:
+```bash
+ls -l --time-style=+%H:%M:%SZ <edited files>   # TZ=UTC, to compare against the stamp
+grep -a '\[build\]' ~/.local/share/com.cuemark.app/logs/cuemark.log | tail -1
+```
+An edit later than the last stamp reached HMR but never a page load.
+
 **The desktop-launcher release binary is a separate build that never auto-rebuilds** — unlike
 `cargo tauri dev`, nothing watches `src-tauri/` for the launcher build (`~/.local/bin/cuemark`,
 see `run-app` skill's "Desktop launcher" section). It only updates when someone explicitly runs

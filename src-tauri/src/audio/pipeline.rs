@@ -3068,7 +3068,8 @@ impl DeckAudioPipeline {
         // NaN target = velocity mode (see ScratchFeeder::target_frames_bits). Written
         // unconditionally so a gesture that started in position mode can be handed over
         // to velocity mode without restarting the feeder.
-        self.begin_or_update_scratch(rate, f64::NAN, hold_ms)
+        // Inertia is position-mode only — see SCRATCH_RATE_INERTIA_MS.
+        self.begin_or_update_scratch(rate, f64::NAN, hold_ms, 0.0)
     }
 
     /// Position-mode scratch: drive the feeder toward an absolute content position
@@ -3084,9 +3085,19 @@ impl DeckAudioPipeline {
     ///
     /// `target_secs` is **content time**, the same domain as the waveform, cue points and
     /// the PCM buffer itself — not the tempo-scaled seek domain `seek()` takes.
-    pub fn scratch_to(&mut self, target_secs: f64, hold_ms: u64) -> Result<(), String> {
+    ///
+    /// `inertia_ms` is the platter-mass taste setting (`SCRATCH_RATE_INERTIA_MS`), carried
+    /// on every call rather than set once: it is a user preference that can move mid-gesture,
+    /// and riding along with the target that is already being sent each frame costs nothing
+    /// and cannot arrive out of order with respect to it.
+    pub fn scratch_to(
+        &mut self,
+        target_secs: f64,
+        hold_ms: u64,
+        inertia_ms: f64,
+    ) -> Result<(), String> {
         let rate = self.pcm_buffer.as_ref().map(|p| p.rate as f64).unwrap_or(48_000.0);
-        self.begin_or_update_scratch(0.0, target_secs.max(0.0) * rate, hold_ms)
+        self.begin_or_update_scratch(0.0, target_secs.max(0.0) * rate, hold_ms, inertia_ms)
     }
 
     /// Shared body of `scratch()`/`scratch_to()`: starts the feeder and switches the
@@ -3097,7 +3108,13 @@ impl DeckAudioPipeline {
         rate: f64,
         target_frames: f64,
         hold_ms: u64,
+        inertia_ms: f64,
     ) -> Result<(), String> {
+        let inertia_ms = if inertia_ms.is_finite() {
+            inertia_ms.clamp(0.0, SCRATCH_RATE_INERTIA_MAX_MS)
+        } else {
+            SCRATCH_RATE_INERTIA_MS
+        };
         let pcm = self.pcm_buffer.clone().ok_or_else(|| {
             format!("[{}] no PCM buffer decoded — scratch unavailable for this file", self.deck_id)
         })?;
@@ -3108,6 +3125,7 @@ impl DeckAudioPipeline {
         if let Some(feeder) = &inner.scratch_feeder {
             feeder.rate_bits.store(rate.to_bits(), Ordering::Relaxed);
             feeder.target_frames_bits.store(target_frames.to_bits(), Ordering::Relaxed);
+            feeder.inertia_ms_bits.store(inertia_ms.to_bits(), Ordering::Relaxed);
             // Gap since the previous update, measured here rather than in the feeder
             // thread: this is the arrival time of the input event itself, whereas the
             // feeder only ever sees the *latest* value at 15ms chunk boundaries and so
@@ -3215,6 +3233,7 @@ impl DeckAudioPipeline {
             rate,
             target_frames,
             hold_ms,
+            inertia_ms,
             inner.delivery_probes.clone(),
         ));
         Ok(())
@@ -3508,6 +3527,11 @@ struct ScratchFeeder {
     /// whole gesture with nothing to correct it against. A target is absolute: it
     /// cannot drift, and coalescing several updates into the latest one loses nothing.
     target_frames_bits: Arc<AtomicU64>,
+    /// Platter inertia in milliseconds — see `SCRATCH_RATE_INERTIA_MS`. Refreshed by every
+    /// `scratch_to()` call rather than captured at spawn (unlike `hold_ms`), so the
+    /// Settings slider can be moved *during* a gesture and heard immediately, which is the
+    /// only practical way to tune a taste setting by ear.
+    inertia_ms_bits: Arc<AtomicU64>,
     /// Set by take_and_join_feeder() to tell the thread to fade out and exit.
     stop_requested: Arc<AtomicBool>,
     /// Buffer-frame cursor, updated by the feeder thread every chunk so
@@ -3630,12 +3654,123 @@ const SCRATCH_SERVO_LAG_CHUNKS: f64 = 4.0;
 /// several chunks, which is what dragging a record fast actually sounds like.
 const SCRATCH_TARGET_MAX_RATE: f64 = 8.0;
 
+/// Position mode: **platter mass.** Time constant of a one-pole lag applied to the servo's
+/// commanded rate, in milliseconds, before it is used to advance the cursor — so playback
+/// speed (and therefore pitch) changes continuously instead of stepping once per chunk.
+/// 0 disables it and restores the pre-2026-08-14 behaviour exactly.
+///
+/// **The problem it fixes: the target is an impulse train, so the rate was a sawtooth.**
+/// One jog detent is a fixed `VINYL_SEC_PER_TICK` (7.0ms of content) jump — at a realistic
+/// cueing speed of 0.15x that is *3.1 chunks' worth* of cursor travel arriving at once,
+/// every 47ms. The servo answers each jump with a rate spike that decays over
+/// `SCRATCH_SERVO_LAG_CHUNKS`, so the commanded rate ran as a ~21Hz sawtooth whose peaks
+/// were roughly twice its own mean. The user report was that scratching sounded "frantic
+/// … in the way the sound responds to midi events"; the mechanism is that the *pitch* was
+/// being modulated by an octave at the tick repetition rate. It is visible in the live
+/// telemetry of 2026-08-08 even at the smooth end of the range — `rate mean=1.026
+/// max=1.424` inside one second of a steady 1.03x gesture — and `target_gaps_ms`'s own
+/// doc comment already recorded it as "swings instantaneous rate 3-6x above its
+/// one-second mean" without naming it as the audible fault.
+///
+/// Filtering the rate rather than the target is what makes this the *platter*: the servo
+/// still chases an absolute position, so nothing here can drift or accumulate — this only
+/// says the cursor's *velocity* cannot change instantaneously, which is exactly what a
+/// mass does and exactly what the impulse train is missing. Real vinyl is smooth under a
+/// jerky hand for the same reason.
+///
+/// **Sizing** (simulated across the real chain — MIDI ticks → rAF coalescing → 15ms
+/// chunks — and cross-checked against the live rate spreads above). Mean chunk-to-chunk
+/// rate discontinuity at 0.15x, as a fraction of the mean rate, against the total position
+/// lag it costs:
+///
+/// | inertia | total lag | jerk @0.15x | rate swing @0.15x |
+/// |---|---|---|---|
+/// | 0 (old) | 60ms | 0.207 | 0.86 |
+/// | 20ms | 80ms | 0.090 | 0.77 |
+/// | **40ms** | **120ms** | **0.037** | **0.50** |
+/// | 60ms | 180ms | 0.017 | 0.38 |
+/// | 90ms | 270ms | 0.008 | 0.31 |
+///
+/// 40ms takes the frantic edge off by 5.6x for a lag a scrub gesture can still be steered
+/// by. Past ~60ms the returns flatten while the latency does not, which is why this is a
+/// **taste setting** (Settings → Audio → vinyl jog) rather than a fixed constant: the
+/// trade is smoothness against immediacy and there is no free value.
+///
+/// ⚠️ **Velocity mode (shuttle) deliberately does not use this** — free-running between
+/// ticks is that mode's whole point, and its rate is already smoothed by an EMA on the
+/// frontend. `scratch()` passes 0.
+const SCRATCH_RATE_INERTIA_MS: f64 = 40.0;
+
+/// Upper bound on the inertia setting, so a stored preference cannot turn the deck into a
+/// flywheel that ignores the hand for the better part of a second.
+///
+/// 90ms is already far past the useful range — the measured return flattens above ~60ms
+/// (jerk 0.029 at the 40ms default against 0.008 at 90ms) while the lag it costs does not —
+/// so this is a guard rail rather than a recommendation.
+///
+/// It is 90 and not more for a reason that is easy to miss: the coupled servo lag is what
+/// sets how long a *stopped* hand takes to reach silence, and past this the deck keeps
+/// audibly coasting for longer than the frontend's own `SCRUB_HOLD_MS` (1000ms) backstop
+/// would allow it to. Measured on the replay harness, decaying from a 1.0x scrub: 900ms at
+/// 90, 1080ms at 120, 1365ms at 150. Beyond the cap the two mechanisms would be racing to
+/// end the same gesture, and which one won would depend on the hand.
+const SCRATCH_RATE_INERTIA_MAX_MS: f64 = 90.0;
+
+/// Effective servo lag for a given platter inertia — never shorter than
+/// `SCRATCH_SERVO_LAG_CHUNKS`, and never shorter than twice the inertia.
+///
+/// ⚠️ **This coupling is load-bearing, not tidiness.** Filtering the rate puts a second
+/// pole *inside* the servo's own feedback loop, so the two time constants together set the
+/// loop's damping. Left at the fixed 4 chunks, an inertia comparable to the servo lag makes
+/// the loop underdamped: simulated at 60ms inertia against a fixed lag it rings ~17% past
+/// the target with a ~2Hz envelope, and every crossing of zero rate is a direction reversal
+/// the feeder answers with a 5ms gain ramp — i.e. it would reintroduce the "2-8 `ramps` per
+/// second" artefact that `HandTracker`'s absorb logic was written to kill on 2026-08-09.
+/// Holding the ratio at 2 keeps the damping ratio near 0.7 across the whole knob range, so
+/// turning the knob up can only ever make the gesture smoother and slower, never rougher.
+fn servo_lag_chunks(inertia_ms: f64) -> f64 {
+    (2.0 * inertia_ms / SCRATCH_CHUNK_MS as f64).max(SCRATCH_SERVO_LAG_CHUNKS)
+}
+
+/// Per-output-frame coefficient of the one-pole rate lag. `inertia_ms <= 0` yields exactly
+/// 1.0 — the filter becomes a pass-through and the feeder behaves as it did before it
+/// existed, which is what makes 0 a true kill switch rather than an approximation.
+fn inertia_coefficient(inertia_ms: f64, sample_rate: f64) -> f64 {
+    if inertia_ms <= 0.0 {
+        return 1.0;
+    }
+    let tau_frames = inertia_ms.min(SCRATCH_RATE_INERTIA_MAX_MS) * sample_rate / 1000.0;
+    1.0 - (-1.0 / tau_frames.max(1.0)).exp()
+}
+
 /// Position mode: target changes larger than this stop being a scrub and become a jump —
 /// the cursor snaps and re-ramps through `SCRATCH_FADE_FRAMES` instead of sweeping. At
 /// `SCRATCH_TARGET_MAX_RATE` a sweep covers ~0.12s of content per 15ms chunk, so without
 /// a snap a coarse drag across a whole-track overview (easily 100s in one gesture) would
 /// spend many seconds racing through content nobody asked to hear.
+///
+/// A **floor**, not the whole rule — see `snap_frames()`.
 const SCRATCH_TARGET_SNAP_SECS: f64 = 0.5;
+
+/// How far the cursor may fall behind the target before the servo stops sweeping and jumps.
+///
+/// ⚠️ **This cannot be a fixed distance, because a fast drag sustains one.** A first-order
+/// lag tracks a moving target with a standing error of `hand_speed × lag`, so at the servo's
+/// own rate ceiling the error a *legitimate* gesture holds is `SCRATCH_TARGET_MAX_RATE ×
+/// lag`. Any threshold below that is reachable without anybody jumping anywhere, and the
+/// result is not a subtle mistuning: the servo snaps, reports `arrived`, mutes, snaps again
+/// — every chunk, for as long as the drag continues. Measured on the replay harness at 1.0x
+/// with the widest inertia setting: **78% of chunks silent and the cursor travelling at
+/// 0.001x**, i.e. the gesture stops working altogether.
+///
+/// Latent until 2026-08-14 because `SCRATCH_SERVO_LAG_CHUNKS` was fixed at 4, where the
+/// standing error at 8x is 0.48s and the fixed 0.5s threshold cleared it by 4%. Making the
+/// lag a function of the platter-inertia setting is what turned a 4% margin into a knob the
+/// user can turn straight through it.
+fn snap_frames(sample_rate: f64, chunk_frames: f64, lag_chunks: f64) -> f64 {
+    (SCRATCH_TARGET_SNAP_SECS * sample_rate)
+        .max(SCRATCH_TARGET_MAX_RATE * chunk_frames * lag_chunks)
+}
 
 /// Position mode: how long the cursor keeps moving after target updates stop, in 15ms
 /// chunks, tapering linearly to a standstill across the window.
@@ -3795,7 +3930,13 @@ struct ServoStep {
 /// One chunk of the position-mode servo: given where the cursor is and where the caller
 /// wants it, decide this chunk's rate. See `SCRATCH_SERVO_LAG_CHUNKS` for why the error is
 /// spread over several chunks rather than closed inside one.
-fn servo_step(target: f64, cursor: f64, chunk_frames: f64, snap_frames: f64) -> ServoStep {
+fn servo_step(
+    target: f64,
+    cursor: f64,
+    chunk_frames: f64,
+    snap_frames: f64,
+    lag_chunks: f64,
+) -> ServoStep {
     let err = target - cursor;
     if err.abs() > snap_frames {
         return ServoStep { rate: 0.0, arrived: true, snapped: true };
@@ -3803,7 +3944,7 @@ fn servo_step(target: f64, cursor: f64, chunk_frames: f64, snap_frames: f64) -> 
     if err.abs() < SCRATCH_TARGET_EPSILON_FRAMES {
         return ServoStep { rate: 0.0, arrived: true, snapped: false };
     }
-    let rate = (err / (chunk_frames * SCRATCH_SERVO_LAG_CHUNKS))
+    let rate = (err / (chunk_frames * lag_chunks))
         .clamp(-SCRATCH_TARGET_MAX_RATE, SCRATCH_TARGET_MAX_RATE);
     ServoStep { rate, arrived: false, snapped: false }
 }
@@ -3830,10 +3971,12 @@ fn spawn_scratch_feeder(
     initial_rate: f64,
     initial_target: f64,
     hold_ms: u64,
+    initial_inertia_ms: f64,
     delivery: DeliveryProbes,
 ) -> ScratchFeeder {
     let rate_bits = Arc::new(AtomicU64::new(initial_rate.to_bits()));
     let target_frames_bits = Arc::new(AtomicU64::new(initial_target.to_bits()));
+    let inertia_ms_bits = Arc::new(AtomicU64::new(initial_inertia_ms.to_bits()));
     let stop_requested = Arc::new(AtomicBool::new(false));
     let cursor_frames_bits = Arc::new(AtomicU64::new(start_frame.to_bits()));
     let last_update = Arc::new(Mutex::new(Instant::now()));
@@ -3841,6 +3984,7 @@ fn spawn_scratch_feeder(
 
     let rate_bits_t = rate_bits.clone();
     let target_t = target_frames_bits.clone();
+    let inertia_t = inertia_ms_bits.clone();
     let stop_t = stop_requested.clone();
     let cursor_t = cursor_frames_bits.clone();
     let last_update_t = last_update.clone();
@@ -3860,13 +4004,20 @@ fn spawn_scratch_feeder(
         let mut hand = HandTracker::new(initial_target);
         let mut fade_pos: usize = 0; // frames into an in-progress fade-in/reversal ramp
         let mut hold_gain: f32 = 1.0; // ramps toward 0 while idle beyond hold_ms, else toward 1
+        // Platter velocity: the rate the cursor is *actually* advancing at, which the servo's
+        // commanded rate pulls on through a one-pole lag rather than setting outright. See
+        // SCRATCH_RATE_INERTIA_MS. Starts at rest, so a gesture spins up rather than
+        // beginning mid-stride.
+        let mut rate_smoothed: f64 = 0.0;
         let mut next_wake = Instant::now();
-        let snap_frames = SCRATCH_TARGET_SNAP_SECS * pcm.rate as f64;
+        // Recomputed per chunk below rather than captured here: it depends on the servo lag,
+        // which depends on the inertia setting, which the user can move mid-gesture.
 
         log::info!(
             "[scratch/{deck_id}] feeder start frame={start_frame:.0} rate={initial_rate:.3} \
-             mode={} hold_ms={hold_ms}",
-            if initial_target.is_nan() { "velocity" } else { "position" }
+             mode={} hold_ms={hold_ms} inertia={:.0}ms",
+            if initial_target.is_nan() { "velocity" } else { "position" },
+            if initial_target.is_nan() { 0.0 } else { initial_inertia_ms },
         );
 
         // Per-second feeder telemetry. Added 2026-08-08 after a live report of "a few
@@ -3895,6 +4046,7 @@ fn spawn_scratch_feeder(
         let mut tel_samples: u64 = 0;
         let mut tel_rate_sum: f64 = 0.0;
         let mut tel_rate_max: f64 = 0.0;
+        let mut tel_jerk_sum: f64 = 0.0;
         let mut tel_cursor_start = cursor;
         let mut tel_since = Instant::now();
         // Baseline for the delivery counters, which are cumulative for the life of the
@@ -3915,6 +4067,18 @@ fn spawn_scratch_feeder(
             // it is still just how fast the cursor walks the buffer, exactly as in
             // velocity mode. `arrived` means there is nothing left to cover, which is the
             // position-mode equivalent of velocity mode's hold_ms idle.
+            // Velocity mode has no servo to smooth and wants none (see
+            // SCRATCH_RATE_INERTIA_MS), so it always reads 0 here regardless of the setting.
+            let inertia_ms = if target.is_nan() {
+                0.0
+            } else {
+                f64::from_bits(inertia_t.load(Ordering::Relaxed))
+                    .clamp(0.0, SCRATCH_RATE_INERTIA_MAX_MS)
+            };
+            let lag_chunks = servo_lag_chunks(inertia_ms);
+            let inertia_k = inertia_coefficient(inertia_ms, pcm.rate as f64);
+            let snap_frames = snap_frames(pcm.rate as f64, chunk_frames as f64, lag_chunks);
+
             let mut arrived = false;
             let mut coasting = false;
             let commanded_rate = if target.is_nan() {
@@ -3928,25 +4092,44 @@ fn spawn_scratch_feeder(
                     .step(target.clamp(0.0, max_frame), chunk_frames as f64)
                     .clamp(0.0, max_frame);
                 coasting = hand.coasting();
-                let step = servo_step(aim, cursor, chunk_frames as f64, snap_frames);
+                let step = servo_step(aim, cursor, chunk_frames as f64, snap_frames, lag_chunks);
                 if step.snapped {
                     // Too far to sweep — jump, and re-ramp so the splice doesn't click.
                     cursor = target.clamp(0.0, max_frame);
                     fade_pos = 0;
                     tel_snaps += 1;
+                    // The platter's momentum belongs to content the user just jumped away
+                    // from — carrying it across would coast the cursor off the landing spot.
+                    rate_smoothed = 0.0;
                     // A jump says nothing about hand speed, and coasting on a stale estimate
                     // after one would walk the cursor away from where the user just landed.
                     hand.reset(cursor);
                     coasting = false;
                 }
-                arrived = step.arrived;
+                // ⚠️ **Position alone stops meaning "at rest" once the platter has mass.**
+                // `SCRATCH_TARGET_EPSILON_FRAMES` is a quarter of a millisecond wide, and a
+                // spinning platter sweeps through a band that narrow in a single chunk — so
+                // `step.arrived` fires on a *pass-through*, mutes the chunk, and stops the
+                // cursor dead in the middle of motion the user is still hearing. Measured on
+                // the 2026-08-08 sparse-drag schedule: 0% muted without inertia, **9% with
+                // it** — the "gentle drag drops out" bug, re-entering through the smoothing.
+                //
+                // A record is silent when it has come to rest, not when it happens to pass a
+                // mark, so arrival needs both. The velocity bound is expressed in the same
+                // units as the position one — the platter must be slow enough that a whole
+                // chunk of coasting could not carry it out of the epsilon band — which is why
+                // it cannot fire spuriously at the epsilon's own scale.
+                //
+                // At `inertia_ms == 0` this term is false by construction, so `arrived` is
+                // exactly `step.arrived` and the kill switch stays bit-identical.
+                let platter_moving = inertia_ms > 0.0
+                    && rate_smoothed.abs() * chunk_frames as f64 > SCRATCH_TARGET_EPSILON_FRAMES;
+                arrived = step.arrived && !platter_moving;
                 step.rate
             };
             if coasting && !arrived { tel_coast += 1; }
             tel_chunks += 1;
             if arrived { tel_arrived += 1; }
-            tel_rate_sum += commanded_rate.abs();
-            tel_rate_max = tel_rate_max.max(commanded_rate.abs());
             let fade_pos_before = fade_pos;
 
             if !stopping {
@@ -3957,9 +4140,18 @@ fn spawn_scratch_feeder(
                 // ramps per pause, i.e. an audible click each time the hand hesitated or
                 // crossed zero. This is the "scratchy pops" half of the 2026-08-08 live
                 // report; the silence half was the servo (SCRATCH_SERVO_LAG_CHUNKS).
-                let sign = if commanded_rate > 0.0 {
+                //
+                // The sign is taken from the *platter*, not from the command: the fade
+                // exists to mask the splice where the cursor reverses, and with inertia
+                // engaged the command reverses up to one time constant before the cursor
+                // does. Reading the command here would put the ramp on content that is
+                // still travelling the old way — and would fire it on commands the platter
+                // never actually follows through, which is the ramp-storm shape that
+                // `HandTracker`'s absorb logic was written to end.
+                let motion_rate = if inertia_ms > 0.0 { rate_smoothed } else { commanded_rate };
+                let sign = if motion_rate > 0.0 {
                     1.0
-                } else if commanded_rate < 0.0 {
+                } else if motion_rate < 0.0 {
                     -1.0
                 } else {
                     0.0
@@ -3982,8 +4174,20 @@ fn spawn_scratch_feeder(
                 && (arrived
                     || last_update_t.lock().unwrap().elapsed().as_millis() as u64 > hold_ms);
             let effective_rate = if idle { 0.0 } else { commanded_rate };
+            // Arrival stops the platter outright rather than letting it spin down through
+            // the filter. Coasting past the target instead would push the cursor back out
+            // beyond SCRATCH_TARGET_EPSILON_FRAMES, un-arriving it and re-arriving it a few
+            // chunks later — measured in simulation as 3 `arrived` flaps and 2-3 sign flips
+            // (i.e. gain ramps) for every single stop of the hand, at 60ms inertia. The
+            // motion given up is under a millisecond of content and it is given up
+            // underneath the hold_gain fade, so nothing is audible except the artefact that
+            // does not happen.
+            if idle {
+                rate_smoothed = 0.0;
+            }
             let target_hold_gain: f32 = if idle { 0.0 } else { 1.0 };
             let hold_step = 1.0 / SCRATCH_FADE_FRAMES as f32;
+            let chunk_rate_start = rate_smoothed;
 
             let mut out = vec![0f32; chunk_frames * 2];
             for i in 0..chunk_frames {
@@ -4013,10 +4217,28 @@ fn spawn_scratch_feeder(
                 tel_sumsq += (l * gain) as f64 * (l * gain) as f64;
 
                 if !stopping {
-                    cursor = (cursor + effective_rate).clamp(0.0, max_frame);
+                    // Per output frame, not per chunk: a chunk-rate filter would still step
+                    // the pitch 66.7 times a second, just by less each time. Advancing the
+                    // filter inside the loop is what makes playback speed a continuous
+                    // function of time, which is the whole point. `inertia_k == 1.0` when
+                    // the setting is 0 or the gesture is velocity mode, collapsing this to
+                    // `rate_smoothed = effective_rate` — the original code, exactly.
+                    rate_smoothed += (effective_rate - rate_smoothed) * inertia_k;
+                    cursor = (cursor + rate_smoothed).clamp(0.0, max_frame);
                 }
             }
             tel_samples += chunk_frames as u64;
+            // Telemetry describes what was *heard*, so it reads the platter rather than the
+            // command: with inertia engaged the two differ by exactly the amount this
+            // feature exists to remove, and reporting the command would hide the effect.
+            tel_rate_sum += rate_smoothed.abs();
+            tel_rate_max = tel_rate_max.max(rate_smoothed.abs());
+            // Chunk-to-chunk change in playback speed — the "frantic" metric. A rate that
+            // steps around by a large fraction of its own mean every 15ms is heard as pitch
+            // modulation at the update rate, and it is the one number that separates a
+            // rough gesture from a smooth one at the same mean speed. Summed as an absolute
+            // and normalised against the mean rate at report time.
+            tel_jerk_sum += (rate_smoothed - chunk_rate_start).abs();
 
             cursor_t.store(cursor.to_bits(), Ordering::Relaxed);
 
@@ -4110,7 +4332,8 @@ fn spawn_scratch_feeder(
                 log::info!(
                     "[scratch-tel/{deck_id}] chunks={tel_chunks} ({:.0}/s, late {:.0}%) | \
                      rms={rms:.5} ({dbfs:.1} dBFS) | arrived {:.0}% coast {:.0}% \
-                     snaps={tel_snaps} ramps={tel_ramps} | rate mean={:.3} max={:.3} | \
+                     snaps={tel_snaps} ramps={tel_ramps} | rate mean={:.3} max={:.3} \
+                     jerk={:.3} (inertia {:.0}ms, lag {:.1}ch) | \
                      {targets_report} | \
                      cursor {:.3}s -> {:.3}s \
                      ({:+.3}s in {secs:.2}s = {:.2}x) | delivery {delivery_report}",
@@ -4120,6 +4343,12 @@ fn spawn_scratch_feeder(
                     100.0 * tel_coast as f64 / tel_chunks.max(1) as f64,
                     tel_rate_sum / tel_chunks.max(1) as f64,
                     tel_rate_max,
+                    // Normalised against the mean, so it is comparable across gestures at
+                    // different speeds: 0.2 means playback speed jumps by a fifth of its own
+                    // average every 15ms, which is the "frantic" report as a number.
+                    tel_jerk_sum / tel_rate_sum.max(1e-9),
+                    inertia_ms,
+                    lag_chunks,
                     tel_cursor_start / pcm.rate as f64,
                     cursor / pcm.rate as f64,
                     (cursor - tel_cursor_start) / pcm.rate as f64,
@@ -4135,6 +4364,7 @@ fn spawn_scratch_feeder(
                 tel_samples = 0;
                 tel_rate_sum = 0.0;
                 tel_rate_max = 0.0;
+                tel_jerk_sum = 0.0;
                 tel_cursor_start = cursor;
                 tel_since = Instant::now();
             }
@@ -4144,6 +4374,7 @@ fn spawn_scratch_feeder(
     ScratchFeeder {
         rate_bits,
         target_frames_bits,
+        inertia_ms_bits,
         stop_requested,
         cursor_frames_bits,
         last_update,
@@ -4176,14 +4407,77 @@ mod servo_test {
     /// a slow drag delivers 5–12 events/s at ~2.3px each with gaps to 1180ms, and the target
     /// only exists at those instants.
     fn replay_sampled(hand_speed: f64, updates_ms: &[f64], secs: f64) -> (f64, f64) {
+        let r = replay_inertia(hand_speed, updates_ms, secs, 0.0);
+        (r.silent_fraction, r.mean_speed)
+    }
+
+    /// What one replayed gesture measured.
+    struct Replay {
+        /// Fraction of chunks that produced no sound.
+        silent_fraction: f64,
+        /// Mean speed the cursor actually walked at over the whole replay, in playback-rate
+        /// units — spin-up included.
+        mean_speed: f64,
+        /// Mean speed once the platter is up to speed. A large inertia genuinely takes a
+        /// fraction of a second to reach the hand's pace, and averaging that transient into a
+        /// short replay reads as a *tracking error* when it is really just a run that was
+        /// mostly spin-up.
+        settled_speed: f64,
+        /// Mean chunk-to-chunk change in playback speed as a fraction of `mean_speed` —
+        /// the `jerk` field of `[scratch-tel]`, and the thing a listener calls "frantic".
+        jerk: f64,
+        /// Times the *platter's* direction reversed. Each one costs a 5ms gain ramp in the
+        /// feeder, so on a one-direction gesture this must stay at zero.
+        sign_flips: usize,
+    }
+
+    /// Advance the feeder's per-output-frame rate filter across one whole chunk.
+    ///
+    /// Returns `(cursor_advance, rate_at_end)`. This is the exact closed form of the
+    /// recurrence the feeder runs per sample (`r += (cmd - r) * k`, summed into the cursor
+    /// each frame) — asserted against a literal per-sample loop in
+    /// `inertia_closed_form_matches_per_sample_loop`, so a test that passes here is a
+    /// statement about the shipping arithmetic and not about a convenient approximation.
+    fn advance_inertia(rate_now: f64, commanded: f64, k: f64, frames: f64) -> (f64, f64) {
+        if k >= 1.0 {
+            return (commanded * frames, commanded);
+        }
+        let decay = (1.0 - k).powf(frames);
+        let end = commanded + (rate_now - commanded) * decay;
+        // sum_{n=1..N} [cmd + (r0-cmd)(1-k)^n]
+        let advance =
+            commanded * frames + (rate_now - commanded) * (1.0 - k) * (1.0 - decay) / k;
+        (advance, end)
+    }
+
+    /// `replay_sampled` with the platter-inertia filter engaged, reporting the smoothness
+    /// metrics as well as the audibility ones.
+    fn replay_inertia(
+        hand_speed: f64,
+        updates_ms: &[f64],
+        secs: f64,
+        inertia_ms: f64,
+    ) -> Replay {
+        let lag = servo_lag_chunks(inertia_ms);
+        let k = inertia_coefficient(inertia_ms, RATE);
         let mut cursor = 0.0f64;
         let mut target = 0.0f64;
+        let mut rate_now = 0.0f64;
         let mut hand = HandTracker::new(0.0);
         let chunks = (secs * 1000.0 / SCRATCH_CHUNK_MS as f64) as usize;
         let mut silent = 0usize;
         let mut counted = 0usize;
         let mut moving = false;
         let mut next = 0usize;
+        let mut jerk_sum = 0.0f64;
+        let mut rate_sum = 0.0f64;
+        let mut sign_flips = 0usize;
+        let mut last_sign = 0i32;
+        // Generous enough to cover spin-up at the maximum setting (a 250ms filter behind a
+        // 500ms servo lag), so one constant serves every arm.
+        let settle_ms = 1500.0f64;
+        let settle_chunk = (settle_ms / SCRATCH_CHUNK_MS as f64) as usize;
+        let mut settle_cursor = 0.0f64;
         for c in 0..chunks {
             let now_ms = c as f64 * SCRATCH_CHUNK_MS as f64;
             while next < updates_ms.len() && updates_ms[next] <= now_ms {
@@ -4194,24 +4488,82 @@ mod servo_test {
                 target = sampled;
                 next += 1;
             }
-            let step = servo_step(hand.step(target, CHUNK), cursor, CHUNK, SNAP);
+            let step = servo_step(hand.step(target, CHUNK), cursor, CHUNK, snap_frames(RATE, CHUNK, lag), lag);
             // Counted only once the target has actually moved. Before that the cursor sits on
             // it with zero error and reports `arrived` — correctly, there is nothing to play
             // yet — and counting those chunks made a uniform 300ms schedule read as "7.5%
             // silent" no matter what the servo did. That number was the harness measuring its
             // own first update period, and it moved not at all across a coast on/off A/B,
             // which is what exposed it.
+            // Both halves of the feeder's arrival rule — position *and* the platter having
+            // come to rest. See the `platter_moving` comment there.
+            let platter_moving =
+                inertia_ms > 0.0 && rate_now.abs() * CHUNK > SCRATCH_TARGET_EPSILON_FRAMES;
+            let arrived = step.arrived && !platter_moving;
             if moving {
                 counted += 1;
-                if step.arrived {
+                if arrived {
                     silent += 1;
                 }
             }
-            if !step.arrived {
-                cursor += step.rate * CHUNK;
+            if c == settle_chunk {
+                settle_cursor = cursor;
+            }
+            // Arrival stops the platter dead, exactly as the feeder does — see the `if idle`
+            // branch there for why it must not be allowed to spin down through the filter.
+            if arrived {
+                rate_now = 0.0;
+            } else {
+                let before = rate_now;
+                let (advance, end) = advance_inertia(rate_now, step.rate, k, CHUNK);
+                cursor += advance;
+                rate_now = end;
+                jerk_sum += (rate_now - before).abs();
+            }
+            rate_sum += rate_now.abs();
+            let sign = if rate_now > 0.0 { 1 } else if rate_now < 0.0 { -1 } else { 0 };
+            if sign != 0 && last_sign != 0 && sign != last_sign {
+                sign_flips += 1;
+            }
+            if sign != 0 {
+                last_sign = sign;
             }
         }
-        (silent as f64 / counted.max(1) as f64, cursor / (secs * RATE))
+        Replay {
+            silent_fraction: silent as f64 / counted.max(1) as f64,
+            mean_speed: cursor / (secs * RATE),
+            settled_speed: (cursor - settle_cursor) / ((secs - settle_ms / 1000.0).max(1e-9) * RATE),
+            jerk: jerk_sum / rate_sum.max(1e-9),
+            sign_flips,
+        }
+    }
+
+    /// A vinyl-jog target schedule: MIDI detents of a fixed `VINYL_SEC_PER_TICK` arriving at
+    /// whatever rate the given hand speed implies, then coalesced by the frontend to one
+    /// `audio_scratch_to` per rAF.
+    ///
+    /// This shape is the whole point. Every other harness in this module samples a
+    /// *continuous* hand, which is what a pointer drag delivers; a jog wheel delivers an
+    /// **impulse train**, and at cueing speeds one impulse is several chunks' worth of travel
+    /// arriving at once. That is the input the servo turned into a sawtooth.
+    fn jog_updates(hand_speed: f64, secs: f64) -> Vec<f64> {
+        /// `VINYL_SEC_PER_TICK` in handler.ts: 1.8s per revolution / 256 detents.
+        const SEC_PER_TICK: f64 = 1.8 / 256.0;
+        const RAF_MS: f64 = 1000.0 / 60.0;
+        let tick_interval_ms = 1000.0 * SEC_PER_TICK / hand_speed;
+        let mut ticks = 0.0f64;
+        let mut out = Vec::new();
+        let mut f = 0.0f64;
+        while f < secs * 1000.0 {
+            f += RAF_MS;
+            // Whole detents delivered by now; the frontend flushes the accumulated total.
+            let due = (f / tick_interval_ms).floor();
+            if due > ticks {
+                ticks = due;
+                out.push(f);
+            }
+        }
+        out
     }
 
     /// Uniform update cadence — the original harness, now expressed as a schedule.
@@ -4297,7 +4649,7 @@ mod servo_test {
         let target = 1.0 * RATE * (SCRATCH_SERVO_LAG_CHUNKS * SCRATCH_CHUNK_MS as f64 / 1000.0);
         let mut chunks_to_silence = None;
         for c in 0..200 {
-            let step = servo_step(target, cursor, CHUNK, SNAP);
+            let step = servo_step(target, cursor, CHUNK, SNAP, SCRATCH_SERVO_LAG_CHUNKS);
             if step.arrived {
                 chunks_to_silence = Some(c);
                 break;
@@ -4415,7 +4767,7 @@ mod servo_test {
                 target = hand * RATE * (updates[next] / 1000.0);
                 next += 1;
             }
-            let step = servo_step(tracker.step(target, CHUNK), cursor, CHUNK, SNAP);
+            let step = servo_step(tracker.step(target, CHUNK), cursor, CHUNK, SNAP, SCRATCH_SERVO_LAG_CHUNKS);
             if step.arrived {
                 if now_ms > last_update_ms && silence_at_ms.is_none() {
                     silence_at_ms = Some(now_ms - last_update_ms);
@@ -4487,10 +4839,268 @@ mod servo_test {
     }
 
 
+    // ── Platter inertia ───────────────────────────────────────────────────────────────
+    //
+    // These pin the 2026-08-14 "scratching sounds frantic" fix. The property under test is
+    // *smoothness at a fixed mean speed*, which is a statistical property of a whole gesture
+    // and is invisible to any single-step assertion — the same reason the servo tests above
+    // are written as replays rather than as unit steps.
+
+    /// Not an assertion — a table, printed with `cargo test -- --nocapture inertia_table`.
+    /// The thresholds in the tests below are read off this, and it is the fastest way to
+    /// re-derive them if a constant moves.
+    #[test]
+    fn inertia_table() {
+        println!(
+            "\n{:>5} {:>8} {:>7} {:>7} {:>8} {:>7} {:>6}",
+            "hand", "inertia", "lag(ch)", "jerk", "silent%", "speed", "flips"
+        );
+        for &hand in &[0.15, 0.25, 0.5, 1.0] {
+            for &inertia in &[0.0, 20.0, SCRATCH_RATE_INERTIA_MS, 90.0, SCRATCH_RATE_INERTIA_MAX_MS]
+            {
+                let u = jog_updates(hand, 8.0);
+                let r = replay_inertia(hand, &u, 8.0, inertia);
+                println!(
+                    "{hand:5.2} {inertia:8.0} {:7.2} {:7.4} {:8.1} {:7.4} {:6}",
+                    servo_lag_chunks(inertia),
+                    r.jerk,
+                    r.silent_fraction * 100.0,
+                    r.settled_speed,
+                    r.sign_flips,
+                );
+            }
+        }
+        println!();
+    }
+
+    /// The closed form the replay harness uses must be the arithmetic the feeder actually
+    /// runs, or every inertia test below is measuring a model instead of the product.
+    #[test]
+    fn inertia_closed_form_matches_per_sample_loop() {
+        for &inertia in &[0.0, 15.0, 40.0, 120.0] {
+            let k = inertia_coefficient(inertia, RATE);
+            for &(r0, cmd) in &[(0.0, 1.0), (1.0, 0.0), (0.5, -0.75), (-2.0, 2.0)] {
+                // The feeder's loop, literally.
+                let mut r = r0;
+                let mut advance = 0.0;
+                for _ in 0..CHUNK as usize {
+                    r += (cmd - r) * k;
+                    advance += r;
+                }
+                let (adv_cf, end_cf) = advance_inertia(r0, cmd, k, CHUNK);
+                assert!(
+                    (adv_cf - advance).abs() < 1e-6 * advance.abs().max(1.0),
+                    "inertia={inertia} r0={r0} cmd={cmd}: closed-form advance {adv_cf} != \
+                     per-sample {advance}"
+                );
+                assert!((end_cf - r).abs() < 1e-9, "end rate {end_cf} != {r}");
+            }
+        }
+    }
+
+    /// **The live report, as a number.** A jog wheel does not deliver a continuous hand — it
+    /// delivers one fixed 7.0ms detent at a time, which at a realistic cueing speed is three
+    /// chunks' worth of travel arriving at once, every 47ms. The servo answered each with a
+    /// rate spike, so playback speed ran as a sawtooth whose peaks were about twice its own
+    /// mean: pitch modulated by roughly an octave at the tick rate. The user's words were
+    /// "almost frantic in the way the sound responds to midi events".
+    ///
+    /// Asserted as a *ratio between the two settings* rather than an absolute threshold: the
+    /// absolute number depends on the schedule this harness happens to generate, but the
+    /// improvement is the claim being made.
+    #[test]
+    fn inertia_smooths_the_jog_impulse_train() {
+        // 0.15x and 0.25x bracket the speeds sustained cueing was measured at on the
+        // Starlight (0.10-0.26x — see jogSecondsPerRev's doc comment), which is where the
+        // fault lives: at those speeds a detent is several chunks of travel and the ticks are
+        // 40-50ms apart. Above ~0.5x the detents arrive fast enough that the servo's own lag
+        // already blends them, so the baseline there is 3x smoother to begin with and the
+        // available improvement is correspondingly smaller — hence two thresholds rather than
+        // one, both read off `inertia_table`.
+        for &(hand, min_ratio) in &[(0.15, 5.0), (0.25, 5.0), (0.5, 2.5), (1.0, 2.5)] {
+            let updates = jog_updates(hand, 8.0);
+            assert!(
+                updates.len() > 20,
+                "schedule for {hand}x produced only {} updates — the harness, not the servo, \
+                 is what this would be measuring",
+                updates.len()
+            );
+            let rough = replay_inertia(hand, &updates, 8.0, 0.0);
+            let smooth = replay_inertia(hand, &updates, 8.0, SCRATCH_RATE_INERTIA_MS);
+            assert!(
+                smooth.jerk * min_ratio < rough.jerk,
+                "at {hand}x the default {SCRATCH_RATE_INERTIA_MS}ms of platter inertia cut \
+                 chunk-to-chunk speed jitter only from {:.4} to {:.4} — under {min_ratio}x is \
+                 not the fix that was measured",
+                rough.jerk,
+                smooth.jerk,
+            );
+        }
+    }
+
+    /// **A fast drag must never be mistaken for a jump, at any inertia setting.**
+    ///
+    /// This is the defect `inertia_table` surfaced on 2026-08-14 and the reason
+    /// `snap_frames()` scales with the lag. A first-order servo tracks a moving target with a
+    /// standing error of `hand_speed × lag`; against a *fixed* snap threshold, widening the
+    /// lag walks that standing error straight into it, and the gesture collapses into a
+    /// snap-mute-snap stutter — measured at 78% of chunks silent and a cursor going nowhere.
+    /// Nothing about it looks like a tuning problem from the outside.
+    #[test]
+    fn a_fast_drag_never_snaps_at_any_inertia() {
+        for &hand in &[1.0, 2.0, 4.0, SCRATCH_TARGET_MAX_RATE] {
+            for &inertia in &[0.0, SCRATCH_RATE_INERTIA_MS, SCRATCH_RATE_INERTIA_MAX_MS] {
+                let lag = servo_lag_chunks(inertia);
+                // The standing error a steady hand at this speed sustains, by construction.
+                let standing_err = hand * RATE * (lag * SCRATCH_CHUNK_MS as f64 / 1000.0);
+                let step =
+                    servo_step(standing_err, 0.0, CHUNK, snap_frames(RATE, CHUNK, lag), lag);
+                assert!(
+                    !step.snapped,
+                    "a steady {hand}x drag at {inertia}ms inertia sustains a {:.0}-frame \
+                     tracking error and the servo calls it a jump — every chunk, for as long \
+                     as the drag lasts",
+                    standing_err,
+                );
+            }
+        }
+    }
+
+    /// Smoothing the *rate* must not change the *speed*. The servo still chases an absolute
+    /// position, so inertia may add lag but can never add or lose travel — if it did, a long
+    /// gesture would land somewhere other than where the hand pointed, which is the drift
+    /// that position mode exists to make impossible.
+    #[test]
+    fn inertia_does_not_change_the_speed_the_cursor_walks_at() {
+        for &hand in &[0.15, 0.4, 1.0, 2.0] {
+            for &inertia in &[0.0, 40.0, 120.0, SCRATCH_RATE_INERTIA_MAX_MS] {
+                let updates = jog_updates(hand, 8.0);
+                let r = replay_inertia(hand, &updates, 8.0, inertia);
+                // Settled, not whole-run: spin-up at the widest setting is half a second of
+                // genuine acceleration, and averaging it into a short replay would read as a
+                // tracking error when the steady-state slope is exact.
+                let err = (r.settled_speed - hand).abs() / hand;
+                assert!(
+                    err < 0.02,
+                    "hand {hand}x with {inertia}ms inertia walked the cursor at \
+                     {:.4}x ({:.1}% off)",
+                    r.settled_speed,
+                    err * 100.0,
+                );
+            }
+        }
+    }
+
+    /// Turning the knob up must never make the gesture *rougher*. It can only work if the
+    /// rate filter stays fast relative to the servo loop it sits inside — which is what
+    /// `servo_lag_chunks` couples, and which is easy to break by "simplifying" that coupling
+    /// away. Left uncoupled, a large inertia makes the loop underdamped and the platter rings
+    /// past the target, reversing direction and costing a 5ms gain ramp on every crossing.
+    #[test]
+    fn inertia_is_monotone_and_never_rings() {
+        let updates = jog_updates(0.25, 6.0);
+        let mut prev = f64::INFINITY;
+        for &inertia in &[0.0, 20.0, 40.0, 90.0, SCRATCH_RATE_INERTIA_MAX_MS] {
+            let r = replay_inertia(0.25, &updates, 6.0, inertia);
+            assert!(
+                r.jerk <= prev,
+                "{inertia}ms of inertia is rougher (jerk {:.4}) than the setting below it \
+                 ({prev:.4}) — the knob is not monotone, so a user turning it up gets a \
+                 worse gesture",
+                r.jerk,
+            );
+            prev = r.jerk;
+            assert_eq!(
+                r.sign_flips, 0,
+                "the platter reversed direction {} times on a strictly forward gesture at \
+                 {inertia}ms — that is ringing, and the feeder answers every reversal with a \
+                 5ms gain ramp (the 2026-08-09 'audio tapers out during a slow jog' shape)",
+                r.sign_flips,
+            );
+        }
+    }
+
+    /// 0 is a true kill switch, not an approximation of one: every number a replay reports
+    /// must be bit-identical to the pre-inertia code path.
+    #[test]
+    fn zero_inertia_is_exactly_the_old_behaviour() {
+        assert_eq!(inertia_coefficient(0.0, RATE), 1.0);
+        assert_eq!(servo_lag_chunks(0.0), SCRATCH_SERVO_LAG_CHUNKS);
+        for &hand in &[0.15, 0.28, 1.0] {
+            let updates = bursty(400.0, 3, 17.0, 4.0);
+            let (old_silent, old_speed) = replay_sampled(hand, &updates, 4.0);
+            let new = replay_inertia(hand, &updates, 4.0, 0.0);
+            assert_eq!(old_silent, new.silent_fraction);
+            assert_eq!(old_speed, new.mean_speed);
+        }
+    }
+
+    /// The 2026-08-08 silence fixes must survive the smoothing. Inertia delays convergence,
+    /// which can only *reduce* `arrived` — but "can only" is exactly the kind of reasoning
+    /// this file has been wrong about before, so both of the gestures that were once silent
+    /// are re-run at the shipping default.
+    #[test]
+    fn inertia_does_not_reintroduce_silence() {
+        let steady: Vec<f64> = (0..).map(|i| i as f64 * 30.0).take_while(|t| *t <= 3000.0).collect();
+        let steady = replay_inertia(0.2, &steady, 3.0, SCRATCH_RATE_INERTIA_MS);
+        assert!(
+            steady.silent_fraction < 0.05,
+            "a steady 0.2x scrub went silent for {:.0}% of chunks at the shipping inertia",
+            steady.silent_fraction * 100.0,
+        );
+
+        let sparse = replay_inertia(0.28, &bursty(400.0, 3, 17.0, 4.0), 4.0, SCRATCH_RATE_INERTIA_MS);
+        assert!(
+            sparse.silent_fraction < 0.05,
+            "the sparse 0.28x drag muted {:.0}% of chunks at the shipping inertia — this is \
+             the 'gentle drag drops out' bug returning through the smoothing",
+            sparse.silent_fraction * 100.0,
+        );
+    }
+
+    /// A stopped hand must still come to rest promptly. Inertia is a platter, not a
+    /// flywheel: the feeder stops it dead on arrival precisely so the tail cannot run on.
+    #[test]
+    fn inertia_still_reaches_silence_when_the_hand_stops() {
+        for &inertia in &[0.0, SCRATCH_RATE_INERTIA_MS, SCRATCH_RATE_INERTIA_MAX_MS] {
+            let lag = servo_lag_chunks(inertia);
+            let k = inertia_coefficient(inertia, RATE);
+            // Steady-state lag from a 1.0x scrub, the worst realistic case to decay from,
+            // with the platter already up to speed.
+            let target = 1.0 * RATE * (lag * SCRATCH_CHUNK_MS as f64 / 1000.0);
+            let mut cursor = 0.0f64;
+            let mut rate_now = 1.0f64;
+            let mut chunks_to_silence = None;
+            for c in 0..400 {
+                let step = servo_step(target, cursor, CHUNK, snap_frames(RATE, CHUNK, lag), lag);
+                if step.arrived {
+                    chunks_to_silence = Some(c);
+                    break;
+                }
+                let (advance, end) = advance_inertia(rate_now, step.rate, k, CHUNK);
+                cursor += advance;
+                rate_now = end;
+            }
+            let chunks = chunks_to_silence
+                .unwrap_or_else(|| panic!("{inertia}ms inertia never reached silence"));
+            let ms = chunks as f64 * SCRATCH_CHUNK_MS as f64;
+            // Bounded by the frontend's own `SCRUB_HOLD_MS` backstop (1000ms), which is what
+            // ends a gesture whose updates simply stop. If a platter setting can coast past
+            // that, the two mechanisms race to end the same gesture — see
+            // `SCRATCH_RATE_INERTIA_MAX_MS` for the measured spin-down at each setting.
+            assert!(
+                ms < 1000.0,
+                "{inertia}ms of inertia took {ms}ms to fall silent after the hand stopped — \
+                 a held record is silent, and this one is still coasting past the point where \
+                 hold_ms would have cut it off anyway"
+            );
+        }
+    }
+
     /// A coarse overview drag must not race audibly through the content it skipped.
     #[test]
     fn far_target_snaps_silently() {
-        let step = servo_step(60.0 * RATE, 0.0, CHUNK, SNAP);
+        let step = servo_step(60.0 * RATE, 0.0, CHUNK, SNAP, SCRATCH_SERVO_LAG_CHUNKS);
         assert!(step.snapped && step.arrived && step.rate == 0.0, "{step:?}");
     }
 
@@ -4902,7 +5512,7 @@ mod scratch_smoke_test {
 
         // Converge. Well inside SCRATCH_TARGET_SNAP_SECS, so this sweeps rather than
         // snapping — i.e. it exercises the servo, not the jump path.
-        pipeline.scratch_to(target, HOLD_MS).expect("scratch_to");
+        pipeline.scratch_to(target, HOLD_MS, SCRATCH_RATE_INERTIA_MS).expect("scratch_to");
         std::thread::sleep(Duration::from_millis(250));
         let arrived = pipeline.position().unwrap();
         assert!(
@@ -4927,7 +5537,7 @@ mod scratch_smoke_test {
         // frame, not from wherever the normal branch still thinks it is.
         std::thread::sleep(Duration::from_millis(100));
         let target2 = target + 0.10;
-        pipeline.scratch_to(target2, HOLD_MS).expect("scratch_to 2");
+        pipeline.scratch_to(target2, HOLD_MS, SCRATCH_RATE_INERTIA_MS).expect("scratch_to 2");
         std::thread::sleep(Duration::from_millis(250));
         let arrived2 = pipeline.position().unwrap();
         assert!(
@@ -4997,7 +5607,7 @@ mod scratch_smoke_test {
         }
 
         let start = pipeline.position().unwrap();
-        pipeline.scratch_to(start + 0.20, 1000).expect("scratch_to");
+        pipeline.scratch_to(start + 0.20, 1000, SCRATCH_RATE_INERTIA_MS).expect("scratch_to");
         std::thread::sleep(Duration::from_millis(150));
 
         let expected = scratch_sink_alignment();

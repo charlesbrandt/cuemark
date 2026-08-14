@@ -102,3 +102,34 @@ export const scratchMode = persistentWritable<"shuttle" | "vinyl">("cuemark:scra
  * hardware number hide inside a taste setting. Persisted across restarts.
  */
 export const jogSecondsPerRev = persistentWritable<number>("cuemark:jogSecondsPerRev", 1.8);
+
+/**
+ * Scrub **platter mass**, in milliseconds: how long the scratch feeder's cursor takes to
+ * take up a change in speed. 0 restores the pre-2026-08-14 behaviour exactly.
+ *
+ * A jog wheel does not deliver a hand, it delivers **detents** — one fixed
+ * `VINYL_SEC_PER_TICK` (7.0ms of content) at a time. At the 0.10–0.26x speeds cueing
+ * actually runs at, that is three chunks' worth of cursor travel arriving at once every
+ * ~47ms, and the servo used to answer each one with a rate spike: playback speed ran as a
+ * sawtooth whose peaks were about twice its own mean, i.e. the *pitch* was modulated by
+ * roughly an octave at the tick rate. The user report was that it sounded "almost frantic in
+ * the way the sound responds to midi events". Real vinyl does not do this because a platter
+ * has mass, and this is that mass.
+ *
+ * ⚠️ **The trade is smoothness against immediacy and there is no free value** — which is why
+ * this is a setting and not a constant. Every millisecond here is a millisecond the cursor
+ * lags the hand (and the servo lag it is coupled to adds two more), so a value that feels
+ * beautifully fluid while hunting a cue point can feel unsteerable while beat-juggling.
+ * Measured chunk-to-chunk speed jitter at 0.15x, against the total position lag it costs:
+ * 0ms → 0.173 / 60ms · 20ms → 0.069 / 80ms · **40ms → 0.029 / 120ms** · 90ms → 0.008 / 270ms.
+ * The return flattens well before the lag does. Persisted across restarts.
+ *
+ * Applies to the position-mode scratch path — vinyl-mode jog *and* the waveform drag, which
+ * share it. Shuttle mode is deliberately unaffected: free-running between ticks is that
+ * mode's whole point. See `SCRATCH_RATE_INERTIA_MS` in `pipeline.rs` for the servo-side
+ * story, including why the *servo lag* has to widen alongside this one.
+ */
+export const scrubInertiaMs = persistentWritable<number>("cuemark:scrubInertiaMs", 40);
+
+/** Matches `SCRATCH_RATE_INERTIA_MAX_MS` in `pipeline.rs`, which clamps anything above it. */
+export const SCRUB_INERTIA_MAX_MS = 90;

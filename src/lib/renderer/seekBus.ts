@@ -1,5 +1,6 @@
 import { get, writable } from 'svelte/store';
 import { audioSeek, audioScratchTo, audioStopScratch } from '../audio/pipeline';
+import { scrubInertiaMs } from '../audio/audioSettings';
 import {
   beginScrubGesture,
   endScrubGesture,
@@ -314,7 +315,9 @@ export function updateScrub(deckId: string, targetSecs: number): number {
         // final position unthrottled, so the deck cannot come to rest short of it.
       } else {
         const token = noteScrubDispatch(id);
-        audioScratchTo(id, target, SCRUB_HOLD_MS)
+        // Read per flush, not captured at beginScrub: the whole point of a taste setting is
+        // that it can be moved mid-gesture and heard.
+        audioScratchTo(id, target, SCRUB_HOLD_MS, get(scrubInertiaMs))
           .then(() => noteScrubDispatchResult(id, token, true))
           .catch((err) => {
             noteScrubDispatchResult(id, token, false);

@@ -1,5 +1,10 @@
 # todo
 
+About page
+
+I hope you will use this software to encourage people to dance and have fun and love. 
+TODO: iterate on this seed a bit. 
+
 ## Feature requests — prioritized
 
 Carried over from a 2026-08-08 review pass. Ranked by rough value/effort; each "scope" note is

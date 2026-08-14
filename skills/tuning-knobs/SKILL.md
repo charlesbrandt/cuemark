@@ -92,6 +92,27 @@ numbers for comparison: `fills req=15 done=15 aus=720 decode=1007ms` over 43.9s 
 | **🛑 Do not re-tune the servo lag** | Three sessions blamed the servo by mistake. A slow hand produces only **5–12 pointer events/s with gaps to 1180ms**; the coasting already exists for exactly this. Read the delivery legs first. |
 | **Designed silence** | `arrived%` on a decelerating hand and `snaps` on a coarse drag are silence **by design**. A sustained negative delivery margin during a scratch is **the fix working**, not a fault. `output_queue underrun` fires once per chunk by construction (66.8/s against a 66.7/s chunk rate) and adjudicates nothing. |
 
+### 4c. Platter mass — the scratch sounds frantic / buzzy / jittery
+
+| | |
+|---|---|
+| **Symptom** | Scratching or jogging *works*, at the right speed and with no dropouts, but the sound is rough, buzzy or "frantic" — the pitch audibly jumps with each MIDI detent instead of gliding. Worst at the slow speeds cueing actually uses; barely noticeable above ~0.5x. |
+| **Where** | **Settings → Audio → Platter** (0–90ms, default 40). `cuemark:scrubInertiaMs`; `SCRATCH_RATE_INERTIA_MS` in `pipeline.rs` is the default only. |
+| **Log line** | `[scratch-tel/deck-0] … rate mean=0.152 max=0.31 jerk=0.029 (inertia 40ms, lag 5.3ch)` |
+| **Read `jerk`** | Mean chunk-to-chunk change in playback speed as a fraction of the mean speed. **~0.17 is the un-smoothed behaviour at cueing speed; ~0.03 is the shipping default.** Compare two gestures at the same `rate mean` — that is the only fair comparison, since the metric is normalised but the *input* jitter is not. |
+| **Why it exists** | A jog wheel delivers **detents**, not a hand: one fixed 7.0ms of content at a time, which at 0.15x is 3 chunks' worth of cursor travel arriving at once every 47ms. The servo answered each with a rate spike, so pitch ran as a ~21Hz sawtooth peaking at twice its own mean. `docs/design/waveform-scrub.md`, "Platter mass". |
+| **Applies live** | Sent with every `scratch_to` call, so **move the slider mid-gesture and listen.** No reload, no rebuild. |
+| **The trade** | Smoothness against immediacy, and there is no free value — every ms here is a ms the cursor trails the hand, plus 2 more from the servo lag it is coupled to. 0ms → jerk 0.173 / 60ms lag · 40ms → 0.029 / 120ms · 90ms → 0.008 / 270ms. The return flattens long before the lag does; past ~60ms you are mostly buying latency. |
+| **Kill switch** | 0 — bit-identical to the pre-2026-08-14 path, asserted by `zero_inertia_is_exactly_the_old_behaviour`. |
+| **🛑 Not the knob** | `SCRATCH_SERVO_LAG_CHUNKS` directly. It is now *derived* (`servo_lag_chunks()` holds it at ≥2× the inertia) and that coupling is what keeps the servo loop damped — decoupling it makes a large setting ring, which is audibly **rougher**, not smoother, and reintroduces the 2026-08-09 gain-ramp storm. |
+| **🛑 Also not the knob** | The coast (`SCRATCH_COAST_*`). It is already working; §4 applies. |
+
+⚠️ **If you change the mechanism rather than the setting, `snap_frames()` is load-bearing.**
+A first-order servo sustains a standing error of `hand_speed × lag`, so a *fixed* snap
+threshold becomes reachable by an ordinary fast drag as soon as the lag widens — measured at
+**78% of chunks silent with the cursor going nowhere**, which reads as "scratch stopped
+working" and not at all as a tuning problem. It scales with the lag for that reason.
+
 ### 4b. Shared output graph — cue gates during a scratch, or a jog feels laggy
 
 | | |
@@ -194,6 +215,44 @@ Several of these paths are deliberately silent in specific gestures. Before trea
 silence as a bug, check the designed cases in §4 and in
 `docs/design/scratch-audio-downstream-delivery.md`. When asking for a repro, ask for a
 **slow, smooth, zoomed** gesture — coarse or fast gestures hit the by-design silence.
+
+---
+
+## Adding a knob (rather than turning one)
+
+🛑 **Promoting a tuned constant to a user-facing setting promotes every margin that constant
+was silently protecting into a live failure mode.** Those margins were never written down as
+constraints — they were true by arithmetic accident and had never had to hold.
+
+Establishing case, 2026-08-14, adding §4c's platter mass: the new filter widened the servo
+lag, fixed at 4 chunks since it was tuned. Three defects fell out, **none of them in the new
+code**, all latent for months. The snap threshold was a fixed 0.5s against a legitimate
+standing error of `hand_speed × lag`, which at the old lag topped out at 0.48s — a **4% margin
+nobody had stated** — so widening the lag collapsed a fast drag into snap-mute-snap, 78% of
+chunks silent. Arrival was defined by position alone, safe only while the cursor could not
+have momentum. And the filter is a second pole *inside* the servo loop, so damping is set by
+the *ratio* of the two constants — uncoupled, turning the knob up made it **rougher**.
+
+Before shipping a slider:
+
+1. **List every constant whose correctness depends on the one you are freeing**, and re-derive
+   each as a *function* of the knob rather than a number.
+2. **Write a table test before the assertion tests** — a `#[test]` that just prints a matrix
+   (knob × input → each metric), run with `--nocapture`. Thresholds then get read off real
+   numbers instead of guessed, and the wrong cell is visible at a glance. `servo_test::
+   inertia_table` is the worked example; it is what surfaced the snap collapse while every
+   hand-written assertion passed.
+3. **Sweep the full range and measure.** The knob must be *monotone* in the thing it claims to
+   improve, and 0 (or the old value) must be bit-identical to the old path — assert both.
+4. **Bound it by something real.** `SCRATCH_RATE_INERTIA_MAX_MS = 90` is where spin-down would
+   start racing the frontend's `SCRUB_HOLD_MS` to end the same gesture, not a round number.
+
+⚠️ **When the complaint is about *texture* — rough, frantic, buzzy, jittery — log the
+derivative, not the envelope.** `rate mean` and `max` had been in `[scratch-tel]` all along
+(`mean=1.026 max=1.424` inside one second of a *steady* gesture) and nobody had connected them
+to what a listener heard. A normalised chunk-to-chunk delta (`jerk`) makes the same fault
+legible at a glance. Simulate the real input chain and validate the model against existing
+logs *before* writing code — the evidence was already six days old.
 
 ---
 

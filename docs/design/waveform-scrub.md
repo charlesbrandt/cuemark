@@ -634,3 +634,114 @@ Two changes on the measured path came with it:
 - `noteScrubInput` is the first statement of the pointer handler, ahead of the
   `DRAG_THRESHOLD_PX` guard: the sub-threshold events are still *delivery* evidence even
   though they deliberately send nothing.
+
+---
+
+## Platter mass: the scratch sounded frantic (2026-08-14)
+
+🟢 **Built 2026-08-14.** User report: *"the scrub / scratch effect … sounds almost frantic in
+the way the sound responds to midi events. I would like it to sound smoother like vinyl might
+sound as you move the record faster and slower."* — against a feature that otherwise worked,
+so the requirement was explicitly to smooth it **without** breaking any of the above.
+
+### The mechanism: a jog wheel delivers an impulse train, not a hand
+
+Everything above models the input as a *continuously moving hand, sampled at awkward times* —
+which is what a pointer drag is. A jog wheel is not that. It delivers **detents**: one fixed
+`VINYL_SEC_PER_TICK` (1.8/256 = 7.0ms of content) at a time, and nothing in between.
+
+At the 0.10–0.26x speeds sustained cueing actually runs at (measured 2026-08-10, see
+`jogSecondsPerRev`), that means:
+
+| | at 0.15x |
+|---|---|
+| one detent | 338 frames = 7.0ms of content |
+| cursor travel per 15ms chunk | 108 frames |
+| **so the target jumps** | **3.1 chunks' worth of travel, at once, every 47ms** |
+
+`servo_step` is a first-order lag, so it answers each jump with a rate spike that decays over
+`SCRATCH_SERVO_LAG_CHUNKS`. The commanded rate was therefore a **~21Hz sawtooth whose peaks
+were about twice its own mean** — i.e. the pitch was being modulated by roughly an octave at
+the detent rate. That is the "frantic" sound, and it is not a defect in any one component:
+every part was doing exactly what it was designed to do.
+
+**It was already visible in the instrumentation and had never been named.** The live
+`[scratch-tel]` of 2026-08-08 shows `rate mean=1.026 max=1.424` inside a single second of a
+steady 1.03x gesture — a 38% excursion at the *smoothest* end of the range. And
+`target_gaps_ms`'s own doc comment records "swings instantaneous rate 3–6× above its
+one-second mean" as evidence for a *different* question (the update cadence) without ever
+connecting it to what a listener would hear.
+
+### The fix: give the platter mass
+
+A one-pole lag on the servo's commanded rate, applied **per output frame** (not per chunk — a
+chunk-rate filter would still step the pitch 66.7 times a second, just by less each time),
+before it is used to advance the cursor. `SCRATCH_RATE_INERTIA_MS`, default 40ms, exposed as
+**Settings → Audio → Platter** and sent along with every `scratch_to` call so it can be moved
+mid-gesture and judged by ear.
+
+**Why this is the platter and not just a filter.** It smooths the *velocity*, never the
+position: the servo still chases an absolute target, so nothing here can drift or accumulate,
+and the steady-state speed is provably unchanged (a first-order lag tracks a ramp at the
+input's slope — the same argument that justifies `SCRATCH_SERVO_LAG_CHUNKS`). All it says is
+that the cursor's speed cannot change instantaneously, which is what a mass does and exactly
+what the impulse train is missing. Real vinyl is smooth under a jerky hand for this reason.
+
+Measured on the replay harness, at 0.15x, against the total position lag it costs:
+
+| inertia | total lag | jerk | improvement |
+|---|---|---|---|
+| 0 (old) | 60ms | 0.173 | — |
+| 20ms | 80ms | 0.069 | 2.5× |
+| **40ms (default)** | **120ms** | **0.029** | **6×** |
+| 90ms (max) | 270ms | 0.008 | 22× |
+
+⚠️ **The trade is smoothness against immediacy and there is no free value**, which is why it
+is a setting. The return flattens well before the lag does.
+
+### Three things this broke on the way in, all found by measurement
+
+Each was invisible to the change itself and caught only because the servo tests replay whole
+gestures rather than single steps. All three are pinned by tests now.
+
+1. **Arrival stopped meaning "at rest".** `SCRATCH_TARGET_EPSILON_FRAMES` is 0.25ms wide, and
+   a platter with momentum sweeps through a band that narrow in one chunk — so `arrived` fired
+   on a *pass-through*, muting a chunk in the middle of motion the user was still hearing.
+   **0% muted without inertia, 9% with it** on the 2026-08-08 sparse-drag schedule: the
+   "gentle drag drops out" bug, walking back in through the smoothing. Arrival now requires
+   the platter to have slowed as well as the cursor to be close — which is what the words
+   already meant. False by construction at inertia 0, so the kill switch stays exact.
+
+2. **A fast drag started snapping.** A first-order servo sustains a standing error of
+   `hand_speed × lag`, and `SCRATCH_TARGET_SNAP_SECS` was a *fixed* 0.5s. Widening the lag
+   walks that standing error into the threshold, and the gesture collapses into
+   snap-mute-snap: **78% of chunks silent, cursor travelling at 0.001x.** Latent since the
+   beginning — at the fixed 4-chunk lag the standing error at the servo's own 8x ceiling is
+   0.48s, clearing 0.5s by 4% — and turning the lag into a user-facing knob is what walked it
+   through. `snap_frames()` now scales with the lag, so a threshold that a legitimate steady
+   gesture can reach is no longer expressible.
+
+3. **The knob was not monotone at large values.** The rate filter is a second pole *inside*
+   the servo's feedback loop, so at a fixed lag a large inertia makes the loop underdamped:
+   the platter rings past the target, and every zero crossing is a direction reversal the
+   feeder answers with a 5ms gain ramp — i.e. the "2–8 `ramps` per second" artefact of
+   2026-08-09, rebuilt from a different direction. `servo_lag_chunks()` holds the lag at ≥2×
+   the inertia, which keeps the damping ratio near 0.7 across the whole range, so turning the
+   knob up can only make the gesture smoother, never rougher.
+
+`SCRATCH_RATE_INERTIA_MAX_MS = 90` is where spin-down after a stopped hand (measured 900ms)
+would otherwise start racing the frontend's own `SCRUB_HOLD_MS` (1000ms) to end the gesture.
+
+### Instrument
+
+`[scratch-tel]` gained `jerk=` — mean chunk-to-chunk change in playback speed as a fraction of
+the mean speed, i.e. the frantic-ness as a number — alongside the resolved `inertia` and
+`lag`. Read it against `rate mean`: two gestures at the same mean speed and very different
+`jerk` are the smooth one and the rough one. ~0.17 is the old behaviour at cueing speed,
+~0.03 the shipping default.
+
+### Not verified live yet
+
+Everything above is simulation and unit-level replay of the real chain. The numbers are
+predictions; **the setting is a taste control and the default is a guess at someone else's
+taste.** Expect to move the slider.

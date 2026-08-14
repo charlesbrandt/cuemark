@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listAudioDevices, type AudioDevice } from "../lib/audio/pipeline";
-  import { mainOutputDeviceIds, cueOutputDeviceId, tempoRange, scratchMode, jogSecondsPerRev, networkOutputs } from "../lib/audio/audioSettings";
+  import { mainOutputDeviceIds, cueOutputDeviceId, tempoRange, scratchMode, jogSecondsPerRev, scrubInertiaMs, SCRUB_INERTIA_MAX_MS, networkOutputs } from "../lib/audio/audioSettings";
   import { fontScale } from "../lib/settings/displaySettings";
   import { session, setMidiMapping } from "../lib/state/session";
 
@@ -266,6 +266,47 @@
       </span>
     </div>
   {/if}
+
+  <!--
+    Deliberately *outside* the vinyl-only block: the waveform drag runs the same position-mode
+    scratch path and gets the same platter, whatever the jog wheel is set to. Only shuttle-mode
+    jog is unaffected, and that is a jog setting rather than a scrub one.
+
+    Tuned by ear, so the hint reports the trade in the two units it is actually made in — how
+    far behind the hand the cursor sits, and whether the detent-by-detent jitter is still
+    audible. See scrubInertiaMs's doc comment for the measured table behind these bands.
+  -->
+  <div class="settings-row">
+    <span class="row-label">Platter</span>
+    <input
+      type="range"
+      min="0"
+      max={SCRUB_INERTIA_MAX_MS}
+      step="5"
+      bind:value={$scrubInertiaMs}
+    />
+    <span class="jog-scale-value">
+      {$scrubInertiaMs === 0 ? "off" : `${$scrubInertiaMs}ms`}
+    </span>
+    <button type="button" class="font-scale-reset" onclick={() => scrubInertiaMs.set(40)}>
+      Reset
+    </button>
+    <span class="hint-inline">
+      {#if $scrubInertiaMs === 0}
+        no smoothing &mdash; each MIDI detent lands as its own pitch step
+      {:else}
+        smooths the jog's detent steps &middot; cursor trails the hand by
+        {(3 * $scrubInertiaMs + 60).toFixed(0)}ms
+        {#if $scrubInertiaMs >= 70}(fluid, but sluggish to steer){/if}
+      {/if}
+    </span>
+  </div>
+  <!--
+    ⚠️ Not a fader-style control: this changes how the deck *feels*, so it is meant to be
+    moved while scratching. The value rides along with every scratch_to call rather than
+    being pushed on change, so it takes effect mid-gesture with no extra IPC.
+  -->
+
 
   <div class="settings-row">
     <span class="row-label">Display</span>

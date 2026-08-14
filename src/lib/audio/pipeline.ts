@@ -96,9 +96,19 @@ export function audioScratch(deckId: string, rate: number, holdMs: number): Prom
  *
  * `targetSecs` is content time: the same domain as the waveform, cue points and hot cues.
  * Still worth throttling to once per rAF, since it is an IPC round trip either way.
+ *
+ * `inertiaMs` is the platter-mass taste setting (`scrubInertiaMs`), sent on every call
+ * rather than configured once: it is a preference the user tunes *by ear*, which means
+ * moving it during a live gesture and hearing the difference. Riding along with the target
+ * that is already going out each frame costs nothing and cannot arrive out of order with it.
  */
-export function audioScratchTo(deckId: string, targetSecs: number, holdMs: number): Promise<void> {
-  return invoke("audio_scratch_to", { deckId, targetSecs, holdMs });
+export function audioScratchTo(
+  deckId: string,
+  targetSecs: number,
+  holdMs: number,
+  inertiaMs: number,
+): Promise<void> {
+  return invoke("audio_scratch_to", { deckId, targetSecs, holdMs, inertiaMs });
 }
 
 /** Stops scratch playback and returns to Paused. The next audioPlay() resyncs to the position the scratch cursor reached. */

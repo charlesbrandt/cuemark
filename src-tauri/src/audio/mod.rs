@@ -312,9 +312,18 @@ pub fn audio_scratch(state: State<'_, AudioState>, deck_id: String, rate: f64, h
 /// `DeckAudioPipeline::scratch_to`. Deliberately *not* detached: like `audio_scratch`
 /// this is a per-frame hot path during a gesture, and after the first call it is only an
 /// atomic store behind the manager lock.
+///
+/// `inertia_ms` is the platter-mass taste setting, sent on every call so it can be tuned by
+/// ear during a live gesture — see `SCRATCH_RATE_INERTIA_MS`.
 #[tauri::command]
-pub fn audio_scratch_to(state: State<'_, AudioState>, deck_id: String, target_secs: f64, hold_ms: u64) -> Result<(), String> {
-    state.lock().unwrap().pipeline_mut(&deck_id)?.scratch_to(target_secs, hold_ms)
+pub fn audio_scratch_to(
+    state: State<'_, AudioState>,
+    deck_id: String,
+    target_secs: f64,
+    hold_ms: u64,
+    inertia_ms: f64,
+) -> Result<(), String> {
+    state.lock().unwrap().pipeline_mut(&deck_id)?.scratch_to(target_secs, hold_ms, inertia_ms)
 }
 
 #[tauri::command]
