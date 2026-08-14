@@ -226,6 +226,7 @@ pub fn run() {
             audio::audio_set_cue,
             audio::audio_get_position,
             audio::audio_set_master_volume,
+            audio::audio_set_output_latency,
             audio::audio_set_main_devices,
             audio::audio_set_cue_device,
             audio::audio_set_cue_gain,

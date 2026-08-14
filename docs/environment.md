@@ -8,6 +8,11 @@ scoped per machine, meant to stop the same capability fact from being independen
 of sync in some copies while getting corrected in others. That already happened twice
 (see "Why this doc exists" below) before this file existed.
 
+**Network facts live next door**, in `docs/network-topology.md`: subnets, what this machine
+can and cannot reach, and the one-way NAT that decides which network protocols can work at
+all. Same fact-sheet spirit, different axis — check it before designing anything with a
+network peer.
+
 ## Identify which machine you're on before trusting anything below
 
 ```sh

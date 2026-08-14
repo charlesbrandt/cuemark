@@ -1,6 +1,6 @@
 ---
 name: audio-debugging
-description: Debug GStreamer audio issues in cuemark — bus errors, pitch element, device routing, gain staging, capturing the real device output, WebKit video stream. Load this when the audio pipeline misbehaves, including "it works on one output device but not another".
+description: Debug GStreamer audio issues in cuemark — bus errors, pitch element, device routing, gain staging, capturing the real device output, network/Snapcast outputs, WebKit video stream. Load this when the audio pipeline misbehaves, including "it works on one output device but not another".
 ---
 
 # Cuemark Audio Debugging
@@ -648,6 +648,47 @@ it is not centralized.**
 ---
 
 ## Known failure modes
+
+### A network (Snapcast) output is silent while local outputs are fine
+
+**Symptom**: a `snapcast://…` target is ticked in Main, the deck plays normally on the booth
+monitor, and the room hears nothing.
+
+⚠️ **Diagnose from the server end first.** Everything on cuemark's side reports healthy in
+this failure, by construction: an output branch that cannot attach is deliberately non-fatal
+(`attach_output_graph()` leaves the appsink swallowing buffers rather than blocking the deck),
+so there is no error, no underrun, and no gap warning — the deck cannot tell.
+
+Walk it in this order; each step distinguishes a different cause:
+
+```bash
+# 1. Is the server even offering a tcp:// source? (the usual answer — it is a one-line
+#    config change on the server that is easy to forget after a rebuild/restore)
+ssh plex "grep -n '^source = tcp' /etc/snapserver.conf"
+
+# 2. Is snapserver seeing the stream as playing?  idle here = nothing is arriving
+curl -s -X POST http://10.20.2.97:1780/jsonrpc \
+  -d '{"id":1,"jsonrpc":"2.0","method":"Server.GetStatus"}' | grep -o '"id":"Cuemark","status":"[a-z]*"'
+
+# 3. Did cuemark actually connect?
+ss -tnp | grep 4953
+
+# 4. What did the sink say it built?
+grep "sink: snapcast" ~/.local/share/com.cuemark.app/logs/cuemark.log
+```
+
+**And check which group is on which stream.** A `tcp://` source is deliberately *not* part of
+the `House` meta stream (cuemark's silent keepalive would capture it permanently — see the
+`sound-system` skill), so the speakers must be pointed at the `Cuemark` stream explicitly with
+`Group.SetStream`. "Snapserver says playing, room says silent" is nearly always this.
+
+To test the sink without a server at all: `scripts/probes/snapcast_tcp_sink_probe.py`.
+Full design: `docs/design/network-audio-output.md`. Network reachability facts (the NAT that
+makes AirPlay impossible here): `docs/network-topology.md`.
+
+**Not this entry**: audio that arrives but *late* is working as designed — see the
+`tuning-knobs` skill §6 for the delay setting. Audio that stalls **every** output including
+the booth when the server dies would be the leaky queue having been removed (§7 there).
 
 ### Play never starts, and the whole machine's audio hangs with it (pipewiresink deadlock)
 

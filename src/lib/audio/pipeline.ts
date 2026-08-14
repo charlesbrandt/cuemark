@@ -19,6 +19,18 @@ export function listAudioDevices(): Promise<AudioDevice[]> {
   return invoke("list_audio_devices");
 }
 
+/**
+ * Declare how far behind this app a device's listeners actually are, in milliseconds.
+ *
+ * Only meaningful for network outputs, where the delay past the socket (the receiving
+ * server's buffer, its clients' presentation delay) is on another machine and GStreamer's
+ * latency query structurally cannot see it. Configured in Settings — the app cannot measure
+ * it. Applies live, including to a deck already playing.
+ */
+export function setOutputLatency(deviceId: string, latencyMs: number): Promise<void> {
+  return invoke("audio_set_output_latency", { deviceId, latencyMs });
+}
+
 // ── Per-deck lifecycle ────────────────────────────────────────────────────────
 
 // Returns the track duration in seconds as determined by the GStreamer audio

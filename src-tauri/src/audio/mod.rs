@@ -416,6 +416,32 @@ pub fn audio_set_master_volume(state: State<'_, AudioState>, volume: f32) -> Res
     Ok(())
 }
 
+/// Declare how far behind this process a device's audible output actually is, in
+/// milliseconds — the delay GStreamer's latency query structurally cannot see because it
+/// happens on another machine (a Snapcast server's `buffer`, its clients' presentation
+/// delay). See `OutputGraph::set_extra_latency`.
+///
+/// Configured in Settings, never inferred: it is a property of the receiving system, and
+/// the app has no way to measure it. Zero (the default) means "uncorrected", which is
+/// correct for every local device.
+///
+/// Applies immediately, including to a deck that is already playing — the value is tuned by
+/// ear against a real room, and a correction that only took effect on the next track reload
+/// could not be tuned at all.
+#[tauri::command]
+pub fn audio_set_output_latency(
+    state: State<'_, AudioState>,
+    device_id: String,
+    latency_ms: u32,
+) -> Result<(), String> {
+    let mgr = state.lock().unwrap();
+    mgr.output_graph
+        .lock()
+        .unwrap()
+        .set_extra_latency(&device_id, latency_ms as u64 * 1_000_000);
+    Ok(())
+}
+
 // Async + spawn_blocking (2026-08-01 live incident — see audio_play's doc comment for the
 // full gdb-confirmed root cause). `set_devices()`/`set_cue_device()` below are an even
 // bigger exposure than plain play/pause: they unconditionally tear down and rebuild each

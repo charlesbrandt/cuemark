@@ -1,6 +1,6 @@
 ---
 name: tuning-knobs
-description: The small set of numeric constants that actually change cuemark's live feel — video frame ring, scrub delivery, scratch servo, decode-ahead — with each knob's live symptom, where it lives, how to change it without a rebuild, and which knobs are known traps that must not be turned. Load when a feature "works but feels wrong" live, when about to tune a constant, or when a shipped fix reads as not working.
+description: The small set of numeric constants that actually change cuemark's live feel — video frame ring, scrub delivery, scratch servo, decode-ahead, network output delay — with each knob's live symptom, where it lives, how to change it without a rebuild, and which knobs are known traps that must not be turned. Load when a feature "works but feels wrong" live, when about to tune a constant, or when a shipped fix reads as not working.
 ---
 
 # Tuning knobs
@@ -127,6 +127,27 @@ because `appsink` is not a `GstAudioBaseSink`.
 | **🛑 Known trap** | Lowering `BACKWARD_JUMP_SECONDS`, or making the `setClock` anchor accumulate backward travel, was built, unit-tested and **reverted as a live audio regression** (2026-08-09). Each seek re-decodes ~125 frames of 1080p in software (no VA-API on this machine), starving the main thread and the GStreamer audio threads. |
 | **Instead** | Widen the frame ring (§1), or tune reverse backfill (§1b), which serves travel past the ring without ever moving the primary decoder. The cost is the seek itself, not the seek policy. |
 | **Load-bearing coupling** | Reverse motion stops the decoder feeding on its own as `clockPos` retreats — that is *why* the ring survives a backward gesture. Changing the gate can silently break the ring. |
+
+### 6. Network output delay — the projector runs ahead of the room
+
+| | |
+|---|---|
+| **Symptom** | Audio and video look in sync in the booth, but on a network (Snapcast) output the video is visibly *ahead* of what the room hears — by a constant amount, on every deck, forever. |
+| **Where** | **Settings → Net → delay (ms)**, per target. Not a code constant — it is a property of the *receiving server*, so it is configured, persisted in `cuemark:networkOutputs`, and pushed by `audio_set_output_latency`. |
+| **Start at** | The server's own end-to-end buffer. For the house Snapcast server that is `buffer = 400` in `/etc/snapserver.conf` (Snapcast's own default is 1000). Then tune by ear against the room. |
+| **Log line** | `[audio/out/snap-…] created for …: latency=571ms (queried 171ms + network 400ms)`, and on a change `extra latency now 400ms … applied live to N attached branch(es)`. |
+| **Applies live** | Deliberately — it is shared with the node as an `Arc<AtomicU64>`, not copied at attach. Change it while a deck plays; no reload, no rebuild. |
+| **🛑 Only moves the video when the network target is FIRST in Main** | `attach_output_graph()` takes the position correction from branch 0. That *is* the choice of which output the projector is in sync with, and **you cannot have both**: booth monitor first = video synced to the booth; house first = synced to the room. If turning this knob does nothing, check the ordering before anything else. |
+| **Not this knob** | Booth-and-house echoing in one room is a *different* offset (`ts-offset` on the local sink, not built). And a network output that is silent rather than late is not a latency problem at all — see the audio-debugging skill. |
+
+### 7. Network sink queue — 🛑 do not make it non-leaky
+
+| | |
+|---|---|
+| **Where** | `SNAPCAST_QUEUE_NS` (500ms) and `leaky=downstream` in `make_snapcast_sink()`, `audio/pipeline.rs` |
+| **🛑 Known trap** | `leaky=downstream` looks like sloppiness — it drops audio. It is the only thing stopping a dead or wedged server from stalling **the booth monitor and the cue**: the deck's `tee` has no per-branch queue, so backpressure from any branch stalls every branch. Measured with a control arm: without it, the booth branch received **0 buffers**; with it, the full healthy rate. |
+| **Verify** | `scripts/probes/snapcast_tcp_sink_probe.py --stall` (must pass) **and** `--stall --no-leaky` (must fail). ⚠️ Needs ~35s — kernel socket buffers absorb ~21s of audio first, so a shorter run passes regardless and proves nothing. |
+| **If the room glitches** | Raise `SNAPCAST_QUEUE_NS`. Never remove the leak. |
 
 ---
 

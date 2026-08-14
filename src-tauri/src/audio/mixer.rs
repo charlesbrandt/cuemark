@@ -35,7 +35,9 @@ use gstreamer::glib;
 use gstreamer::{self as gst, prelude::*};
 use gstreamer_app::{AppSink, AppSinkCallbacks, AppSrc};
 
-use super::pipeline::{deck_output_caps, make_sink, parse_device_remap, ChannelRemap};
+use super::pipeline::{
+    deck_output_caps, make_sink, parse_device_remap, parse_snapcast_device, ChannelRemap,
+};
 
 /// Jitter buffer between a deck's handoff and the mixer pad.
 ///
@@ -75,8 +77,12 @@ struct OutputNode {
     channels: i32,
     channel_mask: u64,
     /// Output-side latency in nanoseconds — what `position()` must subtract. See
-    /// `OutputGraph::latency_ns`.
+    /// `OutputGraph::latency_ns`. Shared with every deck attached to this node and read on
+    /// each `position()` call, so a settings change reaches a *playing* deck.
     latency_ns: Arc<AtomicU64>,
+    /// The part of `latency_ns` GStreamer measured, kept so a change to the configured
+    /// network offset can be re-applied without re-querying (or rebuilding) the node.
+    queried_latency_ns: u64,
 }
 
 /// Registry of output pipelines, keyed by bare PipeWire node name (`""` = system default).
@@ -90,11 +96,56 @@ pub struct OutputGraph {
     master_volume: f32,
     /// The clock every deck pipeline slaves to — see `shared_clock()`.
     shared_clock: Option<gst::Clock>,
+    /// Configured extra output latency per device id, in nanoseconds — see
+    /// `set_extra_latency()`. Empty by default: nothing here is inferred, and nothing is
+    /// assumed about any particular server.
+    extra_latency: HashMap<String, u64>,
 }
 
 impl OutputGraph {
     pub fn new() -> Self {
-        Self { nodes: HashMap::new(), master_volume: 1.0, shared_clock: None }
+        Self {
+            nodes: HashMap::new(),
+            master_volume: 1.0,
+            shared_clock: None,
+            extra_latency: HashMap::new(),
+        }
+    }
+
+    /// Declare extra output latency for a device: delay between this process handing audio
+    /// off and the listener hearing it that **GStreamer's latency query cannot see**.
+    ///
+    /// The query ends at the sink. For a local device that is the whole story. For a network
+    /// target everything past the socket — the receiving server's buffer, its clients'
+    /// presentation delay — is on another machine, and uncorrected the deck reports that far
+    /// ahead of what is audible. Audio is the master clock, so the projector runs ahead of
+    /// the music by the same constant.
+    ///
+    /// ⚠️ **This value is not knowable from here and is never guessed.** It is a property of
+    /// the receiving system (for Snapcast, its `buffer` setting), so it is configured in
+    /// Settings and pushed down; the default is zero, which is simply "uncorrected".
+    ///
+    /// Applies live to a node that already exists, because the point of the setting is to be
+    /// tuned by ear against a real room while a deck is playing.
+    pub fn set_extra_latency(&mut self, device: &str, extra_ns: u64) {
+        let key = node_key(device).to_string();
+        self.extra_latency.insert(key.clone(), extra_ns);
+        if let Some(node) = self.nodes.get(&key) {
+            let total = node.queried_latency_ns + extra_ns;
+            node.latency_ns.store(total, Ordering::Relaxed);
+            log::info!(
+                "[audio/out/{}] extra latency now {:.0}ms (queried {:.0}ms → total {:.0}ms), \
+                 applied live to {} attached branch(es)",
+                short(&key), extra_ns as f64 / 1e6, node.queried_latency_ns as f64 / 1e6,
+                total as f64 / 1e6, node.branches.len()
+            );
+        }
+    }
+
+    /// The live latency cell for a device's node, shared with the deck so a settings change
+    /// reaches a deck that is already playing. `None` until the node exists.
+    pub fn latency_handle(&self, device: &str) -> Option<Arc<AtomicU64>> {
+        self.nodes.get(node_key(device)).map(|n| n.latency_ns.clone())
     }
 
     /// The clock deck pipelines must use, once any output node exists.
@@ -338,13 +389,18 @@ impl OutputGraph {
         } else {
             (0, false)
         };
-        latency_ns.store(latency, Ordering::Relaxed);
+        // A network node's audible signal is one machine further away than the latency query
+        // can see. Whatever Settings configured for this device is added here — see
+        // `set_extra_latency()` for why it cannot be measured from this process.
+        let extra = self.extra_latency.get(&node_name).copied().unwrap_or(0);
+        latency_ns.store(latency + extra, Ordering::Relaxed);
 
         log::info!(
             "[audio/out/{}] created for {label}: {channels}ch mask={channel_mask:#x} \
-             state_change={ret:?} latency={:.0}ms — subtracted from every deck position on \
-             this node (see OutputGraph::latency_ns)",
-            short(&node_name), latency as f64 / 1e6
+             state_change={ret:?} latency={:.0}ms (queried {:.0}ms + network {:.0}ms) — \
+             subtracted from every deck position on this node (see OutputGraph::latency_ns)",
+            short(&node_name), (latency + extra) as f64 / 1e6, latency as f64 / 1e6,
+            extra as f64 / 1e6
         );
         // ⚠️ Liveness is checked with the **latency query**, not the `set_state` return.
         // A direct NULL→PLAYING returns ASYNC on a live pipeline too, so an earlier version
@@ -411,6 +467,7 @@ impl OutputGraph {
             channels,
             channel_mask,
             latency_ns,
+            queried_latency_ns: latency,
         })
     }
 }
@@ -620,6 +677,11 @@ fn short(node_name: &str) -> String {
     if node_name.is_empty() {
         return "default".to_string();
     }
+    // A network target's id is an address, not a dotted node name — splitting it on '.'
+    // yields the last octet of an IP and a port, which names nothing.
+    if let Some((host, port)) = parse_snapcast_device(node_name) {
+        return format!("snap-{host}:{port}");
+    }
     node_name.rsplit('.').next().unwrap_or(node_name).to_string()
 }
 
@@ -672,6 +734,85 @@ mod tests {
     fn different_devices_are_different_nodes() {
         let starlight = format!("{STARLIGHT}@FL,FR!{LAYOUT}");
         assert_ne!(node_key(&starlight), node_key(CODEC));
+    }
+
+    /// A network target is its own node, never pooled with a local one — otherwise a deck
+    /// sent to both the booth and the house would land on a single sink and only one of
+    /// them would exist.
+    #[test]
+    fn a_network_target_is_its_own_node() {
+        assert_eq!(node_key("snapcast://10.1.2.3:4953"), "snapcast://10.1.2.3:4953");
+        assert_ne!(node_key("snapcast://10.1.2.3:4953"), node_key(CODEC));
+        assert_eq!(short("snapcast://10.1.2.3:4953"), "snap-10.1.2.3:4953");
+    }
+
+    /// **The Route A path end to end, in-process.** Unlike every other node this graph can
+    /// build, a network node needs no audio hardware at all — so this exercises the real
+    /// `attach` → `create_node` → `make_sink` → `tcpclientsink` chain in ordinary
+    /// `cargo test`, against a listener standing in for snapserver.
+    ///
+    /// Asserts the two things a Snapcast server actually requires, and one this project
+    /// keeps having to relearn:
+    /// - PCM arrives at the socket at the S16LE/48000/2 rate its `tcp://` source expects;
+    /// - it arrives **with no deck attached and nothing playing**, because every node
+    ///   carries a silent keepalive (see `create_node`). ⚠️ That is why cuemark must not be
+    ///   added to a snapserver `meta://` stream: a source that never stops producing would
+    ///   be selected forever and no other source would ever get the speakers back.
+    /// - the configured network latency lands in the cell `position()` reads, on top of the
+    ///   queried one, and can be changed afterwards without rebuilding the node.
+    #[test]
+    fn snapcast_node_streams_pcm_and_carries_its_configured_latency() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        gst::init().expect("gst init");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let device = format!("snapcast://127.0.0.1:{port}");
+
+        let mut graph = OutputGraph::new();
+        // Configured *before* the node exists — the path a persisted setting takes on boot.
+        graph.set_extra_latency(&device, 250_000_000);
+        let _appsrc = graph
+            .attach(&device, ("deck-0".to_string(), "main0".to_string()), "test/main0")
+            .expect("attach to a network node must not need audio hardware");
+
+        let handle = graph.latency_handle(&device).expect("node exists after attach");
+        let with_extra = handle.load(Ordering::Relaxed);
+        assert!(
+            with_extra >= 250_000_000,
+            "configured network latency must be added to the queried latency, got {with_extra}ns"
+        );
+
+        // Read one second of the stream. Nothing is playing: this is the keepalive alone.
+        let (mut conn, _) = listener.accept().expect("tcpclientsink must connect");
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+        let start = std::time::Instant::now();
+        let mut total = 0usize;
+        let mut buf = [0u8; 65536];
+        while start.elapsed() < std::time::Duration::from_secs(1) {
+            match conn.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(_) => break,
+            }
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let rate = total as f64 / elapsed;
+        let expected = 48_000.0 * 2.0 * 2.0; // S16LE stereo at 48kHz
+        assert!(
+            (rate / expected - 1.0).abs() < 0.25,
+            "byte rate {rate:.0}/s is not the S16LE/48000/2 rate {expected:.0}/s snapserver \
+             expects — caps or the sink's sync property are wrong"
+        );
+
+        // Live retune: the whole reason this is a shared cell rather than a copy.
+        graph.set_extra_latency(&device, 700_000_000);
+        assert_eq!(
+            handle.load(Ordering::Relaxed),
+            with_extra - 250_000_000 + 700_000_000,
+            "a latency change must reach an existing node without rebuilding it"
+        );
     }
 
     /// A bare id (a genuinely stereo device) and the empty id (system default) are both

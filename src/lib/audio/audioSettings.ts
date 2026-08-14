@@ -33,6 +33,34 @@ export const mainOutputDeviceIds = persistentWritable<string[]>("cuemark:mainOut
 /** Device ID for the headphone / cue monitor output. '' = none. Persisted across restarts. */
 export const cueOutputDeviceId = persistentWritable<string>("cuemark:cueOutputDeviceId", "");
 
+/**
+ * Network output targets — Snapcast servers, as `snapcast://<host>:<port>` device ids.
+ *
+ * These are **configured, not discovered** — a Snapcast server is reached by address, and
+ * nothing here assumes it is discoverable (mDNS does not cross a routed subnet boundary, so
+ * on many networks it is not). The backend's `list_audio_devices` enumerates local PipeWire
+ * sinks only, so `AudioSettings` merges these in before its stale-id auto-heal runs — an id
+ * the heal cannot see is an id it deletes, which is why this list has to reach the picker
+ * rather than living only in `mainOutputDeviceIds`.
+ *
+ * See `docs/design/network-audio-output.md`. Persisted across restarts.
+ */
+export type NetworkOutput = {
+  id: string;
+  label: string;
+  /**
+   * How far behind this app the target's listeners actually are, in milliseconds — the
+   * receiving server's end-to-end buffer plus its clients' presentation delay.
+   *
+   * ⚠️ **Not a preference and not guessable — a property of the server**, which is why it
+   * has no meaningful default (0 = uncorrected). For Snapcast it is the server's `buffer`
+   * setting. Video syncs to the deck's *first* main output, so this only moves the picture
+   * when the network target is first in the Main list. Tune by ear against the room.
+   */
+  latencyMs: number;
+};
+export const networkOutputs = persistentWritable<NetworkOutput[]>("cuemark:networkOutputs", []);
+
 /** Headphone / cue monitor master gain (0–1). Persisted across restarts. */
 export const cueGain = persistentWritable<number>("cuemark:cueGain", 1.0);
 

@@ -1305,6 +1305,57 @@ mod master_volume_tests {
 }
 
 #[cfg(test)]
+mod snapcast_device_tests {
+    use super::{parse_device_remap, parse_snapcast_device};
+
+    #[test]
+    fn parses_host_and_port() {
+        let (host, port) = parse_snapcast_device("snapcast://10.1.2.3:4953").unwrap();
+        assert_eq!((host.as_str(), port), ("10.1.2.3", 4953));
+        let (host, port) = parse_snapcast_device("snapcast://snapserver.local:4953").unwrap();
+        assert_eq!((host.as_str(), port), ("snapserver.local", 4953));
+    }
+
+    /// An ordinary device id must not be mistaken for a network one — this predicate runs
+    /// first in `make_sink()`, so a false positive would send a local device's audio to a
+    /// TCP socket that does not exist.
+    #[test]
+    fn ordinary_device_ids_are_not_snapcast() {
+        for id in [
+            "",
+            "alsa_output.usb-Guillemot.analog-surround-40",
+            "alsa_output.usb-Guillemot.analog-surround-40@RL,RR!FL,FR,RL,RR",
+        ] {
+            assert!(parse_snapcast_device(id).is_none(), "{id:?} must not parse as snapcast");
+        }
+    }
+
+    /// Malformed ids must fail *loudly* — i.e. not parse — rather than resolve to a
+    /// plausible-looking wrong endpoint. A missing port or an unbracketed IPv6 literal
+    /// would otherwise silently produce a house output that is never heard.
+    #[test]
+    fn malformed_ids_do_not_parse() {
+        for id in [
+            "snapcast://10.1.2.3",         // no port
+            "snapcast://:4953",            // no host
+            "snapcast://host:notaport",    // port not a number
+            "snapcast://fe80::1:4953",     // ambiguous bare IPv6
+            "snapcast://host:99999",       // out of u16 range
+        ] {
+            assert!(parse_snapcast_device(id).is_none(), "{id:?} must not parse");
+        }
+    }
+
+    /// A snapcast id reaches `parse_device_remap()` too (every device id does). It must come
+    /// back as "no remap" rather than an error, or attach would refuse before ever building
+    /// the sink.
+    #[test]
+    fn snapcast_ids_need_no_channel_remap() {
+        assert!(parse_device_remap("snapcast://10.1.2.3:4953").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
 mod channel_remap_tests {
     use super::{compute_channel_remap, parse_device_remap};
 
@@ -1427,7 +1478,105 @@ fn make_appsink(label: &str) -> Result<gst::Element, String> {
     Ok(el)
 }
 
+/// A `snapcast://<host>:<port>` device id — a Snapcast server's `tcp://` stream source
+/// rather than a local PipeWire node. Returns `None` for every ordinary device id, which is
+/// what keeps this out of the way of the normal path.
+///
+/// Parsed with `rsplit_once(':')` so a bare IPv6 literal fails cleanly rather than being
+/// silently truncated at its first colon: this project's failure mode of record is the
+/// silent one, and a half-parsed host would resolve to nothing and produce a *silent* house
+/// output with no error anywhere. Bracketed IPv6 (`[::1]:4953`) is unsupported, deliberately
+/// — snapserver's own `tcp://` source is documented in terms of a listen IP, and adding a
+/// second address syntax here buys nothing this network needs.
+pub(super) fn parse_snapcast_device(device: &str) -> Option<(String, u16)> {
+    let rest = device.strip_prefix("snapcast://")?;
+    let (host, port) = rest.rsplit_once(':')?;
+    if host.is_empty() || host.contains(':') {
+        return None;
+    }
+    Some((host.to_string(), port.parse().ok()?))
+}
+
+/// The sink for a Snapcast target: raw PCM over one outbound TCP connection, in the exact
+/// format snapserver's `tcp://` source expects (its default `sampleformat = 48000:16:2`).
+///
+/// See `docs/design/network-audio-output.md`. Three things here are load-bearing:
+///
+/// - **`leaky=downstream` on the queue is what stops a network stall killing local audio.**
+///   The deck's `tee` has no per-branch queue, so backpressure from *any* branch stalls the
+///   whole deck — including the DJ's monitor and the cue. A blocked TCP write (dead server,
+///   saturated link) would propagate straight back through the mixer to the deck. The leaky
+///   queue converts that into dropped buffers on the house feed alone, which is the correct
+///   trade: the room briefly glitches, the booth never does.
+/// - **`sync=true`** paces the feed at real time. Snapserver timestamps a `tcp://` source's
+///   PCM *on arrival*, so a sink that pushed as fast as the mixer produced would hand it a
+///   burst and desynchronise every client.
+/// - **The connection is outbound**, one socket, sender→receiver only. That is what lets a
+///   Snapcast server on another subnet work at all when NAT sits between: nothing has to
+///   reach back. It is exactly what AirPlay/RAOP cannot do, which is why that route was
+///   abandoned here (`docs/design/network-audio-output.md` records the measurement).
+fn make_snapcast_sink(host: &str, port: u16, deck_id: &str) -> Result<gst::Element, String> {
+    let bin = gst::Bin::with_name(&format!("snapcast-{host}-{port}"));
+    let conv = make_el("audioconvert")?;
+    let resample = make_el("audioresample")?;
+    let caps_el = make_el("capsfilter")?;
+    caps_el.set_property(
+        "caps",
+        gst::Caps::builder("audio/x-raw")
+            .field("format", "S16LE")
+            .field("layout", "interleaved")
+            .field("rate", 48_000i32)
+            .field("channels", 2i32)
+            .build(),
+    );
+
+    let queue = make_el("queue")?;
+    queue.set_property("max-size-buffers", 0u32);
+    queue.set_property("max-size-bytes", 0u32);
+    queue.set_property("max-size-time", SNAPCAST_QUEUE_NS);
+    queue.set_property_from_str("leaky", "downstream");
+
+    let sink = gst::ElementFactory::make("tcpclientsink")
+        .build()
+        .map_err(|e| format!("tcpclientsink not found (apt install gstreamer1.0-plugins-base): {e}"))?;
+    sink.set_property("host", host);
+    sink.set_property("port", port as i32);
+    sink.set_property("sync", true);
+
+    let els = [&conv, &resample, &caps_el, &queue, &sink];
+    bin.add_many(els)
+        .map_err(|e| format!("[audio/{deck_id}] snapcast bin add_many: {e}"))?;
+    gst::Element::link_many(els)
+        .map_err(|e| format!("[audio/{deck_id}] snapcast bin link: {e}"))?;
+
+    let pad = conv
+        .static_pad("sink")
+        .ok_or_else(|| format!("[audio/{deck_id}] audioconvert has no sink pad"))?;
+    let ghost = gst::GhostPad::with_target(&pad)
+        .map_err(|e| format!("[audio/{deck_id}] snapcast ghost pad: {e}"))?;
+    bin.add_pad(&ghost)
+        .map_err(|e| format!("[audio/{deck_id}] snapcast add_pad: {e}"))?;
+
+    log::info!(
+        "[audio/{deck_id}] sink: snapcast tcp://{host}:{port} (S16LE/48000/2, leaky queue \
+         {}ms) — the network delay past this socket is configured in Settings, see \
+         OutputGraph::set_extra_latency",
+        SNAPCAST_QUEUE_NS / 1_000_000
+    );
+    Ok(bin.upcast())
+}
+
+/// Leaky-queue depth in front of the Snapcast sink. Big enough to ride out ordinary network
+/// jitter on a wired LAN, small enough that a dead server discards rather than accumulates.
+const SNAPCAST_QUEUE_NS: u64 = 500_000_000; // 500ms
+
 pub(super) fn make_sink(device: &str, deck_id: &str) -> Result<gst::Element, String> {
+    // A network target is not a PipeWire node and shares none of the handling below — no
+    // device property, no buffer/latency times, no stream properties.
+    if let Some((host, port)) = parse_snapcast_device(device) {
+        return make_snapcast_sink(&host, port, deck_id);
+    }
+
     // Device string may encode a stereo-pair target: "node-name@CH1,CH2".
     // Strip the @suffix here — the actual channel remapping is done via GStreamer caps
     // inserted before this sink by the caller (the sink routes by caps channel positions,
@@ -1558,7 +1707,7 @@ struct CueBranch {
 struct OutputAttachment {
     branches: Vec<BranchKey>,
     handoffs: Vec<(String, Arc<HandoffCounters>)>,
-    latency_ns: u64,
+    latency_ns: Arc<AtomicU64>,
 }
 
 struct PipelineInner {
@@ -1634,7 +1783,11 @@ struct PipelineInner {
     output_branches: Vec<BranchKey>,
     /// Output-side latency of the **main** branch's node, in nanoseconds — subtracted by
     /// `position()`. See `OutputGraph::latency_ns` for why this is not optional.
-    output_latency_ns: u64,
+    ///
+    /// Shared with the node rather than copied, so a Settings change to a network output's
+    /// configured delay reaches a deck that is **already playing** — which is the only way
+    /// that value can be tuned, since it is tuned by ear against a real room.
+    output_latency_ns: Arc<AtomicU64>,
 }
 
 pub struct DeckAudioPipeline {
@@ -2105,7 +2258,7 @@ impl DeckAudioPipeline {
         // already been baked into the first buffers.
         let mut output_branches: Vec<BranchKey> = Vec::new();
         let mut handoffs: Vec<(String, Arc<HandoffCounters>)> = Vec::new();
-        let mut output_latency_ns: u64 = 0;
+        let mut output_latency_ns: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         if !pending_handoffs.is_empty() {
             let graph = self.output_graph.clone().expect("shared_output implies a graph");
             let mut g = graph.lock().unwrap();
@@ -2123,7 +2276,9 @@ impl DeckAudioPipeline {
                         // always a main branch (the cue entry is pushed last), and cue is a
                         // monitoring output whose latency nothing reads.
                         if idx == 0 {
-                            output_latency_ns = g.latency_ns(device);
+                            output_latency_ns = g
+                                .latency_handle(device)
+                                .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
                         }
                     }
                     Err(e) => {
@@ -2156,7 +2311,8 @@ impl DeckAudioPipeline {
                     log::info!(
                         "[audio/{}] using shared output clock {} (output latency {:.0}ms \
                          subtracted from reported position)",
-                        self.deck_id, clock.name(), output_latency_ns as f64 / 1e6
+                        self.deck_id, clock.name(),
+                        output_latency_ns.load(Ordering::Relaxed) as f64 / 1e6
                     );
                 }
                 None => log::warn!(
@@ -3296,7 +3452,7 @@ impl DeckAudioPipeline {
         // decoder is early" and would be chased in entirely the wrong file.
         //
         // Zero on the legacy path, so this is a no-op there.
-        let latency_secs = inner.output_latency_ns as f64 / 1_000_000_000.0;
+        let latency_secs = inner.output_latency_ns.load(Ordering::Relaxed) as f64 / 1e9;
 
         // A negative position is never meaningful to callers (the waveform's playhead
         // math divides by duration and draws off-canvas on a negative result) — clamp

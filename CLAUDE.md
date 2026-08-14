@@ -69,6 +69,21 @@ which cuemark does on every play (≥1 main sink + the cue branch per deck). See
 `docs/design/pipewiresink-play-hang.md` before changing the sink; re-run
 `scripts/probes/pipewiresink_multisink_deadlock.py` if you do.
 
+**A network target is an ordinary output device.** A `snapcast://<host>:<port>` device id gets
+its own node in the shared graph — same mixer, same master volume, same keepalive — ending in
+`tcpclientsink` instead of `pulsesink`, feeding a Snapcast server's `tcp://` stream source
+(built 2026-08-13). Targets are **configured in Settings, never discovered or hardcoded**.
+Two things are load-bearing and silent when broken: **`leaky=downstream` on the sink's queue**
+(the deck's `tee` has no per-branch queue, so without it a dead server stalls the booth monitor
+and the cue too — measured, with a control arm), and **the per-target `delay` setting**, since
+GStreamer's latency query cannot see past the socket and the projector would otherwise run
+ahead of the room. 🛑 Do **not** add cuemark to a snapserver `meta://` stream: the node's silent
+keepalive means it never stops producing, so it would take the speakers forever. AirPlay was
+tried first and is **impossible across NAT** — RAOP needs the receiver to reach back.
+**Read `docs/design/network-audio-output.md` before touching any of it.**
+`docs/network-topology.md` is the canonical network fact sheet (subnets, the one-way NAT, what
+is reachable) — read it before designing anything else that talks to a network peer.
+
 **Full gotchas and rationale** — position-tracking drift math, the `pendingSeekTarget` seek-race filter,
 why `v.playbackRate` writes must be rAF-throttled, rate-then-seek ordering, EOS handling, PipeWire quantum
 sizing, preroll, the `uridecodebin` video-decoder-skip signal, and the tee/`async=false` sink topology:
@@ -656,6 +671,7 @@ Several automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb
 | `scripts/watchdog-soak-test.sh <video> [seconds]` | The design doc's full 10-minute false-positive soak (default 600s) — looped playback + a MIDI-rate burst every 60s, asserts zero watchdog triggers. Run before relying on recovery in prod, not on every change. |
 | `scripts/check-launcher-staleness.sh [path]` | Is `~/.local/bin/cuemark` behind the code? Exit 0 fresh / 1 stale / 2 not built. No toolchain or running app needed. Run before diagnosing anything against a non-dev launch. |
 | `scripts/scratch-capture.sh` + `scripts/scratch-envelope.py` | **Any audio symptom the in-pipeline probes call healthy.** Captures the PipeWire device monitor — downstream of everything — and reports a per-window envelope (`rms`, `hp200`, zero-crossing rate) with `[scratch-tel]` joined inline, separating **GATED / PITCHED / CLEAN**. `rms` is blind to frequency, so this sees the whole class of faults the pipeline's own instruments structurally cannot. Ended a four-session investigation in one pass. See the `audio-debugging` skill for the traps (the stub recorder, the wrong-node capture, UTC vs local). |
+| `scripts/probes/snapcast_tcp_sink_probe.py` | **Before changing the network output sink** (`make_snapcast_sink()`) — stands in for snapserver: does the sink produce the S16LE/48000/2 stream a `tcp://` source expects, and does a jammed server leave the rest of the deck alone. Always run `--stall --no-leaky` too: it is the control arm, and it must **fail**. ⚠️ The stall arms need ~35s — kernel socket buffers absorb ~21s of audio before a jammed socket backs up as far as the tee, so a shorter run passes regardless and proves nothing. Seconds, no app, no server. |
 | `scripts/probes/shared_output_mixer_probe.py` | **Before changing the shared output graph** (`audio/mixer.rs`) — one `audiomixer` into one `pulsesink`, fed by live `appsrc` branches: does an idle pad stall the aggregator, does the 4-channel matrix chain negotiate, can a branch attach to a PLAYING mixer. Always run `--not-live` too: it is the control arm that proves the idle-pad check can fail, and it fails *hard* (zero buffers at the sink for as long as one branch is idle). Seconds, no app; stop cuemark first if using the real device. |
 | `scripts/probes/shared_node_stream_diff.py` | **Why does the same two-sink topology gate on one device and not another?** Samples `pw-top` (xruns, quantum, rate, wait/busy) and `pw-dump` (negotiated format, node state) for cuemark's own streams during a jog gesture, joined by the private `cuemark.branch` key — both streams present as `NAME = cuemark` and pw-top alone cannot tell main from cue. `--compare A.json B.json` diffs a failing arm against a working one. Capture **both** arms the same way; the comparison is the whole value. Pre-flight refuses on an idle/suspended stream, which reports `ERR 0` forever and reads exactly like a healthy one. |
 | `scripts/probes/offscreencanvas_webgl_capture_probe.py` | Can pixels be read back out of a WebGL canvas on this WebKitGTK? Run **before designing anything that moves rendered content between windows or processes**, and before trusting any pixel assertion against WebGL output. Seconds, no app, no Xvfb. |

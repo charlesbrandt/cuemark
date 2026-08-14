@@ -8,7 +8,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import {
     audioLoad, audioUnload, audioSetCue, audioSetMasterVolume, audioSetMainDevices,
-    audioSetCueDevice, audioSetCueGain, gridGetSaved,
+    audioSetCueDevice, audioSetCueGain, gridGetSaved, setOutputLatency,
   } from "./lib/audio/pipeline";
   import { clearSavedGrid, markGridSaved, hasSavedGrid } from "./lib/audio/gridSource";
   import { setDeckOnsets } from "./lib/audio/onsetStore";
@@ -24,7 +24,7 @@
   import WaveformCanvas from "./components/WaveformCanvas.svelte";
   import AudioSettings from "./components/AudioSettings.svelte";
   import DiggerQueue from "./components/DiggerQueue.svelte";
-  import { mainOutputDeviceIds, cueOutputDeviceId, cueGain } from "./lib/audio/audioSettings";
+  import { mainOutputDeviceIds, cueOutputDeviceId, cueGain, networkOutputs } from "./lib/audio/audioSettings";
   import { fontScale, queueSidebarWidth } from "./lib/settings/displaySettings";
   import { CodecPlayer, type DemuxInfo } from "./lib/video/codecPlayer";
   import { videoPathOverrides, videoPathDefault, resolveVideoPath } from "./lib/video/videoPathSettings";
@@ -151,6 +151,19 @@
   // Sync main output devices to Rust audio pipeline (runs on init with persisted value)
   $effect(() => {
     audioSetMainDevices($mainOutputDeviceIds).catch(console.error);
+  });
+
+  // Each network output's configured delay — the part of its latency that happens on another
+  // machine and that no query here can see (docs/design/network-audio-output.md).
+  //
+  // ⚠️ This lives in App, not in AudioSettings, because AudioSettings is only mounted while
+  // the Settings panel is open. A persisted delay pushed from there would not reach the audio
+  // graph until someone opened the panel — so every set would start with the projector
+  // running ahead of the room, and the fix would look like it had never been applied.
+  $effect(() => {
+    for (const n of $networkOutputs) {
+      setOutputLatency(n.id, n.latencyMs ?? 0).catch(console.error);
+    }
   });
 
   // Sync headphone output device to Rust audio pipeline.
