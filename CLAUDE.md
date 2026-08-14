@@ -262,6 +262,20 @@ absolutely, so position is still the control variable and an estimate error can 
 accumulate nor persist. Per-gesture delivery legs are instrumented by
 `src/lib/audio/scrubStats.ts` (`[scrub-deliver]`/`[scrub-sec]`) — read them before blaming the
 servo, which three sessions did by mistake.
+**The platter has mass** (2026-08-14): a one-pole lag on the servo's commanded rate,
+per output frame, `SCRATCH_RATE_INERTIA_MS` (default 40ms, **Settings → Audio → Platter**,
+0 = exactly the old path). A jog wheel delivers **detents, not a hand** — one fixed 7.0ms of
+content, which at cueing speed is 3 chunks' worth of travel arriving at once every 47ms — so
+the servo answered each with a rate spike and pitch ran as a ~21Hz sawtooth peaking at twice
+its own mean. That was the "scratching sounds frantic" report. ⚠️ Three couplings are
+load-bearing and each broke something silently when it was missing: **arrival needs the
+platter at rest, not just the cursor close** (a momentary pass-through of the 0.25ms epsilon
+band muted 9% of a gentle drag); **`snap_frames()` must scale with the servo lag** (a fixed
+threshold is reachable by an ordinary fast drag once the lag widens — 78% silent, cursor
+going nowhere); and **`servo_lag_chunks()` must stay ≥2× the inertia** or the loop rings and
+a larger setting sounds *rougher*. `jerk=` in `[scratch-tel]` is the readout. Not yet
+verified live — the default is a guess at someone else's taste.
+
 **Read `docs/design/waveform-scrub.md` before touching** `WaveformCanvas`'s pointer
 handlers, the scrub bus, `jog_nudge`'s vinyl branch, or the feeder's servo. `VINYL_SEC_PER_TICK`
 is calibrated (`1.8 / 256`; the Starlight encoder reports plain ±1 deltas, measured live —
@@ -555,6 +569,18 @@ Rust changes (`src-tauri/`) require a full recompile — Tauri detects them and 
 but **the old binary keeps running until the rebuild finishes and the window restarts**.
 If managing the dev server from Claude Code: kill the background process before making Rust changes,
 then restart after. A change that was edited but never recompiled has no effect at runtime.
+
+🔴 **This failure mode can look like a healthy app producing total silence, not an obviously
+stale fix.** Live-hit 2026-08-14: the network-output feature (`c279488`) was committed, the
+frontend hot-reloaded its new Settings UI/IPC calls immediately, and the dev server was never
+restarted — so the backend serving those calls was still the *previous* commit, with no
+`snapcast://` handling at all. It silently built a `pulsesink` from the literal device string,
+which failed to reach `PLAYING`, which took every other main/cue branch on that deck down with
+it in the same attach pass. No crash, no bus error; raf/poll-stats/position all read healthy.
+The tell: `grep '\[build\] cuemark' cuemark.log | tail -1` against `git log --oneline -1` — if
+the log's sha is an ancestor of HEAD, the running binary predates whatever was just committed.
+Check this before trusting any runtime symptom right after a commit that touched both
+frontend and backend. See the audio-debugging skill's "network output silent" entry.
 
 ⚠️ **An HMR update to `App.svelte` remounts it, which tears the deck down and pauses playback**
 — and repeated remounts can leave the GStreamer pipeline wedged (see the retry-storm tell under

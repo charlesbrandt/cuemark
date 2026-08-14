@@ -659,7 +659,32 @@ this failure, by construction: an output branch that cannot attach is deliberate
 (`attach_output_graph()` leaves the appsink swallowing buffers rather than blocking the deck),
 so there is no error, no underrun, and no gap warning — the deck cannot tell.
 
-Walk it in this order; each step distinguishes a different cause:
+🔴 **First, check whether the *booth* is silent too — that is a different bug entirely, and
+it is client-side, not server-side.** Live-hit 2026-08-14: right after the network target was
+first added in Settings, deck-0's main0, main1, main2 (network) *and* cue all failed to
+attach in the same batch — total silence on every output, not just the room. Cause: the
+frontend (Vite HMR) had picked up the just-committed network-output feature, but
+`cargo tauri dev`'s backend was still running the **previous** commit — Rust changes need a
+full rebuild+restart (see `feedback_dev_server_lifecycle.md`), and that never happened after
+the feature landed. The stale `make_sink()` had no `snapcast://` dispatch at all, so it
+handed the literal id straight to `pulsesink device="snapcast://host:port"`, which is not a
+real PipeWire node and fails to reach `PLAYING` — and that single failure took the other
+main branches and cue down with it in the same `attach_output_graph()` pass.
+
+Two cheap checks settle it before touching the server at all:
+
+```bash
+# Does the build running right now actually contain the feature you just committed?
+grep "\[build\] cuemark" ~/.local/share/com.cuemark.app/logs/cuemark.log | tail -1
+git log --oneline -1        # compare the sha — if the log's sha is an ancestor, restart the dev server
+
+# Smoking gun: a correctly-built backend NEVER constructs this. If this line is in the log,
+# the running binary predates the feature — full stop, restart, don't touch snapserver.
+grep 'sink: pulsesink device=.*snapcast://' ~/.local/share/com.cuemark.app/logs/cuemark.log
+```
+
+If the booth is fine and only the network target is silent, it's a real server-side question —
+walk it in this order; each step distinguishes a different cause:
 
 ```bash
 # 1. Is the server even offering a tcp:// source? (the usual answer — it is a one-line
