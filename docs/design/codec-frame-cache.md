@@ -549,3 +549,35 @@ Still open, none of them blocking:
    heavier load, so this is expected to hold, but the case where fill CPU can reach *live*
    audio has not actually been run.
 4. AV1 is unaffected — still on the legacy `<video>` path, so it has no `CodecPlayer`.
+
+
+Original request:
+
+### Jog wheel reverse doesn't play video in reverse [DONE — live-verified 2026-08-13]
+
+Was: `codecPlayer.ts`'s frame ring only covers ~0.7–1.28s of travel; beyond that
+`getFrameForTime()` froze on the nearest cached frame instead of continuing to scrub.
+
+Built as **scrub GOP fill**: on a *paused* deck, a third `VideoDecoder` in `codecWorker.ts`
+decodes the GOP the gesture is in and returns an evenly-spaced subsample (~3fps across a ~10s
+GOP), walking GOP by GOP for as long as the gesture continues. The primary decoder is never
+touched, which keeps this clear of the 2026-08-09 reverse-seek regression. `settleAfterScrub`
+shipped with it as a prerequisite — without it a long scrub leaves the picture frozen after
+play is pressed.
+
+**Live run 1: audio clean throughout** (at ~19× the corrected build's decode load — the main
+risk, substantially de-risked). Video had three defects, all fixed same-day:
+1. built reverse-only, so one direction always froze — *"the first direction takes
+   preference"*, observed in both orders. Now direction-agnostic.
+2. a request loop — 179 fills in one 22s gesture, 257s decoded to cover 13.7s.
+3. the in-flight guard latched; fills stopped permanently and silently.
+
+**Live run 2: user-confirmed working**, both directions with mid-gesture direction changes,
+audio clean, 43.9s of travel in one gesture. Decode fell **28× per second of travel**
+(658ms/s → 23ms/s); `fills req=15 done=15`, `stale=0.5%`.
+
+Remaining open items, none blocking (`docs/design/codec-frame-cache.md` §7b): the fill
+decoder's `reset()`-vs-transferred-frames assumption is unproven on this WebKitGTK; only
+~1.9s-GOP 720p content has been exercised; two-deck cueing (where fill CPU can reach *live*
+audio) has not been run. Kill switch: `localStorage['cuemark:codecReverseBackfill'] = '0'`.
+
