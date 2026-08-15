@@ -31,8 +31,8 @@ crash.
 
 The trigger the first time this was hit: a Tailscale ACL grant that allowed `tcp:22`/
 `tcp:32400` to the Snapcast host but not its stream/control ports, from a machine that reaches
-`plex` via a Tailscale subnet route rather than `mele`'s direct LAN path — see
-`docs/network-topology.md`'s "Tailscale subnet route" section. That's a network-config problem,
+`plex` via a Tailscale subnet route rather than `mele`'s direct LAN path — see the private
+network-topology notes' "Tailscale subnet route" section. That's a network-config problem,
 independent of the app bug; **fixing it alone would not have fixed the freeze mechanism**, since
 any unreachable target (dead server, wrong port, a different firewall another day) would
 reproduce it.
@@ -228,9 +228,8 @@ locally. Two independent blockers, both structural:
 - **RAOP requires the receiver to send timing and retransmit requests back to the sender.**
   Behind one-way NAT those never arrive. Verified directly: a UDP packet sent from the server
   to the sender's port never arrived, while the sender's outbound TCP worked fine. The
-  measurement, the commands that produced it and the full topology are in
-  `docs/network-topology.md` — that is the canonical home for the network facts; this doc
-  only records what they meant for the audio path.
+  measurement, the commands that produced it and the full topology are tracked privately, not
+  in this repo; this doc only records what they meant for the audio path.
 
 This is not a tuning problem and no amount of buffer configuration reaches it. Route A works
 on the same network precisely because it is **one outbound connection with no return path**.

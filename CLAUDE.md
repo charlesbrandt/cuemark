@@ -85,8 +85,8 @@ freezing play/pause for *every* deck, not just the network one (fixed 2026-08-14
 stream: the node's silent keepalive means it never stops producing, so it would take the
 speakers forever. AirPlay was tried first and is **impossible across NAT** — RAOP needs the
 receiver to reach back. **Read `docs/design/network-audio-output.md` before touching any of it.**
-`docs/network-topology.md` is the canonical network fact sheet (subnets, the one-way NAT, what
-is reachable) — read it before designing anything else that talks to a network peer.
+Network topology facts (subnets, the one-way NAT, what is reachable) are tracked privately,
+not in this repo — check before designing anything else that talks to a network peer.
 
 **Full gotchas and rationale** — position-tracking drift math, the `pendingSeekTarget` seek-race filter,
 why `v.playbackRate` writes must be rAF-throttled, rate-then-seek ordering, EOS handling, PipeWire quantum

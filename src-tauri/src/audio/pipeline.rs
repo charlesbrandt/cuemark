@@ -1573,7 +1573,7 @@ fn make_snapcast_sink(host: &str, port: u16, deck_id: &str) -> Result<gst::Eleme
     TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| {
         format!(
             "[audio/{deck_id}] snapcast: could not reach {host}:{port} within {}s ({e}) — check \
-             the server is running and reachable (firewall/ACL); see docs/network-topology.md",
+             the server is running and reachable (firewall/ACL)",
             CONNECT_TIMEOUT.as_secs()
         )
     })?;

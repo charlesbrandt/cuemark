@@ -8,10 +8,9 @@ scoped per machine, meant to stop the same capability fact from being independen
 of sync in some copies while getting corrected in others. That already happened twice
 (see "Why this doc exists" below) before this file existed.
 
-**Network facts live next door**, in `docs/network-topology.md`: subnets, what this machine
-can and cannot reach, and the one-way NAT that decides which network protocols can work at
-all. Same fact-sheet spirit, different axis — check it before designing anything with a
-network peer.
+**Network facts (subnets, what this machine can and cannot reach, the one-way NAT that
+decides which network protocols can work at all) are tracked privately, not in this repo.**
+Same fact-sheet spirit, different axis — check before designing anything with a network peer.
 
 ## Identify which machine you're on before trusting anything below
 
@@ -66,7 +65,7 @@ environment-specific narrative was derived on.
 | Session | Wayland, GNOME |
 | WebKitGTK | 2.52.3 (stable across the OS-version history below) |
 | OS history | 24.04 (before 2026-08-02) → 26.04 "resolute", freshly installed (2026-08-02, reconfirmed 2026-08-04) → 24.04 again (from 2026-08-05 onward). **Why it moved is not documented anywhere** — could be a real reinstall, could be something else. Don't trust either version without re-running the identify commands above. |
-| Network path to `10.20.2.0/24` | Via a **Tailscale subnet route**, not a direct LAN — different from `mele`'s path and, as of 2026-08-14, more restrictive (an ACL grant gap silently blocked cuemark's Snapcast ports). See `docs/network-topology.md` "Tailscale subnet route" before trusting any reachability claim to `plex` from this machine. |
+| Network path to the home LAN | Via a **Tailscale subnet route**, not a direct LAN — different from `mele`'s path and, as of 2026-08-14, more restrictive (an ACL grant gap silently blocked cuemark's Snapcast ports). See the private network-topology notes' "Tailscale subnet route" section before trusting any reachability claim from this machine. |
 
 **VA-API: ABSENT.** No `*_drv_video.so` under `/usr/lib/x86_64-linux-gnu/dri` (checked
 2026-08-05: only d3d12/nouveau/r600/radeonsi/virtio_gpu), no `gstreamer1.0-vaapi`,

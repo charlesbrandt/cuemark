@@ -722,7 +722,7 @@ curl -s -X POST http://10.20.2.97:1780/jsonrpc -d '{"id":1,"jsonrpc":"2.0","meth
 To test the sink without a server at all: `scripts/probes/snapcast_tcp_sink_probe.py`.
 Full design: `docs/design/network-audio-output.md`. Network reachability facts (the NAT that
 makes AirPlay impossible here, plus a second network path on `underground` with its own ACL
-gotcha): `docs/network-topology.md`.
+gotcha) are tracked privately, not in this repo.
 
 **Not this entry**: audio that arrives but *late* is working as designed — see the
 `tuning-knobs` skill §6 for the delay setting. Audio that stalls **every** output including
@@ -774,8 +774,8 @@ different (server config vs. network policy): ping the host first. `ping` succee
 `TcpStream::connect`/`nc`/`curl` to the specific port hangs with **no connection-refused** is
 the signature of a firewall or ACL silently dropping the SYN — a genuinely closed port refuses
 instantly. This is exactly how a Tailscale ACL grant that omitted the needed ports was found
-live 2026-08-14 (`docs/network-topology.md`'s "Tailscale subnet route" section) — the target
-looked "down" until that distinction was made.
+live 2026-08-14 (the private network-topology notes' "Tailscale subnet route" section) — the
+target looked "down" until that distinction was made.
 
 **Also fixed alongside this**: the failure used to be `log::error!`-only, so Settings kept
 showing the target as configured/checked with no sign it never came up. `attach_output_graph()`
