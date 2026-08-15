@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install — Cuemark</title>
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="wrap">
+    <div class="brand">
+      <img src="../assets/icon.svg" alt="">
+      Cuemark
+    </div>
+    <nav class="site-nav">
+      <a href="./" class="active">Docs</a>
+      <a href="https://github.com/charlesbrandt/cuemark">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+    <h1>Install</h1>
+    <p>
+      Cuemark is currently source-only — you build and run it yourself.
+      It targets Linux, developed against Ubuntu, with PipeWire for audio
+      and Tauri (Rust + WebKit) as the app shell.
+    </p>
+
+    <h2>Runtime requirements</h2>
+    <table>
+      <tr><th>Requirement</th><th>Notes</th></tr>
+      <tr><td>PipeWire</td><td>Audio routing. Standard on Ubuntu 22.04+, Fedora 34+.</td></tr>
+      <tr><td>WirePlumber</td><td>PipeWire session manager; provides <code>wpctl</code> for device enumeration.</td></tr>
+      <tr><td>GStreamer + plugins</td><td>Audio/video decode and playback.</td></tr>
+    </table>
+
+    <h2>Build requirements</h2>
+    <ul>
+      <li><strong>Rust</strong> ≥ 1.75 — install via <a href="https://rustup.rs">rustup</a>.</li>
+      <li><strong>Node.js</strong> ≥ 18 + npm</li>
+      <li><strong>Tauri CLI</strong> — <code>cargo install tauri-cli --version "^2"</code></li>
+    </ul>
+
+    <h2>Linux packages</h2>
+    <p>Install all build and runtime dependencies in one shot:</p>
+    <pre><code># Tauri build dependencies (WebKit, GTK, SSL, icon rendering, system tray)
+sudo apt-get install \
+  libwebkit2gtk-4.1-dev \
+  libgtk-3-dev \
+  libssl-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev
+
+# GStreamer dev headers (required to compile the Rust GStreamer bindings)
+sudo apt-get install \
+  libgstreamer1.0-dev \
+  libgstreamer-plugins-base1.0-dev
+
+# ALSA dev headers (required by the midir MIDI crate on Linux)
+sudo apt-get install \
+  libasound2-dev
+
+# GStreamer runtime plugins
+sudo apt-get install \
+  gstreamer1.0-plugins-base \
+  gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad \
+  gstreamer1.0-plugins-ugly \
+  gstreamer1.0-libav \
+  gstreamer1.0-pipewire
+
+# PipeWire + WirePlumber (usually pre-installed on modern desktops)
+sudo apt-get install \
+  pipewire \
+  pipewire-audio \
+  wireplumber</code></pre>
+
+    <div class="note">
+      <code>pactl</code> (from <code>pulseaudio-utils</code>) is <strong>not</strong>
+      required — Cuemark uses <code>pw-dump</code> (from <code>pipewire-bin</code>)
+      for device enumeration.
+    </div>
+
+    <h2>Build and run</h2>
+    <pre><code>git clone https://github.com/charlesbrandt/cuemark.git
+cd cuemark
+npm install
+cargo tauri dev</code></pre>
+
+    <p>
+      <code>cargo tauri dev</code> starts the Vite dev server and opens the Tauri
+      window with hot-reload for the frontend. See
+      <a href="running.html">Running Cuemark</a> for a production build and
+      dual-display setup.
+    </p>
+
+    <h2>Verify GStreamer plugins landed</h2>
+    <p>
+      The build can succeed and the app can launch even if a runtime plugin
+      package is missing — that only shows up when you try to play a track
+      (it loads but never plays, with no visible error). Confirm before
+      reporting a fresh install as working:
+    </p>
+    <pre><code>gst-inspect-1.0 pitch   # soundtouch tempo element, from plugins-bad</code></pre>
+    <p>If this prints "No such element or plugin", re-check the plugins-bad install above.</p>
+  </div>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    Cuemark is free and open source, licensed under
+    <a href="https://github.com/charlesbrandt/cuemark/blob/main/LICENSE">Apache&nbsp;2.0</a>.
+    &middot;
+    <a href="https://github.com/charlesbrandt/cuemark">GitHub</a>
+  </div>
+</footer>
+</body>
+</html>

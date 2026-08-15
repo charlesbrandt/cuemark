@@ -130,3 +130,7 @@ calibration instructions.
 
 See [`CLAUDE.md`](CLAUDE.md) for a full description of the rendering pipeline, data model,
 MIDI architecture, and development phases.
+
+## License
+
+Apache License 2.0 — see [`LICENSE`](LICENSE).

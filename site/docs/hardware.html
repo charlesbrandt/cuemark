@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIDI Controller — Cuemark</title>
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="wrap">
+    <div class="brand">
+      <img src="../assets/icon.svg" alt="">
+      Cuemark
+    </div>
+    <nav class="site-nav">
+      <a href="./" class="active">Docs</a>
+      <a href="https://github.com/charlesbrandt/cuemark">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+    <h1>MIDI controller</h1>
+    <p>
+      Cuemark is developed against and ships a built-in control map for the
+      <strong>Hercules DJControl Starlight</strong>, a USB MIDI DJ controller
+      with jog wheels, a crossfader, per-deck play/pause/loop buttons, and
+      volume/tempo faders.
+    </p>
+
+    <h2>Setup</h2>
+    <ol>
+      <li>Plug the controller in <strong>before</strong> launching Cuemark — MIDI devices are enumerated at startup.</li>
+      <li>Launch Cuemark. The controller should be detected automatically and mapped to its default layout.</li>
+      <li>Jog wheels drive scratch/nudge on their deck; the crossfader blends the two mapped decks' video and audio together; transport buttons control play/pause and looping.</li>
+    </ol>
+
+    <div class="note">
+      MIDI input uses the Rust <code>midir</code> crate rather than the
+      browser's Web MIDI API, which is unreliable inside the WebKitGTK
+      frontend Cuemark runs in. Raw MIDI events are mapped to structured
+      actions in the Rust backend and delivered to the UI over Tauri's IPC.
+    </div>
+
+    <h2>Other controllers</h2>
+    <p>
+      Only the Starlight has a built-in map today. The mapping layer
+      (<code>MidiMap: HashMap&lt;(status, data1), ControlBinding&gt;</code> in
+      <code>src-tauri/src/midi.rs</code>) isn't hardcoded to one device, so a
+      new controller mainly needs its own note/CC layout captured — see the
+      project's <code>skills/midi/</code> reference and
+      <a href="https://github.com/charlesbrandt/cuemark/blob/main/midi-troubleshooting.md">midi-troubleshooting.md</a>
+      for how the Starlight's map was worked out, as a template for a new one.
+      MIDI learn mode (map any control by pressing it once) is on the
+      roadmap — see <code>todo.md</code> in the repository.
+    </p>
+  </div>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    Cuemark is free and open source, licensed under
+    <a href="https://github.com/charlesbrandt/cuemark/blob/main/LICENSE">Apache&nbsp;2.0</a>.
+    &middot;
+    <a href="https://github.com/charlesbrandt/cuemark">GitHub</a>
+  </div>
+</footer>
+</body>
+</html>

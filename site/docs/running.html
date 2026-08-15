@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Running Cuemark</title>
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="wrap">
+    <div class="brand">
+      <img src="../assets/icon.svg" alt="">
+      Cuemark
+    </div>
+    <nav class="site-nav">
+      <a href="./" class="active">Docs</a>
+      <a href="https://github.com/charlesbrandt/cuemark">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+    <h1>Running Cuemark</h1>
+
+    <h2>Development mode</h2>
+    <pre><code>cargo tauri dev        # starts the Vite dev server + Tauri window
+npm run check           # TypeScript + Svelte type check
+npm test                # beat-grid / BPM algorithm tests
+cd src-tauri && cargo check   # Rust type check only</code></pre>
+    <p>
+      Frontend files hot-reload instantly. Rust changes under
+      <code>src-tauri/</code> trigger a full recompile, and the old binary
+      keeps running until that finishes — give it a moment after editing
+      backend code.
+    </p>
+
+    <h2>Two windows, two displays</h2>
+    <p>
+      Cuemark opens a <strong>control window</strong> (deck previews,
+      crossfader, media browser, MIDI status) and a separate
+      <strong>output window</strong> that does the actual GPU compositing
+      and is meant to run fullscreen on a second display — the projector.
+      Move the output window to display 2 and press fullscreen; layout is
+      currently manual (automatic display selection is on the roadmap).
+    </p>
+
+    <h2>Logging</h2>
+    <p>
+      Backend logs — the audio pipeline, MIDI events, device enumeration,
+      GStreamer bus messages — are always written to a log file, regardless
+      of how the app was launched:
+    </p>
+    <pre><code>tail -f ~/.local/share/com.cuemark.app/logs/cuemark.log</code></pre>
+
+    <h2>Loading media</h2>
+    <p>
+      Decks are video-only: load a video file onto a deck, loop it, and
+      control playback rate. Audio and video stay in sync off the audio
+      clock, so pitch-preserving rate changes (via the jog wheel or tempo
+      fader) don't need a seek.
+    </p>
+  </div>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    Cuemark is free and open source, licensed under
+    <a href="https://github.com/charlesbrandt/cuemark/blob/main/LICENSE">Apache&nbsp;2.0</a>.
+    &middot;
+    <a href="https://github.com/charlesbrandt/cuemark">GitHub</a>
+  </div>
+</footer>
+</body>
+</html>
