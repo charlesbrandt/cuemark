@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listAudioDevices, type AudioDevice } from "../lib/audio/pipeline";
-  import { mainOutputDeviceIds, cueOutputDeviceId, tempoRange, scratchMode, jogSecondsPerRev, scrubInertiaMs, SCRUB_INERTIA_MAX_MS, networkOutputs } from "../lib/audio/audioSettings";
+  import { mainOutputDeviceIds, cueOutputDeviceId, tempoRange, scratchMode, jogSecondsPerRev, scrubInertiaMs, SCRUB_INERTIA_MAX_MS, networkOutputs, outputAttachStatus } from "../lib/audio/audioSettings";
   import { fontScale } from "../lib/settings/displaySettings";
   import { session, setMidiMapping } from "../lib/state/session";
 
@@ -71,6 +71,13 @@
       return kept.length > 0 ? kept : [""];
     });
     if ($cueOutputDeviceId === id) cueOutputDeviceId.set("");
+    // Otherwise a removed-then-re-added target under the same id would show a stale badge
+    // from before it was ever touched this session.
+    outputAttachStatus.update(m => {
+      if (!(id in m)) return m;
+      const { [id]: _, ...rest } = m;
+      return rest;
+    });
   }
 
   onMount(async () => {
@@ -185,6 +192,11 @@
       </label>
       <span class="net-chip">{n.label}</span>
       <span class="side-label">{n.id.replace("snapcast://", "")}</span>
+      {#if $outputAttachStatus[n.id] && !$outputAttachStatus[n.id].ok}
+        <span class="net-error" title={$outputAttachStatus[n.id].message ?? ""}>
+          ⚠ not connected
+        </span>
+      {/if}
       <label class="device-check">
         delay
         <input
@@ -439,6 +451,16 @@
     border-radius: 3px;
     color: var(--text);
     white-space: nowrap;
+  }
+
+  .net-error {
+    padding: 1px 4px;
+    border: 1px solid color-mix(in srgb, #ff6b6b 50%, transparent);
+    border-radius: 3px;
+    color: #ff6b6b;
+    font-size: calc(10px * var(--font-scale));
+    white-space: nowrap;
+    cursor: help;
   }
 
   .net-remove,

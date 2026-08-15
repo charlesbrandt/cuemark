@@ -24,7 +24,7 @@
   import WaveformCanvas from "./components/WaveformCanvas.svelte";
   import AudioSettings from "./components/AudioSettings.svelte";
   import DiggerQueue from "./components/DiggerQueue.svelte";
-  import { mainOutputDeviceIds, cueOutputDeviceId, cueGain, networkOutputs } from "./lib/audio/audioSettings";
+  import { mainOutputDeviceIds, cueOutputDeviceId, cueGain, networkOutputs, outputAttachStatus } from "./lib/audio/audioSettings";
   import { fontScale, queueSidebarWidth } from "./lib/settings/displaySettings";
   import { CodecPlayer, type DemuxInfo } from "./lib/video/codecPlayer";
   import { videoPathOverrides, videoPathDefault, resolveVideoPath } from "./lib/video/videoPathSettings";
@@ -50,6 +50,7 @@
   let midiUnlisten: (() => void) | undefined;
   let dragDropUnlisten: (() => void) | undefined;
   let eosUnlisten: (() => void) | undefined;
+  let outputAttachUnlisten: (() => void) | undefined;
   let stopSessionSync: (() => void) | undefined;
   let tapTimestamps: number[] = [];
   let tapResetTimer: ReturnType<typeof setTimeout> | undefined;
@@ -265,6 +266,17 @@
       updateDeck(event.payload, { playing: false });
     });
 
+    // Surfaces a network/local output that failed to attach (e.g. an unreachable Snapcast
+    // target) as a badge in Settings instead of only a backend log line — see
+    // `outputAttachStatus`'s doc comment in audioSettings.ts.
+    outputAttachUnlisten = await listen<{ deviceId: string; deckId: string; ok: boolean; message: string | null }>(
+      'output-attach-status',
+      (event) => {
+        const { deviceId, ok, message } = event.payload;
+        outputAttachStatus.update(m => ({ ...m, [deviceId]: { ok, message, at: Date.now() } }));
+      },
+    );
+
     // Tauri intercepts OS file-drop before it reaches the DOM, so DataTransfer is
     // empty in the HTML5 drop event. Use the Tauri webview API for actual paths.
     dragDropUnlisten = await getCurrentWebview().onDragDropEvent((event) => {
@@ -306,6 +318,7 @@
     midiUnlisten?.();
     dragDropUnlisten?.();
     eosUnlisten?.();
+    outputAttachUnlisten?.();
     stopSessionSync?.();
     clearInterval(watchdogIntervalId);
     cancelAnimationFrame(rafId);

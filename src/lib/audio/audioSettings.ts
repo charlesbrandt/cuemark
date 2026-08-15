@@ -61,6 +61,21 @@ export type NetworkOutput = {
 };
 export const networkOutputs = persistentWritable<NetworkOutput[]>("cuemark:networkOutputs", []);
 
+/**
+ * Last known attach outcome per output device id, fed by the backend's `output-attach-status`
+ * Tauri event (`OutputAttachStatusEvent` in `pipeline.rs`, listened for in `App.svelte`).
+ *
+ * Exists because attach failures used to be `log::error!`-only: a Snapcast target that can't
+ * be reached (dead server, blocked port, unreachable host) left Settings showing it as
+ * configured and checked with no sign it never came up — the app looked healthy and produced
+ * silence. Cleared automatically when a later attach for the same device succeeds (`ok: true`),
+ * so fixing the network doesn't leave a stale error on screen forever. Deliberately **not**
+ * persisted — this is a live connection outcome, not a setting, and a failure from a previous
+ * session has nothing to say about whether the target is reachable now.
+ */
+export type OutputAttachStatus = { ok: boolean; message: string | null; at: number };
+export const outputAttachStatus = writable<Record<string, OutputAttachStatus>>({});
+
 /** Headphone / cue monitor master gain (0–1). Persisted across restarts. */
 export const cueGain = persistentWritable<number>("cuemark:cueGain", 1.0);
 

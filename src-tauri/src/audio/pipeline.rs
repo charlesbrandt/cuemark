@@ -1353,6 +1353,37 @@ mod snapcast_device_tests {
     fn snapcast_ids_need_no_channel_remap() {
         assert!(parse_device_remap("snapcast://10.1.2.3:4953").unwrap().is_none());
     }
+
+    /// Regression guard for the 2026-08-14 app-wide freeze: `tcpclientsink` has no `timeout`
+    /// property, so a target that never accepts used to block `pipeline.set_state(Playing)` —
+    /// and with it the shared output graph's mutex — for the OS's own TCP timeout (~2 minutes
+    /// on Linux). `make_snapcast_sink()` must fail well before that, on a bounded pre-flight
+    /// probe, whenever nothing is listening.
+    #[test]
+    fn unreachable_target_fails_fast_not_after_minutes() {
+        // Bind to grab a free port, then drop the listener so the port goes back to closed —
+        // a connection attempt gets refused (or a probe timeout) almost immediately, never a
+        // ~2-minute OS-level hang, which is the case this regression guard exists for.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let start = std::time::Instant::now();
+        let result = super::make_snapcast_sink("127.0.0.1", port, "deck-test");
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "nothing listens on {port} — this must fail, not silently succeed");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?} to fail — the whole point is failing well under the ~2-minute \
+             OS connect timeout that caused the original freeze"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("could not reach") || msg.contains("refused") || msg.contains("Connection"),
+            "error message should explain the connect failure, got: {msg}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1515,7 +1546,38 @@ pub(super) fn parse_snapcast_device(device: &str) -> Option<(String, u16)> {
 ///   Snapcast server on another subnet work at all when NAT sits between: nothing has to
 ///   reach back. It is exactly what AirPlay/RAOP cannot do, which is why that route was
 ///   abandoned here (`docs/design/network-audio-output.md` records the measurement).
+///
+/// **Pre-flights the connection with a bounded timeout before building `tcpclientsink`.**
+/// `tcpclientsink` has no `timeout` property — checked directly against gst-plugins-base
+/// 1.28 with `gst-inspect-1.0 tcpclientsink`, it genuinely does not exist — so its `connect()`
+/// runs unbounded inside `pipeline.set_state(Playing)` in `OutputGraph::create_node()`. That
+/// call executes while `attach_output_graph()` holds the shared output graph's mutex, so an
+/// unreachable target doesn't just leave this one output silent, it freezes every deck's
+/// play/pause behind that lock for as long as the OS takes to give up on the TCP handshake
+/// (~2 minutes on Linux for a target that never responds — no RST, just silence). Root-caused
+/// 2026-08-14: a Tailscale ACL grant that permitted `tcp:22`/`tcp:32400` to the Snapcast host
+/// but not its stream/control ports produced exactly that hang. Failing fast here, before the
+/// graph lock is ever touched, turns a multi-minute app-wide freeze into a same-second error.
 fn make_snapcast_sink(host: &str, port: u16, deck_id: &str) -> Result<gst::Element, String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+    let addr = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("[audio/{deck_id}] snapcast: could not resolve {host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("[audio/{deck_id}] snapcast: {host}:{port} resolved to no address"))?;
+    // Only a reachability probe — dropped immediately. tcpclientsink opens its own connection;
+    // by the time it does, the address has already been confirmed live, so its own (unbounded)
+    // connect is expected to resolve near-instantly rather than actually block.
+    TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| {
+        format!(
+            "[audio/{deck_id}] snapcast: could not reach {host}:{port} within {}s ({e}) — check \
+             the server is running and reachable (firewall/ACL); see docs/network-topology.md",
+            CONNECT_TIMEOUT.as_secs()
+        )
+    })?;
+
     let bin = gst::Bin::with_name(&format!("snapcast-{host}-{port}"));
     let conv = make_el("audioconvert")?;
     let resample = make_el("audioresample")?;
@@ -1708,6 +1770,24 @@ struct OutputAttachment {
     branches: Vec<BranchKey>,
     handoffs: Vec<(String, Arc<HandoffCounters>)>,
     latency_ns: Arc<AtomicU64>,
+}
+
+/// Emitted for every **main** output branch attach attempt (never cue — see
+/// `attach_output_graph`), success and failure alike. Before this event existed, a failure was
+/// `log::error!` only: Settings kept showing the target as configured, checked, with no
+/// indication it never came up — the exact "reads exactly like a healthy app producing silence"
+/// failure mode this project has hit before with other instruments. Emitting on success too
+/// (`ok: true, message: None`) is what lets the frontend clear a stale badge once a target that
+/// used to fail comes back — without it, fixing the network leaves the last error on screen
+/// forever. The frontend keys off `deviceId` to badge the matching row in `AudioSettings`'s
+/// network-outputs list; see `outputAttachStatus` in `audioSettings.ts`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutputAttachStatusEvent {
+    device_id: String,
+    deck_id: String,
+    ok: bool,
+    message: Option<String>,
 }
 
 struct PipelineInner {
@@ -2280,6 +2360,18 @@ impl DeckAudioPipeline {
                                 .latency_handle(device)
                                 .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
                         }
+                        // Clears a stale failure badge in Settings if this device previously
+                        // failed to attach — see OutputAttachStatusEvent's doc comment.
+                        if branch != "cue" {
+                            if let Some(ref app) = self.app {
+                                let _ = app.emit("output-attach-status", OutputAttachStatusEvent {
+                                    device_id: device.clone(),
+                                    deck_id: self.deck_id.clone(),
+                                    ok: true,
+                                    message: None,
+                                });
+                            }
+                        }
                     }
                     Err(e) => {
                         // Same asymmetry as the legacy path, for the same reason: a cue
@@ -2298,6 +2390,17 @@ impl DeckAudioPipeline {
                                  device in Settings, or unset CUEMARK_SHARED_OUTPUT to fall \
                                  back to the legacy per-branch sinks."
                             );
+                            // Log-only had no path to the UI at all — Settings kept showing the
+                            // target as configured with no sign it never came up. See
+                            // OutputAttachStatusEvent's doc comment.
+                            if let Some(ref app) = self.app {
+                                let _ = app.emit("output-attach-status", OutputAttachStatusEvent {
+                                    device_id: device.clone(),
+                                    deck_id: self.deck_id.clone(),
+                                    ok: false,
+                                    message: Some(e.clone()),
+                                });
+                            }
                         }
                     }
                 }

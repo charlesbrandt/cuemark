@@ -702,18 +702,86 @@ ss -tnp | grep 4953
 grep "sink: snapcast" ~/.local/share/com.cuemark.app/logs/cuemark.log
 ```
 
-**And check which group is on which stream.** A `tcp://` source is deliberately *not* part of
-the `House` meta stream (cuemark's silent keepalive would capture it permanently — see the
-`sound-system` skill), so the speakers must be pointed at the `Cuemark` stream explicitly with
-`Group.SetStream`. "Snapserver says playing, room says silent" is nearly always this.
+**And check which group is on which stream — check this FIRST, before anything on cuemark's
+side.** Live-confirmed 2026-08-14: cuemark attached cleanly, played, `Server.GetStatus` showed
+the `Cuemark` stream healthy, and the room was *still* silent, because both client groups had
+`stream_id: "House"` (the pre-existing Spotify/AirPlay meta stream) instead of `Cuemark`. A
+`tcp://` source is deliberately *not* part of a meta stream (cuemark's silent keepalive would
+capture it permanently), so nothing points a speaker at it automatically — a group has to be
+switched with `Group.SetStream` explicitly, every time, since **this does not persist**: a
+snapserver restart or anyone using Spotify/AirPlay again silences cuemark with zero indication
+anywhere in cuemark's own logs (the attach is still healthy from cuemark's point of view).
+"Snapserver's `Cuemark` stream says playing/idle-because-nothing's-loaded, room says silent" is
+nearly always this, not a cuemark or network bug:
+```sh
+curl -s -X POST http://10.20.2.97:1780/jsonrpc -d '{"id":1,"jsonrpc":"2.0","method":"Server.GetStatus"}' \
+  | python3 -c "import json,sys; [print(g['id'],'->',g['stream_id']) for g in json.load(sys.stdin)['result']['server']['groups']]"
+# fix: Group.SetStream with the group id and {"stream_id":"Cuemark"}
+```
 
 To test the sink without a server at all: `scripts/probes/snapcast_tcp_sink_probe.py`.
 Full design: `docs/design/network-audio-output.md`. Network reachability facts (the NAT that
-makes AirPlay impossible here): `docs/network-topology.md`.
+makes AirPlay impossible here, plus a second network path on `underground` with its own ACL
+gotcha): `docs/network-topology.md`.
 
 **Not this entry**: audio that arrives but *late* is working as designed — see the
 `tuning-knobs` skill §6 for the delay setting. Audio that stalls **every** output including
-the booth when the server dies would be the leaky queue having been removed (§7 there).
+the booth when the server dies would be the leaky queue having been removed (§7 there). The
+*whole app* freezing (not just the network output going silent) when you press play on an
+unreachable target is the next entry, not this one.
+
+### Pressing play freezes the *whole app* (not just the network output) when a Snapcast target is unreachable — FIXED 2026-08-14
+
+**Symptom**: distinct from the entry above — this isn't "the room is silent while everything
+else looks healthy," it's total unresponsiveness. Press play with a `snapcast://` target
+configured that nothing answers on, and *every* deck's play/pause stops working for **about
+two minutes**, then a delayed error finally appears. The render loop (`raf`/`poll-stats`) keeps
+ticking at a healthy fps the whole time, so it doesn't look like a crash or a spin — it looks
+like input is being silently dropped. The tell in the log: a burst of
+`detached-pipeline IPC received: play` (or `pause`) lines roughly every 200ms — the frontend's
+own transport retry loop hammering a backend call that never returns in time — followed, only
+after that ~2-minute gap, by:
+```
+[audio/deck-N/mainM] could not attach main output to the shared output graph
+([out/snap-<host>:<port>] set_state(Playing): Element failed to change its state) — THIS OUTPUT IS SILENT.
+```
+The ~2-minute gap between the first retry and that error is the signature — it's the Linux TCP
+SYN-retry timeout for a target that never sends so much as a RST, not a GStreamer timeout (there
+isn't one — see below).
+
+**Root cause, two layers, both now fixed** (full writeup:
+`docs/design/network-audio-output.md` "App-wide freeze"):
+1. `tcpclientsink` has **no `timeout` property** (verified with `gst-inspect-1.0
+   tcpclientsink` against gst-plugins-base 1.28 — don't assume one exists from memory or from
+   how other sink elements behave, check the actual element). Its `connect()` blocked
+   synchronously inside `pipeline.set_state(Playing)` for as long as the OS took to give up.
+2. That call runs in `OutputGraph::create_node()` (`mixer.rs`) while
+   `attach_output_graph()` (`pipeline.rs`) holds the **shared output graph's mutex** — the
+   same lock every other deck's play/pause/attach needs. This is the same class of bug as "Play
+   never starts, and the whole machine's audio hangs with it" and "UI freeze on first track
+   load" below: a blocking call made while holding a lock other unrelated operations also need.
+   Whenever a *new* symptom looks like "the whole app hangs, not just the thing I touched,"
+   check what mutex the slow call is running under before assuming it's isolated.
+
+Fixed by pre-flighting the target with a bounded `TcpStream::connect_timeout()` (3s) in
+`make_snapcast_sink()` *before* the graph lock or `tcpclientsink` are ever touched. An
+unreachable target now fails in ~3s with a clear message instead of freezing everything for
+minutes. Regression guard: `unreachable_target_fails_fast_not_after_minutes` in `pipeline.rs`.
+
+**How to tell "nothing is listening" from "an ACL/firewall is silently dropping it"** — both
+produce the identical multi-minute hang, and this matters because the fix is completely
+different (server config vs. network policy): ping the host first. `ping` succeeding while a
+`TcpStream::connect`/`nc`/`curl` to the specific port hangs with **no connection-refused** is
+the signature of a firewall or ACL silently dropping the SYN — a genuinely closed port refuses
+instantly. This is exactly how a Tailscale ACL grant that omitted the needed ports was found
+live 2026-08-14 (`docs/network-topology.md`'s "Tailscale subnet route" section) — the target
+looked "down" until that distinction was made.
+
+**Also fixed alongside this**: the failure used to be `log::error!`-only, so Settings kept
+showing the target as configured/checked with no sign it never came up. `attach_output_graph()`
+now emits an `output-attach-status` Tauri event (both success and failure) and
+`AudioSettings.svelte` shows a `⚠ not connected` badge on the target's row, cleared
+automatically once a later attach succeeds. Check that badge first, before logs.
 
 ### Play never starts, and the whole machine's audio hangs with it (pipewiresink deadlock)
 

@@ -73,14 +73,18 @@ which cuemark does on every play (≥1 main sink + the cue branch per deck). See
 its own node in the shared graph — same mixer, same master volume, same keepalive — ending in
 `tcpclientsink` instead of `pulsesink`, feeding a Snapcast server's `tcp://` stream source
 (built 2026-08-13). Targets are **configured in Settings, never discovered or hardcoded**.
-Two things are load-bearing and silent when broken: **`leaky=downstream` on the sink's queue**
+Three things are load-bearing and silent when broken: **`leaky=downstream` on the sink's queue**
 (the deck's `tee` has no per-branch queue, so without it a dead server stalls the booth monitor
-and the cue too — measured, with a control arm), and **the per-target `delay` setting**, since
+and the cue too — measured, with a control arm), **the per-target `delay` setting**, since
 GStreamer's latency query cannot see past the socket and the projector would otherwise run
-ahead of the room. 🛑 Do **not** add cuemark to a snapserver `meta://` stream: the node's silent
-keepalive means it never stops producing, so it would take the speakers forever. AirPlay was
-tried first and is **impossible across NAT** — RAOP needs the receiver to reach back.
-**Read `docs/design/network-audio-output.md` before touching any of it.**
+ahead of the room, and **the bounded pre-flight connect in `make_snapcast_sink()`** — `tcpclientsink`
+has no `timeout` property, so an unreachable target used to block `pipeline.set_state(Playing)`,
+and with it the shared output graph's mutex, for the OS's own TCP timeout (~2 minutes),
+freezing play/pause for *every* deck, not just the network one (fixed 2026-08-14; see
+"App-wide freeze" in the design doc). 🛑 Do **not** add cuemark to a snapserver `meta://`
+stream: the node's silent keepalive means it never stops producing, so it would take the
+speakers forever. AirPlay was tried first and is **impossible across NAT** — RAOP needs the
+receiver to reach back. **Read `docs/design/network-audio-output.md` before touching any of it.**
 `docs/network-topology.md` is the canonical network fact sheet (subnets, the one-way NAT, what
 is reachable) — read it before designing anything else that talks to a network peer.
 

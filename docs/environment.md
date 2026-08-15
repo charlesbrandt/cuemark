@@ -58,6 +58,7 @@ environment-specific narrative was derived on.
 
 | | |
 |---|---|
+| Hostname | `underground` (confirmed 2026-08-14 by CPU/GPU signature match — the hostname itself isn't otherwise documented anywhere in this repo) |
 | CPU | Intel i7-3615QM, Ivy Bridge, 4C/8T |
 | GPU | Intel HD 4000 (Ivy Bridge, gen7) + Nvidia GK107M (disabled via `nouveau` blacklist; its HDA audio function still enumerates as ALSA card) |
 | Model | MacBookPro9,1 or 10,1 — docs disagree/hedge on which; not confirmed to be two distinct units vs. one under-specified label |
@@ -65,6 +66,7 @@ environment-specific narrative was derived on.
 | Session | Wayland, GNOME |
 | WebKitGTK | 2.52.3 (stable across the OS-version history below) |
 | OS history | 24.04 (before 2026-08-02) → 26.04 "resolute", freshly installed (2026-08-02, reconfirmed 2026-08-04) → 24.04 again (from 2026-08-05 onward). **Why it moved is not documented anywhere** — could be a real reinstall, could be something else. Don't trust either version without re-running the identify commands above. |
+| Network path to `10.20.2.0/24` | Via a **Tailscale subnet route**, not a direct LAN — different from `mele`'s path and, as of 2026-08-14, more restrictive (an ACL grant gap silently blocked cuemark's Snapcast ports). See `docs/network-topology.md` "Tailscale subnet route" before trusting any reachability claim to `plex` from this machine. |
 
 **VA-API: ABSENT.** No `*_drv_video.so` under `/usr/lib/x86_64-linux-gnu/dri` (checked
 2026-08-05: only d3d12/nouveau/r600/radeonsi/virtio_gpu), no `gstreamer1.0-vaapi`,
@@ -100,6 +102,48 @@ switch back). Always resolve the binary — see "Cross-machine facts" below.
 `grim`/`scrot`/`gnome-screenshot`/`spectacle`/`import` all absent (per `run-app` and
 `verify-ui` skills). `python3-gi` + `gir1.2-webkit2-4.1` + `Xvfb` + `tauri-driver` are
 present and this is how headless verification works — see `verify-ui` skill.
+
+**Nvidia GK107 (GT650M) / nouveau is now enumerated and can become the default GPU
+for WebKitGTK's WebGL context — this crashes cuemark during video playback.** The
+Nvidia GPU was originally disabled via a `nouveau` blacklist (kernel
+`nouveau.modeset=0` + `/etc/modprobe.d/blacklist-nouveau.conf`); that blacklist was
+reverted on this machine on 2026-08-14 (`~/mbpr/revert-nouveau-blacklist.sh`) to fix
+S3 suspend/resume, which needs a real KMS driver on whichever GPU Apple's firmware
+POSTs — that's the Nvidia GPU here (`boot_vga=1` on `0000:01:00.0`, confirmed via
+`cat /sys/bus/pci/devices/0000:01:00.0/boot_vga`), not the Intel one. With nouveau
+active, Mesa's EGL device auto-selection picks the Nvidia GPU as `[default]`
+(confirmed via `DRI_PRIME_DEBUG=1`), so WebKitGTK's WebGL context now runs on
+nouveau's classic Kepler GL driver instead of `crocus`. That driver faults during
+cuemark's FBO-per-deck compositing — `dmesg`/journal shows repeated
+`nouveau 0000:01:00.0: gr: TRAP ch N [... cuemark[PID]]` /
+`GPC0/PROP trap: ... [ZETA_STORAGE_TYPE_MISMATCH]` starting within ~1s of a deck
+entering Playing, escalating within seconds to `nouveau: kernel rejected pushbuf: No
+such device` — the kernel kills the GPU channel and the whole process dies (not a
+hang; `systemd --user` shows the app scope exiting minutes into the session).
+**This is upstream nouveau/Kepler immaturity, not a cuemark bug** — the same FBO
+compositing has run for months against `crocus` without this fault class, and
+`ZETA_STORAGE_TYPE_MISMATCH` is a nouveau-classic depth/stencil-surface validation
+path cuemark's 2D alpha-blend compositing shouldn't even be exercising.
+
+**Fix applied 2026-08-14, machine-local only** (this machine's
+`~/.local/share/applications/cuemark.desktop`, *not* checked into the repo — nothing
+here should propagate to other machines): keep nouveau for KMS/suspend, but force
+Mesa to pick the Intel GPU for rendering via Mesa's generic hybrid-graphics PRIME
+selection, which `libEGL_mesa.so.0` on this Mesa version (26.0.3) honors for the
+Wayland/GBM EGL platform, not just GLX:
+```
+Exec=env DRI_PRIME=pci-0000_00_02_0 cuemark
+```
+(`pci-0000_00_02_0` is the Intel GPU's PCI address `0000:00:02.0` in Mesa's
+`pci-%04x_%02x_%02x_%1u` DRI_PRIME format — confirmed selecting `renderD129`
+`8086:166` over the `[default]` renderD128 `10de:fd5` via `DRI_PRIME_DEBUG=1`.)
+**Live-confirmed fixed 2026-08-14**: a 288s track played start to finish (`EOS`
+logged, matching the file's duration) with zero `nouveau`/`TRAP`/
+`ZETA_STORAGE_TYPE_MISMATCH`/`kernel rejected pushbuf` lines in `journalctl` for the
+whole session. See `cuemark-video-crash-after-nouveau-revert-20260814.md` in
+`~/mbpr/`. Note this override does not auto-restore itself — if this machine's
+`.desktop` file is ever regenerated fresh (e.g. by re-running `run-app`'s setup
+steps, which write a plain `Exec=cuemark`), the crash comes back silently.
 
 ### `mele` (Intel N150 mini-PC)
 

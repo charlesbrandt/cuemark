@@ -1,9 +1,83 @@
 # Network audio output — cuemark as a Snapcast source
 
-Status: 🟡 **BUILT 2026-08-13, verified in-process, not yet live against a real server.**
-The whole cuemark side is done and tested: a `snapcast://<host>:<port>` device id is a
-first-class output everywhere a local device is, configured from Settings. What remains is
-one line of config on the Snapcast server (below, "Server side") and a live listen.
+Status: 🟢 **LIVE-VERIFIED 2026-08-14, audible end to end.** Deck-0 attached to a real
+snapserver's `Cuemark` stream, played, and was heard on real speakers (`plex`'s local
+client and `kitchen-pi`) after the fixes below and a manual `Group.SetStream` pointing
+both groups at `Cuemark` (see "Group routing" below — that step does not persist and
+will need repeating). The path from BUILT to here took two more fixes, both below: the
+app-wide freeze on an unreachable target, and a Tailscale ACL gap on the machine used
+for the live test.
+
+## App-wide freeze on an unreachable target — FIXED 2026-08-14
+
+🔴 **Live-hit, not hypothetical.** Pressing play on a deck routed to a `snapcast://` target
+that never answers froze *all* transport control app-wide for ~2 minutes — every deck, not
+just the network one — with no error, while the render loop kept ticking fine (`raf`/
+`poll-stats` stayed healthy), so it read as "the app is alive but nothing responds," not a
+crash.
+
+**Root cause, two layers:**
+
+1. `tcpclientsink` has **no `timeout` property** — checked directly against gst-plugins-base
+   1.28 with `gst-inspect-1.0 tcpclientsink`, it genuinely does not exist. Its `connect()` ran
+   unbounded, inside `pipeline.set_state(gst::State::Playing)` in `OutputGraph::create_node()`
+   (`mixer.rs`), for as long as the OS took to give up on the TCP handshake (~2 minutes on
+   Linux for a target that never responds — no RST, just silence).
+2. That `set_state(Playing)` call runs while `attach_output_graph()` (`pipeline.rs`) holds the
+   **shared output graph's mutex**. Every deck's play/pause/attach path needs that same lock,
+   so the hang wasn't scoped to the one silent output the "unattached branch swallows buffers"
+   design comment (below, "The shape") assumes — it blocked the whole app's transport control
+   for the full ~2 minutes.
+
+The trigger the first time this was hit: a Tailscale ACL grant that allowed `tcp:22`/
+`tcp:32400` to the Snapcast host but not its stream/control ports, from a machine that reaches
+`plex` via a Tailscale subnet route rather than `mele`'s direct LAN path — see
+`docs/network-topology.md`'s "Tailscale subnet route" section. That's a network-config problem,
+independent of the app bug; **fixing it alone would not have fixed the freeze mechanism**, since
+any unreachable target (dead server, wrong port, a different firewall another day) would
+reproduce it.
+
+**Fix**: `make_snapcast_sink()` (`pipeline.rs`) now pre-flights the target with a bounded
+`TcpStream::connect_timeout()` (3s) *before* ever building `tcpclientsink` or touching the
+graph lock — an unreachable target now fails in seconds with a clear error instead of freezing
+the app for minutes. Regression guard: `unreachable_target_fails_fast_not_after_minutes` in
+`pipeline.rs`'s `snapcast_device_tests`.
+
+**Also fixed: the failure was silent to the user.** A failed attach used to be `log::error!`
+only — Settings kept showing the target as configured and checked with no sign it never came
+up. `attach_output_graph()` now emits an `output-attach-status` Tauri event (success *and*
+failure) that `AudioSettings.svelte` renders as a `⚠ not connected` badge on the target's row,
+cleared automatically the next time that device attaches successfully. See
+`OutputAttachStatusEvent`'s doc comment in `pipeline.rs` and `outputAttachStatus` in
+`audioSettings.ts`.
+
+⚠️ **This only bounds the initial connect.** It does not add reconnect-on-drop — that's still
+the pre-existing "No reconnect" open item below, unchanged.
+
+## Group routing — live-confirmed 2026-08-14, and it is a real trap
+
+After the freeze fix and the ACL fix above, cuemark attached to the `Cuemark` stream cleanly
+(log showed `attached deck-0/main1`, no errors) and deck-0 played — and the room was still
+silent. `Server.GetStatus` explained it in one look: **both connected client groups (`plex`'s
+own client, `kitchen-pi`) had `stream_id: "House"`** — the pre-existing `meta:///Spotify/AirPlay`
+combination — not `Cuemark`. Nothing was wrong with cuemark, the network path, or snapserver's
+config; the speakers were simply listening to a different stream.
+
+Fixed for this session with `Group.SetStream` per group:
+```sh
+curl -s -X POST http://10.20.2.97:1780/jsonrpc -d \
+  '{"id":1,"jsonrpc":"2.0","method":"Group.SetStream","params":{"id":"<group-id>","stream_id":"Cuemark"}}'
+```
+`Server.GetStatus`'s `groups[].id` gives the ids; `groups[].clients[].host.name` says which
+physical client each one is.
+
+🛑 **This does not persist.** It's a live server-side setting, not config — a snapserver
+restart, or anyone using Spotify/AirPlay again (which likely switches the group back to
+`House`), silences cuemark again with zero indication anywhere in cuemark's own logs, because
+from cuemark's side the attach is still healthy and buffers are still flowing. **When "cuemark
+looks fine but the room is silent," check group routing before anything on cuemark's side** —
+this is now the *expected* first check, not a fallback. Automating this (cuemark calling
+`Group.SetStream` itself when a target is enabled) is not built; see Open items.
 
 Two routes were considered. **Route A (this one) — cuemark connects to a Snapcast server's
 `tcp://` stream source and pushes raw PCM.** Route B — send AirPlay to the `shairport-sync`
@@ -167,8 +241,8 @@ Route A's. The working config is preserved in this doc's history rather than in 
 
 ## Open items
 
-- **Not yet heard.** Everything is verified in-process against a stand-in listener; nobody
-  has listened to a room yet. The delay value in particular is unset until someone tunes it.
+- ~~Not yet heard~~ — **done 2026-08-14**, see Status above. The delay value is still unset
+  and needs tuning by ear against the room now that it's audible at all.
 - **No reconnect.** `tcpclientsink` does not retry. A server restart mid-set leaves that node
   erroring; the deck keeps playing and every other output is unaffected (attach failures are
   already non-fatal — `attach_output_graph()` leaves an unattached branch silently swallowing
@@ -178,3 +252,8 @@ Route A's. The working config is preserved in this doc's history rather than in 
   make the delay field self-populating instead of hand-entered. Deliberately not done yet:
   the value that matters is the one the room *hears*, and the server's setting is only a
   lower bound on it.
+- **Group routing is entirely manual** (see "Group routing" above) — enabling a target in
+  Settings does not point any speaker at it, and there's no cuemark-side indication when a
+  group drifts back to `House`. A `Group.SetStream` call from Settings when a target is
+  ticked (and back to a stored previous stream when unticked) would close this, but it needs
+  a decision about which groups cuemark is allowed to touch — not build yet.

@@ -785,7 +785,20 @@ mod tests {
         );
 
         // Read one second of the stream. Nothing is playing: this is the keepalive alone.
-        let (mut conn, _) = listener.accept().expect("tcpclientsink must connect");
+        //
+        // `make_snapcast_sink` now pre-flights reachability with a short connect-then-drop
+        // probe before ever building `tcpclientsink` (see its doc comment) — so the first
+        // connection this listener sees carries no data and closes immediately. Skip it and
+        // wait for the real streaming connection tcpclientsink opens afterward.
+        let mut conn = loop {
+            let (c, _) = listener.accept().expect("tcpclientsink must connect");
+            c.set_read_timeout(Some(std::time::Duration::from_millis(500))).unwrap();
+            let mut probe = [0u8; 1];
+            match c.peek(&mut probe) {
+                Ok(1..) => break c,
+                _ => continue, // empty/closed: that was the reachability probe
+            }
+        };
         conn.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
         let start = std::time::Instant::now();
         let mut total = 0usize;
