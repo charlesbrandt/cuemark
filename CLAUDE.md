@@ -3,7 +3,7 @@
 VJ / live A/V mixing software for Linux. Built for live performance: garage dance parties,
 projector output, MIDI controller integration. Open source goal.
 
-Domain: cuemark.com (Charles Brandt's former DJ name)
+Domain: cuemark.com
 
 ## Environment
 
