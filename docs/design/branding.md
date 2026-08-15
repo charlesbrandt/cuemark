@@ -25,7 +25,7 @@ Edit it directly rather than the design-canvas HTML for small tweaks; re-import 
 the Claude Design project if the concept changes materially.
 
 ```svg
-<rect width="512" height="512" rx="110" fill="#0c0c0e"/>
+<rect width="512" height="512" rx="110" fill="#2b2b30"/>
 <circle cx="336" cy="176" r="66" fill="#ff2e6e"/>
 <path d="M 218 176 A 118 118 0 0 1 336 58"
       stroke="#ff2e6e" stroke-width="16" stroke-linecap="round"
@@ -73,7 +73,7 @@ gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor
 
 | Role | Hex | Usage |
 |---|---|---|
-| Icon background | `#0c0c0e` | Near-black tile background — matches the app's dark UI register but is a distinct, slightly warmer black than the in-app surfaces. |
+| Icon background | `#2b2b30` | Dark gray tile background — matches the app's dark UI register while staying visibly distinct from a pure-black page or desktop background. Was `#0c0c0e` (near-black) until 2026-08-15: at that value the icon disappeared against the site's `--bg: #0c0c0e`, which is the same hex — changed to a lighter dark gray so the tile edge stays visible on black. |
 | Brand accent ("cue magenta") | `#ff2e6e` | The dot + arc. Reserved for the mark itself — a bright, saturated pink-red chosen to read clearly at 32px and stand apart from the muted grays of the working UI. |
 
 **Open item**: the in-app UI (`src/app.css`) currently uses `#e04040` (a duller
