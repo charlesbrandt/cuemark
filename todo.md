@@ -18,6 +18,26 @@ todo format.
    ends) exposed as a toggle instead of two buttons nobody uses. Scope: UI swap plus wiring
    actual auto-advance logic — medium.
 
+2. **[EXPLORE] Other streaming destinations from within the app (OBS, direct RTMP, …).** The
+   Snapcast target (docs/design/network-audio-output.md) is one destination; a gig stream
+   usually wants OBS or a direct platform RTMP ingest. Zero-code floor that already works:
+   OBS on the gig machine capturing cuemark's projector window (video) + the booth sink's
+   PulseAudio monitor (audio) — fine for one-off streams. In-app options, if we build them,
+   ranked by fit with what exists: **(a) SRT out** — `srtclientsink` off the existing shared
+   output graph (audio first; video is the hard part, see below), consumed by OBS ≥28's
+   Media Source (`srt://…`) or FFmpeg; SRT is the only common option that tolerates the
+   one-way-NAT topology this network has (same reason Route A beat AirPlay; topology
+   facts tracked privately). **(b) Direct RTMP** — `flvmux ! rtmpsink` with H.264/AAC encode, no OBS
+   needed, but video encode in-app hits the same wall as (a)'s video. **(c) NDI** —
+   obs-ndi consumes it, but the GStreamer NDI plugin needs NewTek's proprietary SDK;
+   licensing headache for an open-source goal. The actual blocker for video in all three:
+   GPU→CPU readback of the WebGL composite is broken on the crocus machine and the compositing
+   window is a separate WebKitWebProcess (see CLAUDE.md rendering pipeline) — in-app video
+   out would need either a capture path in the output window itself or
+   `ximagesrc`/pipewiresrc window capture in GStreamer, each with real latency/frame-pace
+   questions. Start with audio-only SRT as a proof, decide video after measuring.
+
+
 **"Transition points for auto-DJ training" — deliberately not built here.** Digger's own
 `mix_transitions` table already reserves `source='play_history'` for transitions *mined from* the
 plays log server-side, and its router docstring explicitly scopes that mining job as "out of scope

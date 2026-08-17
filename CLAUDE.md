@@ -87,6 +87,10 @@ speakers forever. AirPlay was tried first and is **impossible across NAT** — R
 receiver to reach back. **Read `docs/design/network-audio-output.md` before touching any of it.**
 Network topology facts (subnets, the one-way NAT, what is reachable) are tracked privately,
 not in this repo — check before designing anything else that talks to a network peer.
+**Group routing is automatic since 2026-08-16**: ticking a target's Stream checkbox claims
+every speaker group on that server via Snapcast's JSON-RPC (port 1780) and unticking restores
+them — `audio/snapcontrol.rs`, with the reasoning and edge cases in the "Group claiming"
+section of the design doc.
 
 **Full gotchas and rationale** — position-tracking drift math, the `pendingSeekTarget` seek-race filter,
 why `v.playbackRate` writes must be rAF-throttled, rate-then-seek ordering, EOS handling, PipeWire quantum

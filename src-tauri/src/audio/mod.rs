@@ -4,6 +4,7 @@ pub mod mixer;
 pub mod pcm_buffer;
 pub mod pipeline;
 pub mod record;
+pub mod snapcontrol;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -36,6 +37,10 @@ pub struct AudioManager {
     /// An `Arc` because `with_pipeline_detached()` removes a deck from `pipelines` for the
     /// duration of a blocking call, and that deck still has to reach the graph.
     output_graph: Arc<Mutex<OutputGraph>>,
+    /// Live Snapcast group claims, keyed by device id — one per enabled network target.
+    /// Claimed in `audio_set_main_devices` when a target enters the main list, released
+    /// when it leaves (or the app exits, via `take_snapcast_claims`). See `snapcontrol`.
+    snapcast_claims: HashMap<String, snapcontrol::Claim>,
     record: RecordingSink,
 }
 
@@ -48,8 +53,18 @@ impl AudioManager {
             cue_device: String::new(),
             master_volume: 1.0,
             output_graph: Arc::new(Mutex::new(OutputGraph::new())),
+            snapcast_claims: HashMap::new(),
             record: RecordingSink::new(),
         }
+    }
+
+    /// Take every live Snapcast claim out of the manager, for release on app exit —
+    /// quitting with a target enabled must hand the speakers back the same way
+    /// unticking it does. Take-then-release (rather than release-under-lock) keeps the
+    /// JSON-RPC calls out from under the audio mutex; a claim lost to a concurrent
+    /// device change here is impossible because exit is the last event the app processes.
+    pub fn take_snapcast_claims(&mut self) -> Vec<snapcontrol::Claim> {
+        self.snapcast_claims.drain().map(|(_, c)| c).collect()
     }
 
     fn pipeline_mut(&mut self, deck_id: &str) -> Result<&mut DeckAudioPipeline, String> {
@@ -471,7 +486,7 @@ pub fn audio_set_output_latency(
 pub async fn audio_set_main_devices(app: tauri::AppHandle, device_ids: Vec<String>) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AudioState>();
-        let deck_ids: Vec<String> = {
+        let (deck_ids, now_claiming, releasing): (Vec<String>, Vec<String>, Vec<snapcontrol::Claim>) = {
             let mut mgr = state.lock().unwrap();
             // No-op guard: the frontend calls this unconditionally on every mount (App.svelte's
             // `$effect` syncing the persisted `mainOutputDeviceIds` store has no change check),
@@ -486,14 +501,63 @@ pub async fn audio_set_main_devices(app: tauri::AppHandle, device_ids: Vec<Strin
             if mgr.main_devices == device_ids {
                 return Ok(());
             }
+            let previous = mgr.main_devices.clone();
             mgr.main_devices = device_ids.clone();
+            // Snapcast group claiming (snapcontrol.rs): a network target entering the main
+            // list takes over the server's speaker groups; one leaving gives them back.
+            // Diffed under the same guard that already de-duplicates this command, so each
+            // toggle claims/releases exactly once — including the app-start case, where a
+            // persisted ticked target is "entering" an empty list and claims on mount.
+            let is_network = |id: &String| pipeline::parse_snapcast_device(id).is_some();
+            let now_claiming: Vec<String> = device_ids
+                .iter()
+                .filter(|id| is_network(id) && !previous.contains(*id))
+                .cloned()
+                .collect();
+            let mut releasing = Vec::new();
+            for id in previous.iter().filter(|id| is_network(id) && !device_ids.contains(*id)) {
+                if let Some(ticket) = mgr.snapcast_claims.remove(id) {
+                    releasing.push(ticket);
+                }
+            }
             // Nothing to do here for the shared output graph: it learns about devices from
             // each deck's rebuild below (`set_devices` → `load()` → `OutputGraph::attach`),
             // which is also what tears down the branches on the old node. The `MasterMix`
             // stub that used to be called here never did anything.
-            mgr.pipelines.keys().cloned().collect()
-            // mutex released here
+            (
+                mgr.pipelines.keys().cloned().collect(),
+                now_claiming,
+                releasing,
+            )
+            // mutex released here — claim/release do blocking JSON-RPC and must not run
+            // under it, exactly like the per-deck rebuilds below
         };
+        // Releases before claims, so swapping one server for another never routes a group
+        // straight from the old claim to the new one and back. Every failure is logged
+        // and swallowed: the audio path to the tcp:// source is independent of group
+        // routing, so this degrades to the old manual-switch behaviour, never to silence.
+        for ticket in &releasing {
+            if let Err(e) = snapcontrol::release(ticket) {
+                log::warn!(
+                    "[audio/snapcast] release failed ({}) — speakers may need switching back \
+                     manually: {e}",
+                    ticket.describe()
+                );
+            }
+        }
+        for device in &now_claiming {
+            match snapcontrol::claim(device) {
+                Ok(ticket) => {
+                    log::info!("[audio/snapcast] claimed {}", ticket.describe());
+                    state.lock().unwrap().snapcast_claims.insert(device.clone(), ticket);
+                }
+                Err(e) => log::warn!(
+                    "[audio/snapcast] could not claim groups on {device} — audio will still \
+                     stream, but no speaker group switches to it automatically; untick and \
+                     retick the target once the server is reachable: {e}"
+                ),
+            }
+        }
         for deck_id in deck_ids {
             let device_ids = device_ids.clone();
             let outcome = with_pipeline_detached(&state, &deck_id, "set_devices", move |p| p.set_devices(&device_ids));

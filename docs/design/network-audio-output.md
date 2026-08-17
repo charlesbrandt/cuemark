@@ -76,8 +76,41 @@ restart, or anyone using Spotify/AirPlay again (which likely switches the group 
 `House`), silences cuemark again with zero indication anywhere in cuemark's own logs, because
 from cuemark's side the attach is still healthy and buffers are still flowing. **When "cuemark
 looks fine but the room is silent," check group routing before anything on cuemark's side** —
-this is now the *expected* first check, not a fallback. Automating this (cuemark calling
-`Group.SetStream` itself when a target is enabled) is not built; see Open items.
+this is now the *expected* first check, not a fallback. Since 2026-08-16 the switching itself
+is automatic — see "Group claiming" below; this section stays because the *non-persistence*
+trap is unchanged: a snapserver restart mid-set still resets groups to its config defaults
+and nothing re-claims them until the target is toggled or the app restarts.
+
+## Group claiming — built 2026-08-16
+
+Ticking a network target's Stream checkbox now **points every group on that server at this
+app's stream**, and unticking gives each group back what it was on before — no manual
+`Group.SetStream`, no forgotten-switchback silence. Code: `audio/snapcontrol.rs`, hooked into
+`audio_set_main_devices` (which diffs the device list under its existing no-op guard, so each
+toggle claims/releases exactly once) plus a `RunEvent::Exit` hook in `lib.rs` that releases on
+clean app quit. No frontend changes: the Stream checkbox already drove `mainOutputDeviceIds`.
+
+How it finds *our* stream without hardcoding a name: `Server.GetStatus` exposes each stream's
+source `uri`, so the claim matches the target's port against the `tcp://` source's port
+(`uri.host` arrives as `"0.0.0.0:4953"`). The JSON-RPC endpoint is snapserver's own default
+port `1780` — a different listener than the audio port in the device id, which is why it
+can't be read out of the id.
+
+Deliberate semantics, all tested in `snapcontrol.rs` against a scripted fake server:
+
+- **Claim takes every group on the server** (the "which groups may cuemark touch" decision
+  from the old open item: all of them — a Snapcast server whose groups cuemark shouldn't
+  touch is a second server, i.e. a second target).
+- **Release restores only what still makes sense**: a group that vanished, was re-routed by
+  someone else mid-claim, or whose saved stream no longer exists is left alone, never
+  stomped.
+- **A group already on our stream at claim time is a crash leftover** — its true prior stream
+  is unknowable, so the claim records the server's `meta://` stream instead (the one stream
+  that hands the speakers to whichever source is producing). Unticking then restores normal
+  service even after an unclean exit; a clean quit releases on the spot.
+- **Failure is logged, never propagated**: audio reaches the `tcp://` source regardless of
+  group routing, so an unreachable RPC port degrades to the old manual-switch behaviour, not
+  to silence. Untick/retick once the server is reachable to retry the claim.
 
 Two routes were considered. **Route A (this one) — cuemark connects to a Snapcast server's
 `tcp://` stream source and pushes raw PCM.** Route B — send AirPlay to the `shairport-sync`
@@ -251,8 +284,8 @@ Route A's. The working config is preserved in this doc's history rather than in 
   make the delay field self-populating instead of hand-entered. Deliberately not done yet:
   the value that matters is the one the room *hears*, and the server's setting is only a
   lower bound on it.
-- **Group routing is entirely manual** (see "Group routing" above) — enabling a target in
-  Settings does not point any speaker at it, and there's no cuemark-side indication when a
-  group drifts back to `House`. A `Group.SetStream` call from Settings when a target is
-  ticked (and back to a stored previous stream when unticked) would close this, but it needs
-  a decision about which groups cuemark is allowed to touch — not build yet.
+- ~~**Group routing is entirely manual**~~ — **built 2026-08-16**, see "Group claiming"
+  above. Remaining edge, accepted for now: a snapserver restart mid-set resets groups to its
+  config defaults and nothing re-claims until the target is toggled or the app restarts
+  (re-claiming on a server-elected `Server.OnUpdate`-style notification would need a
+  persistent subscription, which nothing else here maintains yet).

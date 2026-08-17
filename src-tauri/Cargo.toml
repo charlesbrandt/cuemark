@@ -27,4 +27,6 @@ gstreamer = { version = "0.23", features = ["v1_18"] }
 gstreamer-audio = "0.23"
 gstreamer-app = "0.23"
 tiny_http = "0.12"
-ureq = "2"
+# "json" feature for Request::send_json in audio/snapcontrol.rs (serde_json is already a
+# direct dependency; the feature only wires ureq's own serde impls to it).
+ureq = { version = "2", features = ["json"] }

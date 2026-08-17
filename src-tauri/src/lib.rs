@@ -271,6 +271,24 @@ pub fn run() {
             app.manage(MediaServerPort(media_server::start(media_cache, video_demux_registry)));
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        // build()+run(callback) rather than run(generate_context!) so the app can act on
+        // RunEvent::Exit: quitting with a Snapcast target still enabled releases the
+        // speaker groups it claimed, the same as unticking the target would. A crash
+        // skips this — that leftover self-heals at the next claim (see snapcontrol.rs).
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                let claims = app.state::<audio::AudioState>().lock().unwrap().take_snapcast_claims();
+                for ticket in claims {
+                    if let Err(e) = audio::snapcontrol::release(&ticket) {
+                        log::warn!(
+                            "[audio/snapcast] exit release failed ({}) — speakers may need \
+                             switching back manually: {e}",
+                            ticket.describe()
+                        );
+                    }
+                }
+            }
+        });
 }
