@@ -54,6 +54,92 @@ cleared automatically the next time that device attaches successfully. See
 ⚠️ **This only bounds the initial connect.** It does not add reconnect-on-drop — that's still
 the pre-existing "No reconnect" open item below, unchanged.
 
+## Post-idle hang, reported 2026-08-15 — 🟡 UNCONFIRMED, two capture attempts, no reproduction yet
+
+User report: deck-0 routed to `snap-192.168.2.97:4953` had been idle (paused) for ~1h40m in a
+live instance; on pressing play, heard a brief blip of sound, then the app appeared to hang.
+Investigated live, in the same session, within minutes of the report.
+
+**What the log actually shows** (`cuemark.log`, build `0ad671f`, dirty, session started
+`18:06:12`): the target attached cleanly at `18:06:12` (`created for deck-0/main1 …
+latency=451ms`) and stayed attached with no bus errors for the rest of the session. The
+reported play was `19:47:58.318` (`Paused → Playing`) → `19:48:10.930` (`Playing → Paused`,
+clean `async-done`) — 12s, no `WARN`/`ERROR`, `poll-stats`/`ipc-ping` round-trips all
+single-digit ms. The `[raf]` heartbeat **never gapped** — 5s-interval log lines run
+continuously through the whole window and past it — and the watchdog (trips at ≥6s silence)
+never logged a `TRIGGER`. At the time of investigation the `cuemark` and `WebKitWebProcess`
+processes were alive and `S`-state (not `T`/`D`/stuck), `WebKitWebProcess` at ~4% CPU, and
+`192.168.2.97:4953` was reachable. So whatever happened either self-resolved in under ~5s, or
+had already fully recovered by the time it was checked — the multi-minute freeze signature
+from the bug above (raf gap + watchdog `TRIGGER`) is not present.
+
+**Leading hypothesis, not yet confirmed**: this is the *other* half of the "No reconnect" gap
+below, not the connect-timeout bug (which only guards `pipeline.set_state(Playing)` on
+*initial* attach — irrelevant here since attach succeeded hours earlier). `tcpclientsink` has
+no timeout on ongoing `send()` either. If the network path to `.97` blipped during the idle
+stretch (host sleep, Wi-Fi drop, etc.) without a clean RST, a write on the already-established
+socket could block the GStreamer streaming thread until the OS's own TCP retransmission gives
+up or the path recovers — same shape as the connect bug, on the write side, and it would
+produce exactly "plays briefly, then goes quiet" if it stalls right after a few buffers.
+Unconfirmed because it never reproduced with anything to inspect.
+
+**If this happens again, capture *during* the stall, before it clears**:
+```sh
+ss -tni state established '( dport = :4953 )'          # socket send-Q backed up = write blocked
+gdb -p $(pgrep -x cuemark) -batch -ex 'thread apply all bt' # which thread, stuck where
+```
+A backed-up send queue plus a GStreamer thread parked in `send()`/`write()` would confirm the
+write-block theory directly. Also check the raf/watchdog log lines at that moment — if this
+theory is right, a *real* hit should this time show a raf gap and (past 6s) a watchdog
+`TRIGGER`, unlike the 2026-08-15 report.
+
+**Update, same day, second occurrence — socket is healthy; the "dead connection" read was a
+misdiagnosis, corrected within the same session.** Ran the capture recipe live on the
+recurrence. First `ss` snapshot on the `.97:4953` connection:
+
+```
+Send-Q 9600  notsent:9600  snd_wnd:1024  lastsnd:47  lastrcv:8954388  lastack:32  busy:8717400ms
+rwnd_limited:3574153ms(41.0%)  retrans:0/259  bytes_sent:1696958440  bytes_acked:1696732801
+```
+
+First read of this called `lastrcv` (~2.49h) evidence of a permanently dead half-open
+connection. **That was wrong** — `lastrcv` is `tcpi_last_data_recv`, time since a
+*data-bearing* segment arrived, not time since any packet. This is a one-way stream (cuemark →
+snapcast); the peer has no application data to ever send back, so `lastrcv` is expected to sit
+at a huge, ever-growing number **on a perfectly healthy connection** and carries no signal here.
+The field that does show freshness is `lastack` (`tcpi_last_ack_recv`) — **32ms**, i.e. the peer
+ACKed something 32 milliseconds ago. A second capture ~5 minutes later confirmed it: `lastack`
+still single/double-digit ms, `segs_in` +9,111, `bytes_acked` +~64MB, `Send-Q` shrinking
+(9600→7552). **The socket is actively exchanging data, not stuck.** `snd_wnd:1024` and
+`rwnd_limited` ~41-42% just describe a small, steady receive buffer on the snapcast side — not
+evidence of failure.
+
+`gdb -p $(pgrep -x cuemark) -batch -ex 'thread apply all bt'` also **failed**: `ptrace:
+Operation not permitted` (`yama/ptrace_scope` blocks a non-parent, non-root attacher on this
+machine). Needs `sudo gdb -p …` or a temporary `echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope`
+next time. Substituted `/proc/<pid>/task/*/{status,wchan}` (no ptrace needed) across all 54
+threads: every thread was `S` (sleeping) on an ordinary wait (futex, poll, hrtimer,
+`inet_csk_accept`), none parked in a write/send syscall — consistent with the socket being fine,
+not with a blocked write that just happened to not need ptrace to see. `cuemark.log`'s `[raf]`
+heartbeat was clean and continuous (`~60.0fps`, no gaps) throughout.
+
+**Net effect: the send()-blocking / dead-socket hypothesis has no supporting evidence from either
+capture**, and the "half-open connection with no keepalive" theory above is retracted pending a
+capture that actually shows a stale `lastack`. What *is* still true and load-bearing: `gdb`
+needs sudo/ptrace_scope adjustment ahead of time, not discovered mid-stall, and `lastrcv` must
+never again be read as connection health for this one-way stream — `lastack` is the field to
+watch.
+
+**New lead**: the user's stop/pause action on the deck may be more relevant than idle duration
+— worth checking whether the original report's "brief blip, then hang" correlates with a
+play→pause or pause→play transition on the network-routed deck specifically, rather than with
+how long it had been idle. Not yet investigated; check `audio_pause`/`audio_play` timestamps
+in `cuemark.log` against the report time if it recurs.
+
+**Still 🟡 UNCONFIRMED overall** — no reproduction has yet shown a raf gap, a watchdog
+`TRIGGER`, a stale `lastack`, or a thread blocked in a syscall. Two capture attempts, two
+different (and partly contradictory) leads, nothing confirmed yet.
+
 ## Group routing — live-confirmed 2026-08-14, and it is a real trap
 
 After the freeze fix and the ACL fix above, cuemark attached to the `Cuemark` stream cleanly
@@ -279,7 +365,11 @@ Route A's. The working config is preserved in this doc's history rather than in 
   erroring; the deck keeps playing and every other output is unaffected (attach failures are
   already non-fatal — `attach_output_graph()` leaves an unattached branch silently swallowing
   buffers rather than blocking), but the house stays dead until the deck is re-routed. A
-  retry-with-backoff on the node's bus ERROR is the obvious next step.
+  retry-with-backoff on the node's bus ERROR is the obvious next step. ⚠️ That's the clean-RST
+  case. `tcpclientsink` also has no timeout on ongoing `send()` — a target that goes silent
+  without closing the connection (sleep, dropped Wi-Fi) can block the streaming thread instead
+  of erroring; see "Post-idle hang, reported 2026-08-15" above for the unconfirmed live report
+  and the capture recipe for next time.
 - **`buffer` is not read from the server.** Snapcast's JSON-RPC could report it, which would
   make the delay field self-populating instead of hand-entered. Deliberately not done yet:
   the value that matters is the one the room *hears*, and the server's setting is only a
