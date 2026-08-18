@@ -23,6 +23,7 @@
   import Crossfader from "./components/Crossfader.svelte";
   import WaveformCanvas from "./components/WaveformCanvas.svelte";
   import AudioSettings from "./components/AudioSettings.svelte";
+  import MidiMonitor from "./components/MidiMonitor.svelte";
   import DiggerQueue from "./components/DiggerQueue.svelte";
   import { mainOutputDeviceIds, cueOutputDeviceId, cueGain, networkOutputs, outputAttachStatus } from "./lib/audio/audioSettings";
   import { fontScale, queueSidebarWidth } from "./lib/settings/displaySettings";
@@ -55,6 +56,10 @@
   let tapTimestamps: number[] = [];
   let tapResetTimer: ReturnType<typeof setTimeout> | undefined;
   let showAudioSettings = $state(false);
+  // Mounting MidiMonitor turns the Rust raw-MIDI feed on and unmounting turns it off, so
+  // this flag is also the feed's gate — keep it default-off and keep the panel unmounted
+  // (not merely hidden) when it is false. See MONITOR in midi.rs.
+  let showMidiMonitor = $state(false);
   let showDiggerQueue = $state(true);
   let showVisualizationPanel = $state(false);
 
@@ -815,6 +820,12 @@
       class:active={showAudioSettings}
       onclick={() => { showAudioSettings = !showAudioSettings; }}
     >Settings</button>
+    <button
+      class="output-btn"
+      class:active={showMidiMonitor}
+      onclick={() => { showMidiMonitor = !showMidiMonitor; }}
+      title="Raw MIDI monitor — every message, mapped or not. Bench tool for mapping a controller."
+    >MIDI</button>
     <div class="toolbar-divider"></div>
     <button
       class="output-btn"
@@ -873,6 +884,10 @@
     <div class="main-content">
       {#if showAudioSettings}
         <AudioSettings />
+      {/if}
+
+      {#if showMidiMonitor}
+        <MidiMonitor />
       {/if}
 
       {#if showVisualizationPanel}

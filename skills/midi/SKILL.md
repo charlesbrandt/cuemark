@@ -102,16 +102,103 @@ the tempo fader's range rescaling, because the EQ range is not user-configurable
 is snapped to neutral (`KNOB_CENTRE_SNAP`): the pot has no detent, so without it "off"
 is a position the user cannot actually select. See `docs/design/deck-eq-and-filter.md` §6.
 
-⚠️ **cuemark holds the MIDI port exclusively.** `amidi -p hw:1,0,0 -d` fails with "Device
-or resource busy" while the app runs — and the first such attempt in a session can look
-like a *silent* empty capture rather than an error. To capture MIDI from a running app,
-read its own log instead:
+⚠️ **cuemark holds the *raw ALSA device* exclusively — but not the sequencer port.**
+`amidi -p hw:1,0,0 -d` fails with "Device or resource busy" while the app runs, and the
+first such attempt in a session can look like a *silent* empty capture rather than an
+error. That is a fact about `hw:1,0,0`, and it was over-generalised here until 2026-08-17:
+`midir` connects through the **ALSA sequencer**, which is multi-subscriber. Verified that
+day — two cuemark instances were connected to the one Starlight at the same time, both
+receiving, neither disturbed:
+
+```
+client 20: 'DJControl Starlight' [type=kernel,card=1]
+    0 'DJControl Starlight MIDI 1'
+        Connecting To: 128:0, 129:0     ← two cuemark clients, both live
+```
+
+So a second instance *can* be driven headlessly to check MIDI behaviour while the user's
+app keeps running (see "Injecting synthetic MIDI" below), and `aseqdump -p 20:0` is a
+perfectly good second opinion on what the hardware is sending. Only `amidi -d` is blocked.
+
+Reading the app's own log still works and needs no extra process:
 ```bash
 tail -n0 -f ~/.local/share/com.cuemark.app/logs/cuemark.log | grep --line-buffered -a '\[midi\]'
 ```
-Every message is logged including unmapped ones, so this sees controls the map ignores.
+⚠️ but **continuous controls are throttled to one line per 500ms per key** there, so a jog
+wheel spinning at ~131 msg/s prints a tidy ±1 twice a second. For anything where the *rate*
+or the *distinct values* matter, use the MIDI monitor below instead — that is what it is for.
 
-Phase 2 goal: MIDI learn mode (click control in UI, wiggle knob to map).
+## Raw MIDI monitor (built 2026-08-17)
+
+**Toolbar → MIDI.** A live, unthrottled table of every message arriving on the port, mapped
+or not, plus port enumeration and a capture export. `src/components/MidiMonitor.svelte` +
+`midi_monitor_set` / `midi_list_ports` / `midi_capture_save` in `midi.rs`. Design and the
+role it plays in controller work: `docs/design/controller-mapping.md` §7a.
+
+It replaces the old "add an `eprintln!` to the MIDI callback and recompile" procedure
+entirely — that meant a Rust rebuild per iteration, and it printed into the same throttled
+stream that hides the interesting part.
+
+| Column | What it answers |
+|---|---|
+| `ctrl` | `STATUS:D1` in hex — the map key, in the exact form `hercules_starlight_map()` uses |
+| `d2` / `range` / `values` | Is this a button, a full-travel fader, or an encoder that only ever sends ±1? |
+| `msg/s` | Live rate over the last 32 messages — *not* a lifetime average, which reads ~0 for a wheel spun a minute ago |
+| `guess` | A hedged shape hint (see the caution below) |
+| `mapped to` | The `ControlBinding` debug form, deck id included — a binding on the **wrong deck** reads as wrong here, not merely as "mapped" |
+
+Rows sort most-recently-touched first, so wiggling a control makes it jump to the top. That
+is the whole interaction model for identifying an unknown surface.
+
+🛑 **The `guess` column is a hint from what has arrived so far, never a conclusion.** A fader
+only nudged looks like an encoder; an encoder spun one way looks like a fader stuck at one
+end. Move a control through its whole travel before believing its row, and settle the
+questions that actually matter — encoder deltas, firmware-vs-host modes — with the capture
+procedures in `docs/design/controller-mapping.md` §8, not by reading this table.
+
+Two properties worth knowing before trusting it:
+
+- **The raw feed is gated off unless the panel is mounted.** Mounting turns it on,
+  unmounting turns it off (`[midi] raw monitor ON`/`off` in the log says which). Two jog
+  wheels alone deliver ~260 msg/s and every emit crosses the GTK main thread — the same
+  thread every audio IPC call uses. Monitoring is a bench activity, not a performance one;
+  don't leave the panel open during a set.
+- **It emits before every filter**, including the `msg.len() < 3` guard the mapping loop
+  applies. A 2-byte message (program change, and anything else a controller does that the
+  mapper cannot handle) is visible here and nowhere else. Confirmed by injection —
+  `C0 05` appears in the monitor and is correctly absent from the action path.
+
+**Save capture** writes `~/.local/share/com.cuemark.app/midi-captures/capture-<epoch>.json`
+— `{t, bytes, len}` per message. That is a replayable fixture: the intent
+(`controller-mapping.md` §9) is to feed one through the resolver in a test and assert an
+action sequence, so profile work can happen without the controller attached.
+
+## Injecting synthetic MIDI into a running cuemark
+
+Because the sequencer port is multi-subscriber (above), a known byte sequence can be pushed
+into a live app — no hardware, no hands. This is how the monitor was verified end to end on
+2026-08-17.
+
+```bash
+aconnect -l | grep -A2 "client.*cuemark"    # find the client; note the PID on each
+# 🔴 With two instances running there are TWO cuemark clients. Match the pid — connecting to
+#    the wrong one drives the user's live app instead of the one under test.
+aconnect 14:0 129:0                          # Midi Through -> the instance under test
+aplaymidi -p 14:0 probe.mid                  # anything sent to Midi Through now arrives
+aconnect -d 14:0 129:0                       # ALWAYS undo it; the route outlives the test
+```
+
+`aplaymidi` needs a standard MIDI file, which is ~30 lines of `struct.pack` to generate (an
+SMF-0 header plus varlen-delta events) — keep the generator in the scratchpad, it is a
+fixture and not worth committing.
+
+⚠️ **Injected messages take the real path**, so a *mapped* key really does toggle the deck.
+Pick unmapped keys for shape tests, and for a mapped one pick something self-cancelling
+(sending `91 03 7F` twice returns `deck.loop` to where it started).
+
+Phase 2 goal: MIDI learn mode — the binding half, deliberately scheduled *after* a second
+controller profile exists. `docs/design/controller-mapping.md` §7 has the reasoning and the
+phase order.
 
 ## Jog-wheel gotchas (fixed 2026-07-21 — see `skills/run-app/SKILL.md` "MIDI audio lag" for detail)
 
@@ -134,19 +221,31 @@ and how to get a real count instead.
 
 ## Adding or re-calibrating a MIDI controller
 
-1. Add a one-line debug print inside the MIDI callback in `midi.rs` (before the map lookup):
-   ```rust
-   eprintln!("[midi] raw: msg[0]=0x{:02X} d1={} d2={}", msg[0], msg[1], msg[2]);
-   ```
-2. Run `cargo tauri dev` and wiggle each physical control. The terminal shows the raw bytes.
-3. `msg[0]` is the **full status byte** — high nibble = message type (`0x90`=Note On, `0xB0`=CC),
-   low nibble = MIDI channel. Keep the full byte as the map key; do **not** mask off the channel
-   nibble — DJ controllers use different channels for left/right decks.
-4. Identify 14-bit CC pairs: if two CC messages fire together where `d1_B = d1_A + 32`, the coarse
-   (MSB) is `d1_A` and the fine (LSB) is `d1_B`. Map the MSB and ignore the LSB.
-5. Add entries to `hercules_starlight_map()` (or a new `foo_map()` function) using `(msg[0], d1)` as
-   the key.
-6. Remove the debug print when done.
+⚠️ **`run_midi_loop` opens exactly one port, matched by name substring at startup, and never
+rescans** — plug the controller in *before* launching. If nothing matches it logs the
+available ports and the listener thread simply returns; there is no retry. Making this
+multi-port and hotplug-capable is phase 1 of `docs/design/controller-mapping.md`.
+
+1. Open **Toolbar → MIDI** and wiggle each physical control. No rebuild, no debug print —
+   every message shows up, mapped or not, and rows sort by most-recently-touched.
+2. `ctrl` is `STATUS:D1`, and `STATUS` is the **full status byte** — high nibble = message
+   type (`0x90`=Note On, `0xB0`=CC), low nibble = MIDI channel. Keep the full byte as the map
+   key; do **not** mask off the channel nibble — DJ controllers use different channels for
+   left/right decks.
+3. 14-bit CC pairs: the monitor flags a `partner CC N+32 seen` when both halves have been
+   touched. Map the MSB and ignore the LSB — except the **tempo fader**, where the MSB barely
+   moves and both are needed (see the channel-layout section above).
+4. **Capture across any mode button before mapping the controls it affects.** The Starlight's
+   Shift and Bass/Filter buttons swap which note/CC a control sends, entirely in firmware, so
+   both modes are just more rows and the host tracks nothing. Whether a given controller does
+   that is a *measurement*, not an assumption — press the mode button with the monitor open
+   and see whether the same physical control changes its `ctrl` key. If it does not, the mode
+   is host-tracked and that is a code feature, not a mapping entry
+   (`docs/design/controller-mapping.md` §6).
+5. Add entries to `hercules_starlight_map()` (or a new `foo_map()` function) using
+   `(status, d1)` as the key.
+6. **Save capture** before you close the panel, so the session's raw bytes survive as a
+   fixture rather than as a memory of what the table said.
 
 ## ⚠️ Open: calibrate `VINYL_SEC_PER_TICK` (needs the controller)
 

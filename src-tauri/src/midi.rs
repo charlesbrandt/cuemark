@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use midir::MidiInput;
@@ -94,6 +95,127 @@ fn knob_to_filter(data2: u8) -> f32 {
 /// always-on-never-noticed failure the tone stage's transparency measurement guards
 /// against at the GStreamer end.
 const KNOB_CENTRE_SNAP: f32 = 0.02;
+
+// ── Raw MIDI monitor ──────────────────────────────────────────────────────────
+//
+// A live, **unthrottled** view of every byte arriving on the port, mapped or not. This
+// exists because neither of the two ways to watch MIDI here can answer the questions that
+// authoring a controller profile actually asks:
+//
+//   * `[midi]` log lines throttle continuous controls to one per 500ms per key (see
+//     `log_throttle` in `run_midi_loop`), so a jog wheel spinning at ~131 msg/s prints a
+//     tidy ±1 twice a second. That hides the tick *rate*, which is the measurement — the
+//     `vinylTally` instrument in `handler.ts` exists solely because of this, and its
+//     comment says so.
+//   * `amidi -d` cannot run at all while cuemark holds the port: it fails with "Device or
+//     resource busy", and the first attempt in a session can present as a *silent empty
+//     capture* rather than an error.
+//
+// See `docs/design/controller-mapping.md` §7a. It is the tool the DDJ-FLX4 profile is
+// meant to be authored with, and §8's unknown list is the set of questions it answers.
+
+/// Off by default; flipped by `midi_monitor_set` while the monitor panel is open.
+///
+/// The gate is not defensive tidiness. Two jog wheels alone deliver ~260 messages/s, and
+/// each emit is a serialize plus a webview dispatch on the GTK main thread — the same
+/// thread every audio IPC call crosses. `postFrame()` learned this lesson the expensive
+/// way (`docs/design/control-window-frame-budget.md`): work done for a listener that isn't
+/// there is invisible and permanent. Monitoring is a bench activity, not a performance one.
+static MONITOR: AtomicBool = AtomicBool::new(false);
+
+/// Name of the port `run_midi_loop` actually opened, for `midi_list_ports` to flag.
+/// `None` until a port is connected — including the case where none matched.
+static CONNECTED_PORT: Mutex<Option<String>> = Mutex::new(None);
+
+/// Cap on bytes carried per message. Ordinary channel-voice messages are 3; this exists so
+/// a SysEx dump (a controller identity reply, say) is *visible* rather than dropped, without
+/// letting one message push megabytes through the event channel.
+const MAX_RAW_BYTES: usize = 16;
+
+/// One observed message, exactly as it arrived.
+#[derive(Serialize, Clone, Debug)]
+pub struct MidiRaw {
+    /// Which surface this came from. Redundant today (one port is opened); carried now
+    /// because multi-port support is next and "which controller sent it" is part of the
+    /// observation, not of the context around it.
+    pub port: String,
+    /// Raw bytes, truncated to `MAX_RAW_BYTES`. Not split into status/d1/d2 here: a
+    /// discovery tool that assumes 3 bytes cannot show the shapes it was opened to find.
+    pub bytes: Vec<u8>,
+    /// True length before truncation, so a clipped SysEx is obvious rather than plausible.
+    pub len: usize,
+    /// Wall-clock epoch ms — the one clock the frontend and the Rust log can be differenced
+    /// across (see `epoch_ms` in lib.rs).
+    pub t: f64,
+    /// Debug spelling of the binding this resolves to, or `None` when the map ignores it.
+    /// Deliberately the `ControlBinding` debug form: it carries the deck id, so a mapping
+    /// that fires on the *wrong deck* reads as wrong here instead of merely as "mapped".
+    pub mapped: Option<String>,
+}
+
+/// Turn the raw feed on or off. Called from the monitor panel's mount/unmount.
+#[tauri::command]
+pub fn midi_monitor_set(enabled: bool) {
+    MONITOR.store(enabled, Ordering::Relaxed);
+    log::info!("[midi] raw monitor {}", if enabled { "ON" } else { "off" });
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct MidiPortInfo {
+    pub name: String,
+    /// Whether this is the port cuemark opened. Exactly one port is opened today, so a
+    /// controller that is plugged in and enumerating but *not* connected shows up here as
+    /// present-and-unclaimed — which is the first question to ask of any new device.
+    pub connected: bool,
+}
+
+/// Enumerate input ports live, without disturbing the open connection.
+///
+/// Answers `docs/design/controller-mapping.md` §8.1 ("does it enumerate as class-compliant
+/// MIDI at all") from inside the app, which matters because cuemark holds its port
+/// exclusively and `amidi -l` is therefore not always available as a second opinion.
+/// Enumerating is not opening: constructing a second `MidiInput` to list ports does not
+/// contend with the live connection.
+#[tauri::command]
+pub fn midi_list_ports() -> Result<Vec<MidiPortInfo>, String> {
+    let midi_in = MidiInput::new("cuemark-enum").map_err(|e| e.to_string())?;
+    let connected = CONNECTED_PORT.lock().unwrap().clone();
+    Ok(midi_in
+        .ports()
+        .iter()
+        .map(|p| {
+            let name = midi_in.port_name(p).unwrap_or_default();
+            MidiPortInfo {
+                connected: connected.as_deref() == Some(name.as_str()),
+                name,
+            }
+        })
+        .collect())
+}
+
+/// Write a captured session to `<app_data>/midi-captures/` and return the path.
+///
+/// The capture is the input to offline profile work: a byte log replayed through the
+/// resolver in a test asserts an action sequence without the controller attached
+/// (`docs/design/controller-mapping.md` §9). It also makes "I turned the knob and it
+/// seemed right" into something a later session can re-examine, which matters because
+/// mapping bugs here are silent and plausible — a swapped assignment gives a knob that
+/// does something, just not the labelled thing.
+#[tauri::command]
+pub fn midi_capture_save(app: AppHandle, json: String) -> Result<String, String> {
+    use tauri::Manager;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("midi-captures");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("capture-{}.json", crate::epoch_ms() as u64));
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    let path = path.display().to_string();
+    log::info!("[midi] capture saved: {path}");
+    Ok(path)
+}
 
 /// What a specific MIDI control does. Stored in the mapping table so the
 /// same logic handles any controller: just swap the map (Phase 2: MIDI learn).
@@ -366,6 +488,7 @@ fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>, persist: &midi_state:
 
     let port_name = midi_in.port_name(&port)?;
     log::info!("[midi] connected to: {port_name}");
+    *CONNECTED_PORT.lock().unwrap() = Some(port_name.clone());
 
     let app = app.clone();
     let map = Arc::clone(midi_map);
@@ -382,6 +505,26 @@ fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>, persist: &midi_state:
         &port,
         "cuemark-midi",
         move |_stamp, msg, _| {
+            // Raw monitor first, ahead of *every* filter below — the length check, the map
+            // lookup and the log throttle. Each of those drops something the monitor exists
+            // to reveal: a 2-byte program change, an unmapped control, the true rate of a
+            // continuous one. Anything filtered before this point is invisible to profile
+            // authoring, which is the whole job (docs/design/controller-mapping.md §7a).
+            if MONITOR.load(Ordering::Relaxed) {
+                let mapped = if msg.len() >= 2 {
+                    map.get(&(msg[0], msg[1])).map(|b| format!("{b:?}"))
+                } else {
+                    None
+                };
+                let _ = app.emit("midi-raw", MidiRaw {
+                    port: port_name.clone(),
+                    bytes: msg.iter().take(MAX_RAW_BYTES).copied().collect(),
+                    len: msg.len(),
+                    t: crate::epoch_ms(),
+                    mapped,
+                });
+            }
+
             if msg.len() < 3 { return; }
             let msg_type = match msg[0] & 0xF0 {
                 0x80 => "NoteOff",

@@ -440,6 +440,21 @@ reload-detection) more than once.
 
 Rust backend (`midir`) receives raw MIDI → maps to structured actions → emits via Tauri `emit()` → frontend applies to session state → calls audio Tauri commands for gain/rate/play/pause changes. MIDI mappings reference `deckId` strings.
 
+⚠️ **Every layer assumes exactly one controller, known at compile time.** The map is a Rust
+function; one port is matched by name substring at startup and never rescanned; deck identity
+is baked into each binding and un-baked again in `handler.ts`; encodings (14-bit `LSB = MSB+32`,
+two's-complement jogs) are hardcoded in the loop body; there is no MIDI *output* at all.
+**`docs/design/controller-mapping.md` is the plan for making that plural** — profiles as data,
+slot-based addressing, and the seam it proposes (Rust decodes wire bytes to a normalized
+signal; TypeScript owns musical meaning, so nothing varying with a *user setting* is computed
+in Rust). Read it before adding a controller or moving any value-mapping code.
+
+**Toolbar → MIDI** is a raw monitor: every message unthrottled, mapped or not, with port
+enumeration and a capture export — the tool for mapping an unknown surface, and the only view
+that shows what the `[midi]` log's 500ms-per-key throttle and the mapper's `len < 3` filter
+both drop. The feed is gated on the panel being mounted; don't leave it open during a set.
+Operating notes: `skills/midi/SKILL.md`.
+
 ## Deck sources
 
 Decks are video-only — `DeckSource` is `{ type: 'video'; filePath; duration } | null`.

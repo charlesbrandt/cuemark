@@ -130,6 +130,14 @@ independent cuemark instance/window alongside the one already running — cheap 
 scripted check (state IPC, `execute/sync`), but see the pixel-verification caveat below
 before trusting a screenshot or canvas-pixel read from it.
 
+✅ **MIDI works in that second instance, concurrently with the live app** (verified
+2026-08-17). `midir` connects through the ALSA *sequencer*, which is multi-subscriber, so
+both instances subscribe to the same controller and both receive — despite the raw `hw:`
+device being exclusive. A known byte sequence can also be *injected* into whichever instance
+you choose, so MIDI-path changes are verifiable with no hardware and no hands; recipe and
+the "match the pid or you'll drive the user's live app" warning are in `skills/midi/SKILL.md`,
+"Injecting synthetic MIDI into a running cuemark".
+
 ⚠️ **A pixel/frame-render check from this second-instance setup was inconclusive on
 `mele` (2026-08-12) and should not be trusted without further isolation.** Loading a
 video into a deck and reading `getCodecFramePts()`/canvas pixels came back

@@ -83,15 +83,27 @@ kick, and confirming the ♩ indicator lands on the kick rather than the raw pre
 - Goal: static/off LEDs during performance so they don't distract
 
 ### MIDI learn mode
-- Rust: always emit raw `midi-raw` events alongside mapped `midi-action` events
-- Frontend: "MIDI Learn" mode button; clicking a mapped UI control → listens for next
+🟢 **Raw feed + monitor panel DONE 2026-08-17** — `midi-raw` events (gated on the panel
+being open), Toolbar → MIDI, capture export. See `skills/midi/SKILL.md`.
+- ⏸ Frontend: "MIDI Learn" mode button; clicking a mapped UI control → listens for next
   incoming `midi-raw` → saves `(status, d1) → action` mapping
-- Custom mappings override the default Hercules map at runtime; persist to `~/.config/cuemark/midi-map.json`
+- ⏸ Custom mappings override the default Hercules map at runtime; persist to a user profile
+
+🛑 **Deliberately scheduled after the FLX4 profile exists**, not before — a learn UI built
+now would encode today's single-controller assumptions into a persisted user-facing format
+and then have to break it. Reasoning and phase order:
+`docs/design/controller-mapping.md` §7.
 
 ### multi-controller support
-- Open all connected MIDI input ports (not just the first/named one)
-- Per-port mapping: if port name matches known controller, load that map; else load custom map
-- UI: settings panel listing connected MIDI devices + their mapping files
+**Designed 2026-08-17: `docs/design/controller-mapping.md`** — read it before starting.
+Profiles become data files keyed by port-name match; bindings address *slots*, never deck
+IDs; Rust decodes wire bytes to a normalized signal and TypeScript owns musical meaning.
+Phase 1+2 there is the part worth doing before the DDJ-FLX4 arrives.
+- Open all connected MIDI input ports (not just the first/named one), with a rescan poll —
+  today a controller plugged in after launch is invisible until restart
+- Per-port mapping: if port name matches a known profile, load it; else load custom
+- UI: settings panel listing connected MIDI devices + their profiles (the monitor's port
+  list is the read-only half of this already)
 
 ---
 
