@@ -2,7 +2,7 @@ import { listen } from "@tauri-apps/api/event";
 import { updateDeck, getDeck, setCrossfader, setMasterVolume, session } from "../state/session";
 import { seekDeck, getDeckTime, quantizeToGrid, setScratching, isScratching, beginScrub, updateScrub, endScrub } from "../renderer/seekBus";
 import { nudgePhaseToMaster } from "../audio/phaseNudge";
-import { syncRate, syncGain, syncVolume } from "../audio/audioSync";
+import { syncRate, syncGain, syncVolume, syncEq, syncFilter } from "../audio/audioSync";
 import { audioScratch, audioStopScratch } from "../audio/pipeline";
 import { cueGain, tempoRange, scratchMode, jogSecondsPerRev } from "../audio/audioSettings";
 import { noteScrubInput } from "../audio/scrubStats";
@@ -68,7 +68,9 @@ export interface MidiAction {
     | "loop_toggle"
     | "sync_toggle"
     | "headphone_cue"
-    | "phase_nudge";
+    | "phase_nudge"
+    | "deck_eq_low"
+    | "deck_filter";
   deck_id?: string;
   value?: number;
   index?: number;
@@ -638,6 +640,32 @@ export async function startMidiListener(): Promise<() => void> {
         nudgePhaseToMaster(deckId);
         break;
       }
+      // ── The Starlight's dual-function tone knob ──────────────────────────────
+      // One physical knob per deck; the controller swaps which CC it sends when the
+      // Bass/Filter button is pressed, so these two cases are the *same* knob and only
+      // one can be live at a time. Rust has already mapped the raw 0–127 into a real dB
+      // value / filter position (`knob_to_eq_db` / `knob_to_filter` in midi.rs), so
+      // there is no range maths here to drift out of sync with the sliders.
+      //
+      // Both follow the continuous-control discipline used by deck_gain above: straight
+      // to GStreamer for audio, rAF-throttled into the store for display. Putting a knob
+      // through the Svelte store at MIDI event rate is the documented way to freeze this
+      // UI (see the jog-wheel gotchas in skills/midi/SKILL.md).
+      case "deck_eq_low": {
+        if (!deckId || a.value === undefined) break;
+        const d = getDeck(deckId);
+        if (!d) break;
+        const eq = { ...d.eq, low: a.value };
+        syncEq(deckId, eq.low, eq.mid, eq.high); // audio: immediate
+        queueDeckPatch(deckId, { eq });          // UI: rAF-throttled
+        break;
+      }
+      case "deck_filter":
+        if (deckId && a.value !== undefined) {
+          syncFilter(deckId, a.value);
+          queueDeckPatch(deckId, { filter: a.value });
+        }
+        break;
     }
   });
   return unlisten;

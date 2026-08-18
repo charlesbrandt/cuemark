@@ -24,11 +24,23 @@ export interface Visualization {
   name?: string;
 }
 
+// Realised in GStreamer as one `equalizer-nbands` (num-bands=3) per deck, sitting
+// between input_selector and output_queue — downstream of the scratch branch's join so
+// a gesture is EQ'd like normal playback, upstream of the tee so the headphone cue
+// hears it too. See make_eq() in src-tauri/src/audio/pipeline.rs.
 export interface DeckEQ {
-  low: number;   // ±12 dB low shelf  @ 250 Hz
-  mid: number;   // ±12 dB mid peak   @ 1 kHz
-  high: number;  // ±12 dB high shelf @ 4 kHz
+  // Range is −24…+12 dB, not symmetric: that is `equalizer-nbands`' own limit, and it
+  // matches how mixers are marked (gentle boost, cut deep enough to work as a kill).
+  // The backend clamps, so a wider UI slider would silently do nothing past the edge.
+  low: number;   // −24…+12 dB low shelf  @ 250 Hz
+  mid: number;   // −24…+12 dB mid peak   @ 1 kHz
+  high: number;  // −24…+12 dB high shelf @ 4 kHz
 }
+
+// Deepest cut the EQ can actually reach — the low end of the element's range, used as
+// the "kill" value by the UI's kill buttons and by the MIDI bass-kill toggle.
+export const EQ_KILL_DB = -24;
+export const EQ_MAX_DB = 12;
 
 export interface Deck {
   id: string;
@@ -51,6 +63,10 @@ export interface Deck {
   loopIn: number | null;   // loop region start (seconds); null = use track start
   loopOut: number | null; // loop region end (seconds); null = use track end
   eq: DeckEQ;
+  filter: number;         // sweep filter: −1 full low-pass … 0 off … +1 full high-pass.
+                          // A single knob covering both filter types, as on a DJ mixer;
+                          // realised as a parked high-pass/low-pass pair, not a
+                          // mode-switched element (switching mode mid-stream clicks).
   cueEnabled: boolean;    // route pre-fader signal to headphone cue context
   syncLocked: boolean;    // continuously re-locks playbackRate to Session.bpm as it changes
                           // (vs. the one-shot Sync button); cleared automatically by any

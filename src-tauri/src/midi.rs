@@ -30,7 +30,70 @@ pub enum MidiAction {
     SyncToggle { deck_id: String },
     HeadphoneCue { deck_id: String },
     PhaseNudge { deck_id: String },
+    /// Low EQ band, in **dB** (already mapped from the knob — see `knob_to_eq_db`).
+    DeckEqLow { deck_id: String, value: f32 },
+    /// Sweep filter position, **−1…+1** (already mapped — see `knob_to_filter`).
+    DeckFilter { deck_id: String, value: f32 },
 }
+
+/// ── The Starlight's dual-function tone knob ───────────────────────────────────
+///
+/// Each deck has **one** knob that acts as either a bass control or a filter sweep,
+/// switched by the global Bass/Filter button at `(0x90, 1)`.
+///
+/// **The controller does the switching itself, in firmware** — verified live 2026-08-17
+/// by capturing the same physical knob across a button press:
+///
+/// ```text
+///   0xB1 d1= 2  d2=63,2,0,38,64,106      ← knob sweeping (fine on CC 34)
+///   0x90 d1= 1  d2=127 → d2=0            ← Bass/Filter button, momentary
+///   0xB1 d1= 1  d2=127,96,73,63,32,15,0  ← same knob, different CC (fine on CC 33)
+/// ```
+///
+/// So cuemark holds **no mode state at all**: the two modes arrive as two different CCs
+/// and map to two different destinations, exactly like Shift's firmware pad remapping.
+/// `(0x90, 1)` stays deliberately unmapped — there is nothing for the host to do with it,
+/// and consuming it would imply a mode the host does not (and must not) track.
+///
+/// The button is momentary (127 on press, 0 on release) and does **not** report which
+/// mode it just selected, which is the other reason host-side tracking would be a bad
+/// idea: after a reconnect the host's guess and the hardware could silently disagree.
+/// Fine CCs (34/33) are ignored — 7-bit is plenty for a tone knob, matching the
+/// volume/crossfader decision above.
+
+/// Knob (0–127) → low-EQ gain in dB.
+///
+/// Centre is flat, with cut and boost on either side. The travel is **asymmetric**
+/// because the element's range is (−24…+12): a real mixer's bass knob behaves the same
+/// way, cutting far harder than it boosts.
+fn knob_to_eq_db(data2: u8) -> f32 {
+    let t = (data2 as f32 / 127.0 - 0.5) * 2.0; // −1 … +1
+    if t.abs() < KNOB_CENTRE_SNAP {
+        return 0.0;
+    }
+    if t < 0.0 {
+        t.abs() * crate::audio::pipeline::EQ_MIN_DB
+    } else {
+        t * crate::audio::pipeline::EQ_MAX_DB
+    }
+}
+
+/// Knob (0–127) → filter position, −1 (full low-pass) … +1 (full high-pass).
+fn knob_to_filter(data2: u8) -> f32 {
+    let t = (data2 as f32 / 127.0 - 0.5) * 2.0;
+    if t.abs() < KNOB_CENTRE_SNAP {
+        0.0
+    } else {
+        t
+    }
+}
+
+/// The knob is a plain pot with no centre detent, so an exact centre is not reachable by
+/// feel. Without this snap, "off" would be a value the user cannot actually select, and
+/// the filter or EQ would sit imperceptibly engaged whenever they tried — the same
+/// always-on-never-noticed failure the tone stage's transparency measurement guards
+/// against at the GStreamer end.
+const KNOB_CENTRE_SNAP: f32 = 0.02;
 
 /// What a specific MIDI control does. Stored in the mapping table so the
 /// same logic handles any controller: just swap the map (Phase 2: MIDI learn).
@@ -57,6 +120,10 @@ pub enum ControlBinding {
     // Nudge deck phase toward the reference deck's phase. No free button on the
     // Starlight — assign via MIDI learn (Phase 2) or add to a custom map.
     PhaseNudge { deck_id: String },
+    /// The dual-function tone knob in its **bass** position — see the block comment above.
+    DeckEqLow { deck_id: String },
+    /// The same physical knob in its **filter** position, arriving on a different CC.
+    DeckFilter { deck_id: String },
     /// Relative jog wheel (7-bit two's complement: 1–63 = CW, 64–127 = CCW)
     JogWheel { deck_id: String },
 }
@@ -94,8 +161,11 @@ fn hercules_starlight_map() -> MidiMap {
     // CC: tempo/pitch fader — 14-bit pair: CC 8 (MSB) + CC 40 (LSB, = 8+32)
     m.insert((0xB1, 8),  ControlBinding::DeckPlaybackRate    { deck_id: "deck-0".into() });
     m.insert((0xB1, 40), ControlBinding::DeckPlaybackRateLsb { deck_id: "deck-0".into() });
-    // CC: bass/filter knob (CC 2 coarse; CC 34 fine — ignored)
-    // TODO: wire to shader u_bass_gain once Phase 2 audio-reactive uniforms land
+    // CC: the dual-function tone knob. ONE physical knob, two CCs — the controller
+    // swaps which one it sends when the Bass/Filter button is pressed (see the block
+    // comment on knob_to_eq_db). Fine CCs 34/33 ignored, 7-bit is plenty.
+    m.insert((0xB1, 2),  ControlBinding::DeckEqLow      { deck_id: "deck-0".into() });
+    m.insert((0xB1, 1),  ControlBinding::DeckFilter     { deck_id: "deck-0".into() });
     // Jog wheel rotation (relative encoder, CC 10, two's complement)
     m.insert((0xB1, 10), ControlBinding::JogWheel       { deck_id: "deck-0".into() });
     // Hot cues on ch 7 (d1 = cue index 0–3); Shift+pad sends d1+8 on same channel
@@ -116,6 +186,8 @@ fn hercules_starlight_map() -> MidiMap {
     m.insert((0xB2, 0),  ControlBinding::DeckGain       { deck_id: "deck-1".into() });
     m.insert((0xB2, 8),  ControlBinding::DeckPlaybackRate    { deck_id: "deck-1".into() });
     m.insert((0xB2, 40), ControlBinding::DeckPlaybackRateLsb { deck_id: "deck-1".into() });
+    m.insert((0xB2, 2),  ControlBinding::DeckEqLow      { deck_id: "deck-1".into() });
+    m.insert((0xB2, 1),  ControlBinding::DeckFilter     { deck_id: "deck-1".into() });
     m.insert((0xB2, 10), ControlBinding::JogWheel       { deck_id: "deck-1".into() });
     // Right hot cues on ch 8; Shift+pad sends d1+8 on same channel
     m.insert((0x97, 0),  ControlBinding::HotCue    { deck_id: "deck-1".into(), index: 0 });
@@ -139,7 +211,12 @@ fn hercules_starlight_map() -> MidiMap {
     m.insert((0x92, 12), ControlBinding::HeadphoneCue { deck_id: "deck-1".into() });
     // Unmapped (no action needed):
     //   (0x90, 3)  = Shift button — controller remaps pads in firmware; no host tracking needed
-    //   (0x90, 1)  = Bass/filter toggle
+    //   (0x90, 1)  = Bass/Filter button — same deal: the controller swaps the tone knob's
+    //                CC in firmware (CC 2 ⇄ CC 1), so both modes are already mapped above
+    //                and there is nothing for the host to do on the button itself.
+    //                ⚠️ Do NOT "improve" this by tracking mode here — the button is
+    //                momentary and never reports which mode it selected, so a host-side
+    //                guess would drift out of sync with the hardware after a reconnect.
     //   (0x91, 15) = Hot-cue mode btn  (0x91, 16) = Loop mode btn
 
     m
@@ -157,6 +234,8 @@ fn is_continuous(binding: Option<&ControlBinding>, status: u8) -> bool {
             | ControlBinding::Crossfader
             | ControlBinding::MasterVolume
             | ControlBinding::CueGain
+            | ControlBinding::DeckEqLow { .. }
+            | ControlBinding::DeckFilter { .. }
             | ControlBinding::JogWheel { .. },
         ) => true,
         None => (status & 0xF0) == 0xB0, // unmapped CC — throttle too
@@ -210,6 +289,14 @@ fn resolve_action(binding: &ControlBinding, data2: u8) -> Option<MidiAction> {
         ControlBinding::PhaseNudge { deck_id } => {
             (data2 > 0).then_some(MidiAction::PhaseNudge { deck_id: deck_id.clone() })
         }
+        ControlBinding::DeckEqLow { deck_id } => Some(MidiAction::DeckEqLow {
+            deck_id: deck_id.clone(),
+            value: knob_to_eq_db(data2),
+        }),
+        ControlBinding::DeckFilter { deck_id } => Some(MidiAction::DeckFilter {
+            deck_id: deck_id.clone(),
+            value: knob_to_filter(data2),
+        }),
         ControlBinding::JogWheel { deck_id } => {
             // 7-bit two's complement: values 1–63 = CW (+), 64–127 = CCW (−).
             let step = if data2 >= 64 { data2 as i32 - 128 } else { data2 as i32 };
@@ -230,6 +317,9 @@ fn persist_kv(action: &MidiAction) -> Option<(String, f32)> {
         MidiAction::Crossfader       { value }          => Some(("crossfader".into(),               *value)),
         MidiAction::MasterVolume     { value }          => Some(("masterVolume".into(),             *value)),
         MidiAction::CueGain          { value }          => Some(("cueGain".into(),                  *value)),
+        // Restored into `deck.eq.low` (not a flat field) — see restoreMidiControlState().
+        MidiAction::DeckEqLow        { deck_id, value } => Some((format!("{deck_id}.eqLow"),        *value)),
+        MidiAction::DeckFilter       { deck_id, value } => Some((format!("{deck_id}.filter"),       *value)),
         _ => None,
     }
 }
@@ -366,5 +456,87 @@ fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>, persist: &midi_state:
     // Hold the connection open. `_conn` drops (closing MIDI) if this returns.
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+}
+
+#[cfg(test)]
+mod tone_knob_tests {
+    use super::{knob_to_eq_db, knob_to_filter, hercules_starlight_map, ControlBinding, KNOB_CENTRE_SNAP};
+    use crate::audio::pipeline::{EQ_MAX_DB, EQ_MIN_DB};
+
+    /// The knob's whole travel, as a table. Centre must be exactly neutral — a knob that
+    /// cannot be returned to "off" is the failure this snap exists to prevent.
+    #[test]
+    fn eq_knob_travel() {
+        assert_eq!(knob_to_eq_db(0), EQ_MIN_DB, "full left = full cut");
+        assert_eq!(knob_to_eq_db(127), EQ_MAX_DB, "full right = full boost");
+        assert_eq!(knob_to_eq_db(64), 0.0, "centre must be exactly flat");
+        assert_eq!(knob_to_eq_db(63), 0.0, "just below centre is still within the snap");
+        assert!(knob_to_eq_db(32) < 0.0, "left half cuts");
+        assert!(knob_to_eq_db(96) > 0.0, "right half boosts");
+    }
+
+    /// Cut and boost are deliberately asymmetric, because the element's range is.
+    /// Equal rotation either side of centre must NOT give equal dB.
+    #[test]
+    fn eq_knob_is_asymmetric_like_the_element() {
+        let cut = knob_to_eq_db(0).abs();
+        let boost = knob_to_eq_db(127).abs();
+        assert!(
+            cut > boost,
+            "cut ({cut}) should exceed boost ({boost}) — the element's range is −24…+12, \
+             and a symmetric mapping would silently throw away half the available cut"
+        );
+    }
+
+    #[test]
+    fn filter_knob_travel() {
+        assert_eq!(knob_to_filter(0), -1.0, "full left = full low-pass");
+        assert_eq!(knob_to_filter(127), 1.0, "full right = full high-pass");
+        assert_eq!(knob_to_filter(64), 0.0, "centre must be exactly off");
+        assert!(knob_to_filter(32) < 0.0);
+        assert!(knob_to_filter(96) > 0.0);
+    }
+
+    /// Everything inside the snap band reads as neutral, on both controls.
+    #[test]
+    fn centre_snap_covers_both_controls() {
+        for d2 in 0u8..=127 {
+            let t = (d2 as f32 / 127.0 - 0.5) * 2.0;
+            if t.abs() < KNOB_CENTRE_SNAP {
+                assert_eq!(knob_to_eq_db(d2), 0.0, "d2={d2} is inside the snap band");
+                assert_eq!(knob_to_filter(d2), 0.0, "d2={d2} is inside the snap band");
+            }
+        }
+    }
+
+    /// Both halves of the dual-function knob must be mapped, for BOTH decks. Live capture
+    /// (2026-08-17) showed the controller swapping CC 2 ⇄ CC 1 on the Bass/Filter button;
+    /// mapping only the mode that happened to be active would leave the knob dead after
+    /// one button press, which reads as "the knob stopped working" rather than as a gap.
+    #[test]
+    fn both_knob_modes_are_mapped_on_both_decks() {
+        let m = hercules_starlight_map();
+        for (status, deck) in [(0xB1u8, "deck-0"), (0xB2u8, "deck-1")] {
+            match m.get(&(status, 2)) {
+                Some(ControlBinding::DeckEqLow { deck_id }) => assert_eq!(deck_id, deck),
+                other => panic!("({status:#04X}, 2) should be DeckEqLow for {deck}, got {other:?}"),
+            }
+            match m.get(&(status, 1)) {
+                Some(ControlBinding::DeckFilter { deck_id }) => assert_eq!(deck_id, deck),
+                other => panic!("({status:#04X}, 1) should be DeckFilter for {deck}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The Bass/Filter button itself must stay unmapped: the controller already switched
+    /// the knob's CC in firmware, so binding the button would mean tracking a mode the
+    /// host cannot observe.
+    #[test]
+    fn bass_filter_button_stays_unmapped() {
+        assert!(
+            hercules_starlight_map().get(&(0x90, 1)).is_none(),
+            "(0x90,1) must stay unmapped — the CC swap already carries the mode"
+        );
     }
 }

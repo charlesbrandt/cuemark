@@ -480,6 +480,59 @@ body {
 .eq-reset:not(:disabled):hover { border-color: var(--accent); color: var(--accent); }
 .eq-reset:disabled { cursor: default; }
 
+/* One band column: readout / travel / kill, stacked so they read as a unit. */
+.eq-band {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.eq-band label { flex: 1; }
+
+/* Per-band kill, sitting under its own slider. */
+.eq-kill {
+  padding: 1px 0;
+  font-size: calc(9px * var(--font-scale));
+  line-height: 1;
+  background: var(--surface2);
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-sm);
+  color: color-mix(in srgb, var(--text) 30%, transparent);
+  cursor: pointer;
+}
+.eq-kill:hover { border-color: var(--accent); color: var(--accent); }
+/* A killed band has to be obvious at a glance across a dark room — this is the
+   control most likely to be left engaged by accident mid-set. */
+.eq-kill.killed {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+}
+
+/* ── Filter sweep ─────────────────────────────────────── */
+.filter-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+.filter-row label {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  color: color-mix(in srgb, var(--text) 45%, transparent);
+  font-family: var(--font-heading);
+  font-size: calc(9px * var(--font-scale));
+  letter-spacing: 0.04em;
+}
+.filter-row label > span { display: flex; justify-content: space-between; }
+.filter-row label strong {
+  color: color-mix(in srgb, var(--text) 70%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+.filter-row input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer; }
+
 /* ── Crossfader (bar — emerald accent) ─────────────────── */
 .crossfader-bar {
   display: flex;

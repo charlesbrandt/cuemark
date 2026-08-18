@@ -368,6 +368,13 @@ pub fn audio_set_eq(
     state.lock().unwrap().pipeline_mut(&deck_id)?.set_eq(low_db, mid_db, high_db)
 }
 
+/// Sweep filter knob: −1 = full low-pass, 0 = off (both filters parked out of band),
+/// +1 = full high-pass.
+#[tauri::command]
+pub fn audio_set_filter(state: State<'_, AudioState>, deck_id: String, pos: f32) -> Result<(), String> {
+    state.lock().unwrap().pipeline_mut(&deck_id)?.set_filter(pos)
+}
+
 #[tauri::command]
 pub fn audio_set_cue(state: State<'_, AudioState>, deck_id: String, enabled: bool) -> Result<(), String> {
     state.lock().unwrap().pipeline_mut(&deck_id)?.set_cue_enabled(enabled)

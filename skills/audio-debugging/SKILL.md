@@ -1211,6 +1211,59 @@ a plausible-looking "5 HMR reloads ≈ 5x duplicate seeks" coincidence turned ou
 herring once a Rust-side `audio_seek` call counter proved the real ratio (238 IPC calls for 92
 logged events) was fully explained by the log throttle, not by stacked event listeners.
 
+## Capturing MIDI while the app is running (2026-08-17)
+
+**cuemark holds the controller's port exclusively.** `amidi -p hw:1,0,0 -d` fails with
+`Device or resource busy` while the app runs — and if the command's stderr is redirected
+into the same file as its output, that presents as a **silent empty capture**, which reads
+exactly like "the user pressed nothing". Two captures were lost to this before the cause
+was noticed.
+
+Don't fight for the port. The app already logs every MIDI message, *including unmapped
+ones* (`midi.rs` logs before the map lookup), so read its log instead:
+
+```bash
+tail -n0 -f ~/.local/share/com.cuemark.app/logs/cuemark.log \
+  | grep --line-buffered -a '\[midi\]'
+```
+
+This is strictly better than `amidi` for mapping work: it shows the decoded
+`status=0xB1 d1=2 d2=63` form *and* whether the map resolved it (`=> DeckGain {...}` vs
+`(unmapped)`), so one capture answers both "what does this control send" and "does cuemark
+already do something with it".
+
+The whole log's history is also a usable corpus for controls nobody has mapped yet — every
+CC the hardware has ever sent is in there:
+
+```bash
+grep -aoP 'status=0x(B0|B1|B2)\s+d1=\s*\d+' ~/.local/share/com.cuemark.app/logs/cuemark.log \
+  | tr -s ' ' | sort | uniq -c | sort -rn
+```
+
+That is how the Starlight's second tone-knob CC was found: the map documented CC 2, but the
+history showed a CC 1/33 pair nobody had ever accounted for — the same knob in its other
+mode. ⚠️ Beware `awk '{print $N}'` on these lines: the log pads `d1=` with variable spaces
+(`d1=  2` vs `d1= 34`), so positional field splitting silently produces `d1=` with no
+number. Use a regex extraction, and sanity-check that the output actually contains digits.
+
+## A control that "doesn't work" may be dead at more than one layer
+
+Before designing a fix, check **every** layer between the UI and the hardware — a stub in
+one is not evidence the others are wired. The deck EQ (2026-08-17) was dead in two
+independent places: `set_eq()` was an `Ok(())` stub in Rust, *and* `audioSetEq()` had zero
+callers in the frontend. Fixing only the stub — which is what its own comment pointed at,
+naming the missing GStreamer element — would have produced a fully working EQ behind
+sliders that still did nothing.
+
+The cheap check is one grep per layer, and it costs seconds:
+
+```bash
+grep -rn "audioSetEq\|audio_set_eq" src/ src-tauri/src/   # who calls it, at every layer
+```
+
+A symptom of "the control does nothing" is consistent with a break anywhere along the
+chain, so enumerate the chain first. Related: `docs/design/silent-failure-inventory.md`.
+
 ## Burst delivery: never derive a rate from inter-event timing (2026-08-08)
 
 The same fact that makes the log throttle misleading has a second, worse consequence. USB

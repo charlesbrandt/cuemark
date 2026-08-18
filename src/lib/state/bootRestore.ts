@@ -4,6 +4,7 @@
  * positions. Extracted from App.svelte's onMount unchanged.
  */
 import { invoke } from "@tauri-apps/api/core";
+import { get } from "svelte/store";
 import { session, updateDeck, setCrossfader, setMasterVolume } from "./session";
 import { sessionRestore } from "../audio/pipeline";
 import { clearSavedGrid } from "../audio/gridSource";
@@ -145,7 +146,17 @@ export async function restoreMidiControlState(globalsRestoredFromSnapshot: boole
       }
     }
     for (const [deckId, patch] of deckPatches) {
-      updateDeck(deckId, patch as Parameters<typeof updateDeck>[1]);
+      // `eqLow` is the one persisted key that does not name a flat Deck field — the
+      // tone knob writes `deck.eq.low`, and a raw patch would create a bogus top-level
+      // `eqLow` property while leaving the actual EQ untouched. Merge it into the
+      // deck's current eq instead, so the other two bands survive.
+      const { eqLow, ...flat } = patch as Record<string, number>;
+      const merged: Record<string, unknown> = { ...flat };
+      if (eqLow !== undefined) {
+        const deck = get(session).decks.find((d) => d.id === deckId);
+        if (deck) merged.eq = { ...deck.eq, low: eqLow };
+      }
+      updateDeck(deckId, merged as Parameters<typeof updateDeck>[1]);
     }
   } catch (e) {
     console.warn("[midi-state] failed to restore saved state:", e);

@@ -1,9 +1,13 @@
 # todo
 
-About page
+Way to record a session
 
-I hope you will use this software to encourage people to dance and have fun and love. 
-TODO: iterate on this seed a bit. 
+~~Bass / filter parameters should work.~~ **DONE 2026-08-17, live-verified** — 3-band EQ
+(`equalizer-nbands`, 250 Hz / 1 kHz / 4 kHz) plus a sweep filter, and the Starlight's
+dual-function tone knob mapped in both its modes. See `docs/design/deck-eq-and-filter.md`;
+§8 maps each "feels wrong" complaint to the constant that fixes it.
+
+What is necessary to build for mac or windows machines. Is that possible?
 
 ## Feature requests — prioritized
 

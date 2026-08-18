@@ -12,7 +12,7 @@
   } from "./lib/audio/pipeline";
   import { clearSavedGrid, markGridSaved, hasSavedGrid } from "./lib/audio/gridSource";
   import { setDeckOnsets } from "./lib/audio/onsetStore";
-  import { syncRate, syncGain, syncVolume, clearDeckAudioSync } from "./lib/audio/audioSync";
+  import { syncRate, syncGain, syncVolume, syncEq, syncFilter, clearDeckAudioSync } from "./lib/audio/audioSync";
   import { startSessionSync } from "./lib/state/sessionRecovery";
   import { restoreSessionOnBoot, restoreMidiControlState, hasPendingAdoption, takePendingAdoption } from "./lib/state/bootRestore";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -210,6 +210,8 @@
       syncRate(deck.id, deck.playbackRate);
       syncGain(deck.id, deck.gain);
       syncVolume(deck.id, deck.volume);
+      syncEq(deck.id, deck.eq.low, deck.eq.mid, deck.eq.high);
+      syncFilter(deck.id, deck.filter);
     }
   });
 
@@ -410,6 +412,8 @@
           syncGain(deckId, d.gain);
           syncRate(deckId, d.playbackRate);
           syncVolume(deckId, d.volume);
+          syncEq(deckId, d.eq.low, d.eq.mid, d.eq.high);
+          syncFilter(deckId, d.filter);
           // Cue is guarded separately by _prevCueStates (see the cueEnabled $effect
           // above) rather than audioSync.ts's module maps. teardownVideoBackendFull
           // clears this deck's entry so the guard doesn't look "unchanged" against a

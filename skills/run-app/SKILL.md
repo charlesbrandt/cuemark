@@ -149,6 +149,19 @@ window the user is actively looking at. Use the **full absolute path**
 (`pkill -f "src-tauri/target/debug/cuemark$"`, note the trailing `$`) or the specific PID
 (`kill $(cat /tmp/cuemark-dev.pid)`) when you only want one of them gone.
 
+⚠️ **The app binary can outlive `cargo tauri dev` and keep holding its resources.** Killing
+the pid file's process plus the repo's Vite left `target/debug/cuemark` still running as an
+orphan (2026-08-17) — and because it still owned the **MIDI port** and the audio devices, a
+relaunch would have hit a busy device rather than a clean start. The stop sequence's own
+`pgrep` line is what catches this, so **read its output instead of assuming the kill worked**;
+if a pid comes back, `kill <pid>` it directly and re-check until it prints `all stopped`.
+
+⚠️ **`cargo tauri dev` may have already rebuilt after a Rust edit.** It watches `src-tauri/`,
+so a Rust change made while it runs can be picked up on its own — the app binary's age
+(`ps -eo pid,etime`) and the `[build]` line's `built=` stamp will show it. That does **not**
+make a restart pointless: a restart is still the only thing that guarantees a full page load,
+and HMR can silently skip a `.svelte` edit (see CLAUDE.md's disk → served → reload ladder).
+
 ## Lifecycle rules (from CLAUDE.md)
 
 - Frontend changes (`.svelte`, `.ts`) → Vite hot-reloads instantly, no restart needed.

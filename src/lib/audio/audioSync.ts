@@ -11,11 +11,15 @@
  *   slider oninput → updateDeck → $effect → syncRate/… → GStreamer
  * The module-level Map prevents the $effect from duplicating a call already made by the MIDI path.
  */
-import { audioSetRate, audioSetGain, audioSetVolume } from './pipeline';
+import { audioSetRate, audioSetGain, audioSetVolume, audioSetEq, audioSetFilter } from './pipeline';
 
 const rateMap   = new Map<string, number>();
 const gainMap   = new Map<string, number>();
 const volumeMap = new Map<string, number>();
+// EQ is three numbers behind one IPC call, so the dedupe key is the triple, not a
+// scalar — keyed on the serialised bands rather than one of them.
+const eqMap     = new Map<string, string>();
+const filterMap = new Map<string, number>();
 
 export function syncRate(deckId: string, rate: number): void {
   const last = rateMap.get(deckId) ?? -1;
@@ -94,9 +98,24 @@ export function syncVolume(deckId: string, volume: number): void {
   audioSetVolume(deckId, volume).catch(console.error);
 }
 
+export function syncEq(deckId: string, low: number, mid: number, high: number): void {
+  const key = `${low}/${mid}/${high}`;
+  if (eqMap.get(deckId) === key) return;
+  eqMap.set(deckId, key);
+  audioSetEq(deckId, low, mid, high).catch(console.error);
+}
+
+export function syncFilter(deckId: string, pos: number): void {
+  if (filterMap.get(deckId) === pos) return;
+  filterMap.set(deckId, pos);
+  audioSetFilter(deckId, pos).catch(console.error);
+}
+
 export function clearDeckAudioSync(deckId: string): void {
   rateMap.delete(deckId);
   gainMap.delete(deckId);
   volumeMap.delete(deckId);
+  eqMap.delete(deckId);
+  filterMap.delete(deckId);
   rateHistory.delete(deckId);
 }

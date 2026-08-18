@@ -28,6 +28,7 @@ function baseDeck(id: string, overrides: Partial<Session['decks'][number]> = {})
     loopIn: null,
     loopOut: null,
     eq: { low: 0, mid: 0, high: 0 },
+    filter: 0,
     cueEnabled: false,
     syncLocked: false,
     ...overrides,

@@ -128,7 +128,11 @@ export function audioSetVolume(deckId: string, volume: number): Promise<void> {
   return invoke("audio_set_volume", { deckId, volume });
 }
 
-/** EQ bands in dB. Shelf/peak frequencies match the Web Audio defaults. */
+/**
+ * EQ bands in dB, clamped backend-side to EQ_MIN_DB..EQ_MAX_DB (−24…+12 — the
+ * `equalizer-nbands` element's own range). Low shelf @ 250 Hz, mid peak @ 1 kHz,
+ * high shelf @ 4 kHz — a DJ mixer's crossovers, see `DeckEQ` in state/types.ts.
+ */
 export function audioSetEq(
   deckId: string,
   lowDb: number,
@@ -136,6 +140,15 @@ export function audioSetEq(
   highDb: number,
 ): Promise<void> {
   return invoke("audio_set_eq", { deckId, lowDb, midDb, highDb });
+}
+
+/**
+ * Sweep filter knob: −1 = full low-pass (down to 200 Hz), 0 = off, +1 = full
+ * high-pass (up to 8 kHz). Travel is logarithmic in frequency, so the knob tracks
+ * pitch rather than Hz. Both filters park out of the audible band at 0.
+ */
+export function audioSetFilter(deckId: string, pos: number): Promise<void> {
+  return invoke("audio_set_filter", { deckId, pos });
 }
 
 // ── Per-deck cue ──────────────────────────────────────────────────────────────

@@ -2,7 +2,8 @@
 ///
 /// Topology:
 ///   uridecodebin → queue(max-buffers=2) → audioconvert → audioresample
-///     → capsfilter(48kHz) → pitch → [spectrum] → output_queue → tee
+///     → capsfilter(48kHz) → pitch → [spectrum] → input_selector
+///       → eq(3-band) → filter_hp → filter_lp → output_queue → tee
 ///         ├─ volume₀ → sink₀  ┐
 ///         ├─ volume₁ → sink₁  ┤  one branch per main output device (≥1; empty → system default)
 ///         └─ cue_valve → cue_volume → cue_queue → pulsesink(cue) | fakesink
@@ -846,6 +847,163 @@ fn make_el(factory: &str) -> Result<gst::Element, String> {
         .map_err(|e| format!("GStreamer element '{factory}' not found: {e}"))
 }
 
+/// ── Tone stage: 3-band EQ + sweep filter ──────────────────────────────────────
+///
+/// Both stages sit between `input_selector` and `output_queue`, which is the only
+/// point in the deck that satisfies all three requirements at once: it is downstream
+/// of the selector (so the scratch/appsrc branch is EQ'd exactly like the normal
+/// branch — a gesture must not change the tone), and upstream of the `tee` (so main
+/// *and* cue hear it, which is what a real mixer's post-EQ PFL does).
+///
+/// Caps there are pinned to `deck_output_caps()` (F32LE/48k/2ch/mask 0x3) by
+/// `rate_caps` and `capsfilter2`. Every element below accepts F32LE natively, so no
+/// `audioconvert` is needed and the caps-identity invariant guarded by the big comment
+/// on `caps_48k` is untouched — nothing here renegotiates anything.
+///
+/// ⚠️ These elements are **permanently in the chain**, including at neutral settings,
+/// so "neutral" has to be genuinely transparent or every deck inherits a colouration
+/// forever. Measured with a per-frequency sine transfer test against an unfiltered
+/// control (30 Hz – 16 kHz): `equalizer-nbands` at 0 dB is exactly flat (0.00 dB);
+/// the two sweep filters parked at their bypass cutoffs contribute at most **+0.24 dB**
+/// of Chebyshev passband ripple. That is the cost of not dynamically relinking a live
+/// pipeline, and it is inaudible.
+
+/// EQ crossovers. These match the band comments already in `src/lib/state/types.ts`
+/// (`DeckEQ`) and a DJ mixer's usual split, *not* `equalizer-3bands`' fixed layout —
+/// whose 11 kHz high band sits so far above a mixer's ~4 kHz crossover that killing
+/// "highs" would leave vocals and hats essentially intact.
+const EQ_LOW_FREQ_HZ: f64 = 250.0;
+const EQ_LOW_BW_HZ: f64 = 250.0;
+const EQ_MID_FREQ_HZ: f64 = 1000.0;
+const EQ_MID_BW_HZ: f64 = 1800.0;
+const EQ_HIGH_FREQ_HZ: f64 = 4000.0;
+const EQ_HIGH_BW_HZ: f64 = 4000.0;
+
+/// `equalizer-nbands` clamps its per-band gain to this range and silently accepts
+/// anything outside it, so the UI slider, the MIDI kill and this constant must agree.
+/// The asymmetry is the element's, and it happens to match how real mixers are marked
+/// (boost is gentle, cut goes deep enough to be a kill).
+pub const EQ_MIN_DB: f32 = -24.0;
+pub const EQ_MAX_DB: f32 = 12.0;
+
+/// Sweep-filter parking cutoffs — the "off" position of the filter knob.
+///
+/// The low-pass parks at 23 kHz rather than 20 kHz on measurement: at 20 kHz its
+/// passband ripple already reaches +0.22 dB by 16 kHz, while 23 kHz holds +0.05 dB.
+/// Both are inaudible; there is no reason to take the worse one.
+const FILTER_HP_PARK_HZ: f32 = 20.0;
+const FILTER_LP_PARK_HZ: f32 = 23_000.0;
+/// Sweep travel. The low-pass end stops at 200 Hz and the high-pass at 8 kHz — past
+/// those a DJ filter is just a mute with extra steps.
+const FILTER_LP_MIN_HZ: f32 = 200.0;
+const FILTER_HP_MAX_HZ: f32 = 8_000.0;
+/// 24 dB/octave. Steep enough to sound like a filter sweep rather than a tone control.
+const FILTER_POLES: i32 = 4;
+/// Knob travel within this of centre is treated as exactly centred. Without it, a
+/// controller that rests one LSB off centre would leave both filters slightly engaged
+/// forever, which is precisely the kind of always-on, never-noticed colouration the
+/// transparency measurement above exists to prevent.
+const FILTER_DEADBAND: f32 = 0.02;
+
+/// Build the deck's 3-band EQ. Bands are addressed through `GstChildProxy`
+/// (`band0`/`band1`/`band2`), which is the only way `equalizer-nbands` exposes them.
+fn make_eq(deck_id: &str) -> Result<gst::Element, String> {
+    let eq = make_el("equalizer-nbands")?;
+    eq.set_property("num-bands", 3u32);
+    // First band is a low shelf and last is a high shelf by construction in
+    // GstIirEqualizer; the explicit `type` here is documentation as much as setting.
+    let bands: [(&str, &str, f64, f64); 3] = [
+        ("band0", "low-shelf", EQ_LOW_FREQ_HZ, EQ_LOW_BW_HZ),
+        ("band1", "peak", EQ_MID_FREQ_HZ, EQ_MID_BW_HZ),
+        ("band2", "high-shelf", EQ_HIGH_FREQ_HZ, EQ_HIGH_BW_HZ),
+    ];
+    for (name, kind, freq, bw) in bands {
+        let band = eq_band(&eq, name)
+            .ok_or_else(|| format!("[audio/{deck_id}] equalizer-nbands has no child '{name}'"))?;
+        band.set_property_from_str("type", kind);
+        band.set_property("freq", freq);
+        band.set_property("bandwidth", bw);
+        band.set_property("gain", 0.0f64);
+    }
+    Ok(eq)
+}
+
+/// Build the sweep filter as a fixed high-pass → low-pass pair rather than one element
+/// switched between modes.
+///
+/// `audiocheblimit` does have a runtime-writable `mode`, but flipping it recalculates
+/// coefficients under a running stream — a click on every pass through centre, on a
+/// control whose whole purpose is to be swept back and forth through centre. Two
+/// elements, each parked out of the audible band when not in use, never change mode at
+/// all: only `cutoff` moves, and the idle one contributes the measured +0.24 dB.
+/// Chebyshev is IIR, so neither adds latency to the scratch path.
+fn make_sweep_filters(deck_id: &str) -> Result<(gst::Element, gst::Element), String> {
+    let hp = make_el("audiocheblimit")
+        .map_err(|e| format!("[audio/{deck_id}] sweep filter (high-pass): {e}"))?;
+    hp.set_property_from_str("mode", "high-pass");
+    hp.set_property("poles", FILTER_POLES);
+    hp.set_property("cutoff", FILTER_HP_PARK_HZ);
+
+    let lp = make_el("audiocheblimit")
+        .map_err(|e| format!("[audio/{deck_id}] sweep filter (low-pass): {e}"))?;
+    lp.set_property_from_str("mode", "low-pass");
+    lp.set_property("poles", FILTER_POLES);
+    lp.set_property("cutoff", FILTER_LP_PARK_HZ);
+
+    Ok((hp, lp))
+}
+
+/// Fetch one of `equalizer-nbands`' band objects.
+///
+/// The bands are not properties of the element — they are `GstChildProxy` children, and
+/// `gst::Element` does not statically implement that interface, so this has to go through
+/// a dynamic cast. Returns `None` rather than panicking: a missing band means the element
+/// is not the one we built, and silently leaving that band flat beats taking the audio
+/// thread down with it.
+fn eq_band(eq: &gst::Element, name: &str) -> Option<glib::Object> {
+    eq.dynamic_cast_ref::<gst::ChildProxy>()?.child_by_name(name)
+}
+
+/// Write band gains onto an EQ element. Free function rather than a method because
+/// `load()` must apply them to an element it has built but not yet stored on `inner`.
+fn apply_eq_to(eq: &gst::Element, low_db: f32, mid_db: f32, high_db: f32) {
+    for (name, db) in [("band0", low_db), ("band1", mid_db), ("band2", high_db)] {
+        if let Some(band) = eq_band(eq, name) {
+            band.set_property("gain", db.clamp(EQ_MIN_DB, EQ_MAX_DB) as f64);
+        }
+    }
+}
+
+/// Write a knob position onto the sweep-filter pair. Free function for the same reason
+/// as `apply_eq_to`.
+fn apply_filter_to(hp: &gst::Element, lp: &gst::Element, pos: f32) {
+    let (hp_hz, lp_hz) = filter_cutoffs(pos);
+    hp.set_property("cutoff", hp_hz);
+    lp.set_property("cutoff", lp_hz);
+}
+
+/// Map a filter-knob position in −1..=1 to the pair's cutoffs, in Hz.
+///
+/// Centre parks both filters. Left of centre sweeps the low-pass down; right of centre
+/// sweeps the high-pass up. Travel is **logarithmic** in frequency, so the knob tracks
+/// pitch rather than Hz — linear travel would spend most of its range above 10 kHz,
+/// where a sweep is barely audible, and cross the musically interesting decade in the
+/// last few percent.
+fn filter_cutoffs(pos: f32) -> (f32, f32) {
+    let pos = pos.clamp(-1.0, 1.0);
+    if pos.abs() < FILTER_DEADBAND {
+        return (FILTER_HP_PARK_HZ, FILTER_LP_PARK_HZ);
+    }
+    // Rescale so the sweep starts at the deadband edge rather than jumping there.
+    let t = ((pos.abs() - FILTER_DEADBAND) / (1.0 - FILTER_DEADBAND)).clamp(0.0, 1.0);
+    let sweep = |from: f32, to: f32| from * (to / from).powf(t);
+    if pos < 0.0 {
+        (FILTER_HP_PARK_HZ, sweep(FILTER_LP_PARK_HZ, FILTER_LP_MIN_HZ))
+    } else {
+        (sweep(FILTER_HP_PARK_HZ, FILTER_HP_MAX_HZ), FILTER_LP_PARK_HZ)
+    }
+}
+
 /// A `valve` with `drop=true` silently swallows the EOS event too, not just data
 /// buffers — confirmed empirically (`gst-launch-1.0 audiotestsrc num-buffers=20 !
 /// valve drop=true ! fakesink` hangs forever instead of exiting on EOS; the same
@@ -1387,6 +1545,98 @@ mod snapcast_device_tests {
 }
 
 #[cfg(test)]
+mod tone_stage_tests {
+    use super::{
+        filter_cutoffs, FILTER_HP_MAX_HZ, FILTER_HP_PARK_HZ, FILTER_LP_MIN_HZ, FILTER_LP_PARK_HZ,
+    };
+
+    /// The whole knob, as a table. Written first because the interesting property of
+    /// `filter_cutoffs` is not any single point but the shape across the travel: the
+    /// idle filter must stay parked, and only one of the pair may ever move.
+    #[test]
+    fn knob_travel_moves_exactly_one_filter() {
+        // (position, which filter should be engaged)
+        let cases: [(f32, &str); 9] = [
+            (-1.0, "lp"),
+            (-0.5, "lp"),
+            (-0.1, "lp"),
+            (-0.01, "none"), // inside the deadband
+            (0.0, "none"),
+            (0.01, "none"), // inside the deadband
+            (0.1, "hp"),
+            (0.5, "hp"),
+            (1.0, "hp"),
+        ];
+        for (pos, engaged) in cases {
+            let (hp, lp) = filter_cutoffs(pos);
+            match engaged {
+                "none" => {
+                    assert_eq!(hp, FILTER_HP_PARK_HZ, "pos {pos}: high-pass should be parked");
+                    assert_eq!(lp, FILTER_LP_PARK_HZ, "pos {pos}: low-pass should be parked");
+                }
+                "lp" => {
+                    assert_eq!(
+                        hp, FILTER_HP_PARK_HZ,
+                        "pos {pos}: high-pass must stay parked while the low-pass sweeps — \
+                         both engaged at once is a band-pass, not a DJ filter"
+                    );
+                    assert!(lp < FILTER_LP_PARK_HZ, "pos {pos}: low-pass should have swept down");
+                    assert!(lp >= FILTER_LP_MIN_HZ - 1.0, "pos {pos}: low-pass swept past its floor");
+                }
+                "hp" => {
+                    assert_eq!(lp, FILTER_LP_PARK_HZ, "pos {pos}: low-pass must stay parked");
+                    assert!(hp > FILTER_HP_PARK_HZ, "pos {pos}: high-pass should have swept up");
+                    assert!(hp <= FILTER_HP_MAX_HZ + 1.0, "pos {pos}: high-pass swept past its ceiling");
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// Full deflection must actually reach the documented endpoints. A sweep that stops
+    /// short is the kind of thing that reads as "the filter feels weak" rather than as a
+    /// bug, and never gets reported as one.
+    #[test]
+    fn full_deflection_reaches_the_endpoints() {
+        let (_, lp) = filter_cutoffs(-1.0);
+        assert!(
+            (lp - FILTER_LP_MIN_HZ).abs() < 1.0,
+            "full left should reach {FILTER_LP_MIN_HZ} Hz, got {lp}"
+        );
+        let (hp, _) = filter_cutoffs(1.0);
+        assert!(
+            (hp - FILTER_HP_MAX_HZ).abs() < 1.0,
+            "full right should reach {FILTER_HP_MAX_HZ} Hz, got {hp}"
+        );
+    }
+
+    /// Travel is logarithmic, so the midpoint of the knob should land near the
+    /// geometric mean of the endpoints, not the arithmetic one. Linear travel would put
+    /// half the knob above 11 kHz where a sweep is barely audible.
+    #[test]
+    fn travel_is_logarithmic_not_linear() {
+        let (_, lp) = filter_cutoffs(-0.5);
+        let geometric = (FILTER_LP_PARK_HZ * FILTER_LP_MIN_HZ).sqrt();
+        let arithmetic = (FILTER_LP_PARK_HZ + FILTER_LP_MIN_HZ) / 2.0;
+        assert!(
+            (lp - geometric).abs() < (lp - arithmetic).abs(),
+            "half travel gave {lp} Hz — closer to the arithmetic mean ({arithmetic}) than the \
+             geometric one ({geometric}), so the knob is sweeping in Hz rather than in pitch"
+        );
+    }
+
+    /// Out-of-range input is clamped, not wrapped or propagated. A controller sending a
+    /// hair over 1.0 must not push a cutoff past Nyquist.
+    #[test]
+    fn out_of_range_positions_clamp() {
+        assert_eq!(filter_cutoffs(5.0), filter_cutoffs(1.0));
+        assert_eq!(filter_cutoffs(-5.0), filter_cutoffs(-1.0));
+        let (hp, lp) = filter_cutoffs(5.0);
+        assert!(hp < 24_000.0 && lp < 24_000.0, "cutoff must stay below Nyquist at 48 kHz");
+    }
+}
+
+#[cfg(test)]
 mod channel_remap_tests {
     use super::{compute_channel_remap, parse_device_remap};
 
@@ -1800,6 +2050,13 @@ struct PipelineInner {
     cue_valve_el: gst::Element,
     /// soundtouch pitch element — `tempo` property controls playback speed without pitch shift.
     pitch_el: gst::Element,
+    /// 3-band EQ, downstream of `input_selector` so it applies to scratch audio too and
+    /// upstream of `tee` so the cue hears it. See `make_eq()`.
+    eq_el: gst::Element,
+    /// Sweep-filter pair, always present and parked out of band when centred. See
+    /// `make_sweep_filters()`.
+    filter_hp_el: gst::Element,
+    filter_lp_el: gst::Element,
     /// Held so we can call set_flushing(true) to stop the bus monitor thread on drop/reload.
     bus: gst::Bus,
     /// Set by the bus monitor thread when EOS arrives; cleared by play() on restart.
@@ -1888,6 +2145,16 @@ pub struct DeckAudioPipeline {
     cue_enabled: bool,
     /// Current tempo multiplier. Re-applied to the pitch element after each load.
     rate: f64,
+    /// EQ band gains in dB. Held here rather than read back off the element because
+    /// `load()` builds a brand-new element on every track load and device rebuild —
+    /// exactly like `rate` above. Without this the EQ would work until the next load
+    /// and then silently reset to flat mid-set.
+    eq_low_db: f32,
+    eq_mid_db: f32,
+    eq_high_db: f32,
+    /// Sweep-filter knob position, −1 (full low-pass) … 0 (off) … +1 (full high-pass).
+    /// Retained across rebuilds for the same reason as the EQ gains.
+    filter_pos: f32,
     /// True when the user has pressed play (intent). Retained across device rebuilds.
     playing: bool,
     /// Called by the bus thread when EOS fires. Used to notify the frontend.
@@ -1935,6 +2202,10 @@ impl DeckAudioPipeline {
             cue_gain: 1.0,
             cue_enabled: false,
             rate: 1.0,
+            eq_low_db: 0.0,
+            eq_mid_db: 0.0,
+            eq_high_db: 0.0,
+            filter_pos: 0.0,
             playing: false,
             eos_callback: None,
             app: None,
@@ -2504,6 +2775,12 @@ impl DeckAudioPipeline {
         // can starve when soundtouch hasn't yet produced a full 1024-sample quantum.
         let output_queue = make_el("queue")?;
 
+        // ── Tone stage ────────────────────────────────────────────────────────────
+        // Sits between input_selector and output_queue so it covers the scratch branch
+        // as well as the normal one, and reaches the cue through the tee. See make_eq().
+        let eq = make_eq(&self.deck_id)?;
+        let (filter_hp, filter_lp) = make_sweep_filters(&self.deck_id)?;
+
         // ── Scratch branch (docs/design/pcm-buffer-playback.md) ────────────────────
         // A dedicated PCM-buffer feeder branch, exclusive-switched against the normal
         // branch via input-selector downstream of pitch. Always present in the topology
@@ -2670,6 +2947,12 @@ impl DeckAudioPipeline {
             vol.set_property("volume", (self.gain * self.vol * deck_master) as f64);
         }
         pitch.set_property("tempo", self.rate as f32);
+        // Re-apply the retained tone settings to the freshly built elements, for the same
+        // reason `tempo` is re-applied on the line above: `load()` runs on every track load
+        // and every device rebuild, and a setting that lives only on the old element is a
+        // setting that vanishes mid-set without a word.
+        apply_eq_to(&eq, self.eq_low_db, self.eq_mid_db, self.eq_high_db);
+        apply_filter_to(&filter_hp, &filter_lp, self.filter_pos);
         queue.set_property("max-size-buffers", 2u32);
         queue.set_property("max-size-bytes", 0u32);
         queue.set_property("max-size-time", 0u64);
@@ -2696,7 +2979,8 @@ impl DeckAudioPipeline {
         pipeline
             .add_many([&src, &queue, &convert, &resample, &rate_caps, &pitch, &output_queue,
                        &tee, &cue_valve, &cue_volume, &cue_queue, &cue_sink,
-                       &appsrc_el, &convert2, &resample2, &capsfilter2, &valve_normal, &input_selector])
+                       &appsrc_el, &convert2, &resample2, &capsfilter2, &valve_normal, &input_selector,
+                       &eq, &filter_hp, &filter_lp])
             .map_err(|e| format!("[{}] pipeline add_many: {e}", self.deck_id))?;
         for (vol, snk) in volume_els.iter().zip(main_sinks.iter()) {
             pipeline.add(vol).map_err(|e| format!("[{}] pipeline add volume: {e}", self.deck_id))?;
@@ -2743,7 +3027,9 @@ impl DeckAudioPipeline {
 
         input_selector.set_property("active-pad", &sel_normal_pad);
 
-        input_selector.link(&output_queue).map_err(|e| format!("input_selector→output_queue: {e}"))?;
+        // input_selector → eq → filter_hp → filter_lp → output_queue
+        gst::Element::link_many([&input_selector, &eq, &filter_hp, &filter_lp, &output_queue])
+            .map_err(|e| format!("input_selector→eq→filter→output_queue: {e}"))?;
         output_queue.link(&tee).map_err(|e| format!("output_queue→tee: {e}"))?;
 
         // tee → main branches (one per configured output device)
@@ -2886,6 +3172,9 @@ impl DeckAudioPipeline {
             cue_volume_el: cue_volume,
             cue_valve_el: cue_valve,
             pitch_el: pitch,
+            eq_el: eq,
+            filter_hp_el: filter_hp,
+            filter_lp_el: filter_lp,
             bus,
             at_eos,
             at_error,
@@ -3123,8 +3412,29 @@ impl DeckAudioPipeline {
         self.apply_volume();
     }
 
-    /// EQ bands in dB. No-op until equalizer-3bands element is added.
-    pub fn set_eq(&self, _low_db: f32, _mid_db: f32, _high_db: f32) -> Result<(), String> {
+    /// EQ band gains in dB, clamped to the element's `EQ_MIN_DB..=EQ_MAX_DB`.
+    ///
+    /// Takes effect immediately on a playing deck (the gains are plain element
+    /// properties) and is retained across track loads and device rebuilds by `load()`.
+    /// Safe to call with no pipeline built — the values are stored and applied when one
+    /// is, so setting EQ on an empty deck is not silently lost.
+    pub fn set_eq(&mut self, low_db: f32, mid_db: f32, high_db: f32) -> Result<(), String> {
+        self.eq_low_db = low_db.clamp(EQ_MIN_DB, EQ_MAX_DB);
+        self.eq_mid_db = mid_db.clamp(EQ_MIN_DB, EQ_MAX_DB);
+        self.eq_high_db = high_db.clamp(EQ_MIN_DB, EQ_MAX_DB);
+        if let Some(inner) = &self.inner {
+            apply_eq_to(&inner.eq_el, self.eq_low_db, self.eq_mid_db, self.eq_high_db);
+        }
+        Ok(())
+    }
+
+    /// Sweep-filter knob position: −1 = full low-pass, 0 = off, +1 = full high-pass.
+    /// Same immediacy and same retention guarantees as `set_eq`.
+    pub fn set_filter(&mut self, pos: f32) -> Result<(), String> {
+        self.filter_pos = pos.clamp(-1.0, 1.0);
+        if let Some(inner) = &self.inner {
+            apply_filter_to(&inner.filter_hp_el, &inner.filter_lp_el, self.filter_pos);
+        }
         Ok(())
     }
 

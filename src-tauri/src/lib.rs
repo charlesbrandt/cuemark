@@ -223,6 +223,7 @@ pub fn run() {
             audio::audio_set_gain,
             audio::audio_set_volume,
             audio::audio_set_eq,
+            audio::audio_set_filter,
             audio::audio_set_cue,
             audio::audio_get_position,
             audio::audio_set_master_volume,

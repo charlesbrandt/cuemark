@@ -68,7 +68,48 @@ to implement different ranges — the rescaling lives in `handler.ts` `deck_play
 through MIDI. Instead, Shift+pad sends a different note number on the same channel (note += 8). No
 host-side shift-state tracking is needed; the shifted notes map directly to `HotCueSet` bindings.
 
-Intentionally unmapped: Bass/filter toggle `(0x90,1)`, mode-switch buttons `(0x91,15/16)`.
+Intentionally unmapped: Bass/Filter button `(0x90,1)`, mode-switch buttons `(0x91,15/16)`.
+
+## The dual-function tone knob (mapped 2026-08-17)
+
+Each deck has **one** knob that acts as either bass or filter, switched by the global
+Bass/Filter button. **The controller does the switching in firmware** — the same physical
+knob simply sends a different CC — so cuemark tracks **no mode state at all**:
+
+| Physical control | MIDI key | Action |
+|---|---|---|
+| Tone knob L — bass mode | `(0xB1, 2)` MSB (`34` LSB ignored) | `DeckEqLow` deck-0 → `deck.eq.low`, −24…+12 dB |
+| Tone knob L — filter mode | `(0xB1, 1)` MSB (`33` LSB ignored) | `DeckFilter` deck-0 → `deck.filter`, −1…+1 |
+| Tone knob R — bass mode | `(0xB2, 2)` MSB | `DeckEqLow` deck-1 |
+| Tone knob R — filter mode | `(0xB2, 1)` MSB | `DeckFilter` deck-1 |
+
+Verified live by capturing one knob across a button press:
+
+```
+0xB1 d1= 2  d2=63,2,0,38,64,106      ← knob sweeping (fine on CC 34)
+0x90 d1= 1  d2=127 → d2=0            ← Bass/Filter button, momentary
+0xB1 d1= 1  d2=127,96,73,63,32,15,0  ← same knob, different CC (fine on CC 33)
+```
+
+🛑 **Do not map `(0x90,1)` and do not track the mode host-side.** Both modes are already
+bound, so the button needs no host action — exactly like Shift `(0x90,3)`. The button is
+*momentary* (127 press / 0 release) and never reports which mode it selected, so any
+host-side guess drifts out of sync with the hardware after a reconnect and the knob then
+silently drives the wrong control.
+
+Knob→value mapping lives in Rust (`knob_to_eq_db` / `knob_to_filter` in `midi.rs`), unlike
+the tempo fader's range rescaling, because the EQ range is not user-configurable. Centre
+is snapped to neutral (`KNOB_CENTRE_SNAP`): the pot has no detent, so without it "off"
+is a position the user cannot actually select. See `docs/design/deck-eq-and-filter.md` §6.
+
+⚠️ **cuemark holds the MIDI port exclusively.** `amidi -p hw:1,0,0 -d` fails with "Device
+or resource busy" while the app runs — and the first such attempt in a session can look
+like a *silent* empty capture rather than an error. To capture MIDI from a running app,
+read its own log instead:
+```bash
+tail -n0 -f ~/.local/share/com.cuemark.app/logs/cuemark.log | grep --line-buffered -a '\[midi\]'
+```
+Every message is logged including unmapped ones, so this sees controls the map ignores.
 
 Phase 2 goal: MIDI learn mode (click control in UI, wiggle knob to map).
 
