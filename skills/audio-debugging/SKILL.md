@@ -277,9 +277,12 @@ PipeWire node — fixed 2026-08-11 by the shared output graph (§10.14).
 
 ### Four traps, all of which fired on first use
 
-- 🔴 **`audio_record_start/stop` is a stub.** `src-tauri/src/audio/record.rs` logs, returns
-  `Ok`, and writes nothing (the encoder chain is "step 8"). The design doc that prescribed it
-  did not know that. Use the capture script.
+- 🟢 **`audio_record_start/stop` was a stub when this trap list was written (2026-08-10) —
+  fixed 2026-08-22, see "What is still a stub" at the end of this file.** For anything that
+  isn't a full recorded file (a quick capture during a debugging session, not a session
+  recording the user keeps), the capture script below is still the right tool — it needs no
+  UI interaction and taps a point downstream of everything, which `audio_record_start` does
+  not.
 - 🔴 **A capture reading ~−53 dBFS and flat is the wrong node, not a quiet take.**
   `pw-record` silently falls back to the default source — here the H1n mic — producing a
   perfectly plausible "clean" envelope of the room. It was caught only because it matched an
@@ -1550,6 +1553,123 @@ exactly what happened in the first attempt at the `output_queue` fix above (see
 docs/design/pcm-buffer-playback.md, "Eighth mechanism," and the A/B-testing
 section just above for how this was caught).
 
+## GStreamer gotcha: `gst_pad_unlink` takes `(srcpad, sinkpad)` — backwards is a
+## silent-ish CRITICAL, not a hard failure (2026-08-22)
+
+`Pad::unlink()` must be called *on the src pad*, with the sink pad passed as the argument —
+mirroring the C API's `gst_pad_unlink(srcpad, sinkpad)`. Calling it the other way round
+(`sink_pad.unlink(&src_pad)`) trips a `GST_PAD_IS_SRC` assertion:
+
+```
+GStreamer-CRITICAL **: gst_pad_unlink: assertion 'GST_PAD_IS_SRC (srcpad)' failed
+```
+
+This is **not fatal** — the process keeps running, `log::info!`/`warn!` never sees it since
+it's glib's own critical-log mechanism, not a GStreamer bus message — so it is very easy to
+ship and never notice unless you're watching stderr or running under a test harness with
+`--nocapture`. Worse, the unlink **silently does not happen**: the pad stays linked, and if
+the caller goes on to `release_request_pad()` a still-linked request pad, that pad's fate
+(and the far end it was linked to) is now undefined-by-omission rather than cleanly torn
+down.
+
+Found live 2026-08-22 building the recording feature's per-deck tap: the tee's `src_%u`
+request pad (a src pad, obviously — every tee request pad is) was being torn down with
+`peer.unlink(&tee_pad)` where `peer` is the *sink* pad on the other end. Two call sites in
+`pipeline.rs` had the identical bug (a rollback path and the main teardown), both copy-paste
+variants of the same wrong pattern — check every `X.unlink(&Y)` call near a tee/mixer request
+pad and confirm `X` is provably the src side, not just "the pad this function happened to
+have a variable for."
+
+The generalizable check: before writing `a.unlink(&b)`, ask which of `a`/`b` came from a
+`request_pad_simple("src_%u")`-style call (or is otherwise definitionally a src pad, like a
+tee's output or an encoder's output) — that one calls `.unlink()`, the other is the argument.
+
+## GStreamer gotcha: a `GstBus` has exactly one real consumer — mixing `add_watch()`
+## and a manual `pop`/`timed_pop_filtered()` on the same bus is a race (2026-08-22)
+
+cuemark already uses two different bus-consumption patterns and that's fine *as long as
+they're never both applied to the same bus*:
+- **Deck pipelines**: a dedicated thread blocking on `bus.iter_timed()` (see "Bus message
+  guide" above) — the deck's own bus, one consumer, for the deck's whole life.
+- **Shared-output nodes**: `watch_bus()`'s `bus.add_watch(closure)` — a GLib `GSource`
+  dispatched by whatever main context is pumping (the GTK main loop in the real app), logging
+  errors/warnings live.
+
+Both mechanisms ultimately call the same underlying `gst_bus_pop()` to take a message off the
+queue — there is no broadcast, no "peek and leave it for the next consumer." Whichever one
+wakes up first gets the message and the other never sees it. So a synchronous
+`bus.timed_pop_filtered(timeout, &[...])` call added *on top of* a bus that already has
+`add_watch()` registered is a real, unpredictable race: it can steal the message the watch was
+about to log, or the watch can steal the message the synchronous call is blocking on — this is
+exactly what `OutputGraph::finish_recording()` needed to block on EOS for. There is no
+"add a second, filtered watch" fix that dodges this; it's the same queue either way.
+
+The fix used for the recording node: make one thing the bus's **sole** consumer for that
+node's entire life. `create_node()` skips `watch_bus()` for `RECORD_DEVICE_KEY` specifically,
+so `finish_recording()`'s `timed_pop_filtered()` is guaranteed to see whatever's there —
+including an error that happened minutes earlier, since `GstBus` retains unpopped messages
+(nothing is lost, only reported later than it occurred, which is an acceptable trade for a
+short-lived node). If a future node ever needs *both* live logging and a later synchronous
+wait, that needs one dedicated thread owning the pop loop, signaling a condvar/channel on the
+messages the synchronous side cares about — not two independent consumers pointed at the same
+bus.
+
+## GStreamer gotcha: `filesink` only flushes to disk on a state transition to `NULL`
+## (or `READY`) — checking file size while the pipeline is still `PLAYING` is a test bug
+
+`GstFileSink` buffers writes via stdio. At low bitrate/near-silent content the encoder's own
+output (a handful of bytes per opus packet, confirmed via fine-grained `GST_DEBUG`) never
+naturally fills that buffer, so `std::fs::metadata(path).len()` reads `0` for a pipeline that
+is working perfectly and has been producing correct, decorated buffers the whole time. This
+cost real time to tell apart from "the encoder chain didn't link" the first time it was hit
+(mixer.rs's `record_node_encodes_and_writes_audio` test) — the fix is to check file size only
+*after* tearing the pipeline down (`Drop`/explicit `set_state(Null)`/`finish_recording()`'s own
+Null at the end), never while it's still live. A GStreamer file-writing test that asserts on
+disk contents needs a teardown step before the assertion, full stop.
+
+⚠️ **The same illusion shows up live in the running app, not just the unit test, and can look
+like a multi-minute stall** (found 2026-08-22 verifying the recording feature end-to-end).
+`ls -la`/`stat` on an in-progress recording plateaued for over a minute of wall clock while the
+recording was genuinely healthy the whole time — two things stack:
+1. The mechanism above (near-silent content barely trickles into the stdio buffer).
+2. **Every output node, including the recording node, carries a permanent silent
+   `audiotestsrc` keepalive** (`docs/design/shared-output-pipeline.md`, "one node per PCM") —
+   so once the source deck stops producing audio (paused, or reached EOS with looping off),
+   the recording doesn't stall or corrupt, it keeps encoding real *digital silence*
+   indefinitely. That silence is exactly the low-bitrate content the stdio-buffering mechanism
+   hides best, so the two faults compound into an apparent stall that can run for minutes.
+
+Don't trust `stat`-during-record to say anything one way or the other. To positively tell
+"stuck", "recording real audio", and "recording silence, working as designed" apart on a
+**finished** file (stop the recording first — see above):
+```bash
+ffmpeg -i out.ogg -af silencedetect=noise=-50dB:d=1 -f null - 2>&1 | grep -iE "silence_start|silence_end"
+ffprobe -v error -count_frames -show_entries stream=nb_read_frames,duration -of default=noprint_wrappers=0 out.ogg
+```
+`silencedetect` timestamps exactly where real audio ends and silence begins; `nb_read_frames`
+evenly spread across the reported duration (rather than clustered at the start) confirms the
+encoder kept running the whole time instead of jamming partway through.
+
+## Debugging technique: seeing buffer-level GStreamer activity needs a per-category
+## level ≥5/6, and shell redirect order still trips people up
+
+`GST_DEBUG=4` (the usual "just show me what's happening" level) is INFO — element creation,
+state changes, caps negotiation. It does **not** show individual buffers moving through the
+pipeline (chain/push events), which log at DEBUG(5)/LOG(6). To actually watch data flow
+through specific elements, name them explicitly:
+
+```bash
+GST_DEBUG=opusenc:6,oggmux:6,audioaggregator:6 <cmd> > /tmp/gst.log 2>&1
+```
+
+That last redirect matters: `<cmd> 2>&1 > /tmp/gst.log` does **not** capture stderr into the
+file — `2>&1` binds stderr to wherever stdout currently points (the terminal, at that point in
+the parsing order), and the later `> /tmp/gst.log` only retargets stdout. Redirection order is
+left-to-right; put the file redirect first: `<cmd> > /tmp/gst.log 2>&1`. `GST_DEBUG` output
+goes to stderr, so the wrong order silently produces an empty (or terminal-only) log — which
+looks exactly like "no output = nothing happening" and wastes a debugging pass on the wrong
+theory.
+
 ---
 
 ## Svelte reactive-storm freezes: when a "no-op guard" doesn't actually no-op
@@ -1638,7 +1758,9 @@ fact rather than trying to pre-filter what's "interesting" live.
 
 | File | Concern |
 |---|---|
-| `src-tauri/src/audio/pipeline.rs` | Per-deck GStreamer pipeline, bus monitor, tempo/pitch element |
+| `src-tauri/src/audio/pipeline.rs` | Per-deck GStreamer pipeline, bus monitor, tempo/pitch element, record-branch tap |
+| `src-tauri/src/audio/mixer.rs` | Shared output graph — one node per device, the `RECORD_DEVICE_KEY` recording node, `finish_recording()` |
+| `src-tauri/src/audio/record.rs` | `RecordingSink` — thin on/off flag; real wiring lives in the two files above |
 | `src-tauri/src/audio/mod.rs` | AudioManager, Tauri command handlers |
 | `src-tauri/src/midi.rs` | MIDI event loop, log throttle, 14-bit rate decoding |
 | `src-tauri/src/media_server.rs` | Local HTTP server for prod video serving (replaces `media://`) |
@@ -1682,6 +1804,28 @@ video, no corruption, lower CPU than dual software decode). If a black-screen or
 symptom returns for H.264, or shows up freshly for AV1/VP9/HEVC, re-add the codec's `va*dec`/
 `vaapi*dec` factory name to the rank string in `main.rs` — see the comment there and the
 2026-06-19/2026-06-20 journal entries for the full history before assuming it's fixed for good.
+
+## Checking whether an encoder/muxer combination is even valid before wiring it into Rust (2026-08-22)
+
+A lighter-weight sibling of the standalone-pipeline technique below — for "does element X
+accept element Y's output caps" questions, not a full behavioral question. Used to confirm
+`flacenc ! oggmux` (moving the recording feature's FLAC output off Matroska onto Ogg for
+crash-safety, see `mixer.rs`'s `build_record_sink_chain()`) was a real, valid pipeline before
+touching any Rust:
+
+```bash
+gst-inspect-1.0 oggmux | sed -n '/SINK template/,/^$/p'   # does it list audio/x-flac?
+gst-launch-1.0 -e audiotestsrc num-buffers=200 ! audioconvert ! audioresample ! \
+  flacenc ! oggmux ! filesink location=/tmp/test.oga
+gst-discoverer-1.0 /tmp/test.oga    # confirms container + codec + duration on the real output
+```
+
+Both checks are cheap (seconds, no app, no real media file) and each catches a different class
+of mistake: `gst-inspect`'s caps listing rules out "this muxer doesn't even accept this
+payload" before writing any code, and `gst-discoverer` on the actual output of a real run rules
+out "the caps matched but the muxed file is malformed" — caps compatibility is necessary, not
+sufficient. Reuse this pattern for any new encoder/muxer/container combination before wiring it
+into `mixer.rs`/`pipeline.rs`.
 
 ## Verifying a GStreamer bug fix without the full app: replicate the pipeline logic standalone (2026-08-12)
 
@@ -1881,8 +2025,14 @@ monitor's RMS. They differed by 10.1 dB where they should have matched to within
 element's windowing; 20·log₁₀(0.346) = −9.2 dB named the culprit immediately.
 
 **What is still a stub**:
-- `set_eq()` in `pipeline.rs` — EQ sliders show in the UI but do nothing to GStreamer
-- `record.rs` — `audio_record_start/stop` returns `Ok` and writes nothing. The shared output
-  graph is the natural place to tap for this (one node, one mix, post-master) and did not
-  exist when the stub was written.
+- ~~`set_eq()` in `pipeline.rs`~~ — fixed 2026-08-17, live-verified; see `docs/design/deck-eq-and-filter.md`.
+- ~~`record.rs`~~ — **no longer a stub as of 2026-08-22.** Full encoder chain built (deck-side
+  `RecordBranch` tap in `pipeline.rs`, `RECORD_DEVICE_KEY` node in `mixer.rs`), frontend wired
+  up (`RecordPanel.svelte`, `recordState.ts`), and live-verified end-to-end via WebDriver click
+  automation — Opus and FLAC both confirmed to produce valid, playable files with real audio
+  content. Both formats mux into **Ogg**, not Matroska (`build_record_sink_chain()`'s doc
+  comment in `mixer.rs` has the crash-safety reasoning: Ogg pages need no footer/index to
+  finalize, so a crash mid-recording still leaves a playable file). See the filesink-buffering
+  entry above (`filesink only flushes to disk on a state transition to NULL`) for a live-app
+  gotcha found while verifying this.
 - ~~`MasterMix`~~ — built 2026-08-11 as `OutputGraph`; see the topology section above.

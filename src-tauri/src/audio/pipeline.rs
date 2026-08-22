@@ -21,7 +21,7 @@ type EosCallback = Arc<dyn Fn() + Send + Sync>;
 use gstreamer::{self as gst, glib, prelude::*};
 use gstreamer_app::{AppSink, AppSrc};
 
-use super::mixer::{wire_handoff, BranchKey, HandoffCounters, OutputGraph};
+use super::mixer::{wire_handoff, BranchKey, HandoffCounters, OutputGraph, RECORD_DEVICE_KEY};
 use tauri::Emitter;
 use super::analysis;
 use super::pcm_buffer::{self, PcmBuffer};
@@ -2125,6 +2125,20 @@ struct PipelineInner {
     /// configured delay reaches a deck that is **already playing** — which is the only way
     /// that value can be tuned, since it is tuned by ear against a real room.
     output_latency_ns: Arc<AtomicU64>,
+    /// Present only while this deck is feeding an active recording. Attached and detached
+    /// dynamically by `attach_record_branch()`/`detach_record_branch()` — never built as
+    /// part of `load()` — so a deck that is never recorded pays nothing for it.
+    record_branch: Option<RecordBranch>,
+}
+
+/// The deck-local half of a recording tap: a fresh `tee` src pad plus the `volume → appsink`
+/// chain hung off it. Deliberately holds nothing from the cue side — this branch is wired
+/// directly off `output_queue_el`'s tee, upstream of `cue_valve`/`cue_volume`, so there is no
+/// edge in this graph a cue buffer could travel to reach a recording.
+struct RecordBranch {
+    tee_pad: gst::Pad,
+    volume: gst::Element,
+    appsink: gst::Element,
 }
 
 pub struct DeckAudioPipeline {
@@ -2186,6 +2200,13 @@ pub struct DeckAudioPipeline {
     /// `with_pipeline_detached()` removes this deck from the manager's map for the duration
     /// of a blocking call, and a detached deck still has to reach the graph.
     output_graph: Option<Arc<Mutex<OutputGraph>>>,
+    /// User/session intent: this deck's output should be tapped into the active recording.
+    /// Retained across device rebuilds for the same reason `playing` is (see its comment) —
+    /// `load()` rebuilds `PipelineInner` from scratch on every track/device change, which
+    /// would otherwise silently drop the record tap on the next reload after a recording
+    /// started. Set by `attach_record_branch()`/cleared by `detach_record_branch()`;
+    /// consulted at the end of `load()` to re-attach automatically.
+    recording: bool,
 }
 
 impl DeckAudioPipeline {
@@ -2212,6 +2233,7 @@ impl DeckAudioPipeline {
             pcm_buffer: None,
             last_scratch_frame: None,
             output_graph: None,
+            recording: false,
         }
     }
 
@@ -2233,6 +2255,145 @@ impl DeckAudioPipeline {
         for key in inner.output_branches.drain(..) {
             g.detach(&key);
         }
+    }
+
+    /// Attach a recording tap to this deck's already-running pipeline. No-op if a tap is
+    /// already attached — `AudioManager` calls this once per currently-loaded deck when a
+    /// recording starts, and again from `load()` for any deck that loads while a recording
+    /// is already in progress, so it must tolerate being asked twice.
+    ///
+    /// Gain staging deliberately mirrors `build_main_branches()` exactly (`gain * vol *
+    /// deck_master`) — the recording should sound like the main output, not a separate mix.
+    ///
+    /// Unlike `build_main_branches()`/`build_cue_branch()`, this is not woven into `load()`'s
+    /// own element construction — it runs standalone, either well after `load()` returns (the
+    /// deck normally already PLAYING) or from the tail of `load()` itself when `recording` is
+    /// already true (the reload self-heal below). Either way every element added here must be
+    /// explicitly synced to the pipeline's current state (PLAYING or the just-prerolled
+    /// PAUSED) before the tee pad is linked; skipping that turns a live tee pushing into a
+    /// NULL sink pad into a pipeline error instead of silence.
+    ///
+    /// The tee itself is not a stored field — found live via `output_queue_el`'s src pad peer,
+    /// the same technique the pad-graph-walk test below uses, since request-pad topology can't
+    /// be captured once at construction time anyway (this call is what adds a pad to it).
+    ///
+    /// ⚠️ **Structural cue exclusion**: this branch is wired directly off that tee, upstream
+    /// of `cue_valve_el`/`cue_volume_el`. There is no path from the cue chain into a recording.
+    pub fn attach_record_branch(&mut self) -> Result<(), String> {
+        let deck_id = self.deck_id.clone();
+        let Some(graph) = self.output_graph.clone() else {
+            return Err(format!("[audio/{deck_id}] recording requires the shared output graph"));
+        };
+        let deck_master = self.deck_master_factor();
+        let (gain, vol) = (self.gain, self.vol);
+        let inner = self.inner.as_mut().ok_or_else(|| format!("[audio/{deck_id}] not loaded"))?;
+        if inner.record_branch.is_some() {
+            return Ok(());
+        }
+
+        let oq_src = inner.output_queue_el.static_pad("src")
+            .ok_or_else(|| format!("[{deck_id}] output_queue: no src pad"))?;
+        let tee_sink = oq_src.peer()
+            .ok_or_else(|| format!("[{deck_id}] output_queue not linked to tee"))?;
+        let tee = tee_sink.parent_element()
+            .ok_or_else(|| format!("[{deck_id}] tee sink pad has no parent"))?;
+
+        let record_vol = make_el("volume")?;
+        record_vol.set_property("volume", (gain * vol * deck_master) as f64);
+        let appsink = make_appsink(&format!("{deck_id}/record"))?;
+
+        inner.pipeline.add_many([&record_vol, &appsink])
+            .map_err(|e| format!("[{deck_id}] pipeline add record branch: {e}"))?;
+        record_vol.link(&appsink).map_err(|e| format!("[{deck_id}] record volume→appsink: {e}"))?;
+        record_vol.sync_state_with_parent()
+            .map_err(|e| format!("[{deck_id}] record volume sync_state: {e}"))?;
+        appsink.sync_state_with_parent()
+            .map_err(|e| format!("[{deck_id}] record appsink sync_state: {e}"))?;
+
+        let tee_pad = tee.request_pad_simple("src_%u")
+            .ok_or_else(|| format!("[{deck_id}] tee: could not request record src pad"))?;
+        let vol_sink_pad = record_vol.static_pad("sink")
+            .ok_or_else(|| format!("[{deck_id}] record volume: no sink pad"))?;
+        if let Err(e) = tee_pad.link(&vol_sink_pad) {
+            tee.release_request_pad(&tee_pad);
+            let _ = inner.pipeline.remove(&record_vol);
+            let _ = inner.pipeline.remove(&appsink);
+            return Err(format!("[{deck_id}] tee→record volume: {e}"));
+        }
+
+        let key: BranchKey = (deck_id.clone(), "record".to_string());
+        let label = format!("{deck_id}/record");
+        let appsrc_result = graph.lock().unwrap().attach(RECORD_DEVICE_KEY, key.clone(), &label);
+        let appsrc = match appsrc_result {
+            Ok(a) => a,
+            Err(e) => {
+                // Unwind exactly like OutputGraph::detach() would: unlink before removing,
+                // stop elements before either.
+                let _ = record_vol.set_state(gst::State::Null);
+                let _ = appsink.set_state(gst::State::Null);
+                // `tee_pad` is the src pad (a tee's request pad is always src); `unlink`
+                // must be called on the src pad with the sink pad as the argument
+                // (`gst_pad_unlink(srcpad, sinkpad)`) — the reverse order trips a
+                // `GST_PAD_IS_SRC` assertion (CRITICAL, not fatal, but leaves the pad
+                // unlinked-in-name-only) without actually unlinking anything.
+                if let Some(peer) = tee_pad.peer() {
+                    let _ = tee_pad.unlink(&peer);
+                }
+                tee.release_request_pad(&tee_pad);
+                let _ = inner.pipeline.remove(&record_vol);
+                let _ = inner.pipeline.remove(&appsink);
+                return Err(format!("[{deck_id}] could not attach record branch to output graph: {e}"));
+            }
+        };
+        let appsink_ref = appsink.downcast_ref::<AppSink>()
+            .ok_or_else(|| format!("[{label}] appsink downcast failed"))?;
+        wire_handoff(appsink_ref, appsrc, label);
+
+        inner.output_branches.push(key);
+        inner.record_branch = Some(RecordBranch { tee_pad, volume: record_vol, appsink });
+        self.recording = true;
+        log::info!("[audio/{deck_id}] record branch attached");
+        Ok(())
+    }
+
+    /// Detach this deck's recording tap, if one is attached. Safe to call unconditionally —
+    /// `AudioManager` calls this on every loaded deck when a recording stops.
+    ///
+    /// This only tears down the *deck-local* half (unlink from this deck's tee, remove the
+    /// elements). It does not send EOS anywhere: `OutputGraph::detach()` treats an appsrc
+    /// going away the same way an idle branch already behaves (silent, not flushed), so the
+    /// recording file's own EOS/finalization has to come from the recording node's pipeline
+    /// directly, once every deck has detached — that lives on the `RecordingSink`/`OutputGraph`
+    /// side, not here.
+    pub fn detach_record_branch(&mut self) {
+        self.recording = false;
+        let Some(inner) = self.inner.as_mut() else { return };
+        let Some(branch) = inner.record_branch.take() else { return };
+        let key: BranchKey = (self.deck_id.clone(), "record".to_string());
+        if let Some(ref graph) = self.output_graph {
+            graph.lock().unwrap().detach(&key);
+        }
+        inner.output_branches.retain(|k| k != &key);
+
+        // Order matters: unlink before releasing the request pad, stop elements before
+        // either — same ordering OutputGraph::detach() uses, for the same reason (avoid the
+        // mixer/tee seeing a half-torn branch on its streaming thread).
+        let _ = branch.volume.set_state(gst::State::Null);
+        let _ = branch.appsink.set_state(gst::State::Null);
+        // `branch.tee_pad` is the src pad — see the matching comment in
+        // `attach_record_branch()`'s rollback path; same backwards-argument bug, same fix.
+        // Live-caught by `record_tap_survives_a_reload`: a `GST_PAD_IS_SRC` CRITICAL on every
+        // detach, which meant the pad was never actually unlinked before the request pad was
+        // released underneath it.
+        if let Some(peer) = branch.tee_pad.peer() {
+            let _ = branch.tee_pad.unlink(&peer);
+        }
+        if let Some(tee) = branch.tee_pad.parent_element() {
+            tee.release_request_pad(&branch.tee_pad);
+        }
+        let _ = inner.pipeline.remove(&branch.volume);
+        let _ = inner.pipeline.remove(&branch.appsink);
+        log::info!("[audio/{}] record branch detached", self.deck_id);
     }
 
     pub fn set_eos_callback(&mut self, f: impl Fn() + Send + Sync + 'static) {
@@ -3193,7 +3354,26 @@ impl DeckAudioPipeline {
             cue_sink_flow,
             output_branches,
             output_latency_ns,
+            record_branch: None,
         });
+
+        // `load()` rebuilds PipelineInner from scratch, which throws away the previous
+        // record tap along with everything else — `recording` is the one piece of intent
+        // that survives on the outer struct (see its doc comment), so re-attach here rather
+        // than leaving a mid-recording track/device change silently drop this deck from the
+        // file. Not fatal on failure — a recording missing one deck's audio is still a
+        // recording; log loudly and let the rest of the load succeed.
+        if self.recording {
+            self.recording = false; // let attach_record_branch() re-set it on success
+            if let Err(e) = self.attach_record_branch() {
+                log::error!(
+                    "[audio/{}] could not re-attach record branch after reload: {e} — this \
+                     deck's audio will be missing from the recording until the next reload",
+                    self.deck_id
+                );
+            }
+        }
+
         Ok(duration)
     }
 
@@ -6408,6 +6588,74 @@ mod scratch_smoke_test {
 
         deck.pause().expect("final pause");
         println!("set_devices_back_to_back_preserves_playing OK");
+    }
+
+    /// Item 3 of the recording feature: a track/device reload while a recording is in
+    /// progress must not silently drop this deck out of the file. `load()` rebuilds
+    /// `PipelineInner` from scratch on every reload — `set_devices()` is the simplest real
+    /// reload path a deck ever takes (it just calls `self.load()` again), so it stands in
+    /// for any of them here. The thing actually under test is the `recording` flag surviving
+    /// on the outer `DeckAudioPipeline` struct and `load()`'s self-heal consulting it — see
+    /// both their doc comments.
+    ///
+    /// Needs a real audio device for the deck's own *main* branch (the recording node itself
+    /// is synthetic — an encoder chain, no hardware), hence `#[ignore]`:
+    ///   cargo test record_tap_survives_a_reload -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn record_tap_survives_a_reload() {
+        init_test_logger();
+        gst::init().expect("gst init");
+        std::env::set_var("CUEMARK_SHARED_OUTPUT", "1");
+        let path = soak_env("CUEMARK_TEST_AUDIO", SOAK_A);
+        assert!(std::path::Path::new(&path).exists(), "missing test media {path} — see SOAK_A's doc comment");
+
+        let out_path = std::env::temp_dir()
+            .join(format!("cuemark-record-reload-test-{}.opus.ogg", std::process::id()));
+        let _ = std::fs::remove_file(&out_path);
+
+        let graph = Arc::new(Mutex::new(OutputGraph::new()));
+        graph.lock().unwrap().set_record_target(out_path.clone(), crate::audio::record::RecordFormat::Opus);
+
+        let mut deck = DeckAudioPipeline::new("reload-record-test");
+        deck.set_output_graph(graph.clone());
+        deck.load(&path).expect("load"); // main branch → system default sink (devices left empty)
+        deck.attach_record_branch().expect("attach record branch");
+        assert!(deck.recording, "recording flag should be set after a successful attach");
+        assert!(
+            deck.inner.as_ref().unwrap().record_branch.is_some(),
+            "record branch should be attached right after attach_record_branch()"
+        );
+
+        deck.play().expect("play");
+        std::thread::sleep(Duration::from_millis(300));
+
+        // The reload: same shape (fresh PipelineInner) as a track or device change mid-recording.
+        deck.set_devices(&[]).expect("reload via set_devices");
+
+        assert!(
+            deck.inner.as_ref().unwrap().record_branch.is_some(),
+            "record branch must survive load()'s PipelineInner rebuild via the self-heal — \
+             this is the bug item 3 exists to fix"
+        );
+        assert!(deck.recording, "recording flag must still be set after reload");
+        assert!(deck.is_playing(), "reload must not have dropped playback either");
+
+        std::thread::sleep(Duration::from_millis(500));
+        deck.pause().expect("pause");
+        deck.detach_record_branch();
+        assert!(!deck.recording, "recording flag must clear on explicit detach");
+        assert!(deck.inner.as_ref().unwrap().record_branch.is_none());
+
+        graph.lock().unwrap().finish_recording().expect("finish_recording");
+        let written = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            written > 0,
+            "reload survived the flag/topology checks but no audio actually reached the \
+             recording file at {out_path:?}"
+        );
+        let _ = std::fs::remove_file(&out_path);
+        println!("record_tap_survives_a_reload OK");
     }
 
     /// **Cue-branch sibling of `sink_flow_gap_gating`** (2026-08-08,

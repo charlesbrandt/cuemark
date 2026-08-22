@@ -1,17 +1,30 @@
-/// Session recording: taps the master mix tee and encodes to a file.
+/// Session recording: encodes to a file, structurally excluding cue/headphone audio.
 ///
-/// The recording sink chain attaches to MasterMix's output tee on start
-/// and releases its pad on stop, leaving the live output uninterrupted.
+/// This struct is just the on/off flag and the target path/format — a deliberately thin
+/// state holder. The actual GStreamer wiring lives in two other places, since a recording
+/// spans every deck plus a dedicated output-graph node, neither of which `RecordingSink`
+/// has any access to:
+///   - `DeckAudioPipeline::attach_record_branch()`/`detach_record_branch()` (`pipeline.rs`)
+///     tap each deck directly off its own tee, upstream of `cue_valve`/`cue_volume` — there
+///     is no graph edge from the cue chain into a recording, by construction, not convention.
+///   - `OutputGraph`'s `RECORD_DEVICE_KEY` node (`mixer.rs`) — `set_record_target()`,
+///     `create_node()`'s encoder chain, and `finish_recording()`'s EOS-and-teardown — mirrors
+///     every other output node except that it is explicitly torn down on stop rather than
+///     retained for the process's life.
+/// `AudioManager::audio_record_start`/`audio_record_stop` (`mod.rs`) are what actually call
+/// all of the above, for every currently-loaded deck.
 ///
-/// Supported formats:
-///   "opus"  → Opus audio in OGG container  (lossy, small files)
-///   "flac"  → FLAC audio in Matroska container (lossless, archival)
+/// Supported formats — both mux into Ogg, deliberately: Ogg pages are self-delimiting and
+/// written sequentially with no footer/index to finalize, so a recording cut off by a crash
+/// (app kill, power loss) is still a valid, playable file up to the last completed page. See
+/// `mixer.rs`'s `build_record_sink_chain()` doc comment for why FLAC moved off Matroska to
+/// get the same property.
+///   "opus"  → Opus audio in Ogg container   (lossy, small files)
+///   "flac"  → FLAC audio in Ogg container   (lossless, archival, crash-safe like opus)
 ///
-/// GStreamer chain (once wired in step 8):
-///   [tee src pad] → queue → audioconvert → audioresample
-///     → opusenc|flacenc → oggmux|matroskamux → filesink
-///
-/// Step 1 / stub: struct and command signatures only.
+/// GStreamer chain, per deck, into the shared record node:
+///   [deck tee src pad] → volume → appsink ⇒ handoff ⇒ appsrc → queue → matrix → caps → mixer
+///     → master_volume → audioconvert → audioresample → opusenc|flacenc → oggmux → filesink
 
 use serde::{Deserialize, Serialize};
 
@@ -46,8 +59,11 @@ impl RecordingSink {
         }
     }
 
-    /// Attach to the master mix tee and begin writing to `output_path`.
-    /// No-op if already recording.
+    /// Record the on/off flag and the chosen target. Errors (does not no-op) if already
+    /// recording — the caller (`AudioManager::audio_record_start`) is expected to check
+    /// `is_active()` if it wants idempotent behavior instead. Building the actual GStreamer
+    /// chain (the output graph's record node, then every deck's tap into it) is the caller's
+    /// job too — see this module's doc comment for why `RecordingSink` itself doesn't do it.
     pub fn start(
         &mut self,
         output_path: std::path::PathBuf,
@@ -59,12 +75,12 @@ impl RecordingSink {
         self.output_path = Some(output_path);
         self.format = format;
         self.active = true;
-        // Step 8: build encoder chain and link to tee.
         log::info!("[record] start recording to {:?} ({})", self.output_path, self.format);
         Ok(())
     }
 
-    /// Detach from the tee, flush, and close the file.
+    /// Clear the on/off flag. As with `start()`, tearing down the actual GStreamer chain
+    /// (every deck's tap, then the record node's own EOS-and-teardown) is the caller's job.
     pub fn stop(&mut self) -> Result<(), String> {
         if !self.active {
             return Err("not recording".into());

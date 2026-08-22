@@ -281,7 +281,18 @@ this Xvfb one and whatever is running on the user's desktop — loads the same o
 `~/.local/share/com.cuemark.app/`. **Every `cuemark:`-prefixed `persistentWritable`
 written through the debug hook escapes the test and changes the user's actual app**,
 permanently, across restarts: `cuemark:videoPathOverride` (per-deck legacy/webcodecs),
-`cuemark:videoPathDefault`, and the audio-settings stores.
+`cuemark:videoPathDefault`, `cuemark:recordingsDir` (the recording feature's auto-save
+folder), and the audio-settings stores.
+
+`persistentWritable` reads `localStorage` once, at module load — setting a new key via
+`execute/sync` after the page has already loaded does **not** take effect until the next full
+navigation. `execute/async` with `location.reload()` in the same script works (this is the
+"reload from inside an async script" case documented in "A real navigation triggered from
+OUTSIDE a WebDriver command" below, not the external-navigation one) — expect the reload
+itself to error the outer call (`"no such frame"`/`"Callback was not called before the unload
+event"`), harmless, since the navigation raced the callback, not the session. Re-check
+`typeof window.__cuemarkDebug` after the reload before trusting the session is still alive,
+same as any other in-script reload.
 
 This is not hypothetical. On 2026-08-13 a **green 10/10** `latency-test.sh` run left
 `{"deck-0":"legacy"}` behind — the script forces deck-0 onto the legacy backend in its
@@ -395,6 +406,38 @@ they had open with a driven instance, and every device-list change is audible.
 6. **Tear down and relaunch the user's normal `cargo tauri dev` session afterward** —
    don't leave them on a debug-hook-enabled driven instance. Same commands as
    "Tear down" above, then relaunch per the `run-app` skill.
+
+### Testing a feature that needs sustained real audio over a whole test run (e.g. recording, 2026-08-22)
+
+Verifying the recording feature (`RecordPanel.svelte` clicks driving real `audio_record_start`/
+`stop`) end-to-end surfaced two things worth carrying into any similar multi-step test:
+
+- **A short test clip can run out mid-test just from WebDriver round-trip overhead.** The
+  known-good 49s clip (see "Reuse a locally-cached copy" below) finished playing partway
+  through a sequence of panel-interaction steps (open panel, set notes, check the filename
+  preview, click Start) — each `execute/sync` round trip and `sleep` between them adds up
+  faster than it feels like while scripting it. For anything that needs audio to keep flowing
+  for the *whole* test, not just at the moment of a single check, re-seek the deck to 0 right
+  before the timed window that actually matters:
+  ```js
+  window.__cuemarkDebug.seek("deck-0", 0);
+  window.__cuemarkDebug.updateDeck("deck-0", {playing: true});
+  ```
+  rather than trusting that the original `play()` call several steps back is still producing
+  audio by the time you get around to sampling something.
+- **`deck.playing` did not flip to `false` after the clip's real EOS in this run** — contrary
+  to what item 5 above says should happen. Raw position (`audio_get_position`) climbed well
+  past the file's own duration (148s+ on a 49s clip) with `getSession().decks[0].playing` still
+  reading `true`; only `ffmpeg -af silencedetect` on the resulting recording (see the
+  filesink-buffering entry in `audio-debugging`) confirmed real audio actually stopped around
+  the file's real duration, with the shared output graph's per-node silent keepalive
+  (`docs/design/shared-output-pipeline.md`) carrying the "recording" forward as genuine digital
+  silence rather than stalling. **Not fully diagnosed** — could be specific to a debug-hook
+  `updateDeck()`-driven load rather than the normal drag-drop/file-picker path, or a genuine gap
+  in the `deck-eos` handling. Don't assume `playing` alone tells you a deck actually stopped;
+  cross-check `getAudioTime()`/raw position against the file's known duration, and see
+  `audio-debugging`'s `query_position returns wall-clock, not content time` entry for why the
+  raw position number is unreliable as a "has it ended" signal on its own.
 
 ## Lightweight webview probes without the app (python3-gi)
 

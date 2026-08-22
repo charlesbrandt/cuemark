@@ -38,6 +38,7 @@ use gstreamer_app::{AppSink, AppSinkCallbacks, AppSrc};
 use super::pipeline::{
     deck_output_caps, make_sink, parse_device_remap, parse_snapcast_device, ChannelRemap,
 };
+use super::record::RecordFormat;
 
 /// Jitter buffer between a deck's handoff and the mixer pad.
 ///
@@ -51,6 +52,13 @@ const MIX_QUEUE_NS: u64 = 30_000_000; // 30ms
 /// `appsrc` byte cap. With `block=true` this backpressures the appsink's streaming thread,
 /// which backpressures the deck pipeline exactly as `pulsesink` did before.
 const APPSRC_MAX_BYTES: u64 = 64 * 1024;
+
+/// Synthetic device key for the recording node — never a real PipeWire node name, so
+/// `node_key()` (which only strips a `@target` suffix) passes it through unchanged and it
+/// can never collide with an actual device id. `create_node()` must special-case this key to
+/// build an encoder→mux→filesink chain instead of a `pulsesink`; that isn't wired yet, so
+/// attaching to this key currently fails the same way an unreachable real device would.
+pub const RECORD_DEVICE_KEY: &str = "__record__";
 
 /// Identifies one deck output attached to a node: `("deck-0", "main0")` / `("deck-0", "cue")`.
 pub type BranchKey = (String, String);
@@ -100,6 +108,11 @@ pub struct OutputGraph {
     /// `set_extra_latency()`. Empty by default: nothing here is inferred, and nothing is
     /// assumed about any particular server.
     extra_latency: HashMap<String, u64>,
+    /// Where the recording node's encoder chain should write, and in what format — read
+    /// exactly once, by `create_node()`, the moment something first attaches to
+    /// `RECORD_DEVICE_KEY`. Must be set (via `set_record_target()`) before that first attach;
+    /// see that method's doc comment for why this can't just be a parameter on `attach()`.
+    record_target: Option<(std::path::PathBuf, RecordFormat)>,
 }
 
 impl OutputGraph {
@@ -109,7 +122,89 @@ impl OutputGraph {
             master_volume: 1.0,
             shared_clock: None,
             extra_latency: HashMap::new(),
+            record_target: None,
         }
+    }
+
+    /// Declare where the *next* recording should write. Must be called before the first deck
+    /// attaches a `RECORD_DEVICE_KEY` branch for that recording — `create_node()` builds the
+    /// encoder/mux/filesink chain once, at node-creation time, and (like every other node)
+    /// has no mechanism to change a sink's target after the fact.
+    ///
+    /// ⚠️ Unlike a real device node, the record node is not meant to be retained for the life
+    /// of the process — see `create_node()`'s doc comment on why every other node is. Whatever
+    /// calls this is responsible for calling `finish_recording()` when the recording stops
+    /// (after every deck has detached), or the file's muxer trailer is never flushed and a
+    /// second recording in the same session has nowhere to attach a *new* target.
+    pub fn set_record_target(&mut self, path: std::path::PathBuf, format: RecordFormat) {
+        self.record_target = Some((path, format));
+    }
+
+    /// Finalize and tear down the recording node: send EOS, wait for it to drain through the
+    /// encoder/muxer to the `filesink` (or an error, or a timeout), then set that pipeline to
+    /// `Null` and drop it from `self.nodes` entirely.
+    ///
+    /// ⚠️ Unlike every other node — retained for the life of the process, see
+    /// `create_node()`'s doc comment — this one must not be, or the muxer trailer is never
+    /// flushed and a second recording has nowhere to attach a fresh target. No-op if no
+    /// recording is in progress (the node was never created, or this was already called).
+    ///
+    /// Must be called only after every deck has detached its `RECORD_DEVICE_KEY` branch
+    /// (`DeckAudioPipeline::detach_record_branch()`) — EOS sent while a deck's appsrc branch
+    /// is still attached races that branch's own buffers and the muxer can see a torn pad.
+    ///
+    /// ⚠️ **The record node deliberately gets no `watch_bus()`** (unlike every other node —
+    /// see the `node_name == RECORD_DEVICE_KEY` guard in `create_node()`). `watch_bus`'s
+    /// `bus.add_watch()` and this method's `bus.timed_pop_filtered()` are two independent
+    /// consumers of the same underlying message queue with no ordering guarantee between
+    /// them — the async watch can steal the EOS this method is blocking on, or this method
+    /// can steal an error the watch would otherwise have logged live. Making this method the
+    /// bus's sole consumer for the node's whole life avoids that race; the trade is that an
+    /// error during the recording (disk full, encoder fault) is only reported here, at stop
+    /// time, rather than live — acceptable since `GstBus` retains unpopped messages, so
+    /// nothing is lost, only delayed.
+    pub fn finish_recording(&mut self) -> Result<(), String> {
+        self.record_target = None;
+        let Some(node) = self.nodes.remove(RECORD_DEVICE_KEY) else {
+            return Ok(());
+        };
+
+        let bus = node.pipeline.bus().expect("a Pipeline always has a bus");
+        if !node.pipeline.send_event(gst::event::Eos::new()) {
+            log::warn!("[audio/out/record] send_event(Eos) was not handled by any element");
+        }
+
+        let timeout = gst::ClockTime::from_seconds(5);
+        let result = match bus.timed_pop_filtered(timeout, &[gst::MessageType::Eos, gst::MessageType::Error]) {
+            Some(msg) => match msg.view() {
+                gst::MessageView::Eos(_) => {
+                    log::info!("[audio/out/record] recording finalized cleanly (EOS)");
+                    Ok(())
+                }
+                gst::MessageView::Error(e) => {
+                    let err = format!(
+                        "recording pipeline error during finalize: {} ({:?})",
+                        e.error(), e.debug()
+                    );
+                    log::error!("[audio/out/record] {err} — file may be truncated/unplayable");
+                    Err(err)
+                }
+                _ => unreachable!("filter only matches Eos/Error"),
+            },
+            None => {
+                let err = format!(
+                    "recording did not reach EOS within {timeout} — file may be truncated/unplayable"
+                );
+                log::error!("[audio/out/record] {err}");
+                Err(err)
+            }
+        };
+
+        // Flush regardless of how we got here — Null is what actually closes the filesink's
+        // fd and guarantees stdio buffers hit disk (see the module test's doc comment for why
+        // that matters even after a clean EOS).
+        let _ = node.pipeline.set_state(gst::State::Null);
+        result
     }
 
     /// Declare extra output latency for a device: delay between this process handing audio
@@ -309,7 +404,25 @@ impl OutputGraph {
         );
         let master_volume_el = make("volume")?;
         master_volume_el.set_property("volume", self.master_volume as f64);
-        let sink = make_sink(device, &format!("out/{}", short(&node_name)))?;
+
+        // The record node has no real device sink — it terminates in an encoder/mux/filesink
+        // chain instead of `make_sink()`'s pulsesink/tcpclientsink. `tail` is always at least
+        // one element (`[real sink]` on every other node) so the rest of this function — add,
+        // link, clock/latency query — stays the same shape for both cases; only what's in the
+        // Vec differs. Applying master_volume ahead of it is deliberate, not an oversight: the
+        // recording is meant to sound like the main output (matching the deck-side gain
+        // staging in `attach_record_branch()`), so it should reflect the master fader too.
+        let tail: Vec<gst::Element> = if node_name == RECORD_DEVICE_KEY {
+            let (path, format) = self.record_target.clone().ok_or_else(|| {
+                format!(
+                    "[out/record] a deck tried to attach a recording branch with no target \
+                     set — call OutputGraph::set_record_target() before starting a recording"
+                )
+            })?;
+            build_record_sink_chain(&path, &format)?
+        } else {
+            vec![make_sink(device, &format!("out/{}", short(&node_name)))?]
+        };
 
         // ── Silent keepalive ──────────────────────────────────────────────────────
         // A permanent live source of digital silence on its own mixer pad. It looks like
@@ -342,15 +455,31 @@ impl OutputGraph {
         );
 
         pipeline
-            .add_many([&keepalive, &keepalive_caps, &mixer, &caps_el, &master_volume_el, &sink])
+            .add_many([&keepalive, &keepalive_caps, &mixer, &caps_el, &master_volume_el])
             .map_err(|e| format!("[out/{}] add_many: {e}", short(&node_name)))?;
+        pipeline
+            .add_many(tail.iter().collect::<Vec<_>>())
+            .map_err(|e| format!("[out/{}] add_many (tail): {e}", short(&node_name)))?;
         gst::Element::link_many([&keepalive, &keepalive_caps, &mixer])
             .map_err(|e| format!("[out/{}] keepalive link: {e}", short(&node_name)))?;
-        gst::Element::link_many([&mixer, &caps_el, &master_volume_el, &sink])
+        gst::Element::link_many([&mixer, &caps_el, &master_volume_el])
             .map_err(|e| format!("[out/{}] link: {e}", short(&node_name)))?;
+        master_volume_el
+            .link(&tail[0])
+            .map_err(|e| format!("[out/{}] master_volume→{}: {e}", short(&node_name), tail[0].name()))?;
+        for pair in tail.windows(2) {
+            pair[0]
+                .link(&pair[1])
+                .map_err(|e| format!("[out/{}] {}→{}: {e}", short(&node_name), pair[0].name(), pair[1].name()))?;
+        }
+        let sink = tail.last().expect("tail is non-empty").clone();
 
         let latency_ns = Arc::new(AtomicU64::new(0));
-        watch_bus(&pipeline, &node_name);
+        // The record node is the one exception — see `finish_recording()`'s doc comment on
+        // why it must be the sole consumer of its own bus, for its entire life.
+        if node_name != RECORD_DEVICE_KEY {
+            watch_bus(&pipeline, &node_name);
+        }
 
         // A live pipeline: NO_PREROLL is the expected answer and is itself a check that
         // is-live took on the appsrcs. ASYNC here means the graph is not live and an idle
@@ -662,6 +791,44 @@ fn make(factory: &str) -> Result<gst::Element, String> {
         .map_err(|e| format!("[audio/out] element '{factory}' missing: {e}"))
 }
 
+/// `audioconvert → audioresample → encoder → muxer → filesink` for the record node's tail —
+/// see `record.rs`'s module doc for the format choices. Takes the node's already-mixed,
+/// already-master-volumed stream, so this is deliberately just format conversion + encoding,
+/// nothing gain-related.
+///
+/// Both formats mux into Ogg (`oggmux` accepts `audio/x-flac` directly, verified with
+/// `gst-inspect-1.0 oggmux` — no need for a second muxer). This is deliberate, not
+/// convenience: Ogg pages are self-delimiting and written sequentially with no footer/index
+/// to finalize, so a recording cut off by a crash is a valid, playable file up to the last
+/// completed page. The FLAC path used `matroskamux` until 2026-08-22 — Matroska normally
+/// writes its Cues and finalizes the segment size at EOS, so a crash-truncated `.mkv` could
+/// be missing seek info and wasn't guaranteed to open cleanly. Ogg-FLAC gets the same
+/// crash-safety property the Opus path already had, for free.
+///
+/// `sync=false` on the filesink: this pipeline has no real device downstream to pace against
+/// (unlike every other node's sink), so nothing should throttle it to wall-clock time — it
+/// should encode and write as fast as its inputs (a live mixer) deliver them, same as any
+/// other non-monitoring filesink consumer.
+fn build_record_sink_chain(
+    path: &std::path::Path,
+    format: &RecordFormat,
+) -> Result<Vec<gst::Element>, String> {
+    let convert = make("audioconvert")?;
+    let resample = make("audioresample")?;
+    let encoder = match format {
+        RecordFormat::Opus => make("opusenc")?,
+        RecordFormat::Flac => make("flacenc")?,
+    };
+    let muxer = make("oggmux")?;
+    let filesink = make("filesink")?;
+    filesink.set_property("sync", false);
+    filesink.set_property(
+        "location",
+        path.to_str().ok_or_else(|| format!("record path is not valid UTF-8: {path:?}"))?,
+    );
+    Ok(vec![convert, resample, encoder, muxer, filesink])
+}
+
 /// The bare PipeWire `node.name` a device id targets — everything before `@`. `""` is the
 /// system default, and is a legitimate key: all default-output branches share one node.
 fn node_key(device: &str) -> &str {
@@ -792,7 +959,7 @@ mod tests {
         // wait for the real streaming connection tcpclientsink opens afterward.
         let mut conn = loop {
             let (c, _) = listener.accept().expect("tcpclientsink must connect");
-            c.set_read_timeout(Some(std::time::Duration::from_millis(500))).unwrap();
+            c.set_read_timeout(Some(std::time::Duration::from_millis(3000))).unwrap();
             let mut probe = [0u8; 1];
             match c.peek(&mut probe) {
                 Ok(1..) => break c,
@@ -826,6 +993,102 @@ mod tests {
             with_extra - 250_000_000 + 700_000_000,
             "a latency change must reach an existing node without rebuilding it"
         );
+    }
+
+    /// Attaching to the record key before `set_record_target()` has ever been called must
+    /// fail clearly, not build a garbage/targetless filesink.
+    #[test]
+    fn record_node_requires_target_before_attach() {
+        gst::init().expect("gst init");
+        let mut graph = OutputGraph::new();
+        let err = graph
+            .attach(RECORD_DEVICE_KEY, ("deck-0".to_string(), "record".to_string()), "test/record")
+            .expect_err("attaching with no record target set must fail");
+        assert!(
+            err.contains("set_record_target"),
+            "error should point at the missing setup step, got: {err}"
+        );
+    }
+
+    /// No real audio device involved: the record node's tail is `audioconvert →
+    /// audioresample → opusenc → oggmux → filesink`, driven by nothing but the node's own
+    /// silent keepalive (see create_node's "Silent keepalive" comment) — same as
+    /// `snapcast_node_streams_pcm_and_carries_its_configured_latency` relies on for its
+    /// stream, no deck branch needed to prove the chain itself links and flows.
+    ///
+    /// This proves bytes are encoded and reach disk once the pipeline tears down via a blunt
+    /// `Drop` (every node → `Null`, no EOS) — the path a process exit takes. The normal
+    /// stop-while-recording path is EOS-based (`finish_recording()`,
+    /// `finish_recording_flushes_via_eos_and_removes_node` below) and is a materially
+    /// different code path (it also removes the node, which this test's `Drop` doesn't).
+    ///
+    /// ⚠️ `filesink` buffers writes in userspace (stdio) and only flushes to disk on
+    /// stop/NULL — at near-silent content the tiny opus frames (a handful of bytes each,
+    /// confirmed via `GST_DEBUG=opusenc:6,oggmux:6`: real decorated buffers with correct
+    /// granule positions flow the whole way through within milliseconds) never fill that
+    /// buffer on their own. So `graph` must be dropped (forcing every node to `Null`, which
+    /// is what triggers `GstFileSink`'s flush+close) *before* checking the file — checking
+    /// while still PLAYING is a test bug, not evidence the chain doesn't work, and cost real
+    /// time to tell apart the first time this test was written.
+    #[test]
+    fn record_node_encodes_and_writes_audio() {
+        gst::init().expect("gst init");
+        let path = std::env::temp_dir().join(format!(
+            "cuemark-record-node-test-{}.opus.ogg",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut graph = OutputGraph::new();
+            graph.set_record_target(path.clone(), RecordFormat::Opus);
+            let _appsrc = graph
+                .attach(RECORD_DEVICE_KEY, ("deck-0".to_string(), "record".to_string()), "test/record")
+                .expect("record node must build and reach PLAYING with no audio hardware");
+
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        } // graph drops here — Drop for OutputGraph sets every node to Null, flushing filesink.
+
+        let written = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            written > 0,
+            "record node produced no bytes at {path:?} even after teardown — encoder chain \
+             did not link or flow"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `finish_recording()`'s own path — EOS, not `Drop`'s blunt `Null`. Also proves the
+    /// node is actually gone afterward, not just flushed: a second `set_record_target()` +
+    /// `attach()` in the same process needs somewhere to build a fresh node, and reusing a
+    /// torn-down node's stale target would silently write into an already-finalized file.
+    #[test]
+    fn finish_recording_flushes_via_eos_and_removes_node() {
+        gst::init().expect("gst init");
+        let path = std::env::temp_dir().join(format!(
+            "cuemark-record-finish-test-{}.opus.ogg",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut graph = OutputGraph::new();
+        graph.set_record_target(path.clone(), RecordFormat::Opus);
+        let _appsrc = graph
+            .attach(RECORD_DEVICE_KEY, ("deck-0".to_string(), "record".to_string()), "test/record")
+            .expect("record node must build and reach PLAYING with no audio hardware");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        graph.finish_recording().expect("finish_recording should see a clean EOS");
+
+        let written = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert!(written > 0, "finish_recording produced no bytes at {path:?}");
+
+        let err = graph
+            .attach(RECORD_DEVICE_KEY, ("deck-0".to_string(), "record".to_string()), "test/record")
+            .expect_err("no target set for a second recording — attach must fail, not reuse the torn-down node");
+        assert!(err.contains("set_record_target"), "got: {err}");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A bare id (a genuinely stereo device) and the empty id (system default) are both

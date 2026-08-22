@@ -236,6 +236,24 @@ pub async fn audio_load(app: tauri::AppHandle, cache: State<'_, Arc<MediaCache>>
         pipeline.set_app(app.clone());
         let result = pipeline.load(&load_path); // preroll runs without holding the mutex
 
+        // A brand-new `DeckAudioPipeline` (this deck's first load, or a reload after
+        // audio_unload) starts with `recording: false` — `load()`'s own self-heal
+        // (pipeline.rs, keyed on that flag) only covers a deck that was already tapped
+        // before this reload. This is the other half of item 3: a deck joining the session
+        // for the first time while a recording is already in progress must join it too, not
+        // silently sit out until the next unrelated reload happens to trip the self-heal.
+        if result.is_ok() {
+            let already_recording = state.lock().unwrap().record.is_active();
+            if already_recording {
+                if let Err(e) = pipeline.attach_record_branch() {
+                    log::error!(
+                        "[audio/{deck_id}] could not attach record branch for a deck loaded \
+                         mid-recording: {e} — this deck's audio will be missing from the recording"
+                    );
+                }
+            }
+        }
+
         // Re-insert the pipeline (even on error, to preserve the object for future loads).
         state.lock().unwrap().pipelines.insert(deck_id, pipeline);
 
@@ -624,22 +642,67 @@ pub fn audio_set_cue_gain(state: State<'_, AudioState>, gain: f32) -> Result<(),
     Ok(())
 }
 
+// Async + spawn_blocking, same reasoning as audio_set_main_devices/audio_set_cue_device
+// above: this touches every loaded deck's pipeline, and each attach is a real GStreamer
+// operation (request pad, add/link elements, sync_state_with_parent). Deck ids are
+// collected under a short lock, then each deck is attached via `with_pipeline_detached` —
+// never all of them under one held `AudioManager` lock, which would stall every other
+// deck's play/pause/position-poll IPC for the whole loop.
 #[tauri::command]
-pub fn audio_record_start(
-    state: State<'_, AudioState>,
+pub async fn audio_record_start(
+    app: tauri::AppHandle,
     output_path: String,
     format: RecordFormat,
 ) -> Result<(), String> {
-    state
-        .lock()
-        .unwrap()
-        .record
-        .start(output_path.into(), format)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AudioState>();
+        let output_path: std::path::PathBuf = output_path.into();
+        let deck_ids: Vec<String> = {
+            let mut mgr = state.lock().unwrap();
+            mgr.record.start(output_path.clone(), format.clone())?;
+            mgr.output_graph.lock().unwrap().set_record_target(output_path, format);
+            mgr.pipelines.keys().cloned().collect()
+            // mutex released here
+        };
+        for deck_id in deck_ids {
+            let outcome = with_pipeline_detached(&state, &deck_id, "record_start", |p| p.attach_record_branch());
+            match outcome {
+                Ok(Err(e)) => log::error!("[audio] record_start: deck {deck_id} did not attach: {e}"),
+                Err(e) => log::error!("[audio] record_start: pipeline vanished for {deck_id}: {e}"),
+                Ok(Ok(())) => {}
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
+// Async + spawn_blocking — `finish_recording()` blocks waiting for EOS on the record node's
+// own bus (up to 5s, see its doc comment), which must not happen while holding the
+// `AudioManager` lock: every deck's detach runs first (fast — unlink/remove, no external
+// wait) and releases the lock, then the EOS wait runs against only the output graph's own
+// mutex, so a playing deck's position poll never stalls behind it.
 #[tauri::command]
-pub fn audio_record_stop(state: State<'_, AudioState>) -> Result<(), String> {
-    state.lock().unwrap().record.stop()
+pub async fn audio_record_stop(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AudioState>();
+        let (deck_ids, graph): (Vec<String>, Arc<Mutex<OutputGraph>>) = {
+            let mut mgr = state.lock().unwrap();
+            mgr.record.stop()?;
+            (mgr.pipelines.keys().cloned().collect(), mgr.output_graph.clone())
+            // mutex released here
+        };
+        for deck_id in deck_ids {
+            if let Err(e) = with_pipeline_detached(&state, &deck_id, "record_stop", |p| p.detach_record_branch()) {
+                log::error!("[audio] record_stop: pipeline vanished for {deck_id}: {e}");
+            }
+        }
+        let result = graph.lock().unwrap().finish_recording();
+        result
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Compute waveform peaks (30/s) and beat-grid RMS envelope (210/s) for a file

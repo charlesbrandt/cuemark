@@ -162,6 +162,17 @@ body {
   color: var(--on-accent);
   font-weight: 800;
 }
+.record-toggle.is-recording {
+  background: #e04040;
+  border-color: #e04040;
+  color: #fff;
+  font-weight: 800;
+  animation: record-toggle-blink 1.2s infinite;
+}
+@keyframes record-toggle-blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0.6; }
+}
 .tap-btn { border-color: var(--accent); color: var(--accent); }
 .tap-btn:hover { background: var(--accent-soft); }
 

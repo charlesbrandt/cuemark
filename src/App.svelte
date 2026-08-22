@@ -25,6 +25,8 @@
   import AudioSettings from "./components/AudioSettings.svelte";
   import MidiMonitor from "./components/MidiMonitor.svelte";
   import DiggerQueue from "./components/DiggerQueue.svelte";
+  import RecordPanel from "./components/RecordPanel.svelte";
+  import { isRecording } from "./lib/audio/recordState";
   import { mainOutputDeviceIds, cueOutputDeviceId, cueGain, networkOutputs, outputAttachStatus } from "./lib/audio/audioSettings";
   import { fontScale, queueSidebarWidth } from "./lib/settings/displaySettings";
   import { CodecPlayer, type DemuxInfo } from "./lib/video/codecPlayer";
@@ -62,6 +64,7 @@
   let showMidiMonitor = $state(false);
   let showDiggerQueue = $state(true);
   let showVisualizationPanel = $state(false);
+  let showRecordPanel = $state(false);
 
   const QUEUE_SIDEBAR_MIN_WIDTH = 220;
   const QUEUE_SIDEBAR_MAX_WIDTH = 640;
@@ -826,6 +829,13 @@
       onclick={() => { showMidiMonitor = !showMidiMonitor; }}
       title="Raw MIDI monitor — every message, mapped or not. Bench tool for mapping a controller."
     >MIDI</button>
+    <button
+      class="output-btn record-toggle"
+      class:active={showRecordPanel}
+      class:is-recording={$isRecording}
+      onclick={() => { showRecordPanel = !showRecordPanel; }}
+      title={$isRecording ? "Recording in progress" : "Record the master mix to disk"}
+    >{$isRecording ? "● REC" : "Record"}</button>
     <div class="toolbar-divider"></div>
     <button
       class="output-btn"
@@ -892,6 +902,10 @@
 
       {#if showVisualizationPanel}
         <VisualizationPanel />
+      {/if}
+
+      {#if showRecordPanel}
+        <RecordPanel />
       {/if}
 
       <div class="waveform-stack">
