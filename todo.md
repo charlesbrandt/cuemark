@@ -73,14 +73,38 @@ kick, and confirming the ♩ indicator lands on the kick rather than the raw pre
 
 ## Batch F — MIDI expansion
 
-### MIDI output / LED control (Starlight)
-- Add MIDI output port enumeration + connection in `midi.rs` (midir supports output)
-- On startup: open Starlight output port; sending any Note On/Off typically hands LED control
-  to software and stops the standalone light show
-- Experiment to discover Starlight LED protocol: send Note On to output port; log which buttons
-  light up at which note numbers
-- Sync LEDs to app state: play button on → Note On `0x91/7`; loop on → Note On `0x91/5`; etc.
-- Goal: static/off LEDs during performance so they don't distract
+### MIDI output / LED control
+🛑 **Blocked on multi-controller phase 1** (below) — MIDI output is per-controller like input
+is, and hand-wiring one controller's LED calls into today's single-controller `midi.rs` is
+exactly the mistake §11 of the design doc tells the next session not to make. Build the
+profile system first; LED init sequences are data for it, not bespoke Rust.
+
+**Starlight**: protocol not yet captured. Same experiment as the FLX4 below — send Note On to
+the output port, log which buttons light at which note numbers — is still open.
+
+**DDJ-FLX4**: protocol fully captured live 2026-08-22, `docs/design/controller-mapping.md`
+§8.5/§11 — this is the spec to implement against, not a thing to re-discover:
+- Right deck (`0x99`) pad LEDs: plain Note On/Off echo, vel `7F` on / `00` off, no handshake.
+- Left deck (`0x97`) pad LEDs: same Note On/Off, but only *after* sending the SysEx
+  `F0 00 40 05 00 00 04 05 00 50 02 F7` once. One-time unlock, not per-note.
+- The SysEx handshake has a side effect: it dims the Hot Cue mode-select LEDs on **both**
+  decks. Relight them with Note On `(0x90,0x1B)` (deck 1) / `(0x91,0x1B)` (deck 2), vel `7F`.
+- So the FLX4's LED-init sequence is: **open output port → send SysEx handshake once →
+  relight default-state mode buttons → then plain Note On/Off drives every pad LED on either
+  deck for the rest of the session.**
+- Untested: whether the handshake also recovers the stuck-pulsing state a bad Note sweep can
+  trigger (§11) — if that recurs before this is built, try the handshake before a physical
+  replug. Also untested: CC-based LED control for non-pad LEDs (jog ring, meters, browse
+  encoder) — treat those as their own capture task, don't assume the pad protocol generalizes.
+
+Implementation shape once phase 1 exists:
+- Add MIDI output port enumeration + connection in `midi.rs` (`midir` supports output;
+  `MidiOutputConnection`, opened by the same port-name match phase 1 already does for input).
+- Give each profile an optional `led_init: Vec<RawMidiMessage>` (or equivalent) run once after
+  connect, and a `state → led message` table for ongoing sync (play on → Note On `0x91/7`,
+  loop on → Note On `0x91/5`, etc., per-controller since note numbers aren't portable).
+- Goal: static/off LEDs during performance so they don't distract, with each controller's
+  standalone demo/light-show state fully handed to cuemark on connect.
 
 ### MIDI learn mode
 🟢 **Raw feed + monitor panel DONE 2026-08-17** — `midi-raw` events (gated on the panel
