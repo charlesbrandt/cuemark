@@ -643,18 +643,20 @@
       OUT{deck.loopOut !== null ? ` ${formatDuration(deck.loopOut)}` : ''}
     </button>
     {#each [0.5, 1, 2, 4, 8] as bars}
-      {@const barSec = masterBpm !== null ? (bars * 4 * 60) / masterBpm : null}
+      {@const barSec = deck.bpm !== null ? (bars * 4 * 60) / deck.bpm : null}
       <button
         class="bar-btn"
         onclick={() => {
           if (barSec === null) return;
-          const inTime = deck.loopIn ?? quantizeToGrid(deck.id, getDeckTime(deck.id) ?? 0);
+          // force=true: a bar/beat loop preset is a grid concept by definition,
+          // independent of the global SNAP toggle.
+          const inTime = deck.loopIn ?? quantizeToGrid(deck.id, getDeckTime(deck.id) ?? 0, true);
           updateDeck(deck.id, { loopIn: inTime, loopOut: inTime + barSec, loop: true });
         }}
         disabled={barSec === null || !deck.source}
         title={barSec !== null
           ? `Loop ${bars === 0.5 ? '½' : bars} bar${bars !== 1 ? 's' : ''} (${barSec.toFixed(2)}s)`
-          : 'Set a main beat reference first'}
+          : "Detect this deck's BPM first"}
       >
         {bars === 0.5 ? '½' : bars}
       </button>

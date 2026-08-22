@@ -462,8 +462,11 @@ export function getPhase(deckId: string): number | null {
 
 // Quantizes t to the nearest beat on deck's grid when snapToBeat is on and the
 // deck has a fitted grid (bpm + downbeat); otherwise returns t unchanged.
-export function quantizeToGrid(deckId: string, t: number): number {
-  if (!get(session).snapToBeat) return t;
+// `force` bypasses the snapToBeat toggle (still requires a fitted grid) — for
+// Beat Loop presets, where snapping to the grid is the whole point of the
+// action rather than a user preference.
+export function quantizeToGrid(deckId: string, t: number, force = false): number {
+  if (!force && !get(session).snapToBeat) return t;
   const deck = get(session).decks.find((d) => d.id === deckId);
   if (!deck || deck.bpm === null || deck.downbeat === null) return t;
   const period = 60 / deck.bpm;
