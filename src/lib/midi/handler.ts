@@ -7,7 +7,13 @@ import { audioScratch, audioStopScratch } from "../audio/pipeline";
 import { cueGain, tempoRange, scratchMode, jogSecondsPerRev } from "../audio/audioSettings";
 import { noteScrubInput } from "../audio/scrubStats";
 import { debugLog } from "../debugLog";
+import { pushMarker } from "../digger/api";
 import { get } from "svelte/store";
+
+// Beat Loop pad ladder — index 0-7 (plain pad 1-4, then shift+pad 1-4). Longer lengths
+// on the plain pads by preference (2026-08-22) — most loops in practice are the bigger
+// ones, so shift is reserved for the shorter, more surgical lengths.
+const LOOP_PRESET_BEATS = [4, 8, 16, 32, 0.25, 0.5, 1, 2];
 
 // Buffers the latest deck patch for continuous MIDI controls (rate, gain, volume)
 // and flushes them once per rAF. This decouples the audio path (immediate, via syncRate/…)
@@ -66,6 +72,7 @@ export interface MidiAction {
     | "hot_cue"
     | "hot_cue_set"
     | "loop_toggle"
+    | "loop_preset"
     | "sync_toggle"
     | "headphone_cue"
     | "phase_nudge"
@@ -480,6 +487,26 @@ export async function startMidiListener(): Promise<() => void> {
         if (d) updateDeck(d.id, { loop: !d.loop });
         break;
       }
+      case "loop_preset": {
+        // Beat Loop pads (Loop pad-mode on the controller — same 4 physical pads as hot
+        // cue, index 0-7 across plain+shift). Doubling ladder 1/4..32 beats is the
+        // community-standard "Beat Loop" convention (Pioneer gear and most DJ software),
+        // chosen live 2026-08-22 after capturing the pad-mode's raw MIDI bytes — the
+        // controller doesn't report labels, only note numbers. Mirrors DeckCard's bar
+        // preset buttons exactly: keep the existing loop-in if one is set (so repeated
+        // presses just change length), else start from the current position.
+        if (!deckId || a.index === undefined) break;
+        const d = getDeck(deckId);
+        if (!d) break;
+        const masterBpm = get(session).bpm;
+        if (masterBpm === null) break;
+        const beats = LOOP_PRESET_BEATS[a.index];
+        if (beats === undefined) break;
+        const beatSec = (beats * 60) / masterBpm;
+        const inTime = d.loopIn ?? quantizeToGrid(d.id, getDeckTime(d.id) ?? 0);
+        updateDeck(d.id, { loopIn: inTime, loopOut: inTime + beatSec, loop: true });
+        break;
+      }
       case "hot_cue": {
         if (!deckId || a.index === undefined) break;
         const d = getDeck(deckId);
@@ -494,9 +521,18 @@ export async function startMidiListener(): Promise<() => void> {
         } else {
           const now = getDeckTime(deckId);
           if (now !== null) {
+            const quantized = quantizeToGrid(d.id, now);
             const cues = [...d.hotCues];
-            cues[a.index] = quantizeToGrid(d.id, now);
+            cues[a.index] = quantized;
             updateDeck(d.id, { hotCues: cues });
+            // Without this, a cue set from the controller never reaches Digger, and the
+            // next track (re)load — which seeds deck.hotCues from Digger's stored markers
+            // (DiggerQueue.svelte) — silently reverts it. Reported live 2026-08-22: cues
+            // set via MIDI were gone after a reload; UI-set cues (DeckCard.svelte, which
+            // already pushes) survived.
+            if (d.diggerTrackId !== null) {
+              pushMarker(d.diggerTrackId, Math.round(quantized * 1000), 'hot_cue', `Hot cue ${a.index + 1}`).catch(console.error);
+            }
           }
         }
         break;
@@ -507,9 +543,13 @@ export async function startMidiListener(): Promise<() => void> {
         if (!d) break;
         const now = getDeckTime(deckId);
         if (now !== null) {
+          const quantized = quantizeToGrid(d.id, now);
           const cues = [...d.hotCues];
-          cues[a.index] = quantizeToGrid(d.id, now);
+          cues[a.index] = quantized;
           updateDeck(d.id, { hotCues: cues });
+          if (d.diggerTrackId !== null) {
+            pushMarker(d.diggerTrackId, Math.round(quantized * 1000), 'hot_cue', `Hot cue ${a.index + 1}`).catch(console.error);
+          }
         }
         break;
       }

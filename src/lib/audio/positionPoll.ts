@@ -169,6 +169,18 @@ export function pollDeckPosition(
       } else {
         codecPlayer.setClock(contentPos, d?.playing ?? false);
       }
+    } else if (isAudioOnlyDeck(capturedDeckId)) {
+      // Audio-only decks have neither a codecPlayer nor a working <video>
+      // ontimeupdate: the legacy fallback element never reaches a ready state
+      // with nothing to decode (see legacyVideo.ts / the "Transport readout
+      // frozen" note), so v.ontimeupdate's loop check never fires either. This
+      // poll is the only place left that can see loopOut being crossed —
+      // confirmed missing live 2026-08-22: loop bounds set correctly (waveform
+      // showed the region), playback just ran straight through them.
+      const d = get(session).decks.find((dd) => dd.id === capturedDeckId);
+      if (!scratching && d?.loop && d.loopIn !== null && d.loopOut !== null && contentPos >= d.loopOut) {
+        audioSeek(capturedDeckId, d.loopIn).catch(console.error);
+      }
     }
   }).catch(() => { pendingPos.delete(capturedDeckId); });
 }

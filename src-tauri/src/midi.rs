@@ -28,6 +28,11 @@ pub enum MidiAction {
     HotCue { deck_id: String, index: u8 },
     HotCueSet { deck_id: String, index: u8 },
     LoopToggle { deck_id: String },
+    /// Beat-loop pad (Loop pad-mode, same 4 physical pads as HotCue — the controller
+    /// firmware remaps them, see `(0x91, 15/16)` in `hercules_starlight_map`). index
+    /// 0-7 (plain + shift) selects a beat length; TypeScript owns the length table and
+    /// the BPM math (see `docs/design/controller-mapping.md`'s Rust/TS value-mapping seam).
+    LoopPreset { deck_id: String, index: u8 },
     SyncToggle { deck_id: String },
     HeadphoneCue { deck_id: String },
     PhaseNudge { deck_id: String },
@@ -237,6 +242,7 @@ pub enum ControlBinding {
     HotCue { deck_id: String, index: u8 },
     HotCueSet { deck_id: String, index: u8 },
     LoopToggle { deck_id: String },
+    LoopPreset { deck_id: String, index: u8 },
     SyncToggle { deck_id: String },
     HeadphoneCue { deck_id: String },
     // Nudge deck phase toward the reference deck's phase. No free button on the
@@ -299,6 +305,17 @@ fn hercules_starlight_map() -> MidiMap {
     m.insert((0x96, 9),  ControlBinding::HotCueSet { deck_id: "deck-0".into(), index: 1 });
     m.insert((0x96, 10), ControlBinding::HotCueSet { deck_id: "deck-0".into(), index: 2 });
     m.insert((0x96, 11), ControlBinding::HotCueSet { deck_id: "deck-0".into(), index: 3 });
+    // Same 4 pads, Loop pad-mode (controller firmware remaps them — see the mode-button
+    // note near the end of this map). Captured live 2026-08-22: plain = d1 16-19, shift
+    // = d1 24-27, exactly the hot-cue layout offset by +16.
+    m.insert((0x96, 16), ControlBinding::LoopPreset { deck_id: "deck-0".into(), index: 0 });
+    m.insert((0x96, 17), ControlBinding::LoopPreset { deck_id: "deck-0".into(), index: 1 });
+    m.insert((0x96, 18), ControlBinding::LoopPreset { deck_id: "deck-0".into(), index: 2 });
+    m.insert((0x96, 19), ControlBinding::LoopPreset { deck_id: "deck-0".into(), index: 3 });
+    m.insert((0x96, 24), ControlBinding::LoopPreset { deck_id: "deck-0".into(), index: 4 });
+    m.insert((0x96, 25), ControlBinding::LoopPreset { deck_id: "deck-0".into(), index: 5 });
+    m.insert((0x96, 26), ControlBinding::LoopPreset { deck_id: "deck-0".into(), index: 6 });
+    m.insert((0x96, 27), ControlBinding::LoopPreset { deck_id: "deck-0".into(), index: 7 });
 
     // ── Right deck (ch 3) ─────────────────────────────────────────────────
     m.insert((0x92, 7),  ControlBinding::DeckPlayToggle { deck_id: "deck-1".into() });
@@ -320,6 +337,15 @@ fn hercules_starlight_map() -> MidiMap {
     m.insert((0x97, 9),  ControlBinding::HotCueSet { deck_id: "deck-1".into(), index: 1 });
     m.insert((0x97, 10), ControlBinding::HotCueSet { deck_id: "deck-1".into(), index: 2 });
     m.insert((0x97, 11), ControlBinding::HotCueSet { deck_id: "deck-1".into(), index: 3 });
+    // Loop pad-mode, right deck — same +16 offset, captured live 2026-08-22.
+    m.insert((0x97, 16), ControlBinding::LoopPreset { deck_id: "deck-1".into(), index: 0 });
+    m.insert((0x97, 17), ControlBinding::LoopPreset { deck_id: "deck-1".into(), index: 1 });
+    m.insert((0x97, 18), ControlBinding::LoopPreset { deck_id: "deck-1".into(), index: 2 });
+    m.insert((0x97, 19), ControlBinding::LoopPreset { deck_id: "deck-1".into(), index: 3 });
+    m.insert((0x97, 24), ControlBinding::LoopPreset { deck_id: "deck-1".into(), index: 4 });
+    m.insert((0x97, 25), ControlBinding::LoopPreset { deck_id: "deck-1".into(), index: 5 });
+    m.insert((0x97, 26), ControlBinding::LoopPreset { deck_id: "deck-1".into(), index: 6 });
+    m.insert((0x97, 27), ControlBinding::LoopPreset { deck_id: "deck-1".into(), index: 7 });
 
     // ── Global (ch 1) ─────────────────────────────────────────────────────
     // Crossfader: 14-bit pair — CC 0 (MSB) mapped; CC 32 (LSB) ignored
@@ -401,6 +427,9 @@ fn resolve_action(binding: &ControlBinding, data2: u8) -> Option<MidiAction> {
         }
         ControlBinding::LoopToggle { deck_id } => {
             (data2 > 0).then_some(MidiAction::LoopToggle { deck_id: deck_id.clone() })
+        }
+        ControlBinding::LoopPreset { deck_id, index } => {
+            (data2 > 0).then_some(MidiAction::LoopPreset { deck_id: deck_id.clone(), index: *index })
         }
         ControlBinding::SyncToggle { deck_id } => {
             (data2 > 0).then_some(MidiAction::SyncToggle { deck_id: deck_id.clone() })
