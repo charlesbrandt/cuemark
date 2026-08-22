@@ -2,10 +2,14 @@
 
 Status: 📐 **DESIGN, with phase 3 built.** Written 2026-08-17, prompted by a
 **Pioneer DJ DDJ-FLX4** on order. The raw MIDI monitor (§7a) was built and verified the
-same day — see the status note in §7. Everything else here is unbuilt. No FLX4 has been
-plugged in yet, so every claim below about that specific device is marked ❓ and must be
-captured before it is designed against — see §8, which is the part to read first when the
-box arrives.
+same day — see the status note in §7. Everything else here is unbuilt.
+
+**2026-08-22: the FLX4 arrived and §8's unknown list is mostly captured** — 6 of 7 items
+resolved live (jog encoding, pad modes, deck-slot count, tempo fader, audio-interface shape;
+LED protocol partially). See §8 for the findings and **§11 for the LED-protocol handoff** —
+that's the one open item with real next steps written down. Phase 4 (author the actual
+`pioneer-ddj-flx4` profile) can start once phase 1 (profiles-as-data) exists; today's session
+only captured facts, it did not build the profile system.
 
 The Starlight mapping as it stands is not wrong; it is *singular*. Every layer assumes
 exactly one controller, known at compile time, with the Starlight's specific encodings baked
@@ -322,32 +326,59 @@ with the monitor (§7a), across the mode change, before writing a single profile
 1. **Does it enumerate as class-compliant MIDI on Linux at all, and in what mode?** Some
    Pioneer units need a button held at power-on to leave their host-software mode. Check
    `aconnect -l` / `amidi -l` before the app touches it.
-2. **Jog encoding, and whether ticks are plain ±1 deltas.** Run the existing calibration
-   procedure verbatim — `docs/design/waveform-scrub.md`'s `[jog-cal/…]`: one revolution
-   slowly, one quickly, compare `absSum`. Equal ⇒ deltas, accumulation exact, and
-   `VINYL_TICKS_PER_REV` gets an FLX4 value. Unequal ⇒ speed-scaled, and a single scale
-   constant cannot be correct for it. This is a *per-controller* constant the moment there
-   are two controllers, so it moves into the profile either way.
-3. **Pad modes: firmware-side or host-tracked?** Capture one pad across a pad-mode button
-   press, exactly as the Bass/Filter knob was captured (`skills/midi/SKILL.md` shows the
-   capture and what the answer looked like). Different note per mode ⇒ table rows, no host
-   state, done. Same note per mode ⇒ §6 applies and it becomes a code feature.
-4. **Deck 1/3, 2/4 switch: does the surface change channel, or does it expect the host to
-   track it?** Same capture shape as (3). Determines whether §3.2's slots are free or need a
-   mode layer.
+2. ✅ **RESOLVED 2026-08-22 — plain ±1 deltas, accumulation exact, no speed-scaling.**
+   Measured via the raw monitor's Save-capture export (segmented by jog-touch note on/off
+   boundaries, not by shell timing — freehand single-revolution trials were unusably noisy,
+   off by as much as 4× on a miscount): 5 slow revolutions = 3602 ticks (720.4/rev,
+   3.65s/rev pace), 5 fast revolutions = 3615 abs ticks (723.0/rev, 1.80s/rev pace — landed
+   almost exactly on real 33⅓rpm). **0.4% apart ⇒ equal**, same conclusion as the Starlight.
+   Byte values `63/65/66` centered on `64` confirm **`offset64` encoding** (not two's
+   complement like the Starlight — `-1` there would be `0x7F`, not `0x3F`). Candidate
+   `VINYL_SEC_PER_TICK` for the FLX4: `1.8 / 721.7 ≈ 0.0025` (vs. the Starlight's
+   `1.8/256`) — a *per-controller* value, confirming this belongs in the profile
+   (`docs/design/waveform-scrub.md`'s `VINYL_SEC_PER_TICK`), not a shared constant, the
+   moment a second controller exists. Jog turn while touched is CC `0x22` (control 34);
+   CC `0x21` (control 33) fires for untouched/pitch-bend rotation — matches the Mixxx
+   mapping's split exactly. Not yet wired into a real binding — no FLX4 map entry exists,
+   this is a captured fact for when phase 4 authors one.
+3. ✅ **RESOLVED 2026-08-22 — firmware-side, same shape as the Starlight's tone knob.**
+   Captured the top-left pad (deck 1, status `0x97`) across three mode-button presses
+   (`0x90`): Hot Cue (`d1=0x1B`) → pad sends `0x00`; Beat Jump (`d1=0x20`) → pad sends
+   `0x20`; Sampler (`d1=0x22`) → pad sends `0x30`. Channel never changes, only the note —
+   confirms §6's "just more rows in the table," no host-tracked mode layer needed. Matches
+   the Mixxx reference mapping's ranges exactly (Hot Cue `0x00-0x07`, Beat Jump `0x20-0x27`,
+   Sampler `0x30-0x37`, all per deck channel). The mode-select buttons themselves
+   (`(0x90,0x1B)` etc.) likely need no binding either, same as the Starlight's Bass/Filter
+   button — the firmware already did the work.
+4. ✅ **RESOLVED 2026-08-22 — no such switch exists.** The FLX4 is a strictly 2-channel
+   controller; Pioneer's own docs confirm deck 3/4 access requires an FLX6/FLX10 or switching
+   focus in software (touching `[DECK 1]`/`[DECK 2]` in rekordbox's Performance mode), not a
+   hardware control. The switch found under "MASTER LEVEL"/"BEAT FX" labeled `1 / 2 / 1&2` is
+   the **Beat FX channel-select**, unrelated to deck slots — confirmed live, sends Note On/Off
+   on channels 4/5 (`0x94`/`0x95`), notes `0x10`/`0x11`. §2's "Deck slots per side" row was a
+   pre-hardware guess and is wrong for this unit: it's **1**, same as the Starlight, so §3.2's
+   slots need no mode layer for the FLX4.
 5. **LED protocol.** Note On to the output port, walk note numbers, log what lights. Same
    experiment already sketched for the Starlight in `todo.md` Batch F. Expect that sending
    *anything* may take the surface out of its standalone light show — check that it can be
    given back.
-6. **The built-in audio interface.** Out of scope for this doc, but do not skip it: if
-   PipeWire exposes the FLX4's master/cue outputs, that is a new output device node, and the
-   shared-output rules apply unchanged — **one `pulsesink` per PCM node**, and "Front"/"Rear"
-   style channel pairs on one device are *one node, not two*
-   (`docs/design/shared-output-pipeline.md`). A DJ controller with master + headphone outs is
-   exactly the shape that trips this.
-7. **Tempo fader**: 14-bit or 7-bit, and which direction is fast. `invert` exists in the
-   profile sketch because the Starlight sends higher values for *slower*, and there is no
-   reason to expect agreement.
+6. ✅ **PARTIALLY RESOLVED 2026-08-22 — confirmed, and it's exactly the anticipated shape.**
+   `wpctl status` shows the FLX4 as device 109 with sink **`DDJ-FLX4 Analog Surround 4.0`**
+   (one 4-channel node — master + cue bundled, same "Front/Rear = one node" pattern
+   `front_and_rear_of_one_device_are_one_node` already tests for) and source
+   `DDJ-FLX4 Analog Stereo` (2ch input, likely mic/line return — out of scope here). Still
+   open: actually wiring an FLX4 output-device option end to end through
+   `make_snapcast_sink`-style device selection and confirming channel-pair assignment
+   (which pair is master vs cue) by ear — this only confirms the node shape, not the wiring.
+7. ✅ **RESOLVED 2026-08-22 — 14-bit, MSB `(0xB0,0)` / LSB `(0xB0,32)`, higher = `+`/faster.**
+   Confirmed genuinely 14-bit, not LSB noise: MSB advances one step roughly every 8-9ms while
+   LSB sweeps its full 0-127 range in between each MSB increment — real fine resolution, same
+   `+32` offset convention as the rest of this controller. Direction, from the physical `+`/`-`
+   printed on the fader: pushing to `+` (bottom) drove the combined value to its max (`127`);
+   pushing to `-` (top) drove it to `0`. So **higher raw value = faster** here — whether that
+   agrees or disagrees with the Starlight's `invert` needs re-deriving the Starlight's own
+   sign convention carefully before setting the flag; don't assume disagreement by default
+   the way this line originally speculated.
 
 ---
 
@@ -394,3 +425,64 @@ control before it is called done.
   platter conventionally means scratch-over-playback, which cuemark's paused-deck feeder
   does not currently do at all. That is a real feature gap, not just a mapping question, and
   it belongs in `docs/design/waveform-scrub.md` once the capture in §8.2 exists.
+
+---
+
+## 11. Handoff — LED protocol (§8.5), next session
+
+**What's confirmed, live, 2026-08-22** (all via `amidi -p hw:1,0,0 -S "<status> <note> <vel>"`,
+sent directly to the raw ALSA device — cuemark has no MIDI output code, see §1's "no MIDI
+output"; sending this way worked fine alongside cuemark's own input connection, no conflict):
+
+- **Right deck (`0x99`) pad LEDs are a plain Note On/Off echo.** Velocity `7F` lights a pad,
+  `00` clears it, from a clean state. No handshake, no SysEx, just the obvious thing.
+- **Left deck (`0x97`) does not respond the same way**, despite being a confirmed-real input
+  channel (real pad presses came in on `0x97` during the §8.3 pad-mode capture). Swept
+  `0x94`–`0x96` and `0x98` too, notes 0-7 each — nothing lit on the left deck from any of
+  those, but the sweep did knock the left deck into a **stuck standalone pulsing animation**
+  that plain Note Off (`vel 00`) across all six channels did **not** clear. Only a physical
+  USB unplug/replug fixed it.
+- The replug **broke cuemark's existing MIDI subscription** (`aconnect -l` lost the
+  `Connecting To:`/`Connected From:` lines) and cuemark did not reconnect on its own —
+  confirms §1/§5's no-hotplug gap applies even to a device it was already talking to, not
+  just a fresh plug-in. Needed a manual dev-server restart to resume.
+
+**What this doesn't tell us yet:**
+
+1. **Is the left deck's LED channel actually different from `0x97`**, or does it need a
+   precondition `0x97` never got (e.g. the SysEx-handshake idea below)? The sweep covering
+   `0x94-0x98` was not exhaustive — didn't try `0x90-0x93`, and didn't try CC-based LED
+   control (some Pioneer surfaces use CC for ring/level LEDs, not just Note).
+2. **Is the pulsing a timeout fallback** ("no valid host session seen recently, resume demo
+   mode") **or a corrupted/latched state** the firmware got stuck in from receiving Note
+   messages it didn't expect? These have different fixes: the first means real DJ software
+   must be sending a periodic keepalive or init handshake cuemark would need to replicate;
+   the second means some specific byte sequence we sent is the actual bug to avoid, not
+   "any raw send is risky."
+3. **A plausible handshake exists in a lower-confidence secondary source** (not the Mixxx
+   XML — a derived/repurposed doc found during initial research, see the chat history for
+   this session): a SysEx `F0 00 40 05 00 00 04 05 00 50 02 F7` supposedly sent by a host
+   app "on every device bind" to sync analog control positions. **Untested.** Worth trying
+   early next session, before more Note sweeping — low risk (malformed SysEx is normally
+   just ignored), and if it's real it may also be the fix for the stuck-pulsing state, not
+   just a nice-to-have.
+
+**Recommended next-session approach** (see the `midi` skill's new "Calibrating a controller
+when the operator is remote" section for the Save-capture-over-timing-races technique used
+throughout this session):
+
+1. Try the SysEx handshake above *first*, before any more raw Note sends, and see if it
+   changes the left deck's behavior at all (including whether it's what un-sticks a pulsing
+   state, if one is already active).
+2. If that doesn't resolve it, capture what a **real session** looks like: run `aseqdump` or
+   the in-app raw monitor while a real DJ app (rekordbox, or Mixxx if installed) drives the
+   FLX4, specifically watching for any outbound-looking traffic near device connect — hard to
+   do with `aseqdump` alone since it's input-only by default; may need `amidi -d` pointed at
+   the device from a machine running such software, or a USB capture (`usbmon`) if nothing
+   else works.
+3. Whatever the left-deck answer turns out to be, this is still just data — no code changes
+   are warranted until phase 1 (profiles-as-data, §3) exists to hold it. Resist the urge to
+   hand-wire an LED call into `midi.rs` for one deck as a one-off.
+4. Keep a physical USB replug as the known-good recovery step if pulsing recurs, and remember
+   it will require a `cargo tauri dev` restart afterward if cuemark's monitor needs to keep
+   working (see the `midi` skill note).

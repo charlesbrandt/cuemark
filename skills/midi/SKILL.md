@@ -173,6 +173,43 @@ Two properties worth knowing before trusting it:
 (`controller-mapping.md` §9) is to feed one through the resolver in a test and assert an
 action sequence, so profile work can happen without the controller attached.
 
+## Calibrating a controller when the operator is remote (chat-relayed testing)
+
+Learned authoring the FLX4 profile (2026-08-22), but applies to any future controller:
+when Claude can't touch the hardware and has to say "capturing now, do the gesture" over
+chat, **a fixed-duration shell capture racing the message round-trip is unreliable** — several
+`timeout Ns aseqdump -p PORT:0` windows came back empty because the instruction hadn't been
+read yet, or caught the wrong motion because the user was still getting into position.
+Freehand "do exactly one revolution" is *also* unreliable even when the timing lines up: two
+careful single-revolution attempts at slow speed came back 153 and 186 ticks — human
+start/end alignment error, not signal.
+
+**What actually worked**: use **Save capture** (above) instead of a shell timer. The
+operator does the gesture at their own pace with no deadline, clicks Save, and reports the
+filename — Claude reads the exact timestamped bytes afterward, no synchronization needed.
+For a repeating-motion measurement (jog ticks/revolution, tempo fader range), ask for
+**multiple reps counted by the operator in one continuous touch** (e.g. "5 slow revolutions,
+pause, 5 fast, then save") rather than isolated single reps — segmenting by touch on/off
+boundaries and dividing by the reported count averages out alignment error instead of being
+dominated by it. This is what took the jog calibration from a noisy ~150-730 range down to
+two independent measurements 0.4% apart.
+
+**Testing LED output without cuemark's own MIDI-output code** (cuemark has none yet — see
+"There is no MIDI output" in `docs/design/controller-mapping.md` §1): send raw bytes directly
+to the ALSA raw device with `amidi -p hw:X,0,0 -S "<status> <note-hex> <velocity-hex>"`. This
+works *while cuemark holds the input connection* — confirmed live, exit 0, no conflict — because
+cuemark connects via the sequencer (multi-subscriber) rather than opening the raw device
+exclusively. Sweep across notes/channels and ask the operator what lit, from a **known blank
+state** (send velocity `00` to every candidate first and confirm dark) — an already-lit pad
+shows no visible change when re-sent, which reads as a false negative for the wrong channel.
+🛑 **Sending raw bytes at a pad LED can knock the controller into a stuck standalone
+"demo" light-show animation that plain Note Off does not clear** (hit live on the FLX4's
+left-deck pads, 2026-08-22) — a physical USB unplug/replug was the only fix found. That
+replug is also a live demonstration of the no-hotplug gap in §1/§5 of the design doc: it
+broke cuemark's existing subscription (confirmed via `aconnect -l` losing the
+`Connecting To:`/`Connected From:` lines), and cuemark did not reconnect on its own — a
+manual dev-server restart was required. Budget for that if LED experiments are on the plan.
+
 ## Injecting synthetic MIDI into a running cuemark
 
 Because the sequencer port is multi-subscriber (above), a known byte sequence can be pushed

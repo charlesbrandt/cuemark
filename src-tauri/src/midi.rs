@@ -497,7 +497,9 @@ fn run_midi_loop(app: &AppHandle, midi_map: &Arc<MidiMap>, persist: &midi_state:
         let mut found = None;
         for p in ports {
             let name = midi_in.port_name(&p).unwrap_or_default().to_lowercase();
-            if name.contains("hercules") || name.contains("starlight") {
+            // TEMP bench widen for FLX4 profile capture — see docs/design/controller-mapping.md §8.
+            // Revert once the FLX4 gets a real profile entry in the phase-1 multi-controller map.
+            if name.contains("hercules") || name.contains("starlight") || name.contains("flx4") {
                 found = Some(p);
                 break;
             }
