@@ -2,6 +2,21 @@
 
 Way to record a session
 
+Combine all of the MIDI and Record Settings to be switchable via a tabbed menu option at the top of the open Settings menu. That way everything can be managed directly in the settings panel without cluttering up the main nav. That will also allow us to change the function of the record button itself (in the main nav) to become the on off toggle for the recording. The animation to indicate that recording is active can be much more subtle. We can keep the button itself filled in red (current toggle functionality), but then there can be a subtle circle to the left of the word "Record" that fades in and out (soothingly) to indicate that recording is active. Then there is no need to open the settings menu once the recording settings have been configured. 
+
+stem support
+loop support
+
+I want to update the app so that it has the potential to recognize and use any number of controllers. We should set up a job to convert mappings from Mixxx to what is needed here. Can we leverage those directly? (Allowing for local updates, as needed). 
+the real cause is in src-tauri/src/midi.rs: run_midi_loop only opens a port whose name contains "hercules" or "starlight" (midi.rs:500), matched once at startup, never rescanned. That's exactly the phase-1 gap your own docs/design/controller-mapping.md §5 describes ("find one port by substring, or give up... plugging a controller in after launch does nothing until the app restarts"). The "MIDI settings" list you're seeing is the raw monitor's Rescan ports panel — it enumerates ports live and shows a ● next to whichever one cuemark actually opened, but it's read-only status, not a picker; there's no "choose this port" control built yet.
+
+So two separate things are going on:
+1. Restarting alone won't help — even fresh, the FLX4's name wouldn't match "hercules"/"starlight".
+2. True hotplug (poll ports every ~2s, open new matches, drop disappeared ones) is real scope — §5 of the design doc, not a one-liner.
+
+docs/design/silent-failure-inventory.md's A1 catalogue entry for record.rs — it's part of a structured historical inventory doc, not a quick fix, so I didn't want to edit it without more context on how that doc wants to represent "since fixed" entries.
+Are there any active silent failures? Things feel stable. I don't want this to cause confusion if it is not providing helpful context now. 
+
 ~~Bass / filter parameters should work.~~ **DONE 2026-08-17, live-verified** — 3-band EQ
 (`equalizer-nbands`, 250 Hz / 1 kHz / 4 kHz) plus a sweep filter, and the Starlight's
 dual-function tone knob mapped in both its modes. See `docs/design/deck-eq-and-filter.md`;
