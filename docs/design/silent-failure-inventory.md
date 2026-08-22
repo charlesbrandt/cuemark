@@ -38,7 +38,7 @@ speculative.
 
 | # | Thing | What it does instead | Source |
 |---|---|---|---|
-| A1 | `audio_record_start/stop` | flag + log line, no file | `src-tauri/src/audio/record.rs` |
+| A1 | `audio_record_start/stop` | flag + log line, no file. **Fixed 2026-08-22** — real encoder chain (`RecordBranch` tap + `RECORD_DEVICE_KEY` node), live-verified end to end | `src-tauri/src/audio/record.rs`, `mixer.rs`, `pipeline.rs` |
 | A2 | `pw-record --target <sink>` | records the default **source** | `scripts/scratch-capture.sh` |
 | A3 | `pulsesink` with unresolvable `device=` | falls back to system default sink | `make_sink()` NOTE, `pipeline.rs` |
 | A4 | `VideoDecoder.isConfigSupported({av01…})` | returns `true`, then decodes **zero frames** | `legacy-video-fallback-cost.md` |
@@ -108,9 +108,7 @@ Drawn from the instances above that were successfully fixed, not invented here.
 
 Ordered by (live-cost avoided) ÷ (effort). Not scheduled.
 
-1. **A1 — decide `record.rs`'s fate.** Either implement step 8 or make `audio_record_start`
-   return `Err("not implemented")`. Returning `Ok` from a stub is the worst of both. Smallest
-   item on this list and it already cost one investigation its planned next step.
+1. ~~**A1 — decide `record.rs`'s fate.**~~ **Fixed 2026-08-22** — see the catalogue row above.
 2. **A3 — assert the sink actually opened.** `pulsesink` cannot tell us, but PipeWire can:
    after PLAYING, confirm via the graph that the stream is linked to the node that was asked
    for, and `log::warn!` naming both when it is not. Directly serves
