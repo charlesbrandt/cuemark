@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { updateDeck, getDeck, setCrossfader, setMasterVolume, session } from "../state/session";
-import { seekDeck, getDeckTime, quantizeToGrid, setScratching, isScratching, beginScrub, updateScrub, endScrub } from "../renderer/seekBus";
+import { seekDeckExitingLoop, getDeckTime, quantizeToGrid, setScratching, isScratching, beginScrub, updateScrub, endScrub } from "../renderer/seekBus";
 import { nudgePhaseToMaster } from "../audio/phaseNudge";
 import { syncRate, syncGain, syncVolume, syncEq, syncFilter } from "../audio/audioSync";
 import { audioScratch, audioStopScratch } from "../audio/pipeline";
@@ -469,7 +469,7 @@ export async function startMidiListener(): Promise<() => void> {
         if (!deckId) break;
         const d = getDeck(deckId);
         if (d) {
-          seekDeck(d.id, d.cuePoint);
+          seekDeckExitingLoop(d.id, d.cuePoint);
           updateDeck(d.id, { playing: false });
         }
         break;
@@ -485,7 +485,20 @@ export async function startMidiListener(): Promise<() => void> {
         const d = getDeck(deckId);
         if (!d) break;
         const t = d.hotCues[a.index];
-        if (t !== undefined && !isNaN(t)) seekDeck(d.id, quantizeToGrid(d.id, t));
+        // Mirrors DeckCard's plain click: jump if the slot is already set, else set it here
+        // (shift+pad, "hot_cue_set", is for moving/overwriting an already-set slot). Without
+        // this branch a plain pad press on an unset slot silently did nothing over MIDI —
+        // reported live 2026-08-22 as "can't set a hot cue via the controller".
+        if (t !== undefined && !isNaN(t)) {
+          seekDeckExitingLoop(d.id, quantizeToGrid(d.id, t));
+        } else {
+          const now = getDeckTime(deckId);
+          if (now !== null) {
+            const cues = [...d.hotCues];
+            cues[a.index] = quantizeToGrid(d.id, now);
+            updateDeck(d.id, { hotCues: cues });
+          }
+        }
         break;
       }
       case "hot_cue_set": {

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { open } from "@tauri-apps/plugin-dialog";
   import { session, updateDeck, removeDeck, setMasterDeck } from "../lib/state/session";
-  import { seekDeck, getDeckTime, getPhase, getVideoEl, getCodecPlayer, quantizeToGrid } from "../lib/renderer/seekBus";
+  import { seekDeckExitingLoop, getDeckTime, getPhase, getVideoEl, getCodecPlayer, quantizeToGrid } from "../lib/renderer/seekBus";
   import { nudgePhaseToMaster } from "../lib/audio/phaseNudge";
   import { tempoRange } from "../lib/audio/audioSettings";
   import { gridSave } from "../lib/audio/pipeline";
@@ -470,7 +470,7 @@
     </button>
     {#if deck.source?.type === "video"}
       <button
-        onclick={() => { seekDeck(deck.id, deck.cuePoint); updateDeck(deck.id, { playing: false }); }}
+        onclick={() => { seekDeckExitingLoop(deck.id, deck.cuePoint); updateDeck(deck.id, { playing: false }); }}
         title="Return to cue ({formatDuration(deck.cuePoint)})"
       >
         ⏮
@@ -678,7 +678,7 @@
         class:set={isSet}
         onclick={(e) => {
           if (isSet && !e.shiftKey) {
-            seekDeck(deck.id, quantizeToGrid(deck.id, t));
+            seekDeckExitingLoop(deck.id, quantizeToGrid(deck.id, t));
           } else {
             const now = getDeckTime(deck.id);
             if (now !== null) {

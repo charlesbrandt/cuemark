@@ -11,7 +11,7 @@ import {
   noteScrubThrottleSkip,
   noteScrubWentSilent,
 } from '../audio/scrubStats';
-import { session } from '../state/session';
+import { session, getDeck, updateDeck } from '../state/session';
 
 // Which decks are mid-scratch-gesture right now. Scratch runs entirely while
 // deck.playing is false, so consumers that gate continuous work on deck.playing
@@ -145,6 +145,18 @@ export function seekDeck(deckId: string, time: number) {
   pendingSeekTarget.set(deckId, { time, setAtMs: performance.now() });
   audioSeek(deckId, time).catch(console.error);
   bumpSeekVersion(deckId);
+}
+
+// For explicit navigation (hot cue, CUE button, click-to-seek — anywhere the user is
+// choosing a new position on purpose) rather than performance moves (scratch, jog nudge,
+// phase nudge) that should leave an active loop alone. Loop *bounds* are untouched —
+// only the on/off flag — so LOOP re-engages the same region if pressed again; nothing
+// else here disengages a loop on jump, which is why those callers stayed on plain
+// seekDeck().
+export function seekDeckExitingLoop(deckId: string, time: number): void {
+  const d = getDeck(deckId);
+  if (d?.loop) updateDeck(deckId, { loop: false });
+  seekDeck(deckId, time);
 }
 
 // Bumped on every direct seek (hot cue jump, CUE button, Digger marker jump, click-to-seek)

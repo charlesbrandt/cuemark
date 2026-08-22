@@ -1,6 +1,6 @@
 <script lang="ts">
   import { analyzeFile, COLOR_UPCOMING, COLOR_PLAYED } from '../lib/audio/waveform';
-  import { seekDeck, getDeckTime, quantizeToGrid, scratchingDecks, seekVersions, beginScrub, updateScrub, endScrub, cancelScrub } from '../lib/renderer/seekBus';
+  import { seekDeckExitingLoop, getDeckTime, quantizeToGrid, scratchingDecks, seekVersions, beginScrub, updateScrub, endScrub, cancelScrub } from '../lib/renderer/seekBus';
   import { getDiggerFileUrl } from '../lib/digger/api';
   import { recordAuxLoop } from '../lib/audio/pollStats';
   import { noteScrubInput } from '../lib/audio/scrubStats';
@@ -613,7 +613,7 @@
       ? dragStartTime - zoomSeconds * Math.max(0.01, deck.playbackRate) * ZOOM_LEAD_RATIO
         + ratio * zoomSeconds * Math.max(0.01, deck.playbackRate)
       : ratio * duration;
-    seekDeck(deck.id, Math.max(0, Math.min(duration, quantizeToGrid(deck.id, t))));
+    seekDeckExitingLoop(deck.id, Math.max(0, Math.min(duration, quantizeToGrid(deck.id, t))));
   }
 
   // A gesture in flight when the deck is torn down (track swap, deck removal) would
