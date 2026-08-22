@@ -45,10 +45,26 @@ defer. What's actually running:
   `docs/design/ddj-flx4-feature-gaps.md` for what's out of scope entirely (Sampler
   pads, Beat FX, browse encoder).
 
+**2026-08-22 (first live spot-check, FLX4 alone, no Starlight attached)**: Play and Cue
+(left deck, slot 0) confirmed working end-to-end — pressing the physical buttons paused/
+resumed playback and jumped to the cue point as expected. `pioneer-ddj-flx4.toml`'s notes
+on those two rows are updated accordingly. ⚠️ **One unresolved wrinkle**: the very first
+attempt that session produced no visible effect even though the Rust log showed both
+actions resolving correctly (`DeckPlayToggle`/`CueJump` with the right slot) and no
+downstream IPC call followed — i.e. the frontend received a correctly-shaped event and did
+nothing with it. A full `cargo tauri dev` restart (unrelated — the whole dev-server process
+tree had vanished, likely from another concurrent session) made it work on the next
+attempt, and it hasn't recurred since. Root cause not found; nothing in the code changed
+between the failure and the success. See `todo.md`'s handoff entry for what to check first
+if this recurs (a `debugLog()`-based diagnostic technique that works but wasn't needed once
+the retry succeeded).
+
 **Still open after this session**: the full §4 normalized-signal refactor for
 EQ/tempo, a real multi-controller routing UI, LED output (still no MIDI output code at
-all — §1/§11), `JogTouch` precedence (§10), and — the concrete next step — a live bench
-pass to confirm or correct every Mixxx-sourced row in `pioneer-ddj-flx4.toml` by ear.
+all — §1/§11), `JogTouch` precedence (§10), the unresolved one-time Play/Cue miss above,
+and — the concrete next step — a live bench pass to confirm or correct every remaining
+Mixxx-sourced row in `pioneer-ddj-flx4.toml` by ear (sync, faders, EQ hi/low, filter,
+crossfader, headphone mix, and the whole right-deck/slot-1 side).
 
 This doc is about *mapping* — wire bytes to bindings cuemark already knows how to act on.
 For physical FLX4 controls whose target *behaviour doesn't exist in cuemark at all* (Beat FX,

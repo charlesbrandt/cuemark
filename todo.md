@@ -89,10 +89,10 @@ kick, and confirming the ♩ indicator lands on the kick rather than the raw pre
 ## Batch F — MIDI expansion
 
 ### MIDI output / LED control
-🛑 **Blocked on multi-controller phase 1** (below) — MIDI output is per-controller like input
-is, and hand-wiring one controller's LED calls into today's single-controller `midi.rs` is
-exactly the mistake §11 of the design doc tells the next session not to make. Build the
-profile system first; LED init sequences are data for it, not bespoke Rust.
+🟢 **Blocker cleared 2026-08-22** — the profile system (phase 1, below) is built and
+committed (`src-tauri/src/midi/{mod,profile,decode,monitor}.rs`,
+`src-tauri/profiles/*.toml`). This is now ready to implement against the spec captured
+below; still zero MIDI output code exists (`midir`'s `MidiOutput` is never constructed).
 
 **Starlight**: protocol not yet captured. Same experiment as the FLX4 below — send Note On to
 the output port, log which buttons light at which note numbers — is still open.
@@ -128,21 +128,65 @@ being open), Toolbar → MIDI, capture export. See `skills/midi/SKILL.md`.
   incoming `midi-raw` → saves `(status, d1) → action` mapping
 - ⏸ Custom mappings override the default Hercules map at runtime; persist to a user profile
 
-🛑 **Deliberately scheduled after the FLX4 profile exists**, not before — a learn UI built
-now would encode today's single-controller assumptions into a persisted user-facing format
-and then have to break it. Reasoning and phase order:
-`docs/design/controller-mapping.md` §7.
+🟡 **Gate technically met 2026-08-22** — a second profile (`pioneer-ddj-flx4`) now exists,
+which is what phase 5's gate in `docs/design/controller-mapping.md` §7 asked for ("schema
+proven against 2 devices"). Still not started; still a reasonable thing to keep deferring
+given the FLX4 profile itself isn't fully bench-verified yet (see the handoff below) — a
+learn UI writing into a schema that might still need row-level corrections is premature.
 
 ### multi-controller support
-**Designed 2026-08-17: `docs/design/controller-mapping.md`** — read it before starting.
-Profiles become data files keyed by port-name match; bindings address *slots*, never deck
-IDs; Rust decodes wire bytes to a normalized signal and TypeScript owns musical meaning.
-Phase 1+2 there is the part worth doing before the DDJ-FLX4 arrives.
-- Open all connected MIDI input ports (not just the first/named one), with a rescan poll —
-  today a controller plugged in after launch is invisible until restart
-- Per-port mapping: if port name matches a known profile, load it; else load custom
-- UI: settings panel listing connected MIDI devices + their profiles (the monitor's port
-  list is the read-only half of this already)
+🟢 **DONE 2026-08-22** — `docs/design/controller-mapping.md`, trimmed scope (see its status
+line for exactly what shipped vs. deferred). Profiles are TOML data files
+(`src-tauri/profiles/*.toml`) keyed by port-name match; bindings address *slots*, never deck
+IDs (`Session.midiMapping: Record<profileId, string[]>`, slot *i* → `decks[i]` default); a
+supervisor thread polls ports every 2s and opens one connection per matched profile — **both
+controllers can be live at once**, confirmed structurally (not yet live-tested with both
+physically connected together, only FLX4-alone so far).
+- ~~Open all connected MIDI input ports... with a rescan poll~~ DONE — the 2s hotplug poll.
+- ~~Per-port mapping...~~ DONE.
+- **Still open**: UI: settings panel listing connected MIDI devices + their profiles for
+  real multi-controller routing. What shipped instead: `AudioSettings.svelte`'s existing L/R
+  selects just retarget at whichever 2-slot profile is currently connected — default
+  slot-routing covers the common single-controller case, but editing two controllers' slot
+  maps independently has no UI yet.
+
+### Handoff: FLX4 bench-verification pass [next session, 2026-08-22]
+
+The profile system + FLX4 profile (above) is built, committed (`ccb1b96`), and passing
+`cargo check`/`cargo test`/`npm run check`. First live spot-check that session (FLX4 alone,
+no Starlight): **Play and Cue on the left deck (slot 0) confirmed working** — see the
+updated `note` field on those two rows in `src-tauri/profiles/pioneer-ddj-flx4.toml` and
+`controller-mapping.md`'s status block. Everything else in that file is still either
+sourced from Mixxx's community mapping (marked `note = "from Mixxx mapping, not
+live-verified on this unit"`) or cuemark's own §8 captures (jog, tempo, pad-mode CC layout —
+already trustworthy, no re-verification needed).
+
+**Next step — walk every remaining Mixxx-sourced row with the FLX4 connected and the app
+running, by ear**: sync, channel fader/trim, EQ hi/mid/low, filter/CFX knob, crossfader,
+headphone mix, and the entire right-deck/slot-1 side (nothing on slot 1 has been touched at
+all yet). Method: `cargo tauri dev`, Toolbar → MIDI monitor open, work down
+`pioneer-ddj-flx4.toml` control by control, updating each `note` field to either confirm
+(like the two rows above) or correct (wrong `d1`/`status`, wrong `invert`, wrong action)
+based on what's actually observed — the monitor's raw feed plus the `[midi/DDJ-FLX4:...]`
+log lines (`grep -a '\[midi/' ` on the dev log) show exactly what byte arrived and what it
+resolved to.
+
+**Unresolved wrinkle worth knowing about, not necessarily worth chasing**: the very first
+Play/Cue attempt that session produced no visible effect even though the Rust log showed
+both actions resolving correctly — right slot, right action type — and no downstream audio
+IPC call followed, meaning the frontend received a well-formed event and silently did
+nothing with it. Investigated live (structural review of `slotDeck()`, the `MidiEvent`
+serde `#[flatten]` wire shape — confirmed correct via a throwaway `serde_json::to_string`
+test, not a bug), but before a firm conclusion the whole `cargo tauri dev` process tree
+vanished (unrelated — another concurrent session's work, evidenced by unrelated uncommitted
+changes to `App.svelte`/`RecordPanel.svelte`/a new `SettingsPanel.svelte` sitting in the
+working tree at the time). A plain restart made the next attempt work, and it hasn't
+recurred. **If it recurs**: the fastest diagnostic is a temporary `debugLog()` call at the
+top of `handler.ts`'s `startMidiListener` callback logging `a.type`, `a.profile`, `a.slot`,
+the resolved `deckId`, and `get(session).decks`/`midiMapping` — it forwards to the same Rust
+log file via the `frontend_log` IPC command, so a single button press shows exactly what the
+frontend saw and resolved to, without needing devtools access. (Used this session; removed
+before committing since the fault never reproduced long enough to interpret the output.)
 
 ---
 

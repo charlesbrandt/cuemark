@@ -33,7 +33,7 @@ d1 = 0x0B
 kind = "button"
 action = "play_toggle"
 slot = 0
-note = "from Mixxx mapping, not live-verified on this unit"
+note = "live-verified 2026-08-22 (FLX4 alone, no Starlight) — works"
 
 [[control]]
 status = 0x90
@@ -41,7 +41,7 @@ d1 = 0x0C
 kind = "button"
 action = "cue_jump"
 slot = 0
-note = "from Mixxx mapping, not live-verified on this unit"
+note = "live-verified 2026-08-22 (FLX4 alone, no Starlight) — works"
 
 [[control]]
 status = 0x90
