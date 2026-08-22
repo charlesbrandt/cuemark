@@ -4,12 +4,12 @@ Status: 📐 **DESIGN, with phase 3 built.** Written 2026-08-17, prompted by a
 **Pioneer DJ DDJ-FLX4** on order. The raw MIDI monitor (§7a) was built and verified the
 same day — see the status note in §7. Everything else here is unbuilt.
 
-**2026-08-22: the FLX4 arrived and §8's unknown list is mostly captured** — 6 of 7 items
-resolved live (jog encoding, pad modes, deck-slot count, tempo fader, audio-interface shape;
-LED protocol partially). See §8 for the findings and **§11 for the LED-protocol handoff** —
-that's the one open item with real next steps written down. Phase 4 (author the actual
-`pioneer-ddj-flx4` profile) can start once phase 1 (profiles-as-data) exists; today's session
-only captured facts, it did not build the profile system.
+**2026-08-22: the FLX4 arrived and §8's unknown list is fully captured** — all 7 items
+resolved live (jog encoding, pad modes, deck-slot count, tempo fader, audio-interface shape,
+and — in a follow-up session the same day — the LED protocol). See §8 for the findings and
+**§11 for the LED-protocol writeup**. Phase 4 (author the actual `pioneer-ddj-flx4` profile)
+can start once phase 1 (profiles-as-data) exists; today's sessions only captured facts, they
+did not build the profile system.
 
 The Starlight mapping as it stands is not wrong; it is *singular*. Every layer assumes
 exactly one controller, known at compile time, with the Starlight's specific encodings baked
@@ -358,10 +358,13 @@ with the monitor (§7a), across the mode change, before writing a single profile
    on channels 4/5 (`0x94`/`0x95`), notes `0x10`/`0x11`. §2's "Deck slots per side" row was a
    pre-hardware guess and is wrong for this unit: it's **1**, same as the Starlight, so §3.2's
    slots need no mode layer for the FLX4.
-5. **LED protocol.** Note On to the output port, walk note numbers, log what lights. Same
-   experiment already sketched for the Starlight in `todo.md` Batch F. Expect that sending
-   *anything* may take the surface out of its standalone light show — check that it can be
-   given back.
+5. ✅ **RESOLVED 2026-08-22 (follow-up session) — SysEx handshake unlocks the left deck; see §11.**
+   Right deck (`0x99`) is a plain Note On/Off echo. Left deck (`0x97`) needed the SysEx
+   `F0 00 40 05 00 00 04 05 00 50 02 F7` sent once first — after that it behaves identically
+   to `0x99` (Note On vel `7F` lights a pad, `00` clears it, no per-note resend of the SysEx
+   needed). The handshake has a real side effect: it dims the Hot Cue mode-select button LEDs
+   on *both* decks, which are then separately relit with Note On to `(0x90,0x1B)` /
+   `(0x91,0x1B)` — a host app must be doing exactly this on connect. Full writeup in §11.
 6. ✅ **PARTIALLY RESOLVED 2026-08-22 — confirmed, and it's exactly the anticipated shape.**
    `wpctl status` shows the FLX4 as device 109 with sink **`DDJ-FLX4 Analog Surround 4.0`**
    (one 4-channel node — master + cue bundled, same "Front/Rear = one node" pattern
@@ -428,61 +431,46 @@ control before it is called done.
 
 ---
 
-## 11. Handoff — LED protocol (§8.5), next session
+## 11. LED protocol (§8.5) — RESOLVED 2026-08-22 (follow-up session)
 
-**What's confirmed, live, 2026-08-22** (all via `amidi -p hw:1,0,0 -S "<status> <note> <vel>"`,
-sent directly to the raw ALSA device — cuemark has no MIDI output code, see §1's "no MIDI
-output"; sending this way worked fine alongside cuemark's own input connection, no conflict):
+**What's confirmed, live** (all via `amidi -p hw:1,0,0 -S "<status> <note> <vel>"`, sent
+directly to the raw ALSA device — cuemark has no MIDI output code, see §1's "no MIDI output";
+sending this way works fine alongside cuemark's own input connection, no conflict; card index
+may differ per machine, check `amidi -l`):
 
 - **Right deck (`0x99`) pad LEDs are a plain Note On/Off echo.** Velocity `7F` lights a pad,
   `00` clears it, from a clean state. No handshake, no SysEx, just the obvious thing.
-- **Left deck (`0x97`) does not respond the same way**, despite being a confirmed-real input
-  channel (real pad presses came in on `0x97` during the §8.3 pad-mode capture). Swept
-  `0x94`–`0x96` and `0x98` too, notes 0-7 each — nothing lit on the left deck from any of
-  those, but the sweep did knock the left deck into a **stuck standalone pulsing animation**
-  that plain Note Off (`vel 00`) across all six channels did **not** clear. Only a physical
-  USB unplug/replug fixed it.
-- The replug **broke cuemark's existing MIDI subscription** (`aconnect -l` lost the
-  `Connecting To:`/`Connected From:` lines) and cuemark did not reconnect on its own —
-  confirms §1/§5's no-hotplug gap applies even to a device it was already talking to, not
-  just a fresh plug-in. Needed a manual dev-server restart to resume.
+- **Left deck (`0x97`) needs a one-time SysEx handshake first, then behaves identically.**
+  The candidate handshake from a lower-confidence secondary source —
+  `F0 00 40 05 00 00 04 05 00 50 02 F7` — is real. Sent once, immediately after, plain
+  Note On (`97 <note> 7F`) / Note Off (`97 <note> 00`) worked on the left-deck pads exactly
+  like `0x99`, confirmed on two different pads, with **no need to resend the SysEx** between
+  them — it is a one-time unlock for the session, not a per-note precondition. This settles
+  question 1 from the original handoff (channel `0x97` was always correct; it just had an
+  unmet precondition) and question 3 (the secondary-source handshake is genuinely the host's
+  init sequence, not a dead end).
+- **The handshake has a real, visible side effect beyond unlocking the left deck**: it dims
+  the Hot Cue mode-select button LEDs on **both** decks (not just left). This is a strong
+  signal for what question 2 was asking — the firmware's default/standalone light state
+  includes those mode buttons lit, and the handshake is a real "host is taking over" signal
+  that resets some LED state as a side effect, not an isolated left-deck fix. A real host app
+  must be relighting them afterward: sending Note On to `(0x90,0x1B)` (deck 1) and
+  `(0x91,0x1B)` (deck 2) — the same `(status, d1)` pairs the mode-select *buttons* themselves
+  use, per §8.3 — restored both to lit, confirmed live. So a real LED-init sequence is at
+  least: SysEx handshake → relight whichever mode buttons should be active by default.
+- This session never revisited the **stuck pulsing state** from the original handoff (the
+  left deck was already idle/dark going in, so there was nothing to un-stick) — whether the
+  handshake is *also* the fix for that specific stuck state remains untested. If it recurs,
+  try the handshake before reaching for a physical replug.
+- Not tested this session: CC-based LED control (moot now that the Note path is confirmed
+  working for both decks), and whether other LED groups (jog ring, level meters, browse
+  encoder) need their own handshake-adjacent quirks — assume "capture before designing" still
+  applies per-control-group rather than generalizing from pads.
 
-**What this doesn't tell us yet:**
-
-1. **Is the left deck's LED channel actually different from `0x97`**, or does it need a
-   precondition `0x97` never got (e.g. the SysEx-handshake idea below)? The sweep covering
-   `0x94-0x98` was not exhaustive — didn't try `0x90-0x93`, and didn't try CC-based LED
-   control (some Pioneer surfaces use CC for ring/level LEDs, not just Note).
-2. **Is the pulsing a timeout fallback** ("no valid host session seen recently, resume demo
-   mode") **or a corrupted/latched state** the firmware got stuck in from receiving Note
-   messages it didn't expect? These have different fixes: the first means real DJ software
-   must be sending a periodic keepalive or init handshake cuemark would need to replicate;
-   the second means some specific byte sequence we sent is the actual bug to avoid, not
-   "any raw send is risky."
-3. **A plausible handshake exists in a lower-confidence secondary source** (not the Mixxx
-   XML — a derived/repurposed doc found during initial research, see the chat history for
-   this session): a SysEx `F0 00 40 05 00 00 04 05 00 50 02 F7` supposedly sent by a host
-   app "on every device bind" to sync analog control positions. **Untested.** Worth trying
-   early next session, before more Note sweeping — low risk (malformed SysEx is normally
-   just ignored), and if it's real it may also be the fix for the stuck-pulsing state, not
-   just a nice-to-have.
-
-**Recommended next-session approach** (see the `midi` skill's new "Calibrating a controller
-when the operator is remote" section for the Save-capture-over-timing-races technique used
-throughout this session):
-
-1. Try the SysEx handshake above *first*, before any more raw Note sends, and see if it
-   changes the left deck's behavior at all (including whether it's what un-sticks a pulsing
-   state, if one is already active).
-2. If that doesn't resolve it, capture what a **real session** looks like: run `aseqdump` or
-   the in-app raw monitor while a real DJ app (rekordbox, or Mixxx if installed) drives the
-   FLX4, specifically watching for any outbound-looking traffic near device connect — hard to
-   do with `aseqdump` alone since it's input-only by default; may need `amidi -d` pointed at
-   the device from a machine running such software, or a USB capture (`usbmon`) if nothing
-   else works.
-3. Whatever the left-deck answer turns out to be, this is still just data — no code changes
-   are warranted until phase 1 (profiles-as-data, §3) exists to hold it. Resist the urge to
-   hand-wire an LED call into `midi.rs` for one deck as a one-off.
-4. Keep a physical USB replug as the known-good recovery step if pulsing recurs, and remember
-   it will require a `cargo tauri dev` restart afterward if cuemark's monitor needs to keep
-   working (see the `midi` skill note).
+**What this means for phase 4 (the actual `pioneer-ddj-flx4` profile)**: an LED-output init
+routine for this controller is now fully specified — send the SysEx handshake once on
+connect, then relight default-state mode buttons — but per §10's open question on `MidiAction`
+`source`/output plumbing and §1's "no MIDI output" gap, there is still no code path to hang
+this on. **No code should be written yet.** This is captured fact for whoever builds MIDI
+output (needed regardless, for LED feedback in general) and the profile system (§3) that would
+hold a per-controller init sequence as data rather than a hand-wired call.
