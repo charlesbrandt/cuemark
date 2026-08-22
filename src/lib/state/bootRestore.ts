@@ -9,6 +9,7 @@ import { session, updateDeck, setCrossfader, setMasterVolume } from "./session";
 import { sessionRestore } from "../audio/pipeline";
 import { clearSavedGrid } from "../audio/gridSource";
 import { cueGain } from "../audio/audioSettings";
+import { slotDeck } from "../midi/handler";
 import { debugLog } from "../debugLog";
 import type { Session } from "./types";
 
@@ -28,6 +29,24 @@ export function takePendingAdoption(deckId: string): { positionSecs: number; pla
   const adopted = pendingAdoption.get(deckId);
   if (adopted) pendingAdoption.delete(deckId);
   return adopted;
+}
+
+/**
+ * A session snapshot written before 2026-08-22 carries the old single-controller
+ * `{left, right}` shape (Session.midiMapping); the current shape is a profile-id-keyed
+ * map of slot arrays. Anything that isn't recognizably the old shape is assumed to
+ * already be current (or absent, which is a valid empty routing table) and passed
+ * through unchanged — this is deliberately not a versioned migration (see
+ * decode::persist_kv's doc comment in midi/decode.rs for why the sibling
+ * midi_state.json rename made the same call): the old shape only ever named the
+ * Starlight's two channels, so there is exactly one sensible target profile id.
+ */
+function migrateMidiMapping(mapping: unknown): Record<string, string[]> {
+  if (mapping && typeof mapping === "object" && "left" in mapping && "right" in mapping) {
+    const m = mapping as { left: string; right: string };
+    return { "hercules-starlight": [m.left, m.right] };
+  }
+  return (mapping as Record<string, string[]> | undefined) ?? {};
 }
 
 export interface BootRestoreResult {
@@ -55,6 +74,7 @@ export async function restoreSessionOnBoot(): Promise<BootRestoreResult> {
     isRecoveryBoot = !!recovery.snapshot && recovery.audio.some((a) => a.filePath);
     if (isRecoveryBoot) {
       const restored = recovery.snapshot as Session;
+      restored.midiMapping = migrateMidiMapping(restored.midiMapping);
       debugLog(`[recovery] rehydrating session — ${recovery.audio.length} live pipeline(s)`);
       // The trust map that gates saved-grid vs. auto-fit precedence (gridSource.ts) is
       // a module-level Map that died with the old page — it's already empty after this
@@ -92,7 +112,7 @@ export async function restoreSessionOnBoot(): Promise<BootRestoreResult> {
         bpm: restored.bpm,
         masterDeckId: restored.masterDeckId,
         crossfaderMapping: restored.crossfaderMapping,
-        midiMapping: restored.midiMapping,
+        midiMapping: migrateMidiMapping(restored.midiMapping),
         crossfaderValue: restored.crossfaderValue,
         crossfaderTargets: restored.crossfaderTargets,
         audioCurve: restored.audioCurve,
@@ -135,10 +155,21 @@ export async function restoreMidiControlState(globalsRestoredFromSnapshot: boole
       } else if (key === "cueGain") {
         cueGain.set(value);
       } else {
+        // Key shape since the 2026-08-22 profile refactor: "{profileId}:{slot}.{field}"
+        // — Rust no longer knows deck ids at all (see midi/decode.rs persist_kv's doc
+        // comment), so slot -> deck is resolved here through the same slotDeck() the
+        // live MIDI path uses. A key from a pre-refactor file won't contain ":" before
+        // the first "." and is silently dropped — the one-time break the rename
+        // deliberately accepted rather than building a versioned migration for values
+        // that aren't changing shape.
         const dot = key.indexOf(".");
-        if (dot > 0) {
-          const deckId = key.slice(0, dot);
+        const colon = key.indexOf(":");
+        if (dot > 0 && colon > 0 && colon < dot) {
+          const profileId = key.slice(0, colon);
+          const slot = Number(key.slice(colon + 1, dot));
           const field = key.slice(dot + 1);
+          const deckId = slotDeck(profileId, slot);
+          if (!deckId) continue;
           const patch = deckPatches.get(deckId) ?? {};
           (patch as Record<string, number>)[field] = value;
           deckPatches.set(deckId, patch);
@@ -146,15 +177,21 @@ export async function restoreMidiControlState(globalsRestoredFromSnapshot: boole
       }
     }
     for (const [deckId, patch] of deckPatches) {
-      // `eqLow` is the one persisted key that does not name a flat Deck field — the
-      // tone knob writes `deck.eq.low`, and a raw patch would create a bogus top-level
-      // `eqLow` property while leaving the actual EQ untouched. Merge it into the
-      // deck's current eq instead, so the other two bands survive.
-      const { eqLow, ...flat } = patch as Record<string, number>;
+      // eqLow/eqMid/eqHigh don't name flat Deck fields — the EQ knobs write into
+      // deck.eq.{low,mid,high}, and a raw patch would create bogus top-level
+      // properties while leaving the actual EQ untouched. Merge them into the deck's
+      // current eq instead, so the other bands survive.
+      const { eqLow, eqMid, eqHigh, ...flat } = patch as Record<string, number>;
       const merged: Record<string, unknown> = { ...flat };
-      if (eqLow !== undefined) {
+      if (eqLow !== undefined || eqMid !== undefined || eqHigh !== undefined) {
         const deck = get(session).decks.find((d) => d.id === deckId);
-        if (deck) merged.eq = { ...deck.eq, low: eqLow };
+        if (deck) {
+          merged.eq = {
+            low: eqLow ?? deck.eq.low,
+            mid: eqMid ?? deck.eq.mid,
+            high: eqHigh ?? deck.eq.high,
+          };
+        }
       }
       updateDeck(deckId, merged as Parameters<typeof updateDeck>[1]);
     }

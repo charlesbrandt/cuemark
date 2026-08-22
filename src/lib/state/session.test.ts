@@ -42,7 +42,7 @@ function resetSession(decks: ReturnType<typeof baseDeck>[]) {
     bpm: null,
     masterDeckId: null,
     crossfaderMapping: { left: 'deck-0', right: 'deck-1' },
-    midiMapping: { left: 'deck-0', right: 'deck-1' },
+    midiMapping: {},
     crossfaderValue: 0.5,
     crossfaderTargets: ['opacity', 'volume'],
     audioCurve: 'equal-power',

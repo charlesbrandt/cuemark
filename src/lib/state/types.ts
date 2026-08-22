@@ -104,11 +104,15 @@ export interface Session {
     left: string;         // deck id
     right: string;        // deck id
   };
-  /** Which software deck the left/right sides of the MIDI controller address. */
-  midiMapping: {
-    left: string;         // deck id driven by left controller channel
-    right: string;        // deck id driven by right controller channel
-  };
+  /**
+   * Which software deck each controller's slot addresses — profile id -> slot index
+   * -> deck id. A profile absent here, or a slot beyond its array's length, falls
+   * back to the default routing (slot i -> decks[i]) — see slotDeck() in
+   * lib/midi/handler.ts. Generalized 2026-08-22 from a single {left,right} pair (one
+   * hardcoded 2-slot controller) to support any number of slots on any number of
+   * simultaneously-connected controllers; see docs/design/controller-mapping.md.
+   */
+  midiMapping: Record<string, string[]>;
   crossfaderValue: number;              // 0.0 (full left) – 1.0 (full right)
   crossfaderTargets: CrossfaderTarget[]; // which deck properties the crossfader drives
   audioCurve: CrossfaderCurve;

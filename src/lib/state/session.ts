@@ -32,7 +32,7 @@ const initial: Session = {
   bpm: null,
   masterDeckId: null,
   crossfaderMapping: { left: "deck-0", right: "deck-1" },
-  midiMapping: { left: "deck-0", right: "deck-1" },
+  midiMapping: {},
   crossfaderValue: 0.5,
   crossfaderTargets: ["opacity", "volume"],
   audioCurve: "equal-power",
@@ -201,8 +201,19 @@ export function setSnapToBeat(value: boolean) {
   session.update((s) => ({ ...s, snapToBeat: value }));
 }
 
-export function setMidiMapping(left: string, right: string) {
-  session.update((s) => ({ ...s, midiMapping: { left, right } }));
+/**
+ * Set one controller's slot -> deck routing. `slots` is the profile's full array
+ * (not a single patched entry) since a slot beyond the array's current length would
+ * otherwise have no way to be addressed — callers read the existing array, patch the
+ * one index that changed, and pass the whole thing back (see AudioSettings.svelte).
+ */
+export function setMidiSlot(profileId: string, slot: number, deckId: string) {
+  session.update((s) => {
+    const existing = s.midiMapping[profileId] ?? [];
+    const slots = [...existing];
+    slots[slot] = deckId;
+    return { ...s, midiMapping: { ...s.midiMapping, [profileId]: slots } };
+  });
 }
 
 export function setVisualization(visualization: Visualization | null) {

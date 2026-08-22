@@ -1,15 +1,59 @@
 # Controller mapping — many controllers, one control surface
 
-Status: 📐 **DESIGN, with phase 3 built.** Written 2026-08-17, prompted by a
-**Pioneer DJ DDJ-FLX4** on order. The raw MIDI monitor (§7a) was built and verified the
-same day — see the status note in §7. Everything else here is unbuilt.
+Status: 🟢 **Phases 1, 3, and a trimmed phase 4 built and live-tested (Rust/TS); phase 2
+partially built.** Written 2026-08-17, prompted by a **Pioneer DJ DDJ-FLX4** on order.
 
-**2026-08-22: the FLX4 arrived and §8's unknown list is fully captured** — all 7 items
-resolved live (jog encoding, pad modes, deck-slot count, tempo fader, audio-interface shape,
-and — in a follow-up session the same day — the LED protocol). See §8 for the findings and
-**§11 for the LED-protocol writeup**. Phase 4 (author the actual `pioneer-ddj-flx4` profile)
-can start once phase 1 (profiles-as-data) exists; today's sessions only captured facts, they
-did not build the profile system.
+**2026-08-22 (build session): profiles-as-data + the FLX4 profile landed**, on top of
+the same-day capture session (§8/§11) and a scope call to trim what shipped now vs.
+defer. What's actually running:
+
+- **Phase 1 (profiles as data) — 🟢 built.** `src-tauri/src/midi/{mod,profile,decode,monitor}.rs`
+  replaced the old single hand-written `hercules_starlight_map()`. Both controllers are
+  TOML files in `src-tauri/profiles/`, loaded via `include_str!` plus an app-data
+  `profiles/*.toml` override directory (same `id` shadows a built-in). §5's hotplug
+  design is built too, not just sketched: a supervisor thread polls ports every 2s,
+  opens one connection per matched profile, and **both controllers can be live at
+  once**, each addressing its own decks — `ControlBinding`/`MidiAction` carry `slot: u8`
+  instead of a baked-in `deck_id`, and `Session.midiMapping` is now
+  `Record<profileId, string[]>` (slot → deck id per controller), with slot *i* →
+  `decks[i]` as the zero-config default. `AudioSettings.svelte`'s L/R selects retarget
+  whichever 2-slot profile is currently connected rather than being redesigned for N
+  controllers — a real per-controller routing UI is still open.
+- **Phase 2 (normalized-signal refactor, §4) — 🟡 built only where it was load-bearing.**
+  The jog wheel is the one place this couldn't be deferred: `JogNudge` was renamed
+  `JogTurn` and now carries **revolutions**, not raw ticks — a per-profile
+  `jog_ticks_per_rev` (Starlight 256, FLX4 ~721.7, §8.2) is divided out in Rust, and a
+  per-profile `invert` flag on the tempo fader recovers each controller's own
+  higher-raw-value sign convention (Starlight `invert=true`, FLX4 `invert=false`, §8.7)
+  — both are wire-format changes, both verified by a capture-replay test
+  (`src-tauri/tests/replay.rs`) landing within 1.0 of the real ~10-revolution capture.
+  **EQ/tempo values themselves stay denormalized** (actual dB, actual multiplier rate,
+  same as before this refactor) — the dB↔bipolar rework §4 describes is deferred, along
+  with any `midi_state.json` version-field ceremony beyond the slot-key rename the slot
+  refactor already forced (`{profileId}:{slot}.{field}`, a one-time silent break, not a
+  migration — see `persist_kv`'s doc comment in `midi/decode.rs`). `DeckEqMid`/
+  `DeckEqHigh` actions were added (the FLX4 has 3 real EQ knobs; cuemark's `mid`/`high`
+  bands existed with zero MIDI path before this).
+- **Phase 4 (author `pioneer-ddj-flx4.toml`) — 🟡 built, but only PART of it is
+  live-verified.** Jog, jog-touch note (deliberately unbound — see §10), pad-mode CC
+  layout, deck-slot count, and the tempo fader are cuemark's own §8/§11 captures. Every
+  other control (play, cue, sync, channel fader, trim, EQ hi/mid/low, filter/CFX,
+  crossfader, headphone mix) is sourced from **Mixxx's shipped mapping, not our own
+  capture** — a deliberate call given no bench pass was available this session — and
+  each such row carries `note = "from Mixxx mapping, not live-verified on this unit"`
+  in the TOML. Treat those as candidates until someone plays the actual controls; see
+  `docs/design/ddj-flx4-feature-gaps.md` for what's out of scope entirely (Sampler
+  pads, Beat FX, browse encoder).
+
+**Still open after this session**: the full §4 normalized-signal refactor for
+EQ/tempo, a real multi-controller routing UI, LED output (still no MIDI output code at
+all — §1/§11), `JogTouch` precedence (§10), and — the concrete next step — a live bench
+pass to confirm or correct every Mixxx-sourced row in `pioneer-ddj-flx4.toml` by ear.
+
+This doc is about *mapping* — wire bytes to bindings cuemark already knows how to act on.
+For physical FLX4 controls whose target *behaviour doesn't exist in cuemark at all* (Beat FX,
+sampler pads, loop halve/double, browse/library, reverse playback, …), see the separate
+inventory in `docs/design/ddj-flx4-feature-gaps.md`.
 
 The Starlight mapping as it stands is not wrong; it is *singular*. Every layer assumes
 exactly one controller, known at compile time, with the Starlight's specific encodings baked
@@ -107,12 +151,15 @@ name    = "Pioneer DJ DDJ-FLX4"
 # A list because ALSA/JACK/CoreMIDI spell the same device differently.
 match   = ["ddj-flx4", "flx4"]
 # How many deck slots this surface addresses. The session maps slot → software deck.
-slots   = 4
+slots   = 4             # ⚠️ pre-hardware guess, wrong — the real profile ships slots=2,
+                         # no 1/3-2/4 switch exists on this unit (§8.4)
 
 [[control]]
 status = 0x90            # full status byte — channel is NOT masked (see §3.1)
 d1     = 0x0B
-kind   = "button"        # momentary | toggle | button
+kind   = "button"        # ⚠️ pre-hardware guess, wrong — resolve_action has no
+                          # toggle/momentary concept; the real closed set the built
+                          # schema uses is button | fader | fader14 | relative
 action = "play_toggle"
 slot   = 0
 
@@ -303,10 +350,10 @@ Which yields the order:
 
 | Phase | Work | Gate to start |
 |---|---|---|
-| **1** | Profiles as data; port the Starlight map verbatim to TOML; slot→deck routing; hotplug/multi-port | now — no hardware needed |
-| **2** | Normalized-signal refactor (§4), incl. `midi_state.json` migration | with phase 1, same change ideally |
-| **3** | Raw MIDI monitor panel (`midi-raw`, unthrottled) — 🟢 **done 2026-08-17** | — |
-| **4** | Author the FLX4 profile by hand from captures (§8) | FLX4 in hand |
+| **1** | Profiles as data; port the Starlight map verbatim to TOML; slot→deck routing; hotplug/multi-port — 🟢 **done 2026-08-22** | now — no hardware needed |
+| **2** | Normalized-signal refactor (§4), incl. `midi_state.json` migration — 🟡 **jog+tempo slice done 2026-08-22, EQ/tempo dB rework deferred** (see the top-of-doc status note) | with phase 1, same change ideally |
+| **3** | Raw MIDI monitor panel (`midi-raw`, unthrottled) — 🟢 **done 2026-08-17**, extended 2026-08-22 for multi-controller (`source`, per-port keying) | — |
+| **4** | Author the FLX4 profile by hand from captures (§8) — 🟡 **done 2026-08-22 for captured controls; every other control sourced from Mixxx, not live-verified** | FLX4 in hand |
 | **5** | Learn-mode binding UI writing user profiles | phase 4 done — schema proven against 2 devices |
 | **6** | MIDI output / LEDs | after 4; FLX4 is the device that needs it |
 
@@ -382,10 +429,22 @@ with the monitor (§7a), across the mode change, before writing a single profile
    agrees or disagrees with the Starlight's `invert` needs re-deriving the Starlight's own
    sign convention carefully before setting the flag; don't assume disagreement by default
    the way this line originally speculated.
+   ✅ **RESOLVED 2026-08-22 (build session) — they disagree.** `rate_from_14bit`'s actual
+   formula, `(8192 − combined)/8192`, makes the Starlight's higher-raw-value = *slower*;
+   this row's own measurement above is higher-raw-value = *faster*. `pioneer-ddj-flx4.toml`
+   ships `invert = false` against the Starlight's `invert = true`, verified by
+   `src-tauri/tests/replay.rs` against the real jog/tempo captures.
 
 ---
 
 ## 9. Testing without hardware
+
+✅ **Both bullets below are built** (2026-08-22 build session): profile validation lives in
+`src-tauri/src/midi/profile.rs`'s tests (the old `tone_knob_tests` moved and split between
+`midi/decode.rs` — the value-mapping math — and `midi/profile.rs` — the map-shape
+assertions), and capture-and-replay is `src-tauri/tests/replay.rs` against real fixtures in
+`src-tauri/tests/captures/`, including the FLX4 jog capture. What follows is the original
+reasoning, kept because it still explains *why*:
 
 The current mapping tests (`tone_knob_tests` in `midi.rs`) are good and should survive the
 move — but they test *one* map by calling it. With profiles, two cheap things become
@@ -419,10 +478,11 @@ control before it is called done.
   serialized with the session; a controller identity is more like a device setting
   (`cuemark:` localStorage, per `audioSettings.ts`). A profile bound to a session that is
   later restored on a machine with a different controller attached needs a defined answer.
-- **Whether the frontend needs to know which controller sent an action.** Today it cannot,
-  and does not need to. With two live surfaces, feedback (LEDs) and "which controller is
-  driving this deck" both want it, which argues for a `source` field on `MidiAction` sooner
-  rather than later — it is nearly free to add now and awkward to retrofit.
+- ✅ **RESOLVED / built 2026-08-22.** `MidiEvent { source: u32, profile: String, action:
+  MidiAction }` (`midi/mod.rs`) wraps every emitted action; `midi_list_controllers` +
+  `"midi-controllers"` expose live connections to the UI. `source` isn't yet consumed
+  frontend-side beyond `MidiMonitor.svelte`'s per-port keying — using it to disambiguate
+  which controller is driving a given deck in the general UI is still open.
 - **`JogTouch` precedence.** When a controller reports platter touch, does touch override
   `deck.playing` for the scratch-vs-bend decision, or gate it? Touching a *playing* FLX4
   platter conventionally means scratch-over-playback, which cuemark's paused-deck feeder

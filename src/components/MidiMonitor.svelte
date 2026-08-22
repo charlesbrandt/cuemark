@@ -20,6 +20,7 @@
   import { listen } from "@tauri-apps/api/event";
 
   interface MidiRaw {
+    source: number;
     port: string;
     bytes: number[];
     len: number;
@@ -34,6 +35,11 @@
 
   interface ControlStat {
     key: string;
+    /** Short port label, shown in its own column. The key itself is namespaced by
+        port (below) so two controllers sending the same (status,d1) — plausible,
+        since profiles reuse the same wire bytes on different physical devices —
+        don't merge into one nonsense row. */
+    port: string;
     status: number;
     d1: number;
     n: number;
@@ -124,8 +130,8 @@
     // 14-bit pairing: a partner 32 CCs away is the near-universal spelling. Reported as a
     // partner sighting rather than as a fact, because "+32" is a convention and a profile
     // is allowed to say otherwise (controller-mapping.md §3.3).
-    const partnerHi = stats.get(`${hex2(s.status)}:${hex2(s.d1 + 32)}`);
-    const partnerLo = s.d1 >= 32 ? stats.get(`${hex2(s.status)}:${hex2(s.d1 - 32)}`) : undefined;
+    const partnerHi = stats.get(`${s.port}:${hex2(s.status)}:${hex2(s.d1 + 32)}`);
+    const partnerLo = s.d1 >= 32 ? stats.get(`${s.port}:${hex2(s.status)}:${hex2(s.d1 - 32)}`) : undefined;
 
     const vals = [...s.values];
     const smallLow = vals.filter((v) => v <= 8).length;
@@ -166,11 +172,12 @@
     }
     const [status, d1] = m.bytes;
     const d2 = m.len >= 3 ? m.bytes[2] : 0;
-    const key = `${hex2(status)}:${hex2(d1)}`;
+    // Namespaced by port, not just (status,d1) — see the ControlStat.port doc comment.
+    const key = `${m.port}:${hex2(status)}:${hex2(d1)}`;
     let s = stats.get(key);
     if (!s) {
       s = {
-        key, status, d1,
+        key, port: m.port, status, d1,
         n: 0, lastD2: d2, minD2: d2, maxD2: d2,
         values: new Set(), recentT: [], mapped: m.mapped, lastT: m.t,
       };
@@ -311,13 +318,14 @@
   {#if rows.length > 0}
     <div class="mm-table">
       <div class="mm-head">
-        <span>ctrl</span><span>type</span><span>ch</span><span>d2</span>
+        <span>port</span><span>ctrl</span><span>type</span><span>ch</span><span>d2</span>
         <span>range</span><span>msg/s</span><span>n</span><span>values</span>
         <span>guess</span><span>mapped to</span>
       </div>
       {#each rows as s (s.key)}
         <div class="mm-row" class:unmapped={!s.mapped}>
-          <span class="mono">{s.key}</span>
+          <span class="mono mm-port-cell" title={s.port}>{s.port.split(":")[0]}</span>
+          <span class="mono">{hex2(s.status)}:{hex2(s.d1)}</span>
           <span>{msgType(s.status)}</span>
           <span class="mono">{(s.status & 0x0f) + 1}</span>
           <span class="mono">{s.lastD2}</span>
@@ -442,10 +450,16 @@
   .mm-head,
   .mm-row {
     display: grid;
-    grid-template-columns: 64px 74px 28px 40px 62px 48px 56px 1fr 168px 1fr;
+    grid-template-columns: 90px 64px 74px 28px 40px 62px 48px 56px 1fr 168px 1fr;
     gap: 8px;
     padding: 2px 8px;
     align-items: baseline;
+  }
+
+  .mm-port-cell {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .mm-head {

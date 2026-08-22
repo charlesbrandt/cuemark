@@ -1,9 +1,31 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { listAudioDevices, type AudioDevice } from "../lib/audio/pipeline";
   import { mainOutputDeviceIds, cueOutputDeviceId, tempoRange, scratchMode, jogSecondsPerRev, scrubInertiaMs, SCRUB_INERTIA_MAX_MS, networkOutputs, outputAttachStatus } from "../lib/audio/audioSettings";
   import { fontScale } from "../lib/settings/displaySettings";
-  import { session, setMidiMapping } from "../lib/state/session";
+  import { session, setMidiSlot } from "../lib/state/session";
+
+  interface ControllerInfo {
+    source: number;
+    port: string;
+    profile_id: string;
+    profile_name: string;
+    slots: number;
+    jog_ticks_per_rev: number;
+  }
+
+  // Which live controller the L/R selects below edit. Deliberately not a full
+  // per-controller routing UI (deferred — see docs/design/controller-mapping.md):
+  // with two controllers live at once this can only edit one at a time, but default
+  // slot-i -> decks[i] routing (session.ts) covers the common case regardless, and a
+  // real multi-controller UI is a bigger redesign than this trimmed pass covers.
+  let controllers = $state<ControllerInfo[]>([]);
+  let activeProfileId = $derived(
+    controllers.find((c) => c.slots >= 2)?.profile_id ?? "hercules-starlight"
+  );
+  let unlistenControllers: (() => void) | undefined;
 
   let localDevices = $state<AudioDevice[]>([]);
   let error = $state("");
@@ -106,6 +128,19 @@
       console.warn("[AudioSettings] dropped stale cue device id:", $cueOutputDeviceId);
       cueOutputDeviceId.set("");
     }
+
+    try {
+      controllers = await invoke<ControllerInfo[]>("midi_list_controllers");
+    } catch (e) {
+      console.error("[AudioSettings] midi_list_controllers failed:", e);
+    }
+    unlistenControllers = await listen<ControllerInfo[]>("midi-controllers", ({ payload }) => {
+      controllers = payload;
+    });
+  });
+
+  onDestroy(() => {
+    unlistenControllers?.();
   });
 
   function toggleMainDevice(id: string, checked: boolean) {
@@ -114,8 +149,10 @@
     );
   }
 
-  let midiMapping = $derived($session.midiMapping);
   let decks = $derived($session.decks);
+  let midiSlots = $derived($session.midiMapping[activeProfileId] ?? []);
+  let midiLeft = $derived(midiSlots[0] ?? decks[0]?.id ?? "");
+  let midiRight = $derived(midiSlots[1] ?? decks[1]?.id ?? "");
 </script>
 
 <div class="audio-settings">
@@ -338,8 +375,8 @@
     <span class="row-label">MIDI</span>
     <span class="side-label">L</span>
     <select
-      value={midiMapping.left}
-      onchange={(e) => setMidiMapping(e.currentTarget.value, midiMapping.right)}
+      value={midiLeft}
+      onchange={(e) => setMidiSlot(activeProfileId, 0, e.currentTarget.value)}
     >
       {#each decks as d (d.id)}
         <option value={d.id}>{d.id}</option>
@@ -347,13 +384,21 @@
     </select>
     <span class="side-label" style="margin-left:8px">R</span>
     <select
-      value={midiMapping.right}
-      onchange={(e) => setMidiMapping(midiMapping.left, e.currentTarget.value)}
+      value={midiRight}
+      onchange={(e) => setMidiSlot(activeProfileId, 1, e.currentTarget.value)}
     >
       {#each decks as d (d.id)}
         <option value={d.id}>{d.id}</option>
       {/each}
     </select>
+    {#if controllers.length > 0}
+      <span class="hint-inline">
+        editing {controllers.find((c) => c.profile_id === activeProfileId)?.profile_name ?? activeProfileId}
+        {#if controllers.length > 1}(other live controllers use default slot routing){/if}
+      </span>
+    {:else}
+      <span class="hint-inline">no controller connected — showing default routing</span>
+    {/if}
   </div>
 </div>
 

@@ -1,0 +1,476 @@
+# Hercules DJControl Starlight — ported verbatim from the old hand-written
+# hercules_starlight_map() (src-tauri/src/midi.rs, pre-2026-08-22). Every key, action,
+# and the "why" behind the two deliberately-unmapped controls carries over unchanged;
+# see docs/design/controller-mapping.md for the profile-format rationale.
+#
+# Channel layout (confirmed by hardware):
+#   ch 2  (0x91 Note On, 0xB1 CC) = left deck   (slot 0)
+#   ch 3  (0x92 Note On, 0xB2 CC) = right deck  (slot 1)
+#   ch 7  (0x96 Note On)          = left hot cues / loop pads
+#   ch 8  (0x97 Note On)          = right hot cues / loop pads (by symmetry; unverified)
+#   ch 1  (0xB0 CC)               = global (crossfader, master volume, cue gain)
+#
+# 14-bit CC pairs: coarse MSB on CC N, fine LSB on CC N+32. Only the tempo fader is
+# modeled as fader14 (both halves matter — the MSB barely moves for small slider
+# adjustments); every other fader/knob here maps its MSB only, matching the original
+# comment "we map the MSB only; 7-bit resolution is sufficient for all controls".
+
+id = "hercules-starlight"
+name = "Hercules DJControl Starlight"
+match = ["hercules", "starlight"]
+slots = 2
+centre_snap = 0.02
+jog_ticks_per_rev = 256.0
+
+# ── Left deck (ch 2, slot 0) ─────────────────────────────────────────────────────
+
+[[control]]
+status = 0x91
+d1 = 7
+kind = "button"
+action = "play_toggle"
+slot = 0
+
+[[control]]
+status = 0x91
+d1 = 6
+kind = "button"
+action = "cue_jump"
+slot = 0
+
+[[control]]
+status = 0x91
+d1 = 3
+kind = "button"
+action = "loop_toggle"
+slot = 0
+
+[[control]]
+status = 0x91
+d1 = 5
+kind = "button"
+action = "sync_toggle"
+slot = 0
+
+# Volume/gain fader (CC 0 coarse; CC 32 fine — ignored, matching the original's
+# 7-bit-is-enough decision). Mapped to "gain" (pre-fader trim), not "volume" — the
+# crossfader drives deck.volume separately.
+[[control]]
+status = 0xB1
+d1 = 0
+kind = "fader"
+action = "gain"
+slot = 0
+
+# Tempo/pitch fader — the one 14-bit pair that matters: CC 8 (MSB) + CC 40 (LSB).
+# invert = true: the Starlight sends higher raw values for negative pitch (pushing
+# down = faster) — the opposite of the FLX4's own convention (see that profile).
+[[control]]
+status = 0xB1
+d1 = 8
+kind = "fader14"
+action = "tempo"
+slot = 0
+invert = true
+
+# The dual-function tone knob: ONE physical knob, two CCs — the controller swaps
+# which one it sends when the Bass/Filter button (0x90,1) is pressed, in firmware.
+# Both rows stay mapped permanently; do NOT add a binding for (0x90,1) — see the
+# note at the bottom of this file.
+[[control]]
+status = 0xB1
+d1 = 2
+kind = "fader"
+action = "eq_low"
+slot = 0
+
+[[control]]
+status = 0xB1
+d1 = 1
+kind = "fader"
+action = "filter"
+slot = 0
+
+# Jog wheel rotation — relative encoder, two's complement, calibrated 256 ticks/rev
+# (docs/design/waveform-scrub.md's [jog-cal/...] procedure).
+[[control]]
+status = 0xB1
+d1 = 10
+kind = "relative"
+encoding = "twos7"
+action = "jog_turn"
+slot = 0
+
+# Hot cues (d1 = cue index 0-3); Shift+pad sends d1+8 on the same channel.
+[[control]]
+status = 0x96
+d1 = 0
+kind = "button"
+action = "hot_cue"
+index = 0
+slot = 0
+
+[[control]]
+status = 0x96
+d1 = 1
+kind = "button"
+action = "hot_cue"
+index = 1
+slot = 0
+
+[[control]]
+status = 0x96
+d1 = 2
+kind = "button"
+action = "hot_cue"
+index = 2
+slot = 0
+
+[[control]]
+status = 0x96
+d1 = 3
+kind = "button"
+action = "hot_cue"
+index = 3
+slot = 0
+
+[[control]]
+status = 0x96
+d1 = 8
+kind = "button"
+action = "hot_cue_set"
+index = 0
+slot = 0
+
+[[control]]
+status = 0x96
+d1 = 9
+kind = "button"
+action = "hot_cue_set"
+index = 1
+slot = 0
+
+[[control]]
+status = 0x96
+d1 = 10
+kind = "button"
+action = "hot_cue_set"
+index = 2
+slot = 0
+
+[[control]]
+status = 0x96
+d1 = 11
+kind = "button"
+action = "hot_cue_set"
+index = 3
+slot = 0
+
+# Same 4 pads, Loop pad-mode (controller firmware remaps them — see the mode-button
+# note at the bottom). Captured live 2026-08-22: plain = d1 16-19, shift = d1 24-27,
+# exactly the hot-cue layout offset by +16.
+[[control]]
+status = 0x96
+d1 = 16
+kind = "button"
+action = "loop_preset"
+index = 0
+slot = 0
+
+[[control]]
+status = 0x96
+d1 = 17
+kind = "button"
+action = "loop_preset"
+index = 1
+slot = 0
+
+[[control]]
+status = 0x96
+d1 = 18
+kind = "button"
+action = "loop_preset"
+index = 2
+slot = 0
+
+[[control]]
+status = 0x96
+d1 = 19
+kind = "button"
+action = "loop_preset"
+index = 3
+slot = 0
+
+[[control]]
+status = 0x96
+d1 = 24
+kind = "button"
+action = "loop_preset"
+index = 4
+slot = 0
+
+[[control]]
+status = 0x96
+d1 = 25
+kind = "button"
+action = "loop_preset"
+index = 5
+slot = 0
+
+[[control]]
+status = 0x96
+d1 = 26
+kind = "button"
+action = "loop_preset"
+index = 6
+slot = 0
+
+[[control]]
+status = 0x96
+d1 = 27
+kind = "button"
+action = "loop_preset"
+index = 7
+slot = 0
+
+# ── Right deck (ch 3, slot 1) — mirrors the left deck exactly ───────────────────
+
+[[control]]
+status = 0x92
+d1 = 7
+kind = "button"
+action = "play_toggle"
+slot = 1
+
+[[control]]
+status = 0x92
+d1 = 6
+kind = "button"
+action = "cue_jump"
+slot = 1
+
+[[control]]
+status = 0x92
+d1 = 3
+kind = "button"
+action = "loop_toggle"
+slot = 1
+
+[[control]]
+status = 0x92
+d1 = 5
+kind = "button"
+action = "sync_toggle"
+slot = 1
+
+[[control]]
+status = 0xB2
+d1 = 0
+kind = "fader"
+action = "gain"
+slot = 1
+
+[[control]]
+status = 0xB2
+d1 = 8
+kind = "fader14"
+action = "tempo"
+slot = 1
+invert = true
+
+[[control]]
+status = 0xB2
+d1 = 2
+kind = "fader"
+action = "eq_low"
+slot = 1
+
+[[control]]
+status = 0xB2
+d1 = 1
+kind = "fader"
+action = "filter"
+slot = 1
+
+[[control]]
+status = 0xB2
+d1 = 10
+kind = "relative"
+encoding = "twos7"
+action = "jog_turn"
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 0
+kind = "button"
+action = "hot_cue"
+index = 0
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 1
+kind = "button"
+action = "hot_cue"
+index = 1
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 2
+kind = "button"
+action = "hot_cue"
+index = 2
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 3
+kind = "button"
+action = "hot_cue"
+index = 3
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 8
+kind = "button"
+action = "hot_cue_set"
+index = 0
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 9
+kind = "button"
+action = "hot_cue_set"
+index = 1
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 10
+kind = "button"
+action = "hot_cue_set"
+index = 2
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 11
+kind = "button"
+action = "hot_cue_set"
+index = 3
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 16
+kind = "button"
+action = "loop_preset"
+index = 0
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 17
+kind = "button"
+action = "loop_preset"
+index = 1
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 18
+kind = "button"
+action = "loop_preset"
+index = 2
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 19
+kind = "button"
+action = "loop_preset"
+index = 3
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 24
+kind = "button"
+action = "loop_preset"
+index = 4
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 25
+kind = "button"
+action = "loop_preset"
+index = 5
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 26
+kind = "button"
+action = "loop_preset"
+index = 6
+slot = 1
+
+[[control]]
+status = 0x97
+d1 = 27
+kind = "button"
+action = "loop_preset"
+index = 7
+slot = 1
+
+# ── Global (ch 1) ────────────────────────────────────────────────────────────────
+
+# Crossfader: 14-bit pair — CC 0 (MSB) mapped; CC 32 (LSB) intentionally not tracked
+# (kind="fader", not "fader14" — 7-bit resolution deemed sufficient, matching the
+# original's explicit comment).
+[[control]]
+status = 0xB0
+d1 = 0
+kind = "fader"
+action = "crossfader"
+
+[[control]]
+status = 0xB0
+d1 = 3
+kind = "fader"
+action = "master_volume"
+
+[[control]]
+status = 0xB0
+d1 = 4
+kind = "fader"
+action = "cue_gain"
+
+[[control]]
+status = 0x91
+d1 = 12
+kind = "button"
+action = "headphone_cue"
+slot = 0
+
+[[control]]
+status = 0x92
+d1 = 12
+kind = "button"
+action = "headphone_cue"
+slot = 1
+
+# Deliberately unmapped (no action needed — carried over from the original map):
+#   (0x90, 3)  = Shift button — controller remaps pads in firmware; no host tracking needed
+#   (0x90, 1)  = Bass/Filter button — the controller swaps the tone knob's CC in firmware
+#                (CC 2 <-> CC 1), so both modes are already mapped above and there is
+#                nothing for the host to do on the button itself.
+#                Do NOT "improve" this by tracking mode here — the button is momentary
+#                and never reports which mode it selected, so a host-side guess would
+#                drift out of sync with the hardware after a reconnect.
+#   (0x91, 15) = Hot-cue mode button   (0x91, 16) = Loop mode button

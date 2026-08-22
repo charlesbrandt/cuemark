@@ -1,0 +1,445 @@
+# Pioneer DJ DDJ-FLX4 — first real profile, authored 2026-08-22. Two different kinds
+# of evidence back the rows below, and they are NOT equally trustworthy:
+#
+#   * Rows with no `note` field were captured live on this exact unit with cuemark's
+#     own raw MIDI monitor (docs/design/controller-mapping.md §8/§11) — jog encoding,
+#     jog-touch note, pad-mode CC layout, deck-slot count, tempo fader direction.
+#   * Rows marked `note = "from Mixxx mapping, not live-verified on this unit"` are
+#     taken from Mixxx's shipped Pioneer-DDJ-FLX4.midi.xml (a third party's reference,
+#     not our own capture) because no bench pass covered these controls yet — play,
+#     cue, sync, faders, EQ, filter, crossfader, headphone mix. Treat them as
+#     candidates, not facts, until a live pass confirms them (see the standing
+#     "capture before designing" rule this project has been bitten by before).
+#
+# LED output, the browse encoder, Beat FX, Sampler pads, and jog touch-as-scratch-
+# trigger are deliberately NOT in this file — see
+# docs/design/controller-mapping.md §6/§10/§11 and docs/design/ddj-flx4-feature-gaps.md.
+# This profile is input-only; cuemark has no MIDI output code at all yet.
+
+id = "pioneer-ddj-flx4"
+name = "Pioneer DJ DDJ-FLX4"
+match = ["ddj-flx4", "flx4"]
+slots = 2
+centre_snap = 0.02
+# Captured live 2026-08-22: 5 slow + 5 fast revolutions measured 3602/3615 ticks
+# (720.4-723.0/rev, 0.4% apart) — controller-mapping.md §8.2.
+jog_ticks_per_rev = 721.7
+
+# ── Deck 1 (slot 0) — status 0x90 (notes) / 0xB0 (CC) ────────────────────────────
+
+[[control]]
+status = 0x90
+d1 = 0x0B
+kind = "button"
+action = "play_toggle"
+slot = 0
+note = "from Mixxx mapping, not live-verified on this unit"
+
+[[control]]
+status = 0x90
+d1 = 0x0C
+kind = "button"
+action = "cue_jump"
+slot = 0
+note = "from Mixxx mapping, not live-verified on this unit"
+
+[[control]]
+status = 0x90
+d1 = 0x58
+kind = "button"
+action = "sync_toggle"
+slot = 0
+note = "from Mixxx mapping, not live-verified on this unit"
+
+[[control]]
+status = 0x90
+d1 = 0x54
+kind = "button"
+action = "headphone_cue"
+slot = 0
+note = "from Mixxx mapping, not live-verified on this unit (Cue/PFL button)"
+
+# Channel fader vs. Trim: the FLX4 has BOTH, unlike the Starlight's single fader.
+# Bound to the DJ-workflow-typical split — the channel fader (the one a DJ rides
+# during a mix) drives volume, the trim knob drives gain (pre-fader trim, matching
+# DeckGain's existing doc comment exactly). This is a judgment call, not a captured
+# fact — the Starlight convention (fader -> gain, volume MIDI-unbound) doesn't
+# transfer cleanly since it never had a separate trim knob to give gain to instead.
+[[control]]
+status = 0xB0
+d1 = 0x13
+kind = "fader14"
+lsb_d1 = 0x33
+action = "volume"
+slot = 0
+note = "from Mixxx mapping, not live-verified on this unit; channel fader -> volume (see file header)"
+
+[[control]]
+status = 0xB0
+d1 = 0x04
+kind = "fader14"
+lsb_d1 = 0x24
+action = "gain"
+slot = 0
+note = "from Mixxx mapping, not live-verified on this unit (Trim knob -> gain)"
+
+[[control]]
+status = 0xB0
+d1 = 0x07
+kind = "fader14"
+lsb_d1 = 0x27
+action = "eq_high"
+slot = 0
+note = "from Mixxx mapping, not live-verified on this unit"
+
+[[control]]
+status = 0xB0
+d1 = 0x0B
+kind = "fader14"
+lsb_d1 = 0x2B
+action = "eq_mid"
+slot = 0
+note = "from Mixxx mapping, not live-verified on this unit"
+
+[[control]]
+status = 0xB0
+d1 = 0x0F
+kind = "fader14"
+lsb_d1 = 0x2F
+action = "eq_low"
+slot = 0
+note = "from Mixxx mapping, not live-verified on this unit"
+
+# ── Deck 2 (slot 1) — status 0x91 (notes) / 0xB1 (CC), same CC/note numbers ──────
+
+[[control]]
+status = 0x91
+d1 = 0x0B
+kind = "button"
+action = "play_toggle"
+slot = 1
+note = "from Mixxx mapping, not live-verified on this unit"
+
+[[control]]
+status = 0x91
+d1 = 0x0C
+kind = "button"
+action = "cue_jump"
+slot = 1
+note = "from Mixxx mapping, not live-verified on this unit"
+
+[[control]]
+status = 0x91
+d1 = 0x58
+kind = "button"
+action = "sync_toggle"
+slot = 1
+note = "from Mixxx mapping, not live-verified on this unit"
+
+[[control]]
+status = 0x91
+d1 = 0x54
+kind = "button"
+action = "headphone_cue"
+slot = 1
+note = "from Mixxx mapping, not live-verified on this unit (Cue/PFL button)"
+
+[[control]]
+status = 0xB1
+d1 = 0x13
+kind = "fader14"
+lsb_d1 = 0x33
+action = "volume"
+slot = 1
+note = "from Mixxx mapping, not live-verified on this unit; channel fader -> volume (see file header)"
+
+[[control]]
+status = 0xB1
+d1 = 0x04
+kind = "fader14"
+lsb_d1 = 0x24
+action = "gain"
+slot = 1
+note = "from Mixxx mapping, not live-verified on this unit (Trim knob -> gain)"
+
+[[control]]
+status = 0xB1
+d1 = 0x07
+kind = "fader14"
+lsb_d1 = 0x27
+action = "eq_high"
+slot = 1
+note = "from Mixxx mapping, not live-verified on this unit"
+
+[[control]]
+status = 0xB1
+d1 = 0x0B
+kind = "fader14"
+lsb_d1 = 0x2B
+action = "eq_mid"
+slot = 1
+note = "from Mixxx mapping, not live-verified on this unit"
+
+[[control]]
+status = 0xB1
+d1 = 0x0F
+kind = "fader14"
+lsb_d1 = 0x2F
+action = "eq_low"
+slot = 1
+note = "from Mixxx mapping, not live-verified on this unit"
+
+# ── Tempo faders — captured live 2026-08-22 (§8.7) ───────────────────────────────
+# 14-bit, MSB (0xB0/0xB1, 0) + LSB (..., 32). invert = false: higher raw value =
+# faster on this unit — the OPPOSITE of the Starlight's own convention (which sets
+# invert = true to recover its unchanged original behaviour). See
+# decode.rs's tempo_from_14bit doc comment for what "natural"/"invert" mean.
+
+[[control]]
+status = 0xB0
+d1 = 0
+kind = "fader14"
+action = "tempo"
+slot = 0
+invert = false
+
+[[control]]
+status = 0xB1
+d1 = 0
+kind = "fader14"
+action = "tempo"
+slot = 1
+invert = false
+
+# ── Jog wheels — captured live 2026-08-22 (§8.2) ─────────────────────────────────
+# offset64 encoding (byte 63/65/66 centered on 64 — NOT two's complement, which
+# would put -1 at 0x7F not 0x3F). CC 0x22 = turn while touched (captured directly on
+# deck 2 / 0xB1); CC 0x21 = untouched/pitch-bend rotation (same action for now — no
+# distinct pitch-bend behaviour is built yet, this is a placeholder mapping, not a
+# statement that bend and scratch should feel identical). Deck 1 / 0xB0 rows are
+# inferred by symmetry, not directly captured — same caveat as the Starlight's own
+# right-hot-cue-channel "by symmetry; unverified" note.
+
+[[control]]
+status = 0xB0
+d1 = 0x22
+kind = "relative"
+encoding = "offset64"
+action = "jog_turn"
+slot = 0
+note = "inferred by symmetry from the captured 0xB1 side, not directly captured"
+
+[[control]]
+status = 0xB0
+d1 = 0x21
+kind = "relative"
+encoding = "offset64"
+action = "jog_turn"
+slot = 0
+note = "inferred by symmetry; untouched/pitch-bend rotation, same action as 0x22 for now"
+
+[[control]]
+status = 0xB1
+d1 = 0x22
+kind = "relative"
+encoding = "offset64"
+action = "jog_turn"
+slot = 1
+
+[[control]]
+status = 0xB1
+d1 = 0x21
+kind = "relative"
+encoding = "offset64"
+action = "jog_turn"
+slot = 1
+note = "untouched/pitch-bend rotation, same action as 0x22 for now"
+
+# Jog touch (0x90/0x91, 0x36) is deliberately NOT bound here. It's real and captured
+# (§11), but JogTouch precedence — whether touching a *playing* deck's platter should
+# trigger scratch-over-playback — is an open design question
+# (docs/design/controller-mapping.md §10, docs/design/waveform-scrub.md), not
+# something to wire to nothing just because the byte is known.
+
+# ── Pads — captured live 2026-08-22 (§8.3/§11), firmware-side modes, flat rows ───
+# Only 4 of the FLX4's 8 physical pads are bound per mode: Deck.hotCues is a
+# fixed 4-slot array (types.ts), so hot_cue index 4-7 would have nothing to write
+# into; loop_preset uses the first 4 entries of LOOP_PRESET_BEATS (the "plain pad"
+# longer lengths: 4/8/16/32 beats) rather than inventing a second half. Deck 1 pads
+# are status 0x97, deck 2 are 0x99 (captured directly).
+
+[[control]]
+status = 0x97
+d1 = 0x00
+kind = "button"
+action = "hot_cue"
+index = 0
+slot = 0
+
+[[control]]
+status = 0x97
+d1 = 0x01
+kind = "button"
+action = "hot_cue"
+index = 1
+slot = 0
+
+[[control]]
+status = 0x97
+d1 = 0x02
+kind = "button"
+action = "hot_cue"
+index = 2
+slot = 0
+
+[[control]]
+status = 0x97
+d1 = 0x03
+kind = "button"
+action = "hot_cue"
+index = 3
+slot = 0
+
+[[control]]
+status = 0x97
+d1 = 0x20
+kind = "button"
+action = "loop_preset"
+index = 0
+slot = 0
+
+[[control]]
+status = 0x97
+d1 = 0x21
+kind = "button"
+action = "loop_preset"
+index = 1
+slot = 0
+
+[[control]]
+status = 0x97
+d1 = 0x22
+kind = "button"
+action = "loop_preset"
+index = 2
+slot = 0
+
+[[control]]
+status = 0x97
+d1 = 0x23
+kind = "button"
+action = "loop_preset"
+index = 3
+slot = 0
+
+[[control]]
+status = 0x99
+d1 = 0x00
+kind = "button"
+action = "hot_cue"
+index = 0
+slot = 1
+
+[[control]]
+status = 0x99
+d1 = 0x01
+kind = "button"
+action = "hot_cue"
+index = 1
+slot = 1
+
+[[control]]
+status = 0x99
+d1 = 0x02
+kind = "button"
+action = "hot_cue"
+index = 2
+slot = 1
+
+[[control]]
+status = 0x99
+d1 = 0x03
+kind = "button"
+action = "hot_cue"
+index = 3
+slot = 1
+
+[[control]]
+status = 0x99
+d1 = 0x20
+kind = "button"
+action = "loop_preset"
+index = 0
+slot = 1
+
+[[control]]
+status = 0x99
+d1 = 0x21
+kind = "button"
+action = "loop_preset"
+index = 1
+slot = 1
+
+[[control]]
+status = 0x99
+d1 = 0x22
+kind = "button"
+action = "loop_preset"
+index = 2
+slot = 1
+
+[[control]]
+status = 0x99
+d1 = 0x23
+kind = "button"
+action = "loop_preset"
+index = 3
+slot = 1
+
+# Sampler mode (0x30-0x37) is deliberately NOT bound — cuemark has no sample-slot
+# concept at all yet (docs/design/ddj-flx4-feature-gaps.md §4), so there is nothing
+# for these pads to drive.
+
+# ── Global / mixer (no deck) — from Mixxx, not live-verified ────────────────────
+
+[[control]]
+status = 0xB6
+d1 = 0x1F
+kind = "fader14"
+lsb_d1 = 0x3F
+action = "crossfader"
+note = "from Mixxx mapping, not live-verified on this unit"
+
+[[control]]
+status = 0xB6
+d1 = 0x17
+kind = "fader14"
+lsb_d1 = 0x37
+action = "filter"
+slot = 0
+note = "from Mixxx mapping, not live-verified on this unit (Filter/CFX knob ch1)"
+
+[[control]]
+status = 0xB6
+d1 = 0x18
+kind = "fader14"
+lsb_d1 = 0x38
+action = "filter"
+slot = 1
+note = "from Mixxx mapping, not live-verified on this unit (Filter/CFX knob ch2)"
+
+# Headphones Mix is actually a cue/master BALANCE knob, not a pure level — bound to
+# the closest existing action (cue_gain) for this trimmed pass rather than inventing
+# a new action; the semantic mismatch is real and worth revisiting once someone can
+# turn this knob and listen.
+[[control]]
+status = 0xB6
+d1 = 0x0C
+kind = "fader14"
+lsb_d1 = 0x2C
+action = "cue_gain"
+note = "from Mixxx mapping, not live-verified on this unit; this is a cue/master BALANCE knob, not a pure level — see comment above"
+
+# Master level and headphone OUTPUT level are confirmed hardware-analog-only on this
+# unit (docs/design/ddj-flx4-feature-gaps.md §8) — no MIDI bytes exist for them, so
+# there is nothing to bind.

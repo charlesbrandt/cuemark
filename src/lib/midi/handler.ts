@@ -56,7 +56,9 @@ function queueCrossfader(value: number) {
   }
 }
 
-// Must match the Rust MidiAction enum (snake_case tag + camelCase fields from serde)
+// Must match the Rust MidiEvent{source,profile,#[flatten] MidiAction} shape (snake_case
+// tag + camelCase fields from serde). Deck-scoped actions carry `slot`, never a deck id
+// — see slotDeck() below for why (docs/design/controller-mapping.md §3.2/§4).
 export interface MidiAction {
   type:
     | "deck_play_toggle"
@@ -64,7 +66,7 @@ export interface MidiAction {
     | "deck_gain"
     | "deck_volume"
     | "deck_playback_rate"
-    | "jog_nudge"
+    | "jog_turn"
     | "crossfader"
     | "master_volume"
     | "cue_gain"
@@ -77,21 +79,32 @@ export interface MidiAction {
     | "headphone_cue"
     | "phase_nudge"
     | "deck_eq_low"
+    | "deck_eq_mid"
+    | "deck_eq_high"
     | "deck_filter";
-  deck_id?: string;
+  /** Which connection sent this — see spawn_listener's NEXT_SOURCE in midi/mod.rs. */
+  source: number;
+  /** Profile id ("hercules-starlight" / "pioneer-ddj-flx4" / …) — the key into
+      Session.midiMapping, and what lets two live controllers route independently. */
+  profile: string;
+  slot?: number;
   value?: number;
   index?: number;
 }
 
-// Remap a MIDI-side deck ID ("deck-0"/"deck-1") to the configured software deck.
-// The Rust map hardcodes "deck-0" for the left controller channel and "deck-1" for
-// the right; midiMapping lets the user reassign without touching the Rust map.
-function midiDeckId(hardcoded: string | undefined): string | undefined {
-  if (!hardcoded) return hardcoded;
-  const m = get(session).midiMapping;
-  if (hardcoded === "deck-0") return m.left;
-  if (hardcoded === "deck-1") return m.right;
-  return hardcoded;
+/**
+ * Resolve a controller's (profile, slot) to a software deck id. Falls back to
+ * slot-i -> decks[i] when the profile has no explicit routing yet (or the array is
+ * shorter than this slot) — zero-config default routing, since there is deliberately
+ * no per-controller settings UI beyond AudioSettings' single-profile L/R selects.
+ * Replaces the old midiDeckId(), which only ever knew "deck-0"/"deck-1" (the
+ * Starlight's own hardcoded channel labels) — this generalizes to any slot count on
+ * any number of simultaneously-connected controllers.
+ */
+export function slotDeck(profile: string, slot: number | undefined): string | undefined {
+  if (slot === undefined) return undefined;
+  const s = get(session);
+  return s.midiMapping[profile]?.[slot] ?? s.decks[slot]?.id;
 }
 
 // Per-deck jog state: saves the rate that was active before jog started so it can be restored.
@@ -100,12 +113,12 @@ const jogTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 // Tick-velocity EMA for the playing-deck jog bend below — same shape as scratchVelocity,
 // kept separate because the two branches (playing vs paused) run independently and a
 // gesture switching between them mid-session must not inherit a stale reading.
-const jogVelocity: Record<string, { lastT: number; emaTicksPerSec: number }> = {};
+const jogVelocity: Record<string, { lastT: number; emaRevsPerSec: number }> = {};
 
 // Paused-deck jog scratch: true bidirectional audio scratch (PCM-buffer feeder branch —
 // pitch bends with speed/direction, like real vinyl) rather than a silent position-only
 // scrub. See docs/design/pcm-buffer-playback.md. Rate is derived from tick *velocity*,
-// tracked as an exponential moving average (EMA) of instantaneous ticks/sec between
+// tracked as an exponential moving average (EMA) of instantaneous revs/sec between
 // consecutive MIDI events — not a hard rolling window summed over a fixed span. A hard
 // window (sum of tick values over the last N ms, divided by the elapsed time since the
 // oldest one still in the window) was tried first and discarded on real hardware: USB
@@ -167,41 +180,15 @@ const SCRATCH_IDLE_MS = 500;
 // targets discards nothing. See seekBus.ts's scrub section and scratch_to() in
 // pipeline.rs. Shuttle mode is untouched below.
 
-// Content seconds of travel per encoder tick. 33⅓rpm is 1.8s per revolution, so the
-// vinyl-faithful value is 1.8 / (ticks per revolution).
-//
-// ✅ Calibrated live against the Starlight 2026-08-08, and the correctness question this
-// constant was blocked on is settled: **the encoder reports plain ±1 deltas, not
-// speed-scaled steps.** Two one-revolution gestures, ~3x apart in speed, both reported
-// `maxAbs=1 values=[1]` across every message — 248 messages over 6.06s (41/s) slow,
-// 276 over 2.11s (131/s) fast. So accumulating ticks into an absolute target is exact,
-// and the design above is correct as built. (The suspicion recorded on
-// SCRATCH_MODE_PARAMS.shuttle below was wrong; corrected there.)
-//
-// 256 ticks/revolution: bracketed by both measurements (-3.1% / +7.8%), a common encoder
-// resolution, and well inside the error of judging "exactly one revolution" by hand —
-// which is the only thing the 248-vs-276 spread measures, since the speed question is
-// already answered by maxAbs. Re-run the [jog-cal/…] procedure in
-// docs/design/waveform-scrub.md if the platter ever feels off-speed.
-//
-// ⚠️ Split in two on 2026-08-10, and the split is the point. The encoder resolution is a
-// **measured hardware fact**; the seconds-per-revolution is a **taste setting** the user
-// turns by ear (`jogSecondsPerRev`, see its doc comment and
-// docs/design/slow-jog-audio-inaudible.md §6). Folding them into one constant is what let
-// "the wheel feels wrong" and "the mapping is unfaithful" argue over the same number — and
-// it invites a wrong hardware value to be hidden by a compensating taste value, which no
-// later calibration would then be able to detect.
-const VINYL_TICKS_PER_REV = 256;
-
-/**
- * Seconds of content per encoder tick. Read per gesture rather than captured at module
- * load: this is A/B'd live by ear, and an HMR edit to re-read it would remount App.svelte
- * and tear the deck down (CLAUDE.md, "Dev server lifecycle"), which makes the comparison
- * cost a re-load and a re-play every time.
- */
-function vinylSecPerTick(): number {
-  return get(jogSecondsPerRev) / VINYL_TICKS_PER_REV; // default 1.8/256 = 0.00703
-}
+// ⚠️ Since the 2026-08-22 profile refactor, Rust emits `JogTurn.value` in
+// **revolutions**, not raw ticks — each controller's own `jog_ticks_per_rev`
+// (Starlight 256, FLX4 ~721.7 — controller-mapping.md §8.2) is divided out on the
+// Rust side before this ever sees a value. So the vinyl branch below multiplies
+// directly by `get(jogSecondsPerRev)` (read per gesture, not captured at module
+// load — this is A/B'd live by ear, and an HMR edit to re-read it would remount
+// App.svelte and tear the deck down, CLAUDE.md "Dev server lifecycle") with no
+// per-controller division needed anymore; that constant (`VINYL_TICKS_PER_REV`)
+// moved into each profile's TOML as a measured hardware fact instead.
 
 // Ends a vinyl gesture once ticks stop, handing the deck back to the normal branch.
 // Longer than SCRATCH_IDLE_MS was for velocity mode's benefit is unnecessary here — the
@@ -210,38 +197,30 @@ function vinylSecPerTick(): number {
 // a restart resume exactly where the previous gesture left off.
 const vinylTarget: Record<string, number> = {};
 
-// Per-gesture raw encoder tally, logged once when the gesture ends. This is the
-// calibration instrument for VINYL_TICKS_PER_REV, and it has to live here rather than in
-// midi.rs: that logger throttles continuous controls to one line per 500ms per key (see
-// its log_throttle map), so the Rust log shows a jog wheel emitting a tidy ±1 every half
-// second no matter how fast it is really spinning — which is exactly the measurement the
-// calibration needs and exactly what is hidden.
-//
-// `absSum` is the number the procedure in docs/design/waveform-scrub.md consumes: rotate
-// one revolution slowly, then quickly, and compare. Equal ⇒ the values are deltas since
-// the last message, accumulation is exact, and absSum IS ticks-per-revolution.
-// Unequal ⇒ they are speed-scaled and no single constant is correct. `maxAbs`/`values`
-// answer the same question a second way in one pass: an encoder reporting plain deltas
-// never emits anything but ±1.
-const vinylTally: Record<string, { n: number; absSum: number; net: number; maxAbs: number; values: Set<number>; t0: number }> = {};
+// Per-gesture raw revolution tally, logged once when the gesture ends. Reports
+// **revolutions**, not ticks — since the 2026-08-22 profile refactor each controller's
+// own ticks-per-revolution is already divided out in Rust (see vinylSecPerRev's doc
+// comment), so there is no per-controller constant left to calibrate here. This still
+// earns its keep as a "did the hand's motion round-trip sanely" sanity check: if
+// `revs` doesn't match what your hand actually did, something upstream (the profile's
+// `jog_ticks_per_rev`, or the encoding) is wrong.
+const vinylTally: Record<string, { n: number; sumRevs: number; netRevs: number; t0: number }> = {};
 
 // Per-mode tuning — see scratchMode's doc comment in audioSettings.ts for the
 // shuttle-vs-vinyl distinction.
+//
+// ⚠️ Rescaled ×256 on 2026-08-22 (was "…PerTickPerSec", tuned against the Starlight's
+// raw ticks): Rust now emits revolutions, so a value tuned per-tick has to be
+// multiplied by the ticks-per-revolution it was implicitly tuned against (256, the
+// Starlight's — the only controller these were ever tuned by ear on) to keep the exact
+// same felt response now that the input unit changed. The Starlight's behaviour here
+// is therefore numerically unchanged; the FLX4 (and any future controller) now shares
+// the same feel automatically instead of inheriting whatever its own ticks-per-rev
+// happens to be.
 const SCRATCH_MODE_PARAMS = {
   shuttle: {
-    // Tunable sensitivity dial: still saturating to the cap on a fairly gentle spin
-    // at 0.35 — lowered to leave more usable range below the cap before it saturates.
-    // Retune here if it still saturates too early/late.
-    //
-    // ⚠️ The reason recorded here until 2026-08-08 was wrong: this comment claimed the
-    // Hercules encoder "appears to report larger step values, not just ±1, as physical
-    // speed increases". It does not. The [jog-cal/…] calibration (see VINYL_TICKS_PER_REV
-    // above) measured `maxAbs=1 values=[1]` over 524 messages across two gestures ~3x
-    // apart in speed. ticksPerSec grows exactly as fast as ticks counted per second — so
-    // if this saturates early, that is the EMA divisor collapsing onto SCRATCH_MIN_DT_MS
-    // under burst delivery, which is the documented reason velocity was abandoned for
-    // vinyl mode. Shuttle keeps it deliberately (free-running between ticks is the point).
-    ratePerTickPerSec: 0.15,
+    // Tunable sensitivity dial — see the 2026-08-22 rescale note above.
+    ratePerRevPerSec: 38.4, // was ratePerTickPerSec: 0.15
     // A rate of exactly 0 would freeze the feeder thread's buffer cursor entirely,
     // so the magnitude floor keeps scratch audio always moving even when the wheel
     // is barely turning — appropriate for shuttle's "always searching" character.
@@ -255,7 +234,7 @@ const SCRATCH_MODE_PARAMS = {
   },
   vinyl: {
     // Much gentler scale than shuttle: vinyl mode is for slow, deliberate motion.
-    ratePerTickPerSec: 0.05,
+    ratePerRevPerSec: 12.8, // was ratePerTickPerSec: 0.05
     // No "always moving" floor needed — holding the wheel still should mean silence,
     // like a stationary hand on a real record, not a slow idle crawl.
     minRate: 0.02,
@@ -280,7 +259,7 @@ const SCRATCH_MODE_PARAMS = {
 // regardless of how fast the wheel was actually spinning (todo-20260808.md item 5: "the
 // jog wheel currently speeds up playback by a fixed amount ... I would like it to
 // respond similar to a vinyl control [with] variable speed adjustments"). Scaling the
-// bend by tick velocity — the same EMA-of-ticks/sec estimate shuttle mode above already
+// bend by tick velocity — the same EMA-of-revs/sec estimate shuttle mode above already
 // uses for this exact hardware/encoder — makes a gentle nudge barely bend pitch and a
 // fast spin bend it further, up to JOG_BEND_MAX.
 //
@@ -290,25 +269,18 @@ const SCRATCH_MODE_PARAMS = {
 // unchanged), and the final Math.max/Math.min clamp below never lets soundtouch see
 // outside [0.25, 4.0] regardless of what the EMA reads.
 //
-// ⚠️ Not yet live-calibrated against the Starlight in this (playing-deck) branch — the
-// only measured tick rates on record are from the paused-deck vinyl calibration
-// (docs/design/waveform-scrub.md's [jog-cal/…] procedure: ~41/s slow, ~131/s fast, full
-// wheel revolutions). JOG_BEND_PER_TICK_PER_SEC is chosen so that range maps to roughly
-// 4.5% bend at the slow end and saturates at JOG_BEND_MAX near the fast end — deliberately
-// modest, since a "pitch bend while playing" is conventionally a small, quick nudge (a
-// few percent) rather than a scratch-scale speed change. Re-tune both constants by ear
-// once this can be tried on real hardware; nothing about the shape (EMA velocity → clamped
-// bend, no compounding) should need to change, only these two numbers.
-const JOG_BEND_PER_TICK_PER_SEC = 0.0011;
+// ⚠️ Rescaled ×256 alongside SCRATCH_MODE_PARAMS above (was "…PerTickPerSec"/
+// "…TicksPerSec") — same reasoning: these were tuned by ear against the Starlight's
+// raw ticks, so the rescale keeps that feel numerically identical now that Rust emits
+// revolutions.
+const JOG_BEND_PER_REV_PER_SEC = 0.2816; // was JOG_BEND_PER_TICK_PER_SEC: 0.0011
 const JOG_BEND_MAX = 0.15;
 // Seed for the very first tick of a gesture, before any inter-tick interval exists to
-// measure — mirrors shuttle's params.minRate/params.ratePerTickPerSec seed above (a
-// deliberately modest assumed rate, not a spike). Using a.value*1000 here (the naive
-// "one tick in ~1ms" reading) would make the first tick of every gesture bend far
-// harder than any sustained spin, before the EMA has a real reading to correct it.
-const JOG_BEND_SEED_TICKS_PER_SEC = 20;
+// measure — mirrors shuttle's params.minRate/params.ratePerRevPerSec seed above (a
+// deliberately modest assumed rate, not a spike).
+const JOG_BEND_SEED_REVS_PER_SEC = 0.078125; // was JOG_BEND_SEED_TICKS_PER_SEC: 20
 
-const scratchVelocity: Record<string, { lastT: number; emaTicksPerSec: number }> = {};
+const scratchVelocity: Record<string, { lastT: number; emaRevsPerSec: number }> = {};
 const scratchIdleTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 // Timestamp the idle timer was (re)armed, so the callback can report how late it
 // actually fired vs. its SCRATCH_IDLE_MS deadline — a live "chokes up" diagnostic.
@@ -349,36 +321,17 @@ function stopScratch(deckId: string) {
     debugLog(`[scratch/${deckId}] audioStopScratch settled after ${(performance.now() - t0).toFixed(0)}ms (IPC round-trip)`);
 
   // Vinyl mode runs through the scrub bus, which owns the teardown (SNAP landing,
-  // setScratching, audioStopScratch) — see the vinyl branch in jog_nudge.
+  // setScratching, audioStopScratch) — see the vinyl branch in jog_turn.
   if (vinylTarget[deckId] !== undefined) {
     delete vinylTarget[deckId];
     const tally = vinylTally[deckId];
     if (tally) {
       delete vinylTally[deckId];
       const secs = (performance.now() - tally.t0) / 1000;
-      // One line per gesture — see vinylTally for what each field is for.
-      //
-      // Reports **ticks/revolution**, not a seconds-per-tick, since 2026-08-10: that is the
-      // hardware fact this gesture actually measures, and it is independent of the
-      // `jogSecondsPerRev` taste setting. The old line printed `1.8/absSum`, which silently
-      // assumed the default scale — so once that setting moves the number is wrong, and it
-      // is wrong in a way that reads as a plausible calibration result. It also invited
-      // reasoning from *uncontrolled* gestures: five sessions' worth of readings only ever
-      // meant anything because someone turned the wheel exactly one revolution on purpose.
-      // Measured ticks/rev across five such gestures: 243–276, hence VINYL_TICKS_PER_REV=256.
-      //
-      // `revs=` restates it as a sanity check: if that does not match what your hand did,
-      // every other number on this line is uninterpretable. Say how far you turned.
-      const ticksPerRev = tally.absSum;
       debugLog(
-        `[jog-cal/${deckId}] msgs=${tally.n} absSum=${tally.absSum} net=${tally.net} ` +
-        `maxAbs=${tally.maxAbs} values=[${[...tally.values].sort((a, b) => a - b).join(',')}] ` +
+        `[jog-cal/${deckId}] msgs=${tally.n} revs=${tally.sumRevs.toFixed(2)} net=${tally.netRevs.toFixed(2)} ` +
         `over ${secs.toFixed(2)}s (${(tally.n / Math.max(secs, 0.001)).toFixed(0)} msg/s) | ` +
-        `if this was exactly ONE revolution, ticks/rev = ${ticksPerRev} ` +
-        `(assumed ${VINYL_TICKS_PER_REV}); revs at that assumption = ` +
-        `${(tally.absSum / VINYL_TICKS_PER_REV).toFixed(2)} | ` +
-        `scale ${get(jogSecondsPerRev).toFixed(2)}s/rev → mean ` +
-        `${((tally.absSum * (get(jogSecondsPerRev) / VINYL_TICKS_PER_REV)) / Math.max(secs, 0.001)).toFixed(2)}x`
+        `scale ${get(jogSecondsPerRev).toFixed(2)}s/rev → mean ${(tally.sumRevs * get(jogSecondsPerRev) / Math.max(secs, 0.001)).toFixed(2)}x`
       );
     }
     endScrub(deckId).then(settled);
@@ -415,7 +368,7 @@ export function flushScratch(deckId: string): void {
 
 export async function startMidiListener(): Promise<() => void> {
   const unlisten = await listen<MidiAction>("midi-action", ({ payload: a }) => {
-    const deckId = midiDeckId(a.deck_id);
+    const deckId = slotDeck(a.profile, a.slot);
     switch (a.type) {
       case "deck_play_toggle": {
         if (!deckId) break;
@@ -553,7 +506,7 @@ export async function startMidiListener(): Promise<() => void> {
         }
         break;
       }
-      case "jog_nudge": {
+      case "jog_turn": {
         if (!deckId || a.value === undefined) break;
         const d = getDeck(deckId);
         if (!d) break;
@@ -563,14 +516,15 @@ export async function startMidiListener(): Promise<() => void> {
           // turntable, so a beat/transient can be found by ear.
           const mode = get(scratchMode);
           if (mode === "vinyl") {
-            // Accumulate ticks into an absolute position and let the feeder servo to it.
-            // Seeded from the deck's current position on the first tick of a gesture;
-            // every later tick is pure displacement, so burst delivery is irrelevant.
-            // See vinylSecPerTick() above for why this replaced the velocity path.
+            // Accumulate revolutions into an absolute position and let the feeder servo
+            // to it. Seeded from the deck's current position on the first tick of a
+            // gesture; every later tick is pure displacement, so burst delivery is
+            // irrelevant. See the ⚠️ note above for the 2026-08-22 ticks-per-rev→revolutions
+            // change that made this a direct `get(jogSecondsPerRev)` multiply.
             const base = vinylTarget[deckId] ?? getDeckTime(deckId) ?? 0;
             if (vinylTarget[deckId] === undefined) {
               beginScrub(deckId, base, true);
-              vinylTally[deckId] = { n: 0, absSum: 0, net: 0, maxAbs: 0, values: new Set(), t0: performance.now() };
+              vinylTally[deckId] = { n: 0, sumRevs: 0, netRevs: 0, t0: performance.now() };
             }
             // Delivery instrumentation (scrubStats.ts). `null` because a MIDI tick arrives
             // over Tauri IPC and carries no platform event time — so this path reports
@@ -580,14 +534,12 @@ export async function startMidiListener(): Promise<() => void> {
             noteScrubInput(deckId, null);
             const tally = vinylTally[deckId];
             tally.n++;
-            tally.absSum += Math.abs(a.value);
-            tally.net += a.value;
-            tally.maxAbs = Math.max(tally.maxAbs, Math.abs(a.value));
-            if (tally.values.size < 16) tally.values.add(a.value);
+            tally.sumRevs += Math.abs(a.value);
+            tally.netRevs += a.value;
             // Store what updateScrub actually accepted, not what we asked for: at a track
             // boundary those differ, and keeping the raw sum would open a silent dead zone
             // as long as the overshoot. See updateScrub's doc comment.
-            vinylTarget[deckId] = updateScrub(deckId, base + a.value * vinylSecPerTick());
+            vinylTarget[deckId] = updateScrub(deckId, base + a.value * get(jogSecondsPerRev));
 
             clearTimeout(scratchIdleTimers[deckId]);
             scratchIdleArmedAt[deckId] = performance.now();
@@ -595,7 +547,7 @@ export async function startMidiListener(): Promise<() => void> {
             break;
           }
           // Shuttle: rate comes from tick velocity, tracked as an EMA of instantaneous
-          // ticks/sec — see the SCRATCH_* constants above for why (a hard rolling window
+          // revs/sec — see the SCRATCH_* constants above for why (a hard rolling window
           // was tried and discarded). Free-running between ticks is the point of this
           // mode, so velocity remains the right control variable for it.
           const params = SCRATCH_MODE_PARAMS[mode];
@@ -603,22 +555,22 @@ export async function startMidiListener(): Promise<() => void> {
           const prev = scratchVelocity[deckId];
           // No prior tick to diff against (gesture just started): seed the EMA so the
           // resulting magnitude comes out to the mode's floor rate rather than guessing
-          // at a velocity from nothing — real ticks/sec takes over from the next tick.
-          const instTicksPerSec = prev
+          // at a velocity from nothing — real revs/sec takes over from the next tick.
+          const instRevsPerSec = prev
             ? (a.value / Math.max(SCRATCH_MIN_DT_MS, now - prev.lastT)) * 1000
-            : Math.sign(a.value) * (params.minRate / params.ratePerTickPerSec);
-          const emaTicksPerSec = prev
-            ? prev.emaTicksPerSec * (1 - SCRATCH_EMA_ALPHA) + instTicksPerSec * SCRATCH_EMA_ALPHA
-            : instTicksPerSec;
-          scratchVelocity[deckId] = { lastT: now, emaTicksPerSec };
+            : Math.sign(a.value) * (params.minRate / params.ratePerRevPerSec);
+          const emaRevsPerSec = prev
+            ? prev.emaRevsPerSec * (1 - SCRATCH_EMA_ALPHA) + instRevsPerSec * SCRATCH_EMA_ALPHA
+            : instRevsPerSec;
+          scratchVelocity[deckId] = { lastT: now, emaRevsPerSec };
 
           const magnitude = Math.min(
             params.maxRate,
-            Math.max(params.minRate, Math.abs(emaTicksPerSec * params.ratePerTickPerSec)),
+            Math.max(params.minRate, Math.abs(emaRevsPerSec * params.ratePerRevPerSec)),
           );
           // Fall back to this tick's own direction when the EMA sums to ~0 (e.g. a
           // direction reversal), so the deck doesn't stall silently instead of switching.
-          const rate = Math.sign(emaTicksPerSec || a.value) * magnitude;
+          const rate = Math.sign(emaRevsPerSec || a.value) * magnitude;
 
           setScratching(deckId, true);
           queueScratchRate(deckId, rate, params.holdMs);
@@ -629,18 +581,18 @@ export async function startMidiListener(): Promise<() => void> {
           break;
         }
         if (!(deckId in jogBaseRate)) jogBaseRate[deckId] = d.playbackRate;
-        // Bend magnitude tracks how fast the wheel is turning (EMA of ticks/sec — see
+        // Bend magnitude tracks how fast the wheel is turning (EMA of revs/sec — see
         // "Playing-deck jog bend" above), not a fixed step per tick.
         const jogNow = performance.now();
         const prevJog = jogVelocity[deckId];
-        const jogInstTicksPerSec = prevJog
+        const jogInstRevsPerSec = prevJog
           ? (a.value / Math.max(SCRATCH_MIN_DT_MS, jogNow - prevJog.lastT)) * 1000
-          : Math.sign(a.value) * JOG_BEND_SEED_TICKS_PER_SEC;
-        const jogEmaTicksPerSec = prevJog
-          ? prevJog.emaTicksPerSec * (1 - SCRATCH_EMA_ALPHA) + jogInstTicksPerSec * SCRATCH_EMA_ALPHA
-          : jogInstTicksPerSec;
-        jogVelocity[deckId] = { lastT: jogNow, emaTicksPerSec: jogEmaTicksPerSec };
-        const bend = Math.max(-JOG_BEND_MAX, Math.min(JOG_BEND_MAX, jogEmaTicksPerSec * JOG_BEND_PER_TICK_PER_SEC));
+          : Math.sign(a.value) * JOG_BEND_SEED_REVS_PER_SEC;
+        const jogEmaRevsPerSec = prevJog
+          ? prevJog.emaRevsPerSec * (1 - SCRATCH_EMA_ALPHA) + jogInstRevsPerSec * SCRATCH_EMA_ALPHA
+          : jogInstRevsPerSec;
+        jogVelocity[deckId] = { lastT: jogNow, emaRevsPerSec: jogEmaRevsPerSec };
+        const bend = Math.max(-JOG_BEND_MAX, Math.min(JOG_BEND_MAX, jogEmaRevsPerSec * JOG_BEND_PER_REV_PER_SEC));
         // Offset from the saved base, not from d.playbackRate — the latter is already the
         // previous tick's nudged value, so adding to it compounds every event instead of
         // producing a bounded bend. A spinning wheel fires many ticks well inside the
@@ -693,17 +645,16 @@ export async function startMidiListener(): Promise<() => void> {
         nudgePhaseToMaster(deckId);
         break;
       }
-      // ── The Starlight's dual-function tone knob ──────────────────────────────
-      // One physical knob per deck; the controller swaps which CC it sends when the
-      // Bass/Filter button is pressed, so these two cases are the *same* knob and only
-      // one can be live at a time. Rust has already mapped the raw 0–127 into a real dB
-      // value / filter position (`knob_to_eq_db` / `knob_to_filter` in midi.rs), so
+      // ── EQ / filter continuous controls ──────────────────────────────────────
+      // Rust has already mapped the raw wire value into a real dB value / filter
+      // position (see eq_db_from_bipolar / filter_from_bipolar in midi/decode.rs), so
       // there is no range maths here to drift out of sync with the sliders.
       //
-      // Both follow the continuous-control discipline used by deck_gain above: straight
-      // to GStreamer for audio, rAF-throttled into the store for display. Putting a knob
-      // through the Svelte store at MIDI event rate is the documented way to freeze this
-      // UI (see the jog-wheel gotchas in skills/midi/SKILL.md).
+      // All three EQ cases follow the continuous-control discipline used by deck_gain
+      // above: straight to GStreamer for audio, rAF-throttled into the store for
+      // display. Putting a knob through the Svelte store at MIDI event rate is the
+      // documented way to freeze this UI (see the jog-wheel gotchas in
+      // skills/midi/SKILL.md).
       case "deck_eq_low": {
         if (!deckId || a.value === undefined) break;
         const d = getDeck(deckId);
@@ -711,6 +662,24 @@ export async function startMidiListener(): Promise<() => void> {
         const eq = { ...d.eq, low: a.value };
         syncEq(deckId, eq.low, eq.mid, eq.high); // audio: immediate
         queueDeckPatch(deckId, { eq });          // UI: rAF-throttled
+        break;
+      }
+      case "deck_eq_mid": {
+        if (!deckId || a.value === undefined) break;
+        const d = getDeck(deckId);
+        if (!d) break;
+        const eq = { ...d.eq, mid: a.value };
+        syncEq(deckId, eq.low, eq.mid, eq.high);
+        queueDeckPatch(deckId, { eq });
+        break;
+      }
+      case "deck_eq_high": {
+        if (!deckId || a.value === undefined) break;
+        const d = getDeck(deckId);
+        if (!d) break;
+        const eq = { ...d.eq, high: a.value };
+        syncEq(deckId, eq.low, eq.mid, eq.high);
+        queueDeckPatch(deckId, { eq });
         break;
       }
       case "deck_filter":
