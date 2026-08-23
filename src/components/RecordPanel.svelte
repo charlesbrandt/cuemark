@@ -1,22 +1,12 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import { open, save } from "@tauri-apps/plugin-dialog";
-  import { audioRecordStart, audioRecordStop, type RecordFormat } from "../lib/audio/pipeline";
+  import { open } from "@tauri-apps/plugin-dialog";
   import {
-    recordFormat, isRecording, recordOutputPath, recordStartedAt, recordingsDir,
+    recordFormat, isRecording, recordOutputPath, recordStartedAt, recordingsDir, recordError,
   } from "../lib/audio/recordState";
-
-  // Both formats mux into Ogg now (see mixer.rs's build_record_sink_chain doc comment) —
-  // Ogg pages need no footer/index to finalize, so a crash mid-recording still leaves a
-  // valid, playable file. ".oga" for FLAC (not ".ogg") so the extension doesn't imply a
-  // video-capable container it isn't.
-  const FORMATS: { id: RecordFormat; label: string; ext: string }[] = [
-    { id: "opus", label: "Opus (small)", ext: "ogg" },
-    { id: "flac", label: "FLAC (lossless)", ext: "oga" },
-  ];
+  import { RECORD_FORMATS as FORMATS, buildRecordFilename, startRecording, stopRecording } from "../lib/audio/recordControl";
 
   let notes = $state("");
-  let error = $state<string | null>(null);
   let starting = $state(false);
   let stopping = $state(false);
   let elapsed = $state("00:00");
@@ -29,27 +19,10 @@
     return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
   }
 
-  function kebabCase(s: string): string {
-    return s.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  }
-
-  function timestamp(): string {
-    const now = new Date();
-    const pad = (n: number) => String(n).padStart(2, "0");
-    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_` +
-      `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-  }
-
-  function buildFilename(fmt: RecordFormat, notesText: string): string {
-    const ext = FORMATS.find((f) => f.id === fmt)!.ext;
-    const notesPart = kebabCase(notesText);
-    return notesPart ? `${timestamp()}_${notesPart}.${ext}` : `${timestamp()}.${ext}`;
-  }
-
   // Live filename preview — recomputed on every render since it embeds the current time,
   // just so the panel isn't showing a filename that's already stale by the time Start is
   // clicked. Not reactive to the second; good enough for a preview.
-  let filenamePreview = $derived(buildFilename($recordFormat, notes));
+  let filenamePreview = $derived(buildRecordFilename($recordFormat, notes));
 
   // Re-derive the ticking display from $recordStartedAt on mount, in case the panel is
   // reopened while a recording (started from a previous mount) is still running.
@@ -77,7 +50,7 @@
     try {
       dir = await open({ directory: true, multiple: false, defaultPath: $recordingsDir || undefined });
     } catch (e) {
-      error = `Could not open folder picker: ${e}`;
+      recordError.set(`Could not open folder picker: ${e}`);
       return;
     }
     if (typeof dir === "string") recordingsDir.set(dir);
@@ -85,37 +58,9 @@
 
   async function handleStart() {
     if ($isRecording || starting) return;
-    error = null;
-
-    let path: string;
-    if ($recordingsDir) {
-      // One click: destination is known, so just build the path and go — no dialog.
-      path = `${$recordingsDir}/${buildFilename($recordFormat, notes)}`;
-    } else {
-      const chosenFormat = FORMATS.find((f) => f.id === $recordFormat)!;
-      let chosen: string | null;
-      try {
-        chosen = await save({
-          title: "Record session to…",
-          defaultPath: buildFilename($recordFormat, notes),
-          filters: [{ name: chosenFormat.label, extensions: [chosenFormat.ext] }],
-        });
-      } catch (e) {
-        error = `Could not open save dialog: ${e}`;
-        return;
-      }
-      if (!chosen) return; // user cancelled
-      path = chosen;
-    }
-
     starting = true;
     try {
-      await audioRecordStart(path, $recordFormat);
-      recordOutputPath.set(path);
-      recordStartedAt.set(performance.now());
-      isRecording.set(true);
-    } catch (e) {
-      error = `Could not start recording: ${e}`;
+      await startRecording(notes);
     } finally {
       starting = false;
     }
@@ -125,12 +70,8 @@
     if (!$isRecording || stopping) return;
     stopping = true;
     try {
-      await audioRecordStop();
-    } catch (e) {
-      error = `Could not stop recording cleanly: ${e}`;
+      await stopRecording();
     } finally {
-      isRecording.set(false);
-      recordStartedAt.set(null);
       stopping = false;
     }
   }
@@ -195,9 +136,9 @@
     </div>
   {/if}
 
-  {#if error}
+  {#if $recordError}
     <div class="settings-row">
-      <span class="rec-error">{error}</span>
+      <span class="rec-error">{$recordError}</span>
     </div>
   {/if}
 </div>

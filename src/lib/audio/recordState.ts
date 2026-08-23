@@ -11,6 +11,10 @@ export const recordFormat = writable<RecordFormat>("opus");
 export const isRecording = writable(false);
 export const recordOutputPath = writable<string | null>(null);
 export const recordStartedAt = writable<number | null>(null);
+// Centralized here (not component-local) because the toolbar Record button can now start/stop
+// a recording without the Settings > Record tab ever being open — an error from that path needs
+// somewhere to land that isn't a mounted component.
+export const recordError = writable<string | null>(null);
 
 // Same persistentWritable/`cuemark:` localStorage pattern as audioSettings.ts —
 // each module keeps its own copy rather than sharing one, by convention here.

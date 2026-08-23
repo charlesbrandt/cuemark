@@ -162,16 +162,28 @@ body {
   color: var(--on-accent);
   font-weight: 800;
 }
+/* Filled solid red for the whole time recording is active — this used to also blink the
+   entire button, which read as an alarm rather than a status light. The button itself now
+   stays put; only the .rec-dot below pulses. */
 .record-toggle.is-recording {
   background: #e04040;
   border-color: #e04040;
   color: #fff;
   font-weight: 800;
-  animation: record-toggle-blink 1.2s infinite;
 }
-@keyframes record-toggle-blink {
-  0%, 50% { opacity: 1; }
-  51%, 100% { opacity: 0.6; }
+.record-toggle .rec-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  vertical-align: middle;
+  animation: rec-dot-pulse 2.4s ease-in-out infinite;
+}
+@keyframes rec-dot-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
 }
 .tap-btn { border-color: var(--accent); color: var(--accent); }
 .tap-btn:hover { background: var(--accent-soft); }

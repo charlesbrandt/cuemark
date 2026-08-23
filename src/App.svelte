@@ -22,11 +22,10 @@
   import DeckCard from "./components/DeckCard.svelte";
   import Crossfader from "./components/Crossfader.svelte";
   import WaveformCanvas from "./components/WaveformCanvas.svelte";
-  import AudioSettings from "./components/AudioSettings.svelte";
-  import MidiMonitor from "./components/MidiMonitor.svelte";
+  import SettingsPanel from "./components/SettingsPanel.svelte";
   import DiggerQueue from "./components/DiggerQueue.svelte";
-  import RecordPanel from "./components/RecordPanel.svelte";
   import { isRecording } from "./lib/audio/recordState";
+  import { toggleRecording } from "./lib/audio/recordControl";
   import { mainOutputDeviceIds, cueOutputDeviceId, cueGain, networkOutputs, outputAttachStatus } from "./lib/audio/audioSettings";
   import { fontScale, queueSidebarWidth } from "./lib/settings/displaySettings";
   import { CodecPlayer, type DemuxInfo } from "./lib/video/codecPlayer";
@@ -57,14 +56,12 @@
   let stopSessionSync: (() => void) | undefined;
   let tapTimestamps: number[] = [];
   let tapResetTimer: ReturnType<typeof setTimeout> | undefined;
-  let showAudioSettings = $state(false);
-  // Mounting MidiMonitor turns the Rust raw-MIDI feed on and unmounting turns it off, so
-  // this flag is also the feed's gate — keep it default-off and keep the panel unmounted
-  // (not merely hidden) when it is false. See MONITOR in midi.rs.
-  let showMidiMonitor = $state(false);
+  // Audio/MIDI/Record settings are tabs inside one SettingsPanel now (todo.md) rather than
+  // three separately-toggled panels. MidiMonitor (one of those tabs) still mounts/unmounts
+  // its Rust raw-MIDI feed gate on tab switch — see its own doc comment, unchanged by this.
+  let showSettings = $state(false);
   let showDiggerQueue = $state(true);
   let showVisualizationPanel = $state(false);
-  let showRecordPanel = $state(false);
 
   const QUEUE_SIDEBAR_MIN_WIDTH = 220;
   const QUEUE_SIDEBAR_MAX_WIDTH = 640;
@@ -820,22 +817,15 @@
     <button class="output-btn" onclick={openOutputWindow}>Output Window</button>
     <button
       class="output-btn"
-      class:active={showAudioSettings}
-      onclick={() => { showAudioSettings = !showAudioSettings; }}
+      class:active={showSettings}
+      onclick={() => { showSettings = !showSettings; }}
     >Settings</button>
     <button
-      class="output-btn"
-      class:active={showMidiMonitor}
-      onclick={() => { showMidiMonitor = !showMidiMonitor; }}
-      title="Raw MIDI monitor — every message, mapped or not. Bench tool for mapping a controller."
-    >MIDI</button>
-    <button
       class="output-btn record-toggle"
-      class:active={showRecordPanel}
       class:is-recording={$isRecording}
-      onclick={() => { showRecordPanel = !showRecordPanel; }}
-      title={$isRecording ? "Recording in progress" : "Record the master mix to disk"}
-    >{$isRecording ? "● REC" : "Record"}</button>
+      onclick={() => { toggleRecording().catch(console.error); }}
+      title={$isRecording ? "Stop recording" : "Start recording the master mix to disk (configure folder/format in Settings > Record)"}
+    >{#if $isRecording}<span class="rec-dot"></span>{/if}Record</button>
     <div class="toolbar-divider"></div>
     <button
       class="output-btn"
@@ -892,20 +882,12 @@
 
   <div class="main-layout">
     <div class="main-content">
-      {#if showAudioSettings}
-        <AudioSettings />
-      {/if}
-
-      {#if showMidiMonitor}
-        <MidiMonitor />
+      {#if showSettings}
+        <SettingsPanel />
       {/if}
 
       {#if showVisualizationPanel}
         <VisualizationPanel />
-      {/if}
-
-      {#if showRecordPanel}
-        <RecordPanel />
       {/if}
 
       <div class="waveform-stack">
