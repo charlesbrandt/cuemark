@@ -273,13 +273,36 @@ VITE_ENABLE_DEBUG_HOOK=1 cargo tauri build --debug --no-bundle
 Sanity-check before trusting a test run: `grep -q '__cuemarkDebug' dist/assets/*.js`
 should match.
 
-### 🔴 This "isolated" instance shares localStorage with the user's real app
+### 🔴 This "isolated" instance shares localStorage with the user's real app — but only sometimes, and it depends on which URL it loaded
 
-The isolation is of the *display and process*, not of storage. Every cuemark instance —
-this Xvfb one and whatever is running on the user's desktop — loads the same origin
-`tauri://localhost` and therefore shares one WebKit localStorage DB under
-`~/.local/share/com.cuemark.app/`. **Every `cuemark:`-prefixed `persistentWritable`
-written through the debug hook escapes the test and changes the user's actual app**,
+The isolation is of the *display and process*, not of storage — but storage sharing itself
+is scoped by **origin**, and the two flows in this skill load different origins:
+
+- **Step 1's standard flow** (`cargo tauri build --no-bundle`, then point tauri-driver at
+  that binary) loads `tauri://localhost` — confirmed via `GET /session/$SESSION/url`
+  2026-08-22 — which WebKit stores in `~/.local/share/com.cuemark.app/localstorage/
+  tauri_localhost_0.localstorage`.
+- **A live `cargo tauri dev` session** loads `http://localhost:1420/` (the Vite dev
+  server), stored separately in `http_localhost_1420.localstorage`. **These are two
+  different localStorage databases** — a standard-flow build-and-drive session does
+  *not* read or write anything the user's `cargo tauri dev` session has set, and vice
+  versa. No capture/restore dance is needed on this flow relative to a live dev session.
+- **The "Shortcut" flow** (§1, pointing tauri-driver at `cargo tauri dev`'s own
+  `target/debug/cuemark` so it loads `http://localhost:1420/` instead of building
+  separately) *does* share storage with a live `cargo tauri dev` session, because it
+  deliberately loads the same origin that session is already using. This is the flow
+  the 2026-08-13 incident below actually went through, and where the warning below applies.
+- Any two **`tauri://localhost`** binaries share storage with *each other* regardless of
+  which one built them — a standard-flow test build, another test build, and the
+  release-profile desktop launcher (`~/.local/bin/cuemark`, see `run-app` skill) are all
+  `tauri://localhost` and therefore all read/write the same `tauri_localhost_0.localstorage`.
+
+So: **before assuming a write is safe or unsafe, check `GET /session/$SESSION/url` and
+compare it against how the thing you're worried about polluting was itself launched** —
+don't assume "isolated process" implies "isolated storage" *or* the reverse.
+
+**Every `cuemark:`-prefixed `persistentWritable` written through the debug hook, on
+whichever origin actually is shared, escapes the test and changes that other app's state**,
 permanently, across restarts: `cuemark:videoPathOverride` (per-deck legacy/webcodecs),
 `cuemark:videoPathDefault`, `cuemark:recordingsDir` (the recording feature's auto-save
 folder), and the audio-settings stores.
@@ -438,6 +461,21 @@ Verifying the recording feature (`RecordPanel.svelte` clicks driving real `audio
   cross-check `getAudioTime()`/raw position against the file's known duration, and see
   `audio-debugging`'s `query_position returns wall-clock, not content time` entry for why the
   raw position number is unreliable as a "has it ended" signal on its own.
+- **The `[record] start recording`/`stop recording` log lines prove the on/off flag flipped,
+  not that any audio was written.** Those two lines come from `RecordingSink` itself
+  (`record.rs`) — a thin state holder with no GStreamer access at all (see its own doc
+  comment). Clicking Record on a session with **zero decks loaded** (no `audio_load` ever
+  called, so `AudioManager.pipelines` is empty) logs both lines cleanly, `isRecording`
+  flips in the UI, and the toolbar dot/title update correctly — but no output file is ever
+  created, because `attach_record_branch()` only runs for decks that already have a live
+  pipeline, and the record node's encoder chain (`oggmux`/`filesink`) never receives a
+  single buffer to write. Confirmed live 2026-08-22 verifying the Settings-panel reorg
+  (`todo.md`'s tabbed-settings item): a toolbar-button click produced matching start/stop
+  log lines and a `recordOutputPath` with a real-looking filename, but the file never
+  appeared on disk. **Verifying the Record button's UI wiring is not the same as verifying
+  the recording feature** — for the latter, load and play at least one deck first, then
+  check the file exists and has non-trivial size (or run `ffmpeg -af silencedetect` per the
+  entry above) before trusting the log.
 
 ## Lightweight webview probes without the app (python3-gi)
 
