@@ -1,9 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { get } from "svelte/store";
-  import { session, addDeck, updateDeck, setMasterBpm, setSnapToBeat } from "./lib/state/session";
+  import { session, addDeck, updateDeck, setSnapToBeat } from "./lib/state/session";
   import VisualizationPanel from "./components/VisualizationPanel.svelte";
-  import { tapTempo } from "./lib/audio/bpm";
   import { startMidiListener } from "./lib/midi/handler";
   import { syncHeadphoneCueLed, syncPlayLed, syncSyncLed } from "./lib/midi/ledSync";
   import { invoke } from "@tauri-apps/api/core";
@@ -57,8 +56,6 @@
   let eosUnlisten: (() => void) | undefined;
   let outputAttachUnlisten: (() => void) | undefined;
   let stopSessionSync: (() => void) | undefined;
-  let tapTimestamps: number[] = [];
-  let tapResetTimer: ReturnType<typeof setTimeout> | undefined;
   // Audio/MIDI/Record settings are tabs inside one SettingsPanel now (todo.md) rather than
   // three separately-toggled panels. MidiMonitor (one of those tabs) still mounts/unmounts
   // its Rust raw-MIDI feed gate on tab switch — see its own doc comment, unchanged by this.
@@ -104,14 +101,6 @@
     document.documentElement.style.setProperty("--font-scale", String($fontScale));
   });
 
-  function handleTap() {
-    const now = Date.now();
-    tapTimestamps.push(now);
-    clearTimeout(tapResetTimer);
-    tapResetTimer = setTimeout(() => { tapTimestamps = []; }, 2000);
-    const bpm = tapTempo(tapTimestamps);
-    if (bpm !== null) setMasterBpm(bpm);
-  }
   type BandAnalysis = { bass: number; mid: number; high: number };
 
   // The control window no longer composites. Since 2026-08-03 it ships each deck's current
@@ -883,11 +872,6 @@
       onclick={() => setSnapToBeat(!$session.snapToBeat)}
       title="Snap seeks, hot cues, and loop points to the nearest beat"
     >SNAP</button>
-    <span class="bpm">{$session.bpm !== null ? `${$session.bpm.toFixed(1)} BPM` : "—"}</span>
-    <button class="tap-btn" onclick={handleTap}>TAP</button>
-    {#if $session.bpm !== null}
-      <button class="tap-reset" onclick={() => { setMasterBpm(null); tapTimestamps = []; }}>✕</button>
-    {/if}
     <div class="toolbar-divider"></div>
     <label class="master-vol">
       Main Volume

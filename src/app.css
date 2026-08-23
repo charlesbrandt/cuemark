@@ -140,8 +140,7 @@ body {
 .btn:disabled { opacity: 0.35; cursor: default; }
 
 .add-deck,
-.output-btn,
-.tap-btn {
+.output-btn {
   font-family: var(--font-heading);
   font-weight: 600;
   font-size: calc(12px * var(--font-scale));
@@ -154,8 +153,7 @@ body {
   border-radius: var(--radius-sm);
 }
 .add-deck:hover,
-.output-btn:hover,
-.tap-btn:hover { border-color: var(--accent); color: var(--accent); }
+.output-btn:hover { border-color: var(--accent); color: var(--accent); }
 .output-btn.active {
   background: var(--accent);
   border-color: var(--accent);
@@ -185,29 +183,6 @@ body {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.25; }
 }
-.tap-btn { border-color: var(--accent); color: var(--accent); }
-.tap-btn:hover { background: var(--accent-soft); }
-
-.tap-reset {
-  background: none;
-  border: none;
-  color: color-mix(in srgb, var(--text) 45%, transparent);
-  cursor: pointer;
-  font-size: calc(14px * var(--font-scale));
-  line-height: 1;
-  padding: 0 2px;
-}
-.tap-reset:hover { color: var(--text); }
-
-.bpm {
-  font-family: var(--font-heading);
-  font-weight: 800;
-  font-size: calc(15px * var(--font-scale));
-  font-variant-numeric: tabular-nums;
-  color: var(--text);
-  white-space: nowrap;
-}
-
 .master-vol {
   display: flex;
   align-items: center;
