@@ -9,6 +9,7 @@
     type DiggerTrack, type DiggerQueueItem,
   } from '../lib/digger/api';
   import { diggerQueue, selectedQueueIndex, loadQueueItemToDeck } from '../lib/digger/queueStore';
+  import { currentDj, currentDjOrNull } from '../lib/digger/djSelector';
   import HistoryPanel from './HistoryPanel.svelte';
 
   let activeTab = $state<'tracks' | 'history'>('tracks');
@@ -61,10 +62,22 @@
 
   onDestroy(() => { unsubscribeQueue?.(); });
 
+  // Resubscribe/refetch when the DJ selector changes — same path already used
+  // when the Digger base URL changes (applyBaseUrl below), per guest-djs.md
+  // item 3. The websocket subscription itself stays global (Digger broadcasts
+  // queue_changed to everyone and each client refetches its own scope, per
+  // the design doc), so only a refetch is needed here, not resubscribe(). The
+  // first run duplicates onMount's own refreshQueue() call — a spurious
+  // refetch is cheap, per the same doc's reasoning about the websocket.
+  $effect(() => {
+    void $currentDj;
+    refreshQueue();
+  });
+
   async function refreshQueue() {
     try {
       error = null;
-      const items = await getQueue();
+      const items = await getQueue(currentDjOrNull($currentDj));
       diggerQueue.set(items);
       // Keep the MIDI-driven cursor in range after a refresh shrinks the list
       // (item consumed/removed elsewhere) rather than pointing past the end.
@@ -95,7 +108,7 @@
   async function addRandom() {
     try {
       const track = await randomTrack(true);
-      await addToQueue(track.id);
+      await addToQueue(track.id, currentDjOrNull($currentDj));
       await refreshQueue();
     } catch (e) {
       error = String(e);
@@ -104,8 +117,9 @@
 
   async function addSuggested() {
     try {
-      const track = await queueNext();
-      await addToQueue(track.id);
+      const owner = currentDjOrNull($currentDj);
+      const track = await queueNext(owner);
+      await addToQueue(track.id, owner);
       await refreshQueue();
     } catch (e) {
       error = String(e);
@@ -114,7 +128,7 @@
 
   async function addSearchResult(track: DiggerTrack) {
     try {
-      await addToQueue(track.id);
+      await addToQueue(track.id, currentDjOrNull($currentDj));
       await refreshQueue();
       searchQuery = '';
       searchResults = [];
@@ -125,7 +139,7 @@
 
   async function removeItem(itemId: number) {
     try {
-      await removeFromQueue(itemId);
+      await removeFromQueue(itemId, currentDjOrNull($currentDj));
       diggerQueue.update(q => q.filter(item => item.id !== itemId));
     } catch (e) {
       error = String(e);

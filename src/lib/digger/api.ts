@@ -134,28 +134,45 @@ export async function randomTrack(hasFile = true): Promise<DiggerTrack> {
   return r.json();
 }
 
-export async function getQueue(): Promise<DiggerQueueItem[]> {
-  const r = await fetch(`${_baseUrl}/queue`);
+// `owner` throughout this section is Digger's queue-scoping param (see
+// docs/design/guest-djs.md "Changes, by side → Cuemark" item 3, in the digger
+// repo) — null/omitted means the owner's (Charles's) queue, matching
+// `queue_items.owner`'s NULL convention. Callers should pass the DJ selector's
+// value through `currentDjOrNull()` (src/lib/digger/djSelector.ts), never the
+// raw store value, so an empty string never reaches Digger as a distinct
+// query param from "omitted".
+
+export async function getQueue(owner: string | null = null): Promise<DiggerQueueItem[]> {
+  const params = new URLSearchParams();
+  if (owner) params.set('owner', owner);
+  const qs = params.toString();
+  const r = await fetch(`${_baseUrl}/queue${qs ? `?${qs}` : ''}`);
   if (!r.ok) throw new Error(`queue ${r.status}`);
   return r.json();
 }
 
-export async function addToQueue(trackId: number): Promise<void> {
+export async function addToQueue(trackId: number, owner: string | null = null): Promise<void> {
   const r = await fetch(`${_baseUrl}/queue/tracks`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ track_id: trackId }),
+    body: JSON.stringify({ track_id: trackId, owner }),
   });
   if (!r.ok) throw new Error(`queue/add ${r.status}`);
 }
 
-export async function removeFromQueue(itemId: number): Promise<void> {
-  const r = await fetch(`${_baseUrl}/queue/${itemId}`, { method: 'DELETE' });
+export async function removeFromQueue(itemId: number, owner: string | null = null): Promise<void> {
+  const params = new URLSearchParams();
+  if (owner) params.set('owner', owner);
+  const qs = params.toString();
+  const r = await fetch(`${_baseUrl}/queue/${itemId}${qs ? `?${qs}` : ''}`, { method: 'DELETE' });
   if (!r.ok) throw new Error(`queue/remove ${r.status}`);
 }
 
-export async function queueNext(): Promise<DiggerTrack> {
-  const r = await fetch(`${_baseUrl}/queue/next`);
+export async function queueNext(owner: string | null = null): Promise<DiggerTrack> {
+  const params = new URLSearchParams();
+  if (owner) params.set('owner', owner);
+  const qs = params.toString();
+  const r = await fetch(`${_baseUrl}/queue/next${qs ? `?${qs}` : ''}`);
   if (!r.ok) throw new Error(`queue/next ${r.status}`);
   return r.json();
 }
@@ -268,11 +285,15 @@ export async function setTrackGain(trackId: number, gain: number): Promise<void>
 // set log (docs/design/play-tracking.md "Cuemark: standardize on the same log" in
 // the digger repo): insert-on-start, ~30s heartbeats, finalize on track-end. No
 // separate "Sessions" concept needed on either side.
-export async function playStart(trackId: number, sourceRef: string): Promise<number> {
+// `listener` = the DJ selector's value at the moment the play started, already
+// resolved through `currentDjOrNull()` by the caller — see history.ts, which
+// captures it once at load time (not read reactively) so a mid-track DJ
+// handoff can't retroactively reassign a play already in progress.
+export async function playStart(trackId: number, sourceRef: string, listener: string | null = null): Promise<number> {
   const r = await fetch(`${_baseUrl}/plays/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ track_id: trackId, context: 'cuemark', source_ref: sourceRef }),
+    body: JSON.stringify({ track_id: trackId, context: 'cuemark', source_ref: sourceRef, listener }),
   });
   if (!r.ok) throw new Error(`plays/start ${r.status}`);
   const { id } = await r.json();

@@ -2,6 +2,7 @@
   import { onDestroy } from 'svelte';
   import { history, liveElapsedMs, type HistoryEntry } from '../lib/state/history';
   import { addToQueue } from '../lib/digger/api';
+  import { currentDj, currentDjOrNull } from '../lib/digger/djSelector';
 
   // Live-updating "duration played" for whichever entry is currently playing —
   // history.ts only updates playedMs on pause/track-change, so tick a local
@@ -17,7 +18,7 @@
   async function reAddToQueue(entry: HistoryEntry) {
     if (entry.diggerTrackId === null) return;
     try {
-      await addToQueue(entry.diggerTrackId);
+      await addToQueue(entry.diggerTrackId, currentDjOrNull($currentDj));
       addedIds = new Set(addedIds).add(entry.id);
       setTimeout(() => {
         addedIds = new Set([...addedIds].filter((id) => id !== entry.id));

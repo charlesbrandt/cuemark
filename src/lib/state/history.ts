@@ -5,10 +5,11 @@
 // A low-frequency subscription is the right tool here (like `audioSetCue`'s
 // guard-only pattern) since play/pause/load are discrete user actions, not
 // continuous MIDI controls that need the audioSync.ts bypass.
-import { writable } from "svelte/store";
+import { writable, get } from "svelte/store";
 import { session } from "./session";
 import type { Deck } from "./types";
 import { playStart, playHeartbeat, playFinish } from "../digger/api";
+import { currentDj, currentDjOrNull } from "../digger/djSelector";
 
 export interface HistoryEntry {
   id: string;
@@ -110,8 +111,13 @@ session.subscribe((s) => {
         startedAt: Date.now(),
         playedMs: 0,
       };
+      // Read the DJ selector HERE, once, at load time — not inside playStart's
+      // async call, and never re-read for this play again. See guest-djs.md
+      // "item 2": a DJ handoff mid-track must not retroactively reassign a
+      // play already in progress.
+      const listener = currentDjOrNull(get(currentDj));
       const diggerPlayId = deck.diggerTrackId !== null
-        ? playStart(deck.diggerTrackId, deck.id).catch((e) => { console.error(e); return null; })
+        ? playStart(deck.diggerTrackId, deck.id, listener).catch((e) => { console.error(e); return null; })
         : null;
       live.set(deck.id, { entry, playStartedAt: deck.playing ? Date.now() : null, diggerPlayId });
       history.update((h) => [entry, ...h].slice(0, MAX_ENTRIES));

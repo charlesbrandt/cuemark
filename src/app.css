@@ -232,6 +232,33 @@ body {
 }
 .master-vol.disabled { opacity: 0.4; }
 
+.dj-selector {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: color-mix(in srgb, var(--text) 60%, transparent);
+  font-family: var(--font-heading);
+  font-size: calc(10px * var(--font-scale));
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.dj-input {
+  background: var(--surface2);
+  border: 1px solid var(--divider);
+  color: var(--text);
+  padding: 5px 8px;
+  font-size: calc(12px * var(--font-scale));
+  font-family: var(--font-body);
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+  border-radius: var(--radius-sm);
+  width: 90px;
+}
+.dj-input:focus { outline: none; border-color: var(--accent); }
+
 
 /* ── Deck grid (decks — indigo accent) ─────────────────── */
 .decks {

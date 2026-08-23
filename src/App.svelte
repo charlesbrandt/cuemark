@@ -46,6 +46,7 @@
   import { debugLog } from "./lib/debugLog";
   import { getDiggerFileUrl } from "./lib/digger/api";
   import { showDiggerQueue } from "./lib/digger/queueStore";
+  import { currentDj, setCurrentDj, getDjHistory } from "./lib/digger/djSelector";
 
   function openOutputWindow() {
     invoke('open_output_window').catch(console.error);
@@ -63,6 +64,19 @@
   // its Rust raw-MIDI feed gate on tab switch — see its own doc comment, unchanged by this.
   let showSettings = $state(false);
   let showVisualizationPanel = $state(false);
+
+  // DJ selector — "who's on the decks" (docs/design/guest-djs.md in the digger
+  // repo). Local input mirrors the persisted store; committed on Enter/blur/
+  // history-pick rather than per-keystroke, so the recent-DJs MRU doesn't fill
+  // with partial fragments while someone is still typing a new name.
+  let djInput = $state($currentDj);
+  $effect(() => { djInput = $currentDj; });
+  let djHistory = $state(getDjHistory());
+  function applyDj(name?: string) {
+    setCurrentDj(name ?? djInput);
+    djInput = $currentDj;
+    djHistory = getDjHistory();
+  }
 
   const QUEUE_SIDEBAR_MIN_WIDTH = 220;
   const QUEUE_SIDEBAR_MAX_WIDTH = 640;
@@ -841,6 +855,27 @@
       onclick={() => { toggleRecording().catch(console.error); }}
       title={$isRecording ? "Stop recording" : "Start recording the master mix to disk (configure folder/format in Settings > Record)"}
     >{#if $isRecording}<span class="rec-dot"></span>{/if}Record</button>
+    <div class="toolbar-divider"></div>
+    <label
+      class="dj-selector"
+      title="Who's on the decks — attributes Digger plays and scopes which queue is shown/edited. Empty = you."
+    >
+      DJ
+      <input
+        type="text"
+        class="dj-input"
+        list="dj-recent-list"
+        placeholder="you"
+        bind:value={djInput}
+        onkeydown={(e) => { if (e.key === 'Enter') applyDj(); }}
+        onblur={() => applyDj()}
+      />
+      <datalist id="dj-recent-list">
+        {#each djHistory as name (name)}
+          <option value={name}></option>
+        {/each}
+      </datalist>
+    </label>
     <div class="toolbar-divider"></div>
     <button
       class="output-btn"
