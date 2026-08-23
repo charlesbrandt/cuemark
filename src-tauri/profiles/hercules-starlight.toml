@@ -30,6 +30,8 @@ d1 = 7
 kind = "button"
 action = "play_toggle"
 slot = 0
+led = true
+note = "LED confirmed 2026-08-23: plain Note On (0x91/0x07/0x7F) lights it, Note Off clears it, no SysEx handshake — same bytes as the button's own input, same pattern as the FLX4 headphone-Cue LED."
 
 [[control]]
 status = 0x91
@@ -51,6 +53,8 @@ d1 = 5
 kind = "button"
 action = "sync_toggle"
 slot = 0
+led = true
+note = "LED confirmed 2026-08-23: plain Note On (0x91/0x05/0x7F) lights it, Note Off clears it, no SysEx handshake."
 
 # Volume/gain fader (CC 0 coarse; CC 32 fine — ignored, matching the original's
 # 7-bit-is-enough decision). Mapped to "gain" (pre-fader trim), not "volume" — the
@@ -241,6 +245,8 @@ d1 = 7
 kind = "button"
 action = "play_toggle"
 slot = 1
+led = true
+note = "LED confirmed 2026-08-23, same plain Note On/Off echo as slot 0, no handshake."
 
 [[control]]
 status = 0x92
@@ -262,6 +268,8 @@ d1 = 5
 kind = "button"
 action = "sync_toggle"
 slot = 1
+led = true
+note = "LED confirmed 2026-08-23, same plain Note On/Off echo as slot 0, no handshake."
 
 [[control]]
 status = 0xB2
@@ -457,6 +465,8 @@ d1 = 12
 kind = "button"
 action = "headphone_cue"
 slot = 0
+led = true
+note = "LED confirmed 2026-08-23: plain Note On (0x91/0x0C/0x7F) lights it, Note Off clears it, no SysEx handshake — same pattern as the FLX4 headphone-Cue LED."
 
 [[control]]
 status = 0x92
@@ -464,6 +474,8 @@ d1 = 12
 kind = "button"
 action = "headphone_cue"
 slot = 1
+led = true
+note = "LED confirmed 2026-08-23, same plain Note On/Off echo as slot 0, no handshake."
 
 # Deliberately unmapped (no action needed — carried over from the original map):
 #   (0x90, 3)  = Shift button — controller remaps pads in firmware; no host tracking needed

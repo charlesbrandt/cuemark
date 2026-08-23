@@ -93,13 +93,17 @@ fn send_led(conn: &mut Conn, slot: u8, action: ActionId, on: bool) {
     }
 }
 
+/// Generic LED-mirror command — any deck-state boolean (headphone cue, play, sync
+/// lock, …) that has a bench-verified `led = true` row for `(slot, action)` on the
+/// named profile. `action` deserializes from the same snake_case strings the TOML
+/// files use (`ActionId`'s `serde(rename_all = "snake_case")`).
 #[tauri::command]
-pub fn midi_set_headphone_cue_led(profile_id: String, slot: u8, on: bool) -> Result<(), String> {
+pub fn midi_set_led(profile_id: String, slot: u8, action: ActionId, on: bool) -> Result<(), String> {
     let mut guard = CONNS.lock().unwrap();
     let Some(map) = guard.as_mut() else { return Ok(()) };
     for conn in map.values_mut() {
         if conn.profile_id == profile_id {
-            send_led(conn, slot, ActionId::HeadphoneCue, on);
+            send_led(conn, slot, action, on);
         }
     }
     Ok(())

@@ -209,7 +209,7 @@ pub fn run() {
             midi::midi_list_ports,
             midi::monitor::midi_capture_save,
             midi::midi_list_controllers,
-            midi::midi_set_headphone_cue_led,
+            midi::midi_set_led,
             watchdog::watchdog_heartbeat,
             session_store::session_sync,
             session_store::session_restore,

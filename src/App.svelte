@@ -5,7 +5,7 @@
   import VisualizationPanel from "./components/VisualizationPanel.svelte";
   import { tapTempo } from "./lib/audio/bpm";
   import { startMidiListener } from "./lib/midi/handler";
-  import { syncHeadphoneCueLed } from "./lib/midi/ledSync";
+  import { syncHeadphoneCueLed, syncPlayLed, syncSyncLed } from "./lib/midi/ledSync";
   import { invoke } from "@tauri-apps/api/core";
   import {
     audioLoad, audioUnload, audioSetCue, audioSetMasterVolume, audioSetMainDevices,
@@ -193,17 +193,29 @@
     audioSetCueGain($cueGain).catch(console.error);
   });
 
-  // Sync deck cueEnabled flags to Rust audio pipeline.
+  // Sync deck cueEnabled flags to Rust audio pipeline, and cueEnabled/playing/
+  // syncLocked to their controller LEDs (bench-verified 2026-08-23 on both the FLX4
+  // and the Starlight — see ledSync.ts).
   // Guard against the coarse $session store: any MIDI update (crossfader,
-  // volume, rate) re-triggers this effect even when cueEnabled is unchanged —
+  // volume, rate) re-triggers this effect even when these flags are unchanged —
   // without the guard that floods IPC at MIDI event rates and stalls the UI.
   const _prevCueStates = new Map<string, boolean>();
+  const _prevPlayStates = new Map<string, boolean>();
+  const _prevSyncStates = new Map<string, boolean>();
   $effect(() => {
     for (const deck of $session.decks) {
       if (_prevCueStates.get(deck.id) !== deck.cueEnabled) {
         _prevCueStates.set(deck.id, deck.cueEnabled);
         audioSetCue(deck.id, deck.cueEnabled).catch(console.error);
         syncHeadphoneCueLed(deck.id, deck.cueEnabled);
+      }
+      if (_prevPlayStates.get(deck.id) !== deck.playing) {
+        _prevPlayStates.set(deck.id, deck.playing);
+        syncPlayLed(deck.id, deck.playing);
+      }
+      if (_prevSyncStates.get(deck.id) !== deck.syncLocked) {
+        _prevSyncStates.set(deck.id, deck.syncLocked);
+        syncSyncLed(deck.id, deck.syncLocked);
       }
     }
   });
