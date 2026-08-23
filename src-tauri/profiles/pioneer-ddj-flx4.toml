@@ -49,7 +49,7 @@ d1 = 0x58
 kind = "button"
 action = "sync_toggle"
 slot = 0
-note = "from Mixxx mapping, not live-verified on this unit"
+note = "live-verified 2026-08-22 (FLX4 alone, no Starlight) — wire byte confirmed (0x90/0x58 vel 127), resolves to SyncToggle{slot:0}. Button LED stayed unlit, which is expected (profile has no MIDI output/LED sync yet, see file header). Deck-bpm-syncing effect not exercised — no track loaded during this pass."
 
 [[control]]
 status = 0x90
@@ -57,7 +57,7 @@ d1 = 0x54
 kind = "button"
 action = "headphone_cue"
 slot = 0
-note = "from Mixxx mapping, not live-verified on this unit (Cue/PFL button)"
+note = "live-verified 2026-08-22 — 0x90/0x54 vel 127 -> HeadphoneCue{slot:0}, confirmed working end to end in the UI. LED doesn't light (MIDI output not built yet, see todo.md)"
 
 # Channel fader vs. Trim: the FLX4 has BOTH, unlike the Starlight's single fader.
 # Bound to the DJ-workflow-typical split — the channel fader (the one a DJ rides
@@ -72,7 +72,7 @@ kind = "fader14"
 lsb_d1 = 0x33
 action = "volume"
 slot = 0
-note = "from Mixxx mapping, not live-verified on this unit; channel fader -> volume (see file header)"
+note = "live-verified 2026-08-22 — bottom to top, value rose smoothly 0.28->0.98, correct direction"
 
 [[control]]
 status = 0xB0
@@ -81,7 +81,7 @@ kind = "fader14"
 lsb_d1 = 0x24
 action = "gain"
 slot = 0
-note = "from Mixxx mapping, not live-verified on this unit (Trim knob -> gain)"
+note = "live-verified 2026-08-22 (Trim knob -> gain) — CCW to CW, value rose smoothly toward 1.0, correct direction"
 
 [[control]]
 status = 0xB0
@@ -90,7 +90,7 @@ kind = "fader14"
 lsb_d1 = 0x27
 action = "eq_high"
 slot = 0
-note = "from Mixxx mapping, not live-verified on this unit"
+note = "live-verified 2026-08-22 — swings through 0dB to +11.6dB correctly. NOTE: the knob's own printed scale reads -26..+6dB; cuemark's actual range is EQ_MIN_DB/EQ_MAX_DB (-24..+12, pipeline.rs) — the wire mapping is correct, this is a deliberate open question about whether to match the printed hardware scale, not a bug. See controller-mapping.md."
 
 [[control]]
 status = 0xB0
@@ -99,7 +99,7 @@ kind = "fader14"
 lsb_d1 = 0x2B
 action = "eq_mid"
 slot = 0
-note = "from Mixxx mapping, not live-verified on this unit"
+note = "live-verified 2026-08-22 — swings -4.4dB..+11.2dB correctly. Same printed-scale-vs-EQ_MIN_DB/MAX_DB note as eq_high above."
 
 [[control]]
 status = 0xB0
@@ -108,7 +108,7 @@ kind = "fader14"
 lsb_d1 = 0x2F
 action = "eq_low"
 slot = 0
-note = "from Mixxx mapping, not live-verified on this unit"
+note = "live-verified 2026-08-22 — swings -3.3dB..+11.4dB correctly. Same printed-scale-vs-EQ_MIN_DB/MAX_DB note as eq_high above."
 
 # ── Deck 2 (slot 1) — status 0x91 (notes) / 0xB1 (CC), same CC/note numbers ──────
 
@@ -118,7 +118,7 @@ d1 = 0x0B
 kind = "button"
 action = "play_toggle"
 slot = 1
-note = "from Mixxx mapping, not live-verified on this unit"
+note = "live-verified 2026-08-22 — 0x91/0x0B -> DeckPlayToggle{slot:1}"
 
 [[control]]
 status = 0x91
@@ -126,7 +126,7 @@ d1 = 0x0C
 kind = "button"
 action = "cue_jump"
 slot = 1
-note = "from Mixxx mapping, not live-verified on this unit"
+note = "live-verified 2026-08-22 — 0x91/0x0C -> CueJump{slot:1}"
 
 [[control]]
 status = 0x91
@@ -134,7 +134,7 @@ d1 = 0x58
 kind = "button"
 action = "sync_toggle"
 slot = 1
-note = "from Mixxx mapping, not live-verified on this unit"
+note = "live-verified 2026-08-22 — 0x91/0x58 -> SyncToggle{slot:1}. LED behavior/deck-bpm-sync effect not exercised, same caveats as slot 0's row"
 
 [[control]]
 status = 0x91
@@ -142,7 +142,7 @@ d1 = 0x54
 kind = "button"
 action = "headphone_cue"
 slot = 1
-note = "from Mixxx mapping, not live-verified on this unit (Cue/PFL button)"
+note = "live-verified 2026-08-22 — 0x91/0x54 -> HeadphoneCue{slot:1}"
 
 [[control]]
 status = 0xB1
@@ -151,7 +151,7 @@ kind = "fader14"
 lsb_d1 = 0x33
 action = "volume"
 slot = 1
-note = "from Mixxx mapping, not live-verified on this unit; channel fader -> volume (see file header)"
+note = "live-verified 2026-08-22 — 0xB1/0x13+0x33, value rose 0.0->0.97 correctly"
 
 [[control]]
 status = 0xB1
@@ -160,7 +160,7 @@ kind = "fader14"
 lsb_d1 = 0x24
 action = "gain"
 slot = 1
-note = "from Mixxx mapping, not live-verified on this unit (Trim knob -> gain)"
+note = "live-verified 2026-08-22 (Trim knob -> gain) — 0xB1/0x04+0x24, value rose 0.0->0.94 correctly"
 
 [[control]]
 status = 0xB1
@@ -169,7 +169,7 @@ kind = "fader14"
 lsb_d1 = 0x27
 action = "eq_high"
 slot = 1
-note = "from Mixxx mapping, not live-verified on this unit"
+note = "live-verified 2026-08-22 — 0xB1/0x07+0x27, swings -24dB..+10.8dB correctly. Same printed-scale-vs-EQ_MIN_DB/MAX_DB note as slot 0's eq_high row"
 
 [[control]]
 status = 0xB1
@@ -178,7 +178,7 @@ kind = "fader14"
 lsb_d1 = 0x2B
 action = "eq_mid"
 slot = 1
-note = "from Mixxx mapping, not live-verified on this unit"
+note = "live-verified 2026-08-22 — 0xB1/0x0B+0x2B, swings -24dB..+7.6dB correctly. Same printed-scale note"
 
 [[control]]
 status = 0xB1
@@ -187,7 +187,7 @@ kind = "fader14"
 lsb_d1 = 0x2F
 action = "eq_low"
 slot = 1
-note = "from Mixxx mapping, not live-verified on this unit"
+note = "live-verified 2026-08-22 — 0xB1/0x0F+0x2F, swings -24dB..+9.4dB correctly. Same printed-scale note"
 
 # ── Tempo faders — captured live 2026-08-22 (§8.7) ───────────────────────────────
 # 14-bit, MSB (0xB0/0xB1, 0) + LSB (..., 32). invert = false: higher raw value =
@@ -408,7 +408,7 @@ d1 = 0x1F
 kind = "fader14"
 lsb_d1 = 0x3F
 action = "crossfader"
-note = "from Mixxx mapping, not live-verified on this unit"
+note = "live-verified 2026-08-22 — 0.0 at full left, rising toward the right, correct direction"
 
 [[control]]
 status = 0xB6
@@ -417,7 +417,7 @@ kind = "fader14"
 lsb_d1 = 0x37
 action = "filter"
 slot = 0
-note = "from Mixxx mapping, not live-verified on this unit (Filter/CFX knob ch1)"
+note = "live-verified 2026-08-22 (Filter/CFX knob ch1) — swings -0.5..+0.93 through centre-flat correctly"
 
 [[control]]
 status = 0xB6
@@ -426,20 +426,27 @@ kind = "fader14"
 lsb_d1 = 0x38
 action = "filter"
 slot = 1
-note = "from Mixxx mapping, not live-verified on this unit (Filter/CFX knob ch2)"
+note = "live-verified 2026-08-22 (Filter/CFX knob ch2) — swings -1.0..+0.84 through centre-flat correctly"
 
-# Headphones Mix is actually a cue/master BALANCE knob, not a pure level — bound to
-# the closest existing action (cue_gain) for this trimmed pass rather than inventing
-# a new action; the semantic mismatch is real and worth revisiting once someone can
-# turn this knob and listen.
+# CORRECTED 2026-08-22, live-verified with an independent raw capture (aseqdump against
+# the ALSA sequencer port, bypassing cuemark's own code entirely — see
+# controller-mapping.md's bench-pass writeup for why an app-level test alone got this
+# wrong twice). HEADPHONES MIX and HEADPHONES LEVEL are two real, physically separate
+# knobs on DIFFERENT CCs, not one shared control as an earlier pass here concluded:
+#   - MIX:   0xB6, CC 0x0C (MSB) / CC 0x2C (LSB) — deliberately left UNBOUND. cuemark has
+#            no cue/master mix-ratio concept, so binding it to cue_gain (a plain level)
+#            would be the same mismatch the very first version of this file's note flagged.
+#   - LEVEL: 0xB6, CC 0x0D (MSB) / CC 0x2D (LSB) — bound below. A pure output level is
+#            exactly what cue_gain is.
 [[control]]
 status = 0xB6
-d1 = 0x0C
+d1 = 0x0D
 kind = "fader14"
-lsb_d1 = 0x2C
+lsb_d1 = 0x2D
 action = "cue_gain"
-note = "from Mixxx mapping, not live-verified on this unit; this is a cue/master BALANCE knob, not a pure level — see comment above"
+note = "live-verified 2026-08-22 via independent aseqdump capture — 0xB6/0x0D+0x2D is the LEVEL knob specifically (see comment above), value swept smoothly on a real turn"
 
-# Master level and headphone OUTPUT level are confirmed hardware-analog-only on this
-# unit (docs/design/ddj-flx4-feature-gaps.md §8) — no MIDI bytes exist for them, so
-# there is nothing to bind.
+# Master level is confirmed hardware-analog-only on this unit (no MIDI bytes observed).
+# Headphone OUTPUT level is NOT analog-only, despite what this comment and
+# ddj-flx4-feature-gaps.md §8 both claimed before 2026-08-22 (sourced from the manual,
+# not a capture) — see the MIX/LEVEL block above, both send real MIDI.

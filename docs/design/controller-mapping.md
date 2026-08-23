@@ -34,14 +34,11 @@ defer. What's actually running:
   migration — see `persist_kv`'s doc comment in `midi/decode.rs`). `DeckEqMid`/
   `DeckEqHigh` actions were added (the FLX4 has 3 real EQ knobs; cuemark's `mid`/`high`
   bands existed with zero MIDI path before this).
-- **Phase 4 (author `pioneer-ddj-flx4.toml`) — 🟡 built, but only PART of it is
-  live-verified.** Jog, jog-touch note (deliberately unbound — see §10), pad-mode CC
-  layout, deck-slot count, and the tempo fader are cuemark's own §8/§11 captures. Every
-  other control (play, cue, sync, channel fader, trim, EQ hi/mid/low, filter/CFX,
-  crossfader, headphone mix) is sourced from **Mixxx's shipped mapping, not our own
-  capture** — a deliberate call given no bench pass was available this session — and
-  each such row carries `note = "from Mixxx mapping, not live-verified on this unit"`
-  in the TOML. Treat those as candidates until someone plays the actual controls; see
+- **Phase 4 (author `pioneer-ddj-flx4.toml`) — 🟢 built and fully bench-verified
+  2026-08-22.** Every row in the file — jog/pad/tempo (cuemark's own §8/§11 captures)
+  and every Mixxx-sourced row (play, cue, sync, channel fader, trim, EQ hi/mid/low,
+  filter/CFX, crossfader, headphone level) — has been confirmed against the real unit;
+  see the bench-pass writeup below for the two findings that came out of it. See
   `docs/design/ddj-flx4-feature-gaps.md` for what's out of scope entirely (Sampler
   pads, Beat FX, browse encoder).
 
@@ -59,12 +56,42 @@ between the failure and the success. See `todo.md`'s handoff entry for what to c
 if this recurs (a `debugLog()`-based diagnostic technique that works but wasn't needed once
 the retry succeeded).
 
-**Still open after this session**: the full §4 normalized-signal refactor for
-EQ/tempo, a real multi-controller routing UI, LED output (still no MIDI output code at
-all — §1/§11), `JogTouch` precedence (§10), the unresolved one-time Play/Cue miss above,
-and — the concrete next step — a live bench pass to confirm or correct every remaining
-Mixxx-sourced row in `pioneer-ddj-flx4.toml` by ear (sync, faders, EQ hi/low, filter,
-crossfader, headphone mix, and the whole right-deck/slot-1 side).
+**2026-08-22 (bench-verification pass, FLX4 alone, no Starlight)**: every remaining
+Mixxx-sourced row in `pioneer-ddj-flx4.toml` walked control-by-control against the real
+unit and confirmed — sync, channel fader, trim, EQ hi/mid/low, filter/CFX, crossfader,
+headphone level, and the entire right-deck/slot-1 side (play/cue/sync/headphone-cue/
+volume/gain/EQ). All wire bytes match what the profile already declared; no `d1`/`status`
+corrections were needed anywhere. Two real findings came out of it, not mapping bugs:
+
+- **EQ knobs' printed hardware scale (-26..+6dB) doesn't match cuemark's actual EQ range**
+  (`EQ_MIN_DB`/`EQ_MAX_DB` in `pipeline.rs`, -24..+12, the real range of GStreamer's
+  `equalizer-nbands` element and shared globally across every controller). The FLX4 in
+  MIDI mode sends a plain 0-127 rotation with no dB semantics on the wire — the printed
+  labels are Pioneer's own convention for standalone-mixer mode, not a protocol fact — so
+  there's no "correct" answer here, just an open taste call on whether to reshape the
+  global dB curve to match this one controller's silkscreen. Not changed.
+- **The FLX4's headphone LEVEL and MIX knobs are physically separate and send different
+  CCs** — but getting there took two wrong turns worth recording, since both were
+  app-level tests and both were wrong the same way. Two rounds of "turn only LEVEL, then
+  turn only MIX" through cuemark's own log both showed `0xB6/0x0C` for *both* knobs,
+  which looked like a firmware quirk (two knobs sharing one CC). It wasn't — a third,
+  independent capture directly off the ALSA sequencer port (`aseqdump -p 20:0`,
+  bypassing cuemark's Rust entirely) with the same "MIX then LEVEL" gesture showed two
+  clean, non-overlapping blocks: MIX on CC `0x0C`/`0x2C`, LEVEL on CC `0x0D`/`0x2D` — one
+  CC apart, easy to miss, and easy to physically confuse between two adjacent unlabeled-
+  on-screen knobs under verbal instruction. **The lesson: for a "these two things look
+  identical" finding, verify with a capture independent of the code path already under
+  test, not just a second attempt through the same path.** `pioneer-ddj-flx4.toml`'s
+  `cue_gain` row is now bound to LEVEL (`0x0D`/`0x2D`, the correct semantic match — a
+  plain output level); MIX (`0x0C`/`0x2C`) is deliberately left unbound, since cuemark
+  has no cue/master mix-ratio concept to bind it to. `ddj-flx4-feature-gaps.md` §8's
+  "HEADPHONES LEVEL is analog-only" claim (sourced from the manual) was also wrong —
+  both knobs send real MIDI.
+
+**Still open**: the full §4 normalized-signal refactor for EQ/tempo, a real
+multi-controller routing UI, LED output (still no MIDI output code at all — §1/§11),
+`JogTouch` precedence (§10), and the unresolved one-time Play/Cue miss noted above (never
+recurred since).
 
 This doc is about *mapping* — wire bytes to bindings cuemark already knows how to act on.
 For physical FLX4 controls whose target *behaviour doesn't exist in cuemark at all* (Beat FX,

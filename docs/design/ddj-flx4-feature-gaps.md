@@ -118,10 +118,15 @@ flagged as its own open item in `controller-mapping.md` §10 and `docs/design/wa
 For completeness — these appear in the manual but **never send MIDI on this unit**, so they
 are neither a mapping task nor an application gap, just controls the box handles itself:
 
-- **MASTER level, HEADPHONES LEVEL knobs** — analog pots on the FLX4's own audio interface
-  output stage. cuemark's `MasterVolume`/`CueGain` actions exist for the *Starlight's*
-  MIDI-driven knobs; the FLX4 doesn't need or want a software equivalent for its own
-  hardware outputs.
+- **MASTER level** — analog pot on the FLX4's own audio interface output stage; no MIDI
+  observed. ⚠️ **CORRECTED 2026-08-22**: this row previously also listed HEADPHONES LEVEL
+  as analog-only, sourced from the manual rather than a live capture. That was wrong —
+  live-verified the same session (via an independent `aseqdump` capture, after two
+  app-level tests initially misattributed it), HEADPHONES LEVEL sends `0xB6`, CC
+  `0x0D`/`0x2D` and is bound to `cue_gain` in `pioneer-ddj-flx4.toml`. The separate
+  HEADPHONES MIX knob also sends real MIDI (`0xB6`, CC `0x0C`/`0x2C`) but is deliberately
+  left unbound — cuemark has no cue/master mix-ratio concept. See `controller-mapping.md`'s
+  bench-pass writeup for the full story.
 - **Channel level indicators (VU meters)** — these would need cuemark to *send* MIDI
   (light an LED/meter from software), which is the same "no MIDI output" gap already
   tracked in `controller-mapping.md` §1/§11. Not re-listed as a separate item.
