@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use midir::{Ignore, MidiInput, MidiInputConnection};
+use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -33,7 +33,7 @@ pub use decode::MidiAction;
 pub use monitor::MidiRaw;
 
 use decode::Decoder;
-use profile::Profile;
+use profile::{ActionId, Profile};
 
 use crate::midi_state;
 
@@ -49,7 +49,60 @@ struct Conn {
     profile_name: String,
     slots: u8,
     jog_ticks_per_rev: f32,
+    profile: Arc<Profile>,
+    /// `None` when no output port of the same name exists, or opening it failed
+    /// (e.g. the controller only exposes a MIDI-in port). LED sends are then a
+    /// silent no-op rather than an error — see `send_led`.
+    output: Option<MidiOutputConnection>,
     _conn: MidiInputConnection<()>,
+}
+
+/// Opens an output connection to the port with this exact name, if one exists.
+/// A controller's input and output ports are enumerated separately by `midir` but
+/// share the same name on every controller seen so far (Starlight, FLX4) — matching
+/// by name is what pairs them up, same as `connect_port` already does for input.
+fn connect_output(name: &str) -> Option<MidiOutputConnection> {
+    let midi_out = MidiOutput::new("cuemark-out").ok()?;
+    let port = midi_out
+        .ports()
+        .into_iter()
+        .find(|p| midi_out.port_name(p).map(|n| n == name).unwrap_or(false))?;
+    match midi_out.connect(&port, "cuemark-midi-out") {
+        Ok(conn) => Some(conn),
+        Err(e) => {
+            log::warn!("[midi] failed to open output port {name}: {e}");
+            None
+        }
+    }
+}
+
+/// Sends a plain Note On (`on`, vel 127) / Note Off (`on=false`, vel 0) to a
+/// bench-verified LED-capable control. Silently does nothing if this connection has
+/// no output port or the profile has no `led = true` row for `(slot, action)` — a
+/// missing LED byte is a "not captured yet" fact, not an error (see `Control::led`).
+fn send_led(conn: &mut Conn, slot: u8, action: ActionId, on: bool) {
+    let Some((status, note)) = conn.profile.led_control(slot, action) else { return };
+    let Some(out) = conn.output.as_mut() else { return };
+    let vel: u8 = if on { 0x7F } else { 0x00 };
+    match out.send(&[status, note, vel]) {
+        Ok(()) => log::info!(
+            "[midi] LED {}: {:?} slot {slot} -> {} (0x{status:02X} 0x{note:02X} 0x{vel:02X})",
+            conn.profile_id, action, if on { "on" } else { "off" }
+        ),
+        Err(e) => log::warn!("[midi] LED send failed on {}: {e}", conn.profile_id),
+    }
+}
+
+#[tauri::command]
+pub fn midi_set_headphone_cue_led(profile_id: String, slot: u8, on: bool) -> Result<(), String> {
+    let mut guard = CONNS.lock().unwrap();
+    let Some(map) = guard.as_mut() else { return Ok(()) };
+    for conn in map.values_mut() {
+        if conn.profile_id == profile_id {
+            send_led(conn, slot, ActionId::HeadphoneCue, on);
+        }
+    }
+    Ok(())
 }
 
 /// Live connections, keyed by port name. `None` until `spawn_listener` runs.
@@ -231,8 +284,13 @@ fn connect_port(app: &AppHandle, name: &str, profile: &Profile, persist: &midi_s
     let source = NEXT_SOURCE.fetch_add(1, Ordering::Relaxed);
     let app2 = app.clone();
     let persist2 = Arc::clone(persist);
-    let profile2 = Arc::new(profile.clone());
+    let profile_arc = Arc::new(profile.clone());
+    let profile2 = Arc::clone(&profile_arc);
     let port_name = name.to_string();
+    let output = connect_output(name);
+    if output.is_some() {
+        log::info!("[midi] opened output port: {name}");
+    }
     let mut decoder = Decoder::new();
     let mut log_throttle: HashMap<(u8, u8), Instant> = HashMap::new();
 
@@ -316,6 +374,8 @@ fn connect_port(app: &AppHandle, name: &str, profile: &Profile, persist: &midi_s
         profile_name: profile.name.clone(),
         slots: profile.slots,
         jog_ticks_per_rev: profile.jog_ticks_per_rev,
+        profile: profile_arc,
+        output,
         _conn: conn,
     })
 }

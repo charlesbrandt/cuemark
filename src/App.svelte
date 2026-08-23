@@ -5,6 +5,7 @@
   import VisualizationPanel from "./components/VisualizationPanel.svelte";
   import { tapTempo } from "./lib/audio/bpm";
   import { startMidiListener } from "./lib/midi/handler";
+  import { syncHeadphoneCueLed } from "./lib/midi/ledSync";
   import { invoke } from "@tauri-apps/api/core";
   import {
     audioLoad, audioUnload, audioSetCue, audioSetMasterVolume, audioSetMainDevices,
@@ -202,6 +203,7 @@
       if (_prevCueStates.get(deck.id) !== deck.cueEnabled) {
         _prevCueStates.set(deck.id, deck.cueEnabled);
         audioSetCue(deck.id, deck.cueEnabled).catch(console.error);
+        syncHeadphoneCueLed(deck.id, deck.cueEnabled);
       }
     }
   });
@@ -432,6 +434,7 @@
           // path bypasses the store for rate/gain/volume.
           _prevCueStates.set(deckId, d.cueEnabled);
           audioSetCue(deckId, d.cueEnabled).catch(console.error);
+          syncHeadphoneCueLed(deckId, d.cueEnabled);
         }
         const s = get(session).decks.find((d) => d.id === deckId)?.source;
         if (duration && s?.type === "video" && s.filePath === filePath && (!s.duration || !Number.isFinite(s.duration))) {

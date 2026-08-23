@@ -202,8 +202,21 @@ boundaries and dividing by the reported count averages out alignment error inste
 dominated by it. This is what took the jog calibration from a noisy ~150-730 range down to
 two independent measurements 0.4% apart.
 
-**Testing LED output without cuemark's own MIDI-output code** (cuemark has none yet — see
-"There is no MIDI output" in `docs/design/controller-mapping.md` §1): send raw bytes directly
+**MIDI output now exists (2026-08-23)** — `src-tauri/src/midi/mod.rs` opens a
+`MidiOutputConnection` alongside each input connection (matched by port name), and a
+per-`Control` TOML flag `led = true` (default false) opts a bench-verified button into a
+plain Note On (vel 127)/Note Off (vel 0) LED echo on its own `(status, d1)` bytes, looked
+up via `Profile::led_control(slot, action)`. **Never set `led = true` on a row that hasn't
+actually been sent and watched light up** — a button accepting input on a byte pair says
+nothing about whether the same bytes accept output; see `Control::led`'s doc comment.
+First control done this way: the FLX4's headphone-Cue toggle
+(`midi_set_headphone_cue_led` Tauri command, `src/lib/midi/ledSync.ts` mirroring
+`deck.cueEnabled`) — confirmed live on both decks, **no SysEx handshake needed**, unlike
+the hot-cue pads below. That is a genuine per-control-group difference, not a discrepancy
+to resolve — the design doc's §11 already predicted this ("assume capture-before-designing
+applies per-control-group rather than generalizing from pads") and it held.
+
+**Testing LED output before wiring app code — send raw bytes directly**
 to the ALSA raw device with `amidi -p hw:X,0,0 -S "<status> <note-hex> <velocity-hex>"`. This
 works *while cuemark holds the input connection* — confirmed live, exit 0, no conflict — because
 cuemark connects via the sequencer (multi-subscriber) rather than opening the raw device
@@ -217,6 +230,16 @@ replug is also a live demonstration of the no-hotplug gap in §1/§5 of the desi
 broke cuemark's existing subscription (confirmed via `aconnect -l` losing the
 `Connecting To:`/`Connected From:` lines), and cuemark did not reconnect on its own — a
 manual dev-server restart was required. Budget for that if LED experiments are on the plan.
+
+**One-question-per-byte beats a batch of candidates for LED confirmation** (used
+2026-08-23 for the headphone-Cue LED, no stuck-animation/replug needed this time): send
+one candidate byte, ask a single yes/no question ("did the LED light?"), wait for the
+answer, send the next. This machine has no screenshot tool (`docs/environment.md`), so the
+operator's eyes are the only instrument for "did a physical LED change state" — collapsing
+several candidates into one message forces them to track which byte produced which result
+from memory, and a stuck-animation risk (previous paragraph) means a wrong guess can
+contaminate the *next* candidate's test too. One byte, one question, one answer is slower
+per-byte but each answer is unambiguous.
 
 **A "these two controls look identical" result needs a capture independent of the test
 that produced it, not a second attempt through the same path.** During the FLX4 bench pass

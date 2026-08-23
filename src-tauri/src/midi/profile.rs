@@ -65,6 +65,15 @@ pub struct Control {
     /// beat_jump only — signed beat count to jump (negative = backward).
     #[serde(default)]
     pub beats: f32,
+    /// Whether this button's own (status, d1) bytes also drive an LED, via a plain
+    /// Note On (vel 127) / Note Off (vel 0) echo — the same pattern confirmed for the
+    /// FLX4's hot-cue pads (controller-mapping.md §11). Bench-verified per row, never
+    /// assumed: a button sending input on these bytes does not imply the same bytes
+    /// accept LED output (the left-deck pads additionally needed a one-time SysEx
+    /// unlock cuemark doesn't send yet — don't set `led = true` on a row that hasn't
+    /// actually been confirmed to light).
+    #[serde(default)]
+    pub led: bool,
     /// Provenance, ignored at runtime — e.g. "from Mixxx mapping, not live-verified".
     #[serde(default)]
     #[allow(dead_code)]
@@ -156,6 +165,17 @@ impl Profile {
             Some(Binding::Msb14(_)) | Some(Binding::Lsb14 { .. }) => true,
             None => (key.0 & 0xF0) == 0xB0,
         }
+    }
+
+    /// The (status, d1) wire bytes for a bench-verified LED-capable button bound to
+    /// `action` at `slot`, if any. Only rows explicitly marked `led = true` qualify —
+    /// see `Control::led`'s doc comment for why this must never be inferred from the
+    /// button binding alone.
+    pub fn led_control(&self, slot: u8, action: ActionId) -> Option<(u8, u8)> {
+        self.map.iter().find_map(|(key, binding)| match binding {
+            Binding::Simple(c) if c.led && c.slot == slot && c.action == action => Some(*key),
+            _ => None,
+        })
     }
 }
 

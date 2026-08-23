@@ -11,10 +11,13 @@
 #     candidates, not facts, until a live pass confirms them (see the standing
 #     "capture before designing" rule this project has been bitten by before).
 #
-# LED output, the browse encoder, Beat FX, Sampler pads, and jog touch-as-scratch-
-# trigger are deliberately NOT in this file — see
-# docs/design/controller-mapping.md §6/§10/§11 and docs/design/ddj-flx4-feature-gaps.md.
-# This profile is input-only; cuemark has no MIDI output code at all yet.
+# The browse encoder, Beat FX, Sampler pads, and jog touch-as-scratch-trigger are
+# deliberately NOT in this file — see docs/design/controller-mapping.md §6/§10/§11
+# and docs/design/ddj-flx4-feature-gaps.md. LED output landed 2026-08-23 for one
+# control (headphone_cue, see its rows' `led = true`) — everything else (hot-cue
+# pads, mode-select buttons) still needs its own bench pass + `led = true` row
+# before it will light; `led` defaults to false and must never be inferred from a
+# button's input binding alone (see `Control::led`'s doc comment in profile.rs).
 
 id = "pioneer-ddj-flx4"
 name = "Pioneer DJ DDJ-FLX4"
@@ -57,7 +60,8 @@ d1 = 0x54
 kind = "button"
 action = "headphone_cue"
 slot = 0
-note = "live-verified 2026-08-22 — 0x90/0x54 vel 127 -> HeadphoneCue{slot:0}, confirmed working end to end in the UI. LED doesn't light (MIDI output not built yet, see todo.md)"
+led = true
+note = "live-verified 2026-08-22 — 0x90/0x54 vel 127 -> HeadphoneCue{slot:0}, confirmed working end to end in the UI. LED confirmed 2026-08-23: plain Note On (0x90/0x54/0x7F) lights it, Note Off (vel 0) clears it, no SysEx handshake needed (unlike the left-deck pads) — same bytes as the button's own input."
 
 [[control]]
 status = 0x90
@@ -210,7 +214,8 @@ d1 = 0x54
 kind = "button"
 action = "headphone_cue"
 slot = 1
-note = "live-verified 2026-08-22 — 0x91/0x54 -> HeadphoneCue{slot:1}"
+led = true
+note = "live-verified 2026-08-22 — 0x91/0x54 -> HeadphoneCue{slot:1}. LED confirmed 2026-08-23, same plain Note On/Off echo as slot 0, no handshake."
 
 [[control]]
 status = 0x91

@@ -2,6 +2,8 @@
 
 Status: 🟢 **Phases 1, 3, and a trimmed phase 4 built and live-tested (Rust/TS); phase 2
 partially built.** Written 2026-08-17, prompted by a **Pioneer DJ DDJ-FLX4** on order.
+**MIDI output landed 2026-08-23** (§11 update below) for one control — see there for what's
+built vs. still only captured-and-not-implemented.
 
 **2026-08-22 (build session): profiles-as-data + the FLX4 profile landed**, on top of
 the same-day capture session (§8/§11) and a scope call to trim what shipped now vs.
@@ -578,3 +580,36 @@ connect, then relight default-state mode buttons — but per §10's open questio
 this on. **No code should be written yet.** This is captured fact for whoever builds MIDI
 output (needed regardless, for LED feedback in general) and the profile system (§3) that would
 hold a per-controller init sequence as data rather than a hand-wired call.
+
+## 12. MIDI output — built 2026-08-23, one control
+
+**§1's "no MIDI output" gap is closed, generically** — `src-tauri/src/midi/mod.rs` now
+opens a `MidiOutputConnection` alongside every input connection (matched to it by port
+name, the same way `connect_port` already pairs a name to a profile). A new per-`Control`
+TOML field, `led: bool` (default `false`), opts one row into a plain Note On (vel
+127)/Note Off (vel 0) echo on its own `(status, d1)` bytes — `Profile::led_control(slot,
+action)` looks it up, `midi_set_headphone_cue_led` (Tauri command) is the one caller so
+far. **`led` must only ever be set on a row that has actually been sent and watched
+light up** — the whole point of keeping it a separate, defaulted-false flag instead of
+inferring LED support from a button's existing input binding is that the two are
+independently-verified facts (see the pad-LED handshake requirement above: the same
+`(status, d1)` accepting input said nothing about whether it would accept output, or
+whether output would need an unlock first).
+
+**First control wired: the headphone-Cue toggle**, both decks — `(0x90, 0x54)` slot 0,
+`(0x91, 0x54)` slot 1, `pioneer-ddj-flx4.toml`'s existing rows (already known from the
+§8 capture) with `led = true` added. Live-verified 2026-08-23: sending vel `7F` lights
+it, vel `00` clears it, **from cuemark's own connection this time**, not a bare `amidi`
+probe. `src/lib/midi/ledSync.ts` mirrors `deck.cueEnabled` to it, hooked into the same
+two `App.svelte` sites that already sync cue state to the audio pipeline (the
+`_prevCueStates` dedup guard and the post-reload re-send) — so the LED now tracks actual
+cuemark state (survives a session restore, a UI click, a MIDI press) rather than just
+echoing the button's own last press.
+
+**Confirms §11's prediction, doesn't extend it**: this control needed **no SysEx
+handshake** — a genuine per-control-group difference from the hot-cue pads, not a
+discrepancy to chase down. Hot-cue pad LEDs, mode-select button LEDs, and every other LED
+group (jog ring, level meters, browse encoder) are still exactly where §11 left them —
+captured-or-not per row, nothing implemented, and each needs its own bench pass before a
+`led = true` row is added for it. The plumbing built here needs zero new Rust for the
+next control; only a new TOML row once that control's own bytes are confirmed live.

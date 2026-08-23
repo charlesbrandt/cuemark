@@ -146,8 +146,11 @@ are neither a mapping task nor an application gap, just controls the box handles
   left unbound — cuemark has no cue/master mix-ratio concept. See `controller-mapping.md`'s
   bench-pass writeup for the full story.
 - **Channel level indicators (VU meters)** — these would need cuemark to *send* MIDI
-  (light an LED/meter from software), which is the same "no MIDI output" gap already
-  tracked in `controller-mapping.md` §1/§11. Not re-listed as a separate item.
+  (light an LED/meter from software). The generic output plumbing landed 2026-08-23
+  (`controller-mapping.md` §12) for one control (headphone-Cue LED); meters are a
+  different control group with their own uncaptured bytes and likely continuous-update
+  semantics (not a plain Note On/Off toggle), so this remains its own uncaptured item,
+  not automatically covered by that plumbing existing. Not re-listed as a separate item.
 - **Microphone input** — 1/4" jack, explicitly not routed to the computer per the manual.
   Nothing for cuemark to do here regardless of feature completeness.
 
