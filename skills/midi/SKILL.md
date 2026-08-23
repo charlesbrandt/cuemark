@@ -130,7 +130,8 @@ or the *distinct values* matter, use the MIDI monitor below instead — that is 
 
 ## Raw MIDI monitor (built 2026-08-17)
 
-**Toolbar → MIDI.** A live, unthrottled table of every message arriving on the port, mapped
+**Toolbar → Settings → MIDI tab** (merged into the tabbed SettingsPanel 2026-08-22; was its
+own toolbar toggle before that). A live, unthrottled table of every message arriving on the port, mapped
 or not, plus port enumeration and a capture export. `src/components/MidiMonitor.svelte` +
 `midi_monitor_set` / `midi_list_ports` / `midi_capture_save` in `midi.rs`. Design and the
 role it plays in controller work: `docs/design/controller-mapping.md` §7a.
@@ -210,6 +211,23 @@ broke cuemark's existing subscription (confirmed via `aconnect -l` losing the
 `Connecting To:`/`Connected From:` lines), and cuemark did not reconnect on its own — a
 manual dev-server restart was required. Budget for that if LED experiments are on the plan.
 
+**A "these two controls look identical" result needs a capture independent of the test
+that produced it, not a second attempt through the same path.** During the FLX4 bench pass
+(2026-08-22), two separate rounds of "turn only knob A, then only knob B" — each relayed
+over chat, each read through cuemark's own `[midi/...]` log — came back with *both* knobs
+producing the exact same CC. That looked like a real hardware quirk (two pots wired to one
+CC) and very nearly got written up as one. It wasn't: a third capture straight off the ALSA
+sequencer port (`aseqdump -p PORT:0`, bypassing cuemark's Rust entirely) with the identical
+"A then B" gesture showed two clean, non-overlapping CCs one number apart. Both app-level
+rounds had the operator confusing two adjacent, similarly-shaped knobs under verbal
+instruction — an easy mistake with no on-screen labels to double-check against, and one
+that a second identical test doesn't catch because it repeats the same operator action, not
+a different measurement. **When a live-hardware result is surprising, get a second opinion
+from a genuinely different capture path before writing it down** — `aseqdump` against the
+raw port (or the "Injecting synthetic MIDI" pattern below, in reverse) is cheap enough that
+there's no reason not to, and it caught something two rounds of careful, honestly-answered
+questions did not.
+
 ## Injecting synthetic MIDI into a running cuemark
 
 Because the sequencer port is multi-subscriber (above), a known byte sequence can be pushed
@@ -258,13 +276,27 @@ and how to get a real count instead.
 
 ## Adding or re-calibrating a MIDI controller
 
-⚠️ **`run_midi_loop` opens exactly one port, matched by name substring at startup, and never
-rescans** — plug the controller in *before* launching. If nothing matches it logs the
-available ports and the listener thread simply returns; there is no retry. Making this
-multi-port and hotplug-capable is phase 1 of `docs/design/controller-mapping.md`.
+Since the 2026-08-22 profile-as-data refactor (`docs/design/controller-mapping.md` phase 1),
+controllers are **TOML files in `src-tauri/profiles/`**, not a hand-written Rust map
+function — the steps below are current for that system, not the older per-controller
+`*_map()` functions this section used to describe. A supervisor thread polls ports every
+2s and opens one connection per matched profile, so **plugging in a controller after
+launch now works** (both controllers can be live at once) — the old "plug in before
+launching or it never connects" limitation is gone.
 
-1. Open **Toolbar → MIDI** and wiggle each physical control. No rebuild, no debug print —
-   every message shows up, mapped or not, and rows sort by most-recently-touched.
+⚠️ **Built-in profiles are compiled into the binary (`include_str!`), not read from disk at
+runtime.** Editing `src-tauri/profiles/*.toml` requires a full Rust rebuild before it takes
+effect — under `cargo tauri dev` this happens automatically on save (watch the `[build]`
+line's timestamp and the `[midi] connected to: ...` reconnect line in the log to confirm),
+but it does mean every edit-and-retest cycle costs a recompile, and it briefly drops the
+MIDI connection while the binary restarts. A **user** profile with a matching `id` under
+`<app_data>/profiles/*.toml` shadows a built-in and *is* read live — useful for iterating
+on a mapping without needing a Rust toolchain at all, though this project's own profiles
+still live as built-ins.
+
+1. Open **Toolbar → Settings → MIDI tab** and wiggle each physical control. No rebuild, no
+   debug print — every message shows up, mapped or not, and rows sort by
+   most-recently-touched.
 2. `ctrl` is `STATUS:D1`, and `STATUS` is the **full status byte** — high nibble = message
    type (`0x90`=Note On, `0xB0`=CC), low nibble = MIDI channel. Keep the full byte as the map
    key; do **not** mask off the channel nibble — DJ controllers use different channels for
@@ -279,9 +311,16 @@ multi-port and hotplug-capable is phase 1 of `docs/design/controller-mapping.md`
    and see whether the same physical control changes its `ctrl` key. If it does not, the mode
    is host-tracked and that is a code feature, not a mapping entry
    (`docs/design/controller-mapping.md` §6).
-5. Add entries to `hercules_starlight_map()` (or a new `foo_map()` function) using
-   `(status, d1)` as the key.
-6. **Save capture** before you close the panel, so the session's raw bytes survive as a
+5. Add a `[[control]]` row to the profile's `.toml` (`status`, `d1`, `kind`, `action`, and
+   `slot`/`lsb_d1`/`index` as needed — see `pioneer-ddj-flx4.toml` for examples of every
+   `kind`). New controller → new file with a unique `id` and a `match` substring list.
+6. **A control that "obviously" matches a manual/silkscreen label, or that resembles an
+   adjacent control you've already captured, still needs its own live capture.** One of
+   two controls bundled under a single hardware-manual claim in this project's own docs
+   (`ddj-flx4-feature-gaps.md` §8, "HEADPHONES LEVEL is analog-only") turned out wrong when
+   finally tested live (2026-08-22) — see the "these two controls look identical" lesson
+   above for the matching trap on the *capture* side.
+7. **Save capture** before you close the panel, so the session's raw bytes survive as a
    fixture rather than as a memory of what the table said.
 
 ## ⚠️ Open: calibrate `VINYL_SEC_PER_TICK` (needs the controller)

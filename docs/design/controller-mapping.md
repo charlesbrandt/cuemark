@@ -350,7 +350,8 @@ If the FLX4's pad modes turn out to be host-tracked ❓, the honest answer is a 
 Split what "learn mode" usually means into two features that have very different value right
 now:
 
-**7a. Raw MIDI monitor — 🟢 BUILT 2026-08-17.** Toolbar → MIDI;
+**7a. Raw MIDI monitor — 🟢 BUILT 2026-08-17.** Toolbar → Settings → MIDI tab (merged into
+the tabbed SettingsPanel 2026-08-22; was its own toolbar toggle before that);
 `src/components/MidiMonitor.svelte`, `midi_monitor_set`/`midi_list_ports`/`midi_capture_save`
 in `midi.rs`. Operating notes and the mapping workflow now live in `skills/midi/SKILL.md`.
 

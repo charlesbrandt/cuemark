@@ -23,6 +23,13 @@ project).
 
 - Pioneer/AlphaTheta's own DDJ-FLX4 manual (part-names-and-functions section), via the
   [Mixxx user manual's hardware page](https://manual.mixxx.org/2.4/en/hardware/controllers/pioneer_ddj_flx4).
+  ⚠️ **The manual is not more trustworthy than the Mixxx mapping below just because it's
+  the vendor's own document.** §8's original "MASTER level, HEADPHONES LEVEL knobs...
+  analog pots" claim was sourced from here and was wrong for HEADPHONES LEVEL — it sends
+  real MIDI, confirmed by a live capture 2026-08-22 (see §8's correction note). A manual
+  describes the control surface for a human, not the wire protocol; treat it the same as
+  the Mixxx mapping below — a lead on *which controls exist*, never a substitute for a
+  capture on this unit.
 - Mixxx's shipped mapping,
   [`Pioneer-DDJ-FLX4.midi.xml`](https://github.com/mixxxdj/mixxx/blob/main/res/controllers/Pioneer-DDJ-FLX4.midi.xml)
   — a third party's byte-level reference, useful for *which controls exist* and *roughly
