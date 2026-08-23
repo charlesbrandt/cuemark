@@ -451,12 +451,17 @@ export async function startMidiListener(): Promise<() => void> {
         if (!deckId || a.index === undefined) break;
         const d = getDeck(deckId);
         if (!d) break;
-        const masterBpm = get(session).bpm;
-        if (masterBpm === null) break;
+        // Loop points are positions on this deck's own content timeline, so the beat
+        // length must come from the deck's own bpm — the session/master bpm is a
+        // different deck's tempo (or a manual tap) and using it here misaligns
+        // loopOut whenever this deck isn't running at exactly that tempo.
+        if (d.bpm === null) break;
         const beats = LOOP_PRESET_BEATS[a.index];
         if (beats === undefined) break;
-        const beatSec = (beats * 60) / masterBpm;
-        const inTime = d.loopIn ?? quantizeToGrid(d.id, getDeckTime(d.id) ?? 0);
+        const beatSec = (beats * 60) / d.bpm;
+        // force=true: a Beat Loop is a grid concept by definition, independent of
+        // the global SNAP toggle (which governs hot cues / manual loop points).
+        const inTime = d.loopIn ?? quantizeToGrid(d.id, getDeckTime(d.id) ?? 0, true);
         updateDeck(d.id, { loopIn: inTime, loopOut: inTime + beatSec, loop: true });
         break;
       }
