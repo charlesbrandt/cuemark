@@ -120,13 +120,20 @@ So a second instance *can* be driven headlessly to check MIDI behaviour while th
 app keeps running (see "Injecting synthetic MIDI" below), and `aseqdump -p 20:0` is a
 perfectly good second opinion on what the hardware is sending. Only `amidi -d` is blocked.
 
-Reading the app's own log still works and needs no extra process:
+Reading the app's own log still works and needs no extra process — but the tag is
+**per-port**, `[midi/<port name>]`, not a bare `[midi]`, so a naive `grep '\[midi\]'`
+matches nothing (learned live during the FLX4 loop-tools bench pass, 2026-08-23 — the
+first several presses silently produced zero tail output and looked like the buttons
+weren't sending anything):
 ```bash
-tail -n0 -f ~/.local/share/com.cuemark.app/logs/cuemark.log | grep --line-buffered -a '\[midi\]'
+tail -n0 -f ~/.local/share/com.cuemark.app/logs/cuemark.log | grep --line-buffered -a '\[midi/'
 ```
 ⚠️ but **continuous controls are throttled to one line per 500ms per key** there, so a jog
 wheel spinning at ~131 msg/s prints a tidy ±1 twice a second. For anything where the *rate*
 or the *distinct values* matter, use the MIDI monitor below instead — that is what it is for.
+🛑 **An empty tail is not proof a control is unmapped or silent** — check the raw log
+(`tail -30`, no grep) before concluding a press produced nothing; a wrong filter pattern
+looks identical to a dead control.
 
 ## Raw MIDI monitor (built 2026-08-17)
 
@@ -227,6 +234,32 @@ from a genuinely different capture path before writing it down** — `aseqdump` 
 raw port (or the "Injecting synthetic MIDI" pattern below, in reverse) is cheap enough that
 there's no reason not to, and it caught something two rounds of careful, honestly-answered
 questions did not.
+
+**A byte "from Mixxx" needs its own live capture even for an ordinary SHIFT-combo, not
+just for exotic controls.** During the FLX4 feature-gaps bench pass (2026-08-23), seven of
+eight newly-added rows matched Mixxx's reference exactly — the eighth, SHIFT+CUE (assumed
+`0x68` for the quantize-toggle binding), was simply wrong: the unit actually sends `0x48`,
+a distinct note from the bare SHIFT button's own note (`0x3F`, held, unmapped — same
+firmware pattern as the Starlight, see "The dual-function tone knob" above). Nothing about
+this control looked more exotic than the seven that matched; the failure was silent (no
+error, the button just did nothing) and would have shipped wrong if the row had gone
+un-bench-tested on the strength of "it's just a SHIFT+CUE, obviously right." Every row
+still marked `"from Mixxx mapping, not live-verified on this unit"` in the profile is a
+candidate, not a fact, regardless of how ordinary the control looks — this is a second,
+independent confirmation of the file's own header comment, not covered by the "adjacent
+knobs" trap above (this was one control, one wrong byte, no operator-confusion angle).
+
+**A bench pass is vulnerable to unrelated work landing on `main` mid-session.** Partway
+through the 2026-08-23 FLX4 pass, deck-1's audio pipeline wedged into a `pause` IPC
+retry-storm (the tell described in CLAUDE.md's dev-server-lifecycle section) — not caused
+by anything in this session's own edits, but by a `git log` check afterward showing HEAD
+had moved (a "Fix hot cue / cue point seeks" commit appeared mid-session, evidently from
+another session or process working on the same repo). Its frontend changes reached Vite's
+watcher and HMR-remounted `App.svelte` while a deck was live. The fix was the standard
+one — reload the window, no dev-server restart needed — but the diagnostic step worth
+keeping is: if a deck wedges for no reason traceable to your own edits, check whether
+`git log -1` moved since the bench pass started before assuming it's the controller
+work's fault.
 
 ## Injecting synthetic MIDI into a running cuemark
 

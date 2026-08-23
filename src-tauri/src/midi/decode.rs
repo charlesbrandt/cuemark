@@ -38,6 +38,20 @@ pub enum MidiAction {
     HotCueSet { slot: u8, index: u8 },
     LoopToggle { slot: u8 },
     LoopPreset { slot: u8, index: u8 },
+    LoopIn { slot: u8 },
+    LoopOut { slot: u8 },
+    /// Halve/double the current loop's length in place, anchored at `loopIn`. No-op
+    /// on the frontend if `loopIn`/`loopOut` aren't both set.
+    LoopHalve { slot: u8 },
+    LoopDouble { slot: u8 },
+    /// Seek by a signed beat count, independent of any loop — "beat jump", the
+    /// seek-without-loop sibling of `LoopPreset` (docs/design/ddj-flx4-feature-gaps.md
+    /// §1). Negative = backward.
+    BeatJump { slot: u8, beats: f32 },
+    /// Global SNAP/quantize toggle (`Session.snapToBeat`) — no deck slot, same shape
+    /// as the toolbar SNAP button. Never had a controller binding before the FLX4's
+    /// SHIFT+CUE rows (docs/design/ddj-flx4-feature-gaps.md, "quantize toggle").
+    SnapToggle {},
     SyncToggle { slot: u8 },
     HeadphoneCue { slot: u8 },
     PhaseNudge { slot: u8 },
@@ -120,6 +134,12 @@ fn resolve_button(c: &Control, data2: u8) -> Option<MidiAction> {
         ActionId::CueJump => Some(MidiAction::CueJump { slot }),
         ActionId::LoopToggle => Some(MidiAction::LoopToggle { slot }),
         ActionId::LoopPreset => Some(MidiAction::LoopPreset { slot, index: c.index }),
+        ActionId::LoopIn => Some(MidiAction::LoopIn { slot }),
+        ActionId::LoopOut => Some(MidiAction::LoopOut { slot }),
+        ActionId::LoopHalve => Some(MidiAction::LoopHalve { slot }),
+        ActionId::LoopDouble => Some(MidiAction::LoopDouble { slot }),
+        ActionId::BeatJump => Some(MidiAction::BeatJump { slot, beats: c.beats }),
+        ActionId::SnapToggle => Some(MidiAction::SnapToggle {}),
         ActionId::SyncToggle => Some(MidiAction::SyncToggle { slot }),
         ActionId::HeadphoneCue => Some(MidiAction::HeadphoneCue { slot }),
         ActionId::PhaseNudge => Some(MidiAction::PhaseNudge { slot }),

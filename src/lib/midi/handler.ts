@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { updateDeck, getDeck, setCrossfader, setMasterVolume, session } from "../state/session";
+import { updateDeck, getDeck, setCrossfader, setMasterVolume, setSnapToBeat, session } from "../state/session";
 import { seekDeckExitingLoop, getDeckTime, quantizeToGrid, setScratching, isScratching, beginScrub, updateScrub, endScrub } from "../renderer/seekBus";
 import { nudgePhaseToMaster } from "../audio/phaseNudge";
 import { syncRate, syncGain, syncVolume, syncEq, syncFilter } from "../audio/audioSync";
@@ -75,6 +75,12 @@ export interface MidiAction {
     | "hot_cue_set"
     | "loop_toggle"
     | "loop_preset"
+    | "loop_in"
+    | "loop_out"
+    | "loop_halve"
+    | "loop_double"
+    | "beat_jump"
+    | "snap_toggle"
     | "sync_toggle"
     | "headphone_cue"
     | "phase_nudge"
@@ -90,6 +96,7 @@ export interface MidiAction {
   slot?: number;
   value?: number;
   index?: number;
+  beats?: number;
 }
 
 /**
@@ -440,6 +447,52 @@ export async function startMidiListener(): Promise<() => void> {
         if (d) updateDeck(d.id, { loop: !d.loop });
         break;
       }
+      case "loop_in": {
+        if (!deckId) break;
+        const d = getDeck(deckId);
+        if (!d) break;
+        const t = getDeckTime(deckId);
+        if (t !== null) updateDeck(d.id, { loopIn: quantizeToGrid(d.id, t) });
+        break;
+      }
+      case "loop_out": {
+        if (!deckId) break;
+        const d = getDeck(deckId);
+        if (!d) break;
+        const t = getDeckTime(deckId);
+        if (t !== null) updateDeck(d.id, { loopOut: quantizeToGrid(d.id, t) });
+        break;
+      }
+      case "loop_halve":
+      case "loop_double": {
+        // Halve/double the current loop's length in place, anchored at loopIn — same
+        // fixed-anchor convention loop_preset (below) already uses. No-op if there's
+        // no loop set yet.
+        if (!deckId) break;
+        const d = getDeck(deckId);
+        if (!d || d.loopIn === null || d.loopOut === null) break;
+        const width = d.loopOut - d.loopIn;
+        const newWidth = a.type === "loop_halve" ? width / 2 : width * 2;
+        updateDeck(d.id, { loopOut: d.loopIn + newWidth });
+        break;
+      }
+      case "beat_jump": {
+        // Seek-without-loop sibling of loop_preset: jump by a fixed beat count on this
+        // deck's own grid, exiting any active loop (same as a hot-cue jump). Grid-forced
+        // like loop_preset — a beat jump is a grid concept by definition, independent of
+        // the SNAP toggle.
+        if (!deckId || a.beats === undefined) break;
+        const d = getDeck(deckId);
+        if (!d || d.bpm === null) break;
+        const now = getDeckTime(deckId);
+        if (now === null) break;
+        const target = now + (a.beats * 60) / d.bpm;
+        seekDeckExitingLoop(d.id, quantizeToGrid(d.id, target, true));
+        break;
+      }
+      case "snap_toggle":
+        setSnapToBeat(!get(session).snapToBeat);
+        break;
       case "loop_preset": {
         // Beat Loop pads (Loop pad-mode on the controller — same 4 physical pads as hot
         // cue, index 0-7 across plain+shift). Doubling ladder 1/4..32 beats is the

@@ -62,6 +62,9 @@ pub struct Control {
     /// tempo only — this controller's fader sign convention vs. the shared formula.
     #[serde(default)]
     pub invert: bool,
+    /// beat_jump only — signed beat count to jump (negative = backward).
+    #[serde(default)]
+    pub beats: f32,
     /// Provenance, ignored at runtime — e.g. "from Mixxx mapping, not live-verified".
     #[serde(default)]
     #[allow(dead_code)]
@@ -91,6 +94,12 @@ pub enum ActionId {
     CueJump,
     LoopToggle,
     LoopPreset,
+    LoopIn,
+    LoopOut,
+    LoopHalve,
+    LoopDouble,
+    BeatJump,
+    SnapToggle,
     SyncToggle,
     HeadphoneCue,
     PhaseNudge,

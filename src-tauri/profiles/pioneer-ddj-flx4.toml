@@ -59,6 +59,74 @@ action = "headphone_cue"
 slot = 0
 note = "live-verified 2026-08-22 — 0x90/0x54 vel 127 -> HeadphoneCue{slot:0}, confirmed working end to end in the UI. LED doesn't light (MIDI output not built yet, see todo.md)"
 
+[[control]]
+status = 0x90
+d1 = 0x10
+kind = "button"
+action = "loop_in"
+slot = 0
+note = "live-verified 2026-08-23"
+
+[[control]]
+status = 0x90
+d1 = 0x11
+kind = "button"
+action = "loop_out"
+slot = 0
+note = "live-verified 2026-08-23"
+
+[[control]]
+status = 0x90
+d1 = 0x4D
+kind = "button"
+action = "loop_toggle"
+slot = 0
+note = "live-verified 2026-08-23 — loop audibly engages/disengages"
+
+[[control]]
+status = 0x90
+d1 = 0x48
+kind = "button"
+action = "snap_toggle"
+note = "live-verified 2026-08-23 — Mixxx's assumed 0x68 was wrong for this unit; real byte captured live: SHIFT+CUE deck 1 sends d1=0x48 (a distinct note, not 0x68). The bare SHIFT button itself also sends its own note (d1=0x3F, held) but that's not bound to anything — the shifted control already arrives as a distinct note, same firmware pattern as the Starlight."
+
+# Cue/Loop Call left/right (halve/double the active loop in place) and SHIFT+Cue/Loop
+# Call (32-beat quick jump, no loop) — from Mixxx (cueLoopCallLeft/Right,
+# quickJumpBack/Forward), live-verified 2026-08-23.
+[[control]]
+status = 0x90
+d1 = 0x51
+kind = "button"
+action = "loop_halve"
+slot = 0
+note = "live-verified 2026-08-23"
+
+[[control]]
+status = 0x90
+d1 = 0x53
+kind = "button"
+action = "loop_double"
+slot = 0
+note = "live-verified 2026-08-23"
+
+[[control]]
+status = 0x90
+d1 = 0x3E
+kind = "button"
+action = "beat_jump"
+slot = 0
+beats = -32.0
+note = "live-verified 2026-08-23 — SHIFT+CUE/LOOP CALL LEFT, quick jump back"
+
+[[control]]
+status = 0x90
+d1 = 0x3D
+kind = "button"
+action = "beat_jump"
+slot = 0
+beats = 32.0
+note = "live-verified 2026-08-23 — SHIFT+CUE/LOOP CALL RIGHT, quick jump forward"
+
 # Channel fader vs. Trim: the FLX4 has BOTH, unlike the Starlight's single fader.
 # Bound to the DJ-workflow-typical split — the channel fader (the one a DJ rides
 # during a mix) drives volume, the trim knob drives gain (pre-fader trim, matching
@@ -143,6 +211,71 @@ kind = "button"
 action = "headphone_cue"
 slot = 1
 note = "live-verified 2026-08-22 — 0x91/0x54 -> HeadphoneCue{slot:1}"
+
+[[control]]
+status = 0x91
+d1 = 0x10
+kind = "button"
+action = "loop_in"
+slot = 1
+note = "live-verified 2026-08-23"
+
+[[control]]
+status = 0x91
+d1 = 0x11
+kind = "button"
+action = "loop_out"
+slot = 1
+note = "live-verified 2026-08-23"
+
+[[control]]
+status = 0x91
+d1 = 0x4D
+kind = "button"
+action = "loop_toggle"
+slot = 1
+note = "live-verified 2026-08-23 — loop audibly engages/disengages"
+
+[[control]]
+status = 0x91
+d1 = 0x48
+kind = "button"
+action = "snap_toggle"
+note = "live-verified 2026-08-23 — same fix as deck 1: Mixxx's assumed 0x68 was wrong, real byte is d1=0x48 (matches deck 1's SHIFT+CUE byte exactly, channel nibble is the only difference)"
+
+[[control]]
+status = 0x91
+d1 = 0x51
+kind = "button"
+action = "loop_halve"
+slot = 1
+note = "live-verified 2026-08-23"
+
+[[control]]
+status = 0x91
+d1 = 0x53
+kind = "button"
+action = "loop_double"
+slot = 1
+note = "live-verified 2026-08-23"
+
+[[control]]
+status = 0x91
+d1 = 0x3E
+kind = "button"
+action = "beat_jump"
+slot = 1
+beats = -32.0
+note = "live-verified 2026-08-23 — SHIFT+CUE/LOOP CALL LEFT, quick jump back"
+
+[[control]]
+status = 0x91
+d1 = 0x3D
+kind = "button"
+action = "beat_jump"
+slot = 1
+beats = 32.0
+note = "live-verified 2026-08-23 — SHIFT+CUE/LOOP CALL RIGHT, quick jump forward"
 
 [[control]]
 status = 0xB1
@@ -399,6 +532,18 @@ slot = 1
 # Sampler mode (0x30-0x37) is deliberately NOT bound — cuemark has no sample-slot
 # concept at all yet (docs/design/ddj-flx4-feature-gaps.md §4), so there is nothing
 # for these pads to drive.
+
+# Beat Jump pad mode (SHIFT+Beat Loop button, jump ±1/2/4/8 beats via the 8 pads) is
+# ALSO deliberately NOT bound here, but for a different reason: the `beat_jump` action
+# it needs already exists (see the SHIFT+Cue/Loop-Call 32-beat rows above, which use
+# it). What's missing is the byte capture. Mixxx's own mapping puts these pads at
+# status 0x97/0x99 d1 0x20-0x27 — but this profile's Beat Loop mode pads (loop_preset,
+# above) were LIVE-CAPTURED on this exact unit at the same status/d1 0x20-0x23. Either
+# Mixxx's reference disagrees with this unit's firmware, or the two pad modes really do
+# share wire bytes and can't be told apart without a mode-select signal this profile
+# system doesn't model — either way, guessing here would likely bind the wrong pads to
+# the wrong action. Needs a real capture (controller physically switched into Beat Jump
+# pad mode, all 8 pads pressed) before writing these rows.
 
 # ── Global / mixer (no deck) — from Mixxx, not live-verified ────────────────────
 

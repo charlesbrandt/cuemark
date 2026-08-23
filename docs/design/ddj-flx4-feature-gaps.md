@@ -1,8 +1,10 @@
 # DDJ-FLX4 feature gaps — what the hardware offers that cuemark doesn't do
 
-Status: 📐 **CATALOGUE, no code implied.** Written 2026-08-22, alongside the FLX4 profile
-work in `docs/design/controller-mapping.md`. This doc answers a different question than
-that one:
+Status: 📐 **CATALOGUE, no code implied**, plus 🟢 **tier 1 + tier 2 rows below are
+implemented and bench-verified live on the real FLX4 (2026-08-23), one byte fixed along
+the way (SHIFT+CUE quantize toggle).** Written 2026-08-22, alongside
+the FLX4 profile work in `docs/design/controller-mapping.md`. This doc answers a different
+question than that one:
 
 > **`controller-mapping.md`** is about *mapping* — turning a physical control's MIDI bytes
 > into a `ControlBinding`/`MidiAction` cuemark already knows how to act on (jog encoding,
@@ -60,23 +62,23 @@ project).
 
 | Control | Hardware behaviour | Status | Notes |
 |---|---|---|---|
-| Loop IN / OUT buttons | Set loop start/end independently at the current position | 🟢 | `deck.loopIn`/`loopOut` + DeckCard's own IN/OUT buttons already do exactly this (`DeckCard.svelte` lines ~624–643) — mouse-only today, no MIDI binding. |
-| 4BEAT/EXIT (loop on/off) | Toggle the currently-set loop | 🟢 | `ControlBinding::LoopToggle` exists and is bound on the Starlight (`(0x91,3)`/`(0x92,3)`). Straightforward FLX4 binding once its CC is captured. |
-| Beat Loop pad mode | 8 pads select a loop length (1/4…32 beats), enable on press | 🟢 | `ControlBinding::LoopPreset` already implements this exact ladder (`LOOP_PRESET_BEATS` in `handler.ts`), built for the Starlight's own Loop pad-mode. FLX4's version is the same shape with 8 discrete pads instead of 4+shift — a wider pad range in the profile, no new logic. |
-| Cue/Loop Call `<` / `>` (halve / double) | Halve or double the current loop length in place | 🔴 | No `LoopHalve`/`LoopDouble` action exists. Would need a new `MidiAction` and a `handler.ts` case that reads `loopIn`/`loopOut`, computes the new width around the same anchor, and re-quantizes. |
-| SHIFT + Cue/Loop Call (jump ±32 beats) | Jump the playhead by a fixed 32-beat block, independent of any loop | 🔴 | No large-jump action exists. Closest relative is `CueJump` (jump to the stored cue point) — different semantics, not reusable as-is. |
-| Reloop/Exit vs plain loop toggle | Re-engage the *last* loop after exiting, rather than toggling a currently-armed one | 🟡 | `LoopToggle` flips `deck.loop` and reuses whatever `loopIn`/`loopOut` are already set, so simple reloop-after-exit already works by accident. What's missing is the *history* case — re-looping a *previous* loop after a different one has since been set — which cuemark has no memory of. Likely fine to ignore unless it's asked for by ear. |
-| Loop Adjust IN / OUT (nudge existing loop boundary by small increments while looping) | Fine-tune loop point without re-dropping it | 🔴 | No incremental-nudge action. Closest existing mechanism is dragging the waveform (`WaveformCanvas`), which isn't wired to loop boundaries specifically. |
-| Beat Jump pad mode (SHIFT+Beat Loop button) — jump playhead ±1/2/4/8 beats, no loop | Quick non-looping navigation | 🔴 | Nothing in cuemark jumps the playhead by a beat count without engaging a loop. `LoopPreset` always sets `loop: true`; this needs a sibling action that seeks without looping. |
+| Loop IN / OUT buttons | Set loop start/end independently at the current position | 🟢 done, live-verified | `deck.loopIn`/`loopOut` + DeckCard's own IN/OUT buttons already did this by mouse. **Implemented 2026-08-22, bench-verified 2026-08-23**: `ActionId::LoopIn`/`LoopOut`, `MidiAction::LoopIn`/`LoopOut` (`decode.rs`), `handler.ts` cases mirroring DeckCard's onclick logic, FLX4 rows at `(0x90/0x91, 0x10)`/`(0x11)` — Mixxx's bytes were correct as-is, confirmed live on both decks. |
+| 4BEAT/EXIT (loop on/off) | Toggle the currently-set loop | 🟢 done, live-verified | `ControlBinding::LoopToggle` already existed (bound on the Starlight). **Implemented 2026-08-22, bench-verified 2026-08-23**: FLX4 binding at `(0x90/0x91, 0x4D)` (RELOOP/EXIT) — Mixxx's byte correct as-is, confirmed live on both decks (loop audibly engages/disengages). |
+| Beat Loop pad mode | 8 pads select a loop length (1/4…32 beats), enable on press | 🟢 done, live-verified | `ControlBinding::LoopPreset` implements this ladder. Already bound and live-verified on the FLX4 as part of the 2026-08-22 bench pass (`loop_preset` rows in `pioneer-ddj-flx4.toml`, status `0x97`/`0x99` d1 `0x20`-`0x23`) — this row was stale when first written; no further work needed. |
+| Cue/Loop Call `<` / `>` (halve / double) | Halve or double the current loop length in place | 🟢 done, live-verified | **Implemented 2026-08-22, bench-verified 2026-08-23**: `ActionId::LoopHalve`/`LoopDouble`, `MidiAction::LoopHalve`/`LoopDouble`, `handler.ts` case (reads `loopIn`/`loopOut`, halves/doubles the width anchored at `loopIn`), FLX4 rows at `(0x90/0x91, 0x51)`/`(0x53)` (Cue/Loop Call left/right) — Mixxx's bytes correct as-is, confirmed live and audible on both decks. |
+| SHIFT + Cue/Loop Call (jump ±32 beats) | Jump the playhead by a fixed 32-beat block, independent of any loop | 🟢 done, live-verified | **Implemented 2026-08-22, bench-verified 2026-08-23**: new generic `ActionId::BeatJump { beats: f32 }` / `MidiAction::BeatJump { slot, beats }` (the seek-without-loop sibling of `LoopPreset` this row originally called for), `handler.ts` case using `seekDeckExitingLoop` + grid-forced `quantizeToGrid`. FLX4 rows at `(0x90/0x91, 0x3D/0x3E)` with `beats = ±32.0` — Mixxx's bytes correct as-is, confirmed live (correct sign, correct magnitude) on both decks. The `BeatJump` action is generic (any signed beat count), so the pad-mode row below can reuse it once captured. |
+| Reloop/Exit vs plain loop toggle | Re-engage the *last* loop after exiting, rather than toggling a currently-armed one | 🟡 | Unchanged — `LoopToggle` flips `deck.loop` and reuses whatever `loopIn`/`loopOut` are already set, so simple reloop-after-exit already works by accident. What's missing is the *history* case — re-looping a *previous* loop after a different one has since been set — which cuemark has no memory of. Likely fine to ignore unless it's asked for by ear. |
+| Loop Adjust IN / OUT (nudge existing loop boundary by small increments while looping) | Fine-tune loop point without re-dropping it | 🔴 **deliberately out of scope for this pass** | Not just a discrete-action gap: per Mixxx's mapping, SHIFT+LOOP IN/OUT *toggles a mode* that then repurposes the jog wheel's turn events to nudge loop points instead of scratching — a stateful mode overlay on the jog-turn path, which CLAUDE.md flags repeatedly as fragile (`docs/design/waveform-scrub.md`, the scrub bus, the feeder's servo). This is a real feature with its own design questions, not a narrow addition — left for a dedicated pass, not bundled into the 2026-08-22 automated sweep. |
+| Beat Jump pad mode (SHIFT+Beat Loop button) — jump playhead ±1/2/4/8 beats, no loop | Quick non-looping navigation | 🟡 **app-side done, binding blocked on a real capture** | The `BeatJump` action this needs already exists (see the 32-beat row above). **Not bound in the FLX4 profile**: Mixxx's mapping puts these pads at status `0x97`/`0x99` d1 `0x20`-`0x27`, which collides directly with this profile's own **live-captured** Beat Loop pad rows at the same keys (`0x20`-`0x23`) — a real disagreement between Mixxx's reference and this unit's actual firmware bytes, not something to guess past. Needs a live capture (see the comment in `pioneer-ddj-flx4.toml` near the Sampler-mode note). |
 
 ## 2. Tone / EQ / filter
 
 | Control | Hardware behaviour | Status | Notes |
 |---|---|---|---|
-| EQ HI / MID / LOW (3 dedicated knobs per channel) | Independent −24…+12 dB shelving/peak per band | 🟢 (mid/high are MIDI-only gaps) | `DeckEQ` already has `low`/`mid`/`high` (`types.ts`), `equalizer-nbands` in the GStreamer chain implements all three (`pipeline.rs` `make_eq`), and `DeckCard`'s EQ sliders already control all three by mouse. **But no MIDI path has ever driven `mid` or `high`** — the Starlight has one dual-function knob that only reaches `low` (`ControlBinding::DeckEqLow`). The FLX4's three separate physical knobs are a clean match for an existing, currently mouse-only feature; `ControlBinding::DeckEqMid`/`DeckEqHigh` variants are new but trivial (same shape as `DeckEqLow`, different target field), not a design gap. |
-| CFX / filter knob | Sweep filter, −1…+1 like a mixer's | 🟢 | `ControlBinding::DeckFilter` already exists and does exactly this. Plain binding once captured — the FLX4 doesn't share a knob between EQ and filter the way the Starlight does, so §6's "firmware-side mode" reasoning doesn't even apply here; it's just one more control. |
+| EQ HI / MID / LOW (3 dedicated knobs per channel) | Independent −24…+12 dB shelving/peak per band | 🟢 done, live-verified | `DeckEQ` has `low`/`mid`/`high`, `equalizer-nbands` implements all three. The Starlight only ever reached `low` (one dual-function knob); the FLX4's three separate knobs were bound and live-verified 2026-08-22 (`eq_low`/`eq_mid`/`eq_high` rows, both decks) as part of the original bench pass — this row was stale when first written; no further work needed. |
+| CFX / filter knob | Sweep filter, −1…+1 like a mixer's | 🟢 done, live-verified | `ControlBinding::DeckFilter` bound and live-verified 2026-08-22 (`filter` rows, both decks, status `0xB6`). Stale row; no further work needed. |
 | Smart CFX / alternate QuickEffect assignments | Assign the CFX knob to a different effect type than "filter" | 🔴 | cuemark has exactly one filter type (the parked HP/LP pair). No effect-assignment concept exists. Low priority — the default (filter) is already covered. |
-| TRIM knob | Pre-fader gain trim | 🟢 | This is `ControlBinding::DeckGain`, already bound on the Starlight's volume fader. Same target, different physical control. |
+| TRIM knob | Pre-fader gain trim | 🟢 done, live-verified | `ControlBinding::DeckGain`, bound to the FLX4's Trim knob and live-verified 2026-08-22 (`gain` rows, both decks). Stale row; no further work needed. |
 
 ## 3. Beat FX section
 
@@ -94,11 +96,11 @@ project).
 
 | Control | Hardware behaviour | Status | Notes |
 |---|---|---|---|
-| PLAY/PAUSE, CUE | Standard transport | 🟢 | `DeckPlayToggle`/`CueJump` already exist and are bound on the Starlight. |
+| PLAY/PAUSE, CUE | Standard transport | 🟢 done, live-verified | `DeckPlayToggle`/`CueJump` bound on the Starlight and live-verified on the FLX4 2026-08-22 (`play_toggle`/`cue_jump` rows, both decks). Stale row; no further work needed. |
 | SHIFT+PLAY (censor/reverse — momentary reverse while held, resumes forward on release) | Backspin-style reverse scrub | 🔴 | `rate_from_14bit` and the scratch feeder both clamp to positive rates (`(1.0 + delta*0.5).clamp(0.25, 4.0)` in `midi.rs`; `SCRATCH_TARGET_MAX_RATE` bounds in `pipeline.rs` are also one-sided). Reverse playback has never been exercised anywhere in the audio pipeline — GStreamer *can* do negative rates with the right seek flags, but nothing here has tried it, and the `pitch` (soundtouch) element's behavior at negative rates is unknown. Worth a probe before assuming it's a small change. |
 | SHIFT+CUE (stutter play from cue point) | Press-and-hold plays from cue, release jumps back | 🔴 | No momentary-preview-from-cue action exists; `CueJump` is a single discrete jump. |
-| Quantize toggle (SHIFT+Cue/PFL) | Toggle beat-quantized cue/loop actions | 🟢 | This is exactly `Session.snapToBeat` (the toolbar SNAP toggle, `quantizeToGrid()` in `seekBus.ts`) — a fully-built feature with zero MIDI binding anywhere, Starlight included. Cheapest possible win once a binding exists: `SnapToggle` action, one line in `handler.ts`. |
-| SYNC (tap) | One-shot tempo+phase match to the reference deck | 🟢 | `ControlBinding::SyncToggle` exists and toggles `deck.syncLocked` (continuous re-lock, per `docs/design/beatmatching.md`) — a stronger behavior than the FLX4's one-shot tap, but a superset, not a gap. |
+| Quantize toggle (SHIFT+Cue/PFL) | Toggle beat-quantized cue/loop actions | 🟢 done, live-verified | This is `Session.snapToBeat` (the toolbar SNAP toggle, `quantizeToGrid()` in `seekBus.ts`). **Implemented 2026-08-22, bench-verified 2026-08-23**: `ActionId::SnapToggle`, `MidiAction::SnapToggle {}` (global, no slot), `handler.ts` case flipping `session.snapToBeat`. **Mixxx's assumed byte (`0x68`) was wrong for this unit** — live capture showed SHIFT+CUE actually sends `d1=0x48` (a distinct note; the bare SHIFT button separately sends its own note `0x3F`, held, unbound). Fixed to `(0x90/0x91, 0x48)` and re-verified live on both decks — the SNAP toolbar toggle now flips on SHIFT+CUE. Still unbound on the Starlight. |
+| SYNC (tap) | One-shot tempo+phase match to the reference deck | 🟢 done, wire-confirmed | `ControlBinding::SyncToggle` toggles `deck.syncLocked` (continuous re-lock, per `docs/design/beatmatching.md`) — a stronger behavior than the FLX4's one-shot tap, but a superset, not a gap. Bound and wire-confirmed on the FLX4 2026-08-22 (`sync_toggle` rows) — the deck-bpm-sync effect itself wasn't exercised in that pass (no track loaded). |
 | SYNC long-press (lock) | Distinguish tap-sync from hold-to-lock | 🟡 | cuemark's `SyncToggle` is already the "lock" behavior unconditionally (see above) — there's no *tap-only* variant to distinguish from. Only relevant if a future design wants the FLX4's tap/hold distinction specifically; today's single toggle already gets to the stronger state. |
 | SHIFT+SYNC (cycle tempo range) | Cycle the tempo fader's ± range | 🟡 | Different UI, same underlying setting: cuemark already has this as `tempoRange` (`audioSettings.ts`, a Settings-panel `<select>` with presets ±4…±100%, per `skills/midi/SKILL.md`). No binding wires a physical control to it; would need a `TempoRangeCycle` action if wanted on-controller. |
 
@@ -144,15 +146,38 @@ are neither a mapping task nor an application gap, just controls the box handles
 
 ## Rough sizing, for whoever scopes this next
 
-Cheapest first, using the 🟢/🟡/🔴 legend above:
+Cheapest first, using the 🟢/🟡/🔴 legend above.
 
-1. **Free once the profile exists** (🟢, no new app code): loop IN/OUT, loop toggle, beat
-   loop pads, EQ mid/high, filter knob, trim, play/cue, sync, **quantize toggle** (genuinely
-   zero-cost — the feature is fully built and has never had *any* controller binding, Starlight included).
-2. **Small, scoped additions** (🔴 but narrow): loop halve/double, 32-beat jump, beat-jump
-   pads (seek-without-loop sibling of `LoopPreset`), loop adjust nudge.
+**Update 2026-08-22 (automated pass, forked sub-agents, sequential):** tiers 1 and 2
+implemented in code, passing `cargo check` / `cargo test midi::` / `npm run check`.
+
+**Update 2026-08-23 (bench pass with the real FLX4, chat-relayed):** all 8 new controls
+verified live on both decks (16 button presses total) — loop IN/OUT, RELOOP/EXIT,
+halve/double, both SHIFT+Cue/Loop-Call beat jumps, and SHIFT+CUE quantize toggle. **One
+real bug found and fixed**: Mixxx's reference byte for SHIFT+CUE (`0x68`) was wrong for
+this unit — live capture showed it actually sends `d1=0x48`, a distinct note from the
+bare SHIFT button's own note (`0x3F`, held, confirmed unmapped and not needed — same
+firmware pattern as the Starlight, the shifted control already arrives as its own note).
+Fixed in `pioneer-ddj-flx4.toml` for both decks, re-verified live. Every other assumed
+byte from Mixxx's mapping was correct as-is. Also surfaced, out of scope for this pass:
+an audible glitch when a loop wraps back to its start (`4BEAT/EXIT` test) — not
+investigated here, worth a follow-up.
+
+1. ~~**Free once the profile exists**~~ **DONE, bench-verified 2026-08-23**: loop IN/OUT,
+   loop toggle, beat loop pads, EQ mid/high, filter knob, trim, play/cue, sync, quantize
+   toggle (byte fixed from Mixxx's wrong `0x68` to the real `0x48`).
+2. ~~**Small, scoped additions**~~ **DONE, bench-verified 2026-08-23**: loop halve/double
+   and the 32-beat SHIFT+Cue/Loop-Call jump (new generic `BeatJump` action), both
+   directions, both decks. Beat-jump *pads* are app-side ready (same `BeatJump` action) but
+   **still not bound** — Mixxx's assumed pad-mode bytes collide with this profile's own
+   live-captured Beat Loop pad bytes at the same keys, so binding them needs a real
+   capture, not a guess (see the row above and the comment in the TOML). Loop adjust nudge
+   was **deliberately excluded** from this pass — it's a stateful jog-wheel mode overlay,
+   not a narrow addition; moved to tier 3 below.
 3. **Real features, own design pass needed**: reverse/censor playback (probe GStreamer
    negative-rate behavior first), sampler pad mode (new audio-source kind), Beat FX (new
-   DSP subsystem), browse/library (blocked on the Phase 3 media browser existing at all).
+   DSP subsystem), browse/library (blocked on the Phase 3 media browser existing at all),
+   **loop adjust nudge** (jog-wheel mode overlay — read `docs/design/waveform-scrub.md`
+   first, this touches fragile territory).
 4. **Already tracked elsewhere, don't duplicate**: jog-touch-as-scratch-trigger
    (`controller-mapping.md` §10), MIDI/LED output (`controller-mapping.md` §1/§11).

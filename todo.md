@@ -166,6 +166,20 @@ back (see the doc for the exact spot).
 fully bench-verified yet") no longer holds — see that section above for whether it's still
 worth building now.
 
+### FLX4 feature-gaps tier 1/2 bench pass — 🟢 DONE 2026-08-23
+
+The loop-tools and quantize-toggle additions from `docs/design/ddj-flx4-feature-gaps.md`
+(loop IN/OUT, RELOOP/EXIT, Cue/Loop Call halve/double, SHIFT+Cue/Loop Call ±32-beat jump,
+SHIFT+CUE quantize toggle — implemented 2026-08-22 against Mixxx's reference bytes)
+bench-verified live on both decks, 16 button presses total, chat-relayed. One byte was
+wrong: SHIFT+CUE's assumed `0x68` — the real byte is `0x48` on this unit, fixed in
+`pioneer-ddj-flx4.toml` for both decks. Everything else matched Mixxx as-is. Full detail
+in the design doc's "Update 2026-08-23" note.
+
+Beat-jump *pads* (SHIFT+Beat Loop button) remain unbound — needs a real capture, blocked
+on the same byte-collision-with-live-captured-Beat-Loop-pads issue noted in the doc. Loop
+adjust nudge remains deliberately out of scope (stateful jog-wheel mode overlay).
+
 ---
 
 ## Batch G — Polish / Phase 3
@@ -242,6 +256,16 @@ shipped 2026-08-12 — see "Digger sync: gain + play history" below.)
 
 
 ## Known issues
+
+### Audible glitch when a loop wraps back to its start [open, 2026-08-23]
+
+🟡 Surfaced live during the FLX4 loop-tools bench pass (RELOOP/EXIT test, real hardware,
+deck-0): a short audible glitch every time the loop point cycles back to `loopIn`. Not
+investigated yet — no reproducer script, no hypothesis. Worth checking whether the seek
+back to `loopIn` is landing exactly on a sample boundary / whether it's the same class of
+issue as the hot-cue/cue-point seek drift fixed in `18795f0`. Loop functionality itself
+(engage/disengage, halve/double, IN/OUT) all work correctly — this is a polish item, not a
+correctness bug in the loop tools themselves.
 
 ### Legacy `<video>` path renders colourful noise since GPU compositing became default [open, 2026-08-13]
 
