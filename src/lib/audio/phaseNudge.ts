@@ -94,7 +94,9 @@ export function nudgePhaseToMaster(deckId: string): void {
     const currentTime = getDeckTime(deckId);
     if (currentTime === null) return;
     const targetTime = Math.max(0, currentTime + delta * beatPeriod);
-    seekDeck(deckId, targetTime);
+    // accurate: true — a keyframe-snapped landing would defeat the purpose of a phase
+    // realignment (delta can be a small fraction of a beat).
+    seekDeck(deckId, targetTime, true);
     return;
   }
 

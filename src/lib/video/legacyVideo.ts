@@ -162,7 +162,10 @@ export function syncLegacyVideoElement(deck: Deck, filePath: string, v: HTMLVide
       if (v.currentTime >= loopOut) {
         v.currentTime = loopIn;
         recordLegacyOp(deckId, "currentTime");
-        audioSeek(deckId, loopIn).catch(console.error);
+        // accurate: true — a keyframe-snapped loop-in is an audible, musically wrong
+        // re-trigger point, the same class of bug fixed for hot cues (see pipeline.rs's
+        // seek() doc comment).
+        audioSeek(deckId, loopIn, true).catch(console.error);
       }
     };
   } else {

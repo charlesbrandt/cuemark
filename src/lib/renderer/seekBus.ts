@@ -130,7 +130,12 @@ export function unregisterVideoEl(deckId: string) {
   endScrubGesture(deckId);
 }
 
-export function seekDeck(deckId: string, time: number) {
+// `accurate`: forwarded to audio_seek — false (default) snaps to the nearest keyframe,
+// fine for the high-frequency scrub-flush path where the next update supersedes this one
+// within milliseconds; pass true for a one-shot deliberate jump (hot cue, cue point,
+// waveform click, loop/beat jump) where landing exactly on `time` is the point. See
+// pipeline.rs's seek() doc comment for the ~0.5s-off failure mode this avoids.
+export function seekDeck(deckId: string, time: number, accurate = false) {
   const el = els.get(deckId);
   if (el) el.currentTime = time;
   // Codec-path decks (no <video> element) route the same seek to their worker instead —
@@ -143,7 +148,7 @@ export function seekDeck(deckId: string, time: number) {
   audioTimes.delete(deckId);
   // Record seek target so the RAF loop can ignore stale pre-seek IPC responses.
   pendingSeekTarget.set(deckId, { time, setAtMs: performance.now() });
-  audioSeek(deckId, time).catch(console.error);
+  audioSeek(deckId, time, accurate).catch(console.error);
   bumpSeekVersion(deckId);
 }
 
@@ -156,7 +161,9 @@ export function seekDeck(deckId: string, time: number) {
 export function seekDeckExitingLoop(deckId: string, time: number): void {
   const d = getDeck(deckId);
   if (d?.loop) updateDeck(deckId, { loop: false });
-  seekDeck(deckId, time);
+  // Every caller here (hot cue, cue point, waveform click, beat jump, loop-preset
+  // adjacent) is a deliberate one-shot jump — accurate: true.
+  seekDeck(deckId, time, true);
 }
 
 // Bumped on every direct seek (hot cue jump, CUE button, Digger marker jump, click-to-seek)
@@ -375,7 +382,10 @@ export function endScrub(deckId: string): Promise<void> {
   if (wasSilent) {
     // seekDeck() below already re-anchors the codec player, so this only flushes counters.
     codecPlayers.get(deckId)?.noteScrubEnded();
-    seekDeck(deckId, final);
+    // accurate: true — this is the gesture's final resting position, not a mid-drag
+    // flush; same "exact position is the point" case as a hot cue (and the analogous
+    // fix already made in pipeline.rs's stop_scratch_feeder() for the audible path).
+    seekDeck(deckId, final, true);
     return Promise.resolve();
   }
   // The audible path deliberately does *not* seek (stop_scratch resyncs the audio itself),
@@ -390,7 +400,7 @@ export function endScrub(deckId: string): Promise<void> {
   const needsSeek = Math.abs(final - target) > 0.001;
   return audioStopScratch(deckId)
     .catch(console.error)
-    .finally(() => { if (needsSeek) seekDeck(deckId, final); });
+    .finally(() => { if (needsSeek) seekDeck(deckId, final, true); });
 }
 
 /**

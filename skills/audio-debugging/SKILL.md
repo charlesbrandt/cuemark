@@ -536,6 +536,34 @@ outright — a wrong one-frame reading self-corrects on the very next poll, unli
 freeze it replaces. See `project_seek_staleness_freeze_fix` memory for the full writeup and
 regression-test repro recipe.
 
+### Seek precision: `KEY_UNIT` vs `ACCURATE` (not the same bug as staleness above)
+
+Symptom: a *discrete* jump (hot cue, cue point, waveform click, loop-in) lands audibly and
+visibly off — playback starts from before/after the requested point by anywhere from a
+fraction of a second to (on a long-GOP source) over a second — while everything else about
+seeking (staleness filtering, domain conversion) is healthy. This is a *different* failure
+from the staleness bug above: the seek completes fine and `query_position` converges, it
+just converges on the wrong number, because `SeekFlags::KEY_UNIT` told the demuxer "nearest
+keyframe is fine, don't decode from further back than that" and the nearest keyframe wasn't
+close to the target.
+
+`DeckAudioPipeline::seek()` (`pipeline.rs`) takes an `accurate: bool` for exactly this —
+`true` selects `ACCURATE` (decode from the prior keyframe up to the exact target; costs a
+bit more, fine for a one-shot jump), `false` selects `KEY_UNIT` (fast, fine only for a
+seek about to be superseded within milliseconds, i.e. the scrub-drag flush loop). Every
+`seekDeck()`/`seekDeckExitingLoop()` call site in `seekBus.ts` already picks the right one —
+see `docs/design/av-sync-architecture.md`'s "Every content-time seek also needs an `accurate`
+choice" paragraph for the full call-site inventory. **If a new seek call site is being added
+and its landing position matters to the user (not just "somewhere close, corrected next
+frame"), it needs `accurate: true` — this is easy to get backwards** because `KEY_UNIT` is
+the path most existing seeks use, and copying the nearest example without checking whether
+it was a hot path or a one-shot jump is exactly how this bug shipped the first time. Verify
+with a real compressed video, not a synthetic tone — a WAV has no GOP structure to snap to,
+so the bug is invisible against `SOAK_A`/`SOAK_B`. `cargo test seek_accurate_lands_on_target
+-- --ignored --nocapture` is the regression test and doubles as a template for probing a new
+call site; flip its `true` to `false` momentarily to confirm the control arm still fails
+before trusting a passing accurate arm.
+
 **Diagnostic technique for "cached/derived value frozen but is the underlying thing actually
 stuck?"**: call the real Tauri command directly from a WebDriver script, bypassing whatever
 frontend caching/derivation is under suspicion, and compare side-by-side:

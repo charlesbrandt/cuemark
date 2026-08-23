@@ -319,8 +319,13 @@ pub async fn audio_pause(app: tauri::AppHandle, deck_id: String) -> Result<(), S
 }
 
 #[tauri::command]
-pub fn audio_seek(state: State<'_, AudioState>, deck_id: String, secs: f64) -> Result<(), String> {
-    state.lock().unwrap().pipeline_mut(&deck_id)?.seek(secs)
+pub fn audio_seek(
+    state: State<'_, AudioState>,
+    deck_id: String,
+    secs: f64,
+    accurate: bool,
+) -> Result<(), String> {
+    state.lock().unwrap().pipeline_mut(&deck_id)?.seek(secs, accurate)
 }
 
 #[tauri::command]

@@ -165,7 +165,8 @@ export function pollDeckPosition(
       const d = get(session).decks.find((dd) => dd.id === capturedDeckId);
       if (!scratching && d?.loop && d.loopIn !== null && d.loopOut !== null && contentPos >= d.loopOut) {
         codecPlayer.notifyLoopWrap(d.loopIn);
-        audioSeek(capturedDeckId, d.loopIn).catch(console.error);
+        // accurate: true — see legacyVideo.ts's mirror of this branch.
+        audioSeek(capturedDeckId, d.loopIn, true).catch(console.error);
       } else {
         codecPlayer.setClock(contentPos, d?.playing ?? false);
       }
@@ -179,7 +180,8 @@ export function pollDeckPosition(
       // showed the region), playback just ran straight through them.
       const d = get(session).decks.find((dd) => dd.id === capturedDeckId);
       if (!scratching && d?.loop && d.loopIn !== null && d.loopOut !== null && contentPos >= d.loopOut) {
-        audioSeek(capturedDeckId, d.loopIn).catch(console.error);
+        // accurate: true — see legacyVideo.ts's mirror of this branch.
+        audioSeek(capturedDeckId, d.loopIn, true).catch(console.error);
       }
     }
   }).catch(() => { pendingPos.delete(capturedDeckId); });

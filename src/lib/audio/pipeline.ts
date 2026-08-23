@@ -56,8 +56,13 @@ export function audioPause(deckId: string): Promise<void> {
   return invoke("audio_pause", { deckId });
 }
 
-export function audioSeek(deckId: string, secs: number): Promise<void> {
-  return invoke("audio_seek", { deckId, secs });
+// `accurate`: false snaps to the nearest keyframe (fast, tolerated for a scrub's
+// high-frequency flush seeks — see seekBus.ts's SILENT_SCRUB_SEEK_MS path); true costs
+// a bit more but lands exactly on `secs`, needed for a one-shot deliberate jump (hot
+// cue, cue point, waveform click, loop/beat jump, phase-nudge realignment) where a
+// keyframe up to a full GOP away is a real, user-visible mispositioning.
+export function audioSeek(deckId: string, secs: number, accurate: boolean): Promise<void> {
+  return invoke("audio_seek", { deckId, secs, accurate });
 }
 
 export function audioSetRate(deckId: string, rate: number): Promise<void> {

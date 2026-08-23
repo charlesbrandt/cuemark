@@ -42,6 +42,18 @@ instances of the same domain mix-up in the scratch code path (`scratch()`'s PCM-
 `stop_scratch_feeder()`'s post-gesture resync seek), fixed the same way. See the design doc for the full
 before/after measurements.
 
+**Every content-time seek also needs an `accurate` choice, independent of the domain conversion above**
+(fixed 2026-08-23, `docs/design/pcm-buffer-playback.md` §2's correction). `DeckAudioPipeline::seek()` takes
+an `accurate: bool` that selects `SeekFlags::ACCURATE` vs `SeekFlags::KEY_UNIT` — `KEY_UNIT` snaps to the
+nearest keyframe, which can land up to a full GOP away from the requested position (measured: a seek to
+3.37s landing at 2.043s). `seekDeck(deckId, time, accurate)` in `seekBus.ts` forwards it through
+`audioSeek()`/`audio_seek`; `seekDeckExitingLoop()` — every hot cue, cue point, waveform click, and beat/loop
+jump — always passes `true`, as do loop wrap-around (`legacyVideo.ts`, `positionPoll.ts`) and a scrub
+gesture's final settle (`endScrub`). Only the scrub-drag's own high-frequency flush loop passes `false`
+(default): the next update supersedes it within milliseconds, so responsiveness beats exactness there.
+**When adding a new seek call site, default to `true`** — `false` is the exception, justified only by a
+call site firing fast enough that being superseded is the normal case.
+
 **`pendingSeekTarget` filter in `seekBus.ts`** — on a heavy video, GStreamer can take >1 s to process a seek
 while still returning the pre-seek position from `query_position`. `seekDeck()` records the seek target in
 `pendingSeekTarget`; the RAF callback drops any IPC result whose computed `contentPos` is > 0.5 s from that

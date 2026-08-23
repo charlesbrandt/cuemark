@@ -3410,7 +3410,7 @@ impl DeckAudioPipeline {
         self.load(&file_path)?;
 
         if position > 0.01 {
-            let _ = self.seek_output_domain(position);
+            let _ = self.seek_output_domain(position, true);
         }
         if was_playing {
             self.play()?;
@@ -3436,7 +3436,7 @@ impl DeckAudioPipeline {
         self.load(&file_path)?;
 
         if position > 0.01 {
-            let _ = self.seek_output_domain(position);
+            let _ = self.seek_output_domain(position, true);
         }
         if was_playing {
             self.play()?;
@@ -3494,15 +3494,25 @@ impl DeckAudioPipeline {
     /// Bypassed at rate 1.0 (no-op division) and by `seek_output_domain` for internal
     /// callers that already have a value in the scaled domain (e.g. `position()`'s
     /// return value, when restoring position across a device-switch pipeline rebuild).
-    pub fn seek(&mut self, secs: f64) -> Result<(), String> {
-        self.seek_output_domain(secs / self.rate)
+    ///
+    /// `accurate`: `KEY_UNIT` snaps to the nearest keyframe, which can be up to a full
+    /// GOP away from `secs` (observed ~0.5s off on an mp4 source, and the same bug
+    /// already fixed once for the scratch resync seek — see `stop_scratch_feeder()`).
+    /// Fine for a scrub's hot-path flush, where the next update supersedes this one
+    /// within milliseconds anyway; wrong for a deliberate one-shot jump (hot cue, cue
+    /// point, waveform click, loop-preset/beat jump, phase-nudge realignment) where the
+    /// exact landing position *is* the point — pass `true` there. Costs a bit more
+    /// (decode from the prior keyframe up to target), but none of those call sites are
+    /// a hot path.
+    pub fn seek(&mut self, secs: f64, accurate: bool) -> Result<(), String> {
+        self.seek_output_domain(secs / self.rate, accurate)
     }
 
     /// Seek to a raw position in the pipeline's own seek/position domain — i.e. exactly
     /// what `query_position`/`position()` return, already tempo-scaled. Used internally
     /// where the caller already holds a value in that domain rather than content time
     /// (see `seek`'s doc comment for why the two differ at any rate != 1.0).
-    fn seek_output_domain(&mut self, secs: f64) -> Result<(), String> {
+    fn seek_output_domain(&mut self, secs: f64, accurate: bool) -> Result<(), String> {
         // The playhead just moved by a route that has nothing to do with the scratch
         // cursor, so the remembered landing frame is now wrong — see `last_scratch_frame`.
         self.last_scratch_frame = None;
@@ -3510,9 +3520,11 @@ impl DeckAudioPipeline {
         // An explicit seek means the user chose a new position — don't restart from 0 on next play().
         inner.at_eos.store(false, Ordering::Relaxed);
         let pos = gst::ClockTime::from_nseconds((secs * 1_000_000_000.0) as u64);
+        let flags = gst::SeekFlags::FLUSH
+            | if accurate { gst::SeekFlags::ACCURATE } else { gst::SeekFlags::KEY_UNIT };
         inner
             .pipeline
-            .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, pos)
+            .seek_simple(flags, pos)
             .map_err(|e| e.to_string())
     }
 
@@ -6405,6 +6417,53 @@ mod scratch_smoke_test {
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
+    //  seek() accuracy — hot cue / cue point / loop-in precision
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// Real-world regression for the "hot cue plays a fraction of a second before the
+    /// cue point" report (2026-08-23). The general seek() path used `FLUSH | KEY_UNIT` —
+    /// fine for a scrub's hot-path flush, wrong for a one-shot deliberate jump (hot cue,
+    /// cue point, waveform click, loop/beat jump), where it can land up to a full GOP
+    /// away from the requested position — the same bug already fixed once for the
+    /// scratch resync seek (see `stop_scratch_feeder()`'s ACCURATE comment). Needs a real
+    /// compressed video (a WAV has no GOP structure to snap to), hence `#[ignore]`:
+    ///   cargo test seek_accurate_lands_on_target -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn seek_accurate_lands_on_target() {
+        init_test_logger();
+        gst::init().expect("gst init");
+        let path = soak_env(
+            "CUEMARK_TEST_VIDEO",
+            "/home/account/.local/share/com.cuemark.app/media_cache/f7c579b98ad2ba15-38856957.mp4",
+        );
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "missing test media {path} — set CUEMARK_TEST_VIDEO"
+        );
+
+        let mut deck = DeckAudioPipeline::new("seek-accuracy-test");
+        deck.load(&path).expect("load");
+
+        // A handful of positions likely to fall mid-GOP rather than exactly on a keyframe.
+        let targets = [3.37, 11.803, 22.15, 34.6];
+        for &target in &targets {
+            deck.seek(target, true).expect("accurate seek");
+            std::thread::sleep(Duration::from_millis(300));
+            let pos = deck.position().expect("position after accurate seek");
+            let err = (pos - target).abs();
+            println!("[seek-accurate] target={target:.3} pos={pos:.3} err={err:.3}");
+            assert!(
+                err < 0.05,
+                "accurate seek to {target}s landed at {pos}s (err {err:.3}s) — expected <0.05s"
+            );
+        }
+        println!(
+            "seek_accurate_lands_on_target OK — every accurate seek landed within 50ms of its target"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
     //  docs/design/audio-dropout-mid-playback.md — D2 verification and D1 reproducer
     // ─────────────────────────────────────────────────────────────────────────────
 
@@ -6855,7 +6914,7 @@ mod scratch_smoke_test {
             // on the first attempt: position pinned at 360.0 for the last 9 minutes.)
             for d in &mut decks {
                 if d.position().unwrap_or(0.0) > 300.0 {
-                    let _ = d.seek(2.0);
+                    let _ = d.seek(2.0, false);
                 }
             }
 
@@ -6998,7 +7057,7 @@ mod scratch_smoke_test {
 
             for d in &mut decks {
                 if d.position().unwrap_or(0.0) > 300.0 {
-                    let _ = d.seek(2.0);
+                    let _ = d.seek(2.0, false);
                 }
             }
 

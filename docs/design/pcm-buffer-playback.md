@@ -301,6 +301,26 @@ Recorded here because each is a distinct pitfall, not just "tune the constants":
    uniformly; a scratch resync's precision requirements are different in kind, not
    degree, from a waveform-click seek.
 
+   ⚠️ **Correction, 2026-08-23: the last clause above was wrong.** A waveform-click
+   seek — and every other one-shot deliberate jump routed through
+   `seekDeckExitingLoop()` (hot cue, cue point, beat/loop-preset jump) — turned out to
+   need exactly the same fix, for exactly the same reason: "exact position is the
+   point" describes those just as much as a scratch resync. Reported live as "hot cue
+   resumes a fraction of a second before the cue point"; root-caused to
+   `DeckAudioPipeline::seek()`/`seek_output_domain()` still using bare `KEY_UNIT` for
+   *every* caller, general seek included — confirmed with the same signature (a
+   real-file seek to 3.37s landing at 2.043s). Fixed by threading an `accurate: bool`
+   through `seek()` → `audio_seek` → `seekDeck()`/`seekDeckExitingLoop()`, `true` for
+   every discrete jump (including loop wrap-around and scrub-gesture-end settle),
+   `false` only for the genuinely hot scrub-flush path. See `pipeline.rs`'s `seek()`
+   doc comment and the `seek_accurate_lands_on_target` test (`#[ignore]`d, run with
+   `cargo test seek_accurate_lands_on_target -- --ignored --nocapture`) for the
+   regression check, with a KEY_UNIT control arm built into how it was verified.
+   **Lesson on the lesson**: naming one call site as the *safe* contrast case in a bug
+   writeup is itself a claim that needs the same "grep every seek" discipline applied
+   to it — don't let a fixed example silently promote its unexamined sibling to
+   "presumed fine."
+
 3. **Displayed timestamp and waveform playhead were completely frozen during
    scratch — the audio was correct the whole time.** Two independent UI paths both
    gate on `deck.playing`, which is always `false` throughout a scratch gesture (see
