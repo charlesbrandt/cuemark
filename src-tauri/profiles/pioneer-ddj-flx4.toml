@@ -595,3 +595,31 @@ note = "live-verified 2026-08-22 via independent aseqdump capture — 0xB6/0x0D+
 # Headphone OUTPUT level is NOT analog-only, despite what this comment and
 # ddj-flx4-feature-gaps.md §8 both claimed before 2026-08-22 (sourced from the manual,
 # not a capture) — see the MIX/LEVEL block above, both send real MIDI.
+
+# ── Browse / queue (§6, ddj-flx4-feature-gaps.md) — wire-confirmed 2026-08-23 via
+# capture-1787503280692.json (Left/Right Load press, Scroll knob CW then CCW). Ties
+# into the Digger queue panel, not a library browser — cuemark has none (see
+# skills/digger-integration/SKILL.md's "No embedded file browser" boundary rule).
+[[control]]
+status = 0xB6
+d1 = 0x40
+kind = "relative"
+encoding = "twos7"
+action = "queue_cursor"
+note = "wire-confirmed 2026-08-23 (capture-1787503280692.json) — CW sent raw 127, CCW sent raw 1, both x5. That's twos7 (127=-1, not offset64's centred-on-64 shape the jog wheels use), i.e. a DIFFERENT relative encoding than this same unit's jog wheels (§8.2). Raw wire sign is kept unflipped in decode.rs (CW=-1, CCW=+1) — a first pass flipped it and live feedback on the real app said that direction read backward. Live-verified direction 2026-08-23."
+
+[[control]]
+status = 0x96
+d1 = 0x46
+kind = "button"
+action = "queue_load"
+slot = 0
+note = "wire-confirmed 2026-08-23 (capture-1787503280692.json) — Left Deck Load, note-on channel 6 (0x96), NOT the per-deck 0x90/0x91 channel other deck-scoped buttons on this unit use. End-to-end load behavior not yet bench-tested against the running app."
+
+[[control]]
+status = 0x96
+d1 = 0x47
+kind = "button"
+action = "queue_load"
+slot = 1
+note = "wire-confirmed 2026-08-23 (capture-1787503280692.json) — Right Deck Load, same channel-6 note-on pattern as slot 0. End-to-end load behavior not yet bench-tested against the running app."

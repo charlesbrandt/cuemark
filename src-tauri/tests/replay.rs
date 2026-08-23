@@ -54,6 +54,32 @@ fn flx4_jog_replay_lands_near_ten_revolutions() {
     );
 }
 
+/// Locks in the queue_cursor sign convention against the real capture it was derived
+/// from (docs/design/ddj-flx4-feature-gaps.md §6) — Left/Right Load press, then Scroll
+/// knob CW x5, then CCW x5. Raw wire sign, unflipped (a first pass flipped it on an
+/// unverified assumption and live feedback said that read backward — see decode.rs).
+/// Without this, a future encoding tweak could silently reverse the direction again
+/// with nothing else catching it.
+#[test]
+fn flx4_queue_browse_replay_matches_capture() {
+    let capture = load("tests/captures/flx4-queue-browse.json");
+    let profile = builtins().into_iter().find(|p| p.id == "pioneer-ddj-flx4").unwrap();
+    let mut decoder = Decoder::new();
+
+    let mut loads = vec![];
+    let mut cursor_deltas = vec![];
+    for m in &capture.messages {
+        match decoder.decode(&profile, &m.bytes) {
+            Some(cuemark_lib::midi::MidiAction::QueueLoad { slot }) => loads.push(slot),
+            Some(cuemark_lib::midi::MidiAction::QueueCursor { delta }) => cursor_deltas.push(delta),
+            _ => {}
+        }
+    }
+
+    assert_eq!(loads, vec![0, 1], "Left Load (slot 0) then Right Load (slot 1), in capture order");
+    assert_eq!(cursor_deltas, vec![-1, -1, -1, -1, -1, 1, 1, 1, 1, 1], "CW x5 must decode as -1, CCW x5 as +1 (raw wire sign, unflipped — see decode.rs)");
+}
+
 /// Sanity check that the Starlight capture still decodes through its own profile —
 /// not a calibration assertion (this file is a short bench sample, not a
 /// counted-revolution capture), just proof the replay path works for both profiles.

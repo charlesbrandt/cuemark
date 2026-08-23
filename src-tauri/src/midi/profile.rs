@@ -117,6 +117,10 @@ pub enum ActionId {
     Crossfader,
     MasterVolume,
     CueGain,
+    /// Browse encoder — moves the Digger queue selection (docs/design/ddj-flx4-feature-gaps.md §6).
+    QueueCursor,
+    /// LOAD button — loads the current queue selection into this slot's deck.
+    QueueLoad,
 }
 
 /// Compiled form of one control — what the decoder actually reads. Distinguishes a

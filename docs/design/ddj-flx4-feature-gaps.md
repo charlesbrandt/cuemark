@@ -106,11 +106,20 @@ project).
 
 ## 6. Browse / library
 
+**Reframed 2026-08-23**: cuemark deliberately has no embedded media browser
+(`skills/digger-integration/SKILL.md`'s "No embedded file browser in cuemark" boundary
+rule — Digger owns the library). So the encoder/LOAD don't drive a library browser;
+they drive a cursor through the **Digger queue panel** that already exists
+(`DiggerQueue.svelte`). See the design discussion in the session that added this —
+three shapes considered (queue-only cursor / cursor also covers search results / full
+paginated library browse), queue-only chosen as the one that needs no new Digger
+endpoint and doesn't duplicate Digger's own UI inside cuemark.
+
 | Control | Hardware behaviour | Status | Notes |
 |---|---|---|---|
-| Rotary browse encoder (turn: navigate list, press: toggle list/tree focus) | Library navigation without touching the mouse/keyboard | 🔴 | No component named anything like a media browser exists in `src/components/` (checked directly — none found). CLAUDE.md's own "Phase 3" roadmap lists "Media browser / clip library" as **not yet built**. This control has nothing to drive until that ships. |
-| LOAD (deck 1 / deck 2) | Load the browser's selected track into a deck | 🔴 | Same dependency — needs the browser to exist first. |
-| SHIFT+browse encoder (waveform zoom) | Zoom the waveform view | 🟡 | `WaveformCanvas` likely has *some* zoom concept already (OVR vs zoomed view is referenced throughout `docs/design/waveform-scrub.md`) — worth checking whether this is a real binding opportunity independent of the browser gap, since it doesn't actually need library UI to exist. Not verified in this pass; flagged for whoever picks this up. |
+| Rotary browse encoder (turn: move queue-cursor) | Move a selection through the Digger queue, wrapping at both ends | 🟢 live-verified 2026-08-23 | **Implemented 2026-08-23**: `ActionId::QueueCursor`/`MidiAction::QueueCursor{delta}` (relative, twos7-encoded — a DIFFERENT relative encoding than this unit's own jog wheels, which use offset64, §8.2), `queueStore.ts`'s `moveQueueSelection()` (wraps), `handler.ts`'s `queue_cursor` case (also auto-opens the queue panel via the new `showDiggerQueue` store). FLX4 row at `(0xB6, 0x40)`. Raw wire sign kept unflipped in `decode.rs` (CW=-1, CCW=+1) — a first pass flipped it on an unverified assumption ("CW should mean forward"), and live testing against the real running app said that direction read backward; reverted to the raw sign and confirmed correct. Locked in by a capture-replay test (`flx4_queue_browse_replay_matches_capture`) against `capture-1787503280692.json`. |
+| LOAD (deck 1 / deck 2) | Load the queue-cursor's current selection into a deck | 🟢 live-verified 2026-08-23 | **Implemented 2026-08-23**: `ActionId::QueueLoad`/`MidiAction::QueueLoad{slot}`, `queueStore.ts`'s `loadSelectedQueueItem()` (reuses the same `loadQueueItemToDeck()` the panel's own click-to-load buttons now call, extracted out of `DiggerQueue.svelte` so the two paths can't drift), `handler.ts`'s `queue_load` case. FLX4 rows at `(0x96, 0x46)`/`(0x96, 0x47)` — note-on channel 6, **not** the per-deck 0x90/0x91 channel other deck-scoped buttons on this unit use; both decks' LOAD share that one channel, distinguished only by note number. |
+| SHIFT+browse encoder (waveform zoom) | Zoom the waveform view | 🟡 | Unchanged — `WaveformCanvas` likely has *some* zoom concept already (OVR vs zoomed view is referenced throughout `docs/design/waveform-scrub.md`), not verified or wired in this pass. |
 
 ## 7. Jog wheel — capacitive touch
 
@@ -174,9 +183,18 @@ investigated here, worth a follow-up.
    capture, not a guess (see the row above and the comment in the TOML). Loop adjust nudge
    was **deliberately excluded** from this pass — it's a stateful jog-wheel mode overlay,
    not a narrow addition; moved to tier 3 below.
+2a. ~~**Browse/queue cursor + LOAD**~~ **DONE, live-verified 2026-08-23** (§6): reframed
+   from "blocked on a media browser" to "cursor through the existing Digger queue panel"
+   — no media browser needed, no new Digger endpoint. `QueueCursor`/`QueueLoad` actions,
+   `queueStore.ts`, FLX4 rows at `(0xB6,0x40)` relative + `(0x96,0x46)`/`(0x96,0x47)`
+   buttons, locked in by `flx4_queue_browse_replay_matches_capture`. **One direction bug
+   found live**: a first pass flipped the encoder's raw sign on the unverified assumption
+   that clockwise should mean "forward" — live testing said that read backward, so the
+   sign flip was reverted (raw wire ticks used as-is: CW=-1, CCW=+1). Re-confirmed correct
+   after the fix.
 3. **Real features, own design pass needed**: reverse/censor playback (probe GStreamer
    negative-rate behavior first), sampler pad mode (new audio-source kind), Beat FX (new
-   DSP subsystem), browse/library (blocked on the Phase 3 media browser existing at all),
+   DSP subsystem), SHIFT+browse encoder waveform zoom (§6, still unverified/unwired),
    **loop adjust nudge** (jog-wheel mode overlay — read `docs/design/waveform-scrub.md`
    first, this touches fragile territory).
 4. **Already tracked elsewhere, don't duplicate**: jog-touch-as-scratch-trigger

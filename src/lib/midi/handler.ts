@@ -8,6 +8,7 @@ import { cueGain, tempoRange, scratchMode, jogSecondsPerRev } from "../audio/aud
 import { noteScrubInput } from "../audio/scrubStats";
 import { debugLog } from "../debugLog";
 import { pushMarker } from "../digger/api";
+import { moveQueueSelection, loadSelectedQueueItem, showDiggerQueue } from "../digger/queueStore";
 import { get } from "svelte/store";
 
 // Beat Loop pad ladder — index 0-7 (plain pad 1-4, then shift+pad 1-4). Longer lengths
@@ -87,7 +88,9 @@ export interface MidiAction {
     | "deck_eq_low"
     | "deck_eq_mid"
     | "deck_eq_high"
-    | "deck_filter";
+    | "deck_filter"
+    | "queue_cursor"
+    | "queue_load";
   /** Which connection sent this — see spawn_listener's NEXT_SOURCE in midi/mod.rs. */
   source: number;
   /** Profile id ("hercules-starlight" / "pioneer-ddj-flx4" / …) — the key into
@@ -97,6 +100,8 @@ export interface MidiAction {
   value?: number;
   index?: number;
   beats?: number;
+  /** queue_cursor only — raw signed wire ticks (unflipped, see decode.rs's QueueCursor doc comment). */
+  delta?: number;
 }
 
 /**
@@ -744,6 +749,18 @@ export async function startMidiListener(): Promise<() => void> {
         if (deckId && a.value !== undefined) {
           syncFilter(deckId, a.value);
           queueDeckPatch(deckId, { filter: a.value });
+        }
+        break;
+      case "queue_cursor":
+        if (a.delta !== undefined) {
+          moveQueueSelection(a.delta);
+          showDiggerQueue.set(true); // auto-open — a cursor move nobody can see is dead UX
+        }
+        break;
+      case "queue_load":
+        if (deckId) {
+          loadSelectedQueueItem(deckId);
+          showDiggerQueue.set(true);
         }
         break;
     }

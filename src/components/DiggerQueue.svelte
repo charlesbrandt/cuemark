@@ -1,20 +1,17 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { openUrl } from '@tauri-apps/plugin-opener';
-  import { ask } from '@tauri-apps/plugin-dialog';
-  import { session, updateDeck } from '../lib/state/session';
+  import { session } from '../lib/state/session';
   import {
     search, randomTrack, getQueue, addToQueue, removeFromQueue, queueNext,
-    getCuemarkPayload, setDiggerBaseUrl, getDiggerBaseUrl, getDiggerBaseUrlHistory, getDiggerWebUrl,
+    setDiggerBaseUrl, getDiggerBaseUrl, getDiggerBaseUrlHistory, getDiggerWebUrl,
     subscribeQueueChanges,
     type DiggerTrack, type DiggerQueueItem,
   } from '../lib/digger/api';
-  import { markGridSaved } from '../lib/audio/gridSource';
-  import { setPendingTrackMeta } from '../lib/state/history';
+  import { diggerQueue, selectedQueueIndex, loadQueueItemToDeck } from '../lib/digger/queueStore';
   import HistoryPanel from './HistoryPanel.svelte';
 
   let activeTab = $state<'tracks' | 'history'>('tracks');
-  let queue = $state<DiggerQueueItem[]>([]);
   let searchResults = $state<DiggerTrack[]>([]);
   let searchQuery = $state('');
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -67,7 +64,11 @@
   async function refreshQueue() {
     try {
       error = null;
-      queue = await getQueue();
+      const items = await getQueue();
+      diggerQueue.set(items);
+      // Keep the MIDI-driven cursor in range after a refresh shrinks the list
+      // (item consumed/removed elsewhere) rather than pointing past the end.
+      if ($selectedQueueIndex >= items.length) selectedQueueIndex.set(Math.max(0, items.length - 1));
     } catch (e) {
       error = `Digger unreachable (${baseUrl})`;
     }
@@ -125,7 +126,7 @@
   async function removeItem(itemId: number) {
     try {
       await removeFromQueue(itemId);
-      queue = queue.filter(q => q.id !== itemId);
+      diggerQueue.update(q => q.filter(item => item.id !== itemId));
     } catch (e) {
       error = String(e);
     }
@@ -133,56 +134,7 @@
 
   async function loadToDeck(item: DiggerQueueItem, deckId: string) {
     try {
-      const deck = decks.find(d => d.id === deckId);
-      if (deck?.playing && deck?.source) {
-        const label = deck.source.type === 'video'
-          ? deck.source.filePath.split('/').pop()
-          : deck.id;
-        const ok = await ask(`${deckId.replace('deck-', 'D')} is playing "${label}". Load anyway?`, { title: 'Deck is playing', kind: 'warning' });
-        if (!ok) return;
-      }
-      const payload = await getCuemarkPayload(item.track_id);
-      if (!payload.filePath) { error = 'No local file for this track'; return; }
-      // Digger's API omits bpm/downbeat entirely when unset rather than sending JSON
-      // `null`, which deserializes as `undefined` — normalize here so the rest of the
-      // app (which only ever checks `!== null`, matching the Deck type) never sees
-      // `undefined` and crashes on e.g. `deck.bpm.toFixed()`.
-      const bpm = payload.bpm ?? null;
-      const downbeat = payload.downbeat ?? null;
-      // Only apply bpm/downbeat as a pair — a downbeat is only meaningful relative to
-      // the bpm it was set against, so a partial grid would produce an inconsistent one.
-      const hasGrid = bpm !== null && downbeat !== null;
-      // A pair being present isn't the same as it being TRUSTWORTHY (see
-      // docs/design/beatmatching.md "Root cause #2"): Digger's legacy librosa-only
-      // detection rounds bpm to 0.1, which compounds into visible beat-grid drift
-      // over a track's length. Only a human-confirmed value (manual/imported) or
-      // Digger's own precise comb-fit ('comb-v1', ported from cuemark's bpm.ts) is
-      // trusted enough to suppress cuemark's own re-fit via markGridSaved below —
-      // anything else still seeds the deck immediately (better than nothing while
-      // waiting) but is left as a hint cuemark's own WaveformCanvas analysis can
-      // still overwrite once it lands, same as the non-Digger fallback path.
-      const trusted = hasGrid && (
-        payload.bpmSource === 'manual' || payload.bpmSource === 'imported' ||
-        payload.beatGridAlgo === 'comb-v1'
-      );
-      // Deck has no title/artist fields — stash them for history.ts's session-store
-      // subscriber to pick up right after this updateDeck() call lands.
-      setPendingTrackMeta(deckId, item.title, item.artist);
-      updateDeck(deckId, {
-        source: { type: 'video', filePath: payload.filePath, duration: 0, loadSeq: Date.now() },
-        playing: false,
-        cuePoint: payload.cuePoint ?? 0,
-        hotCues: payload.hotCues ?? [],
-        diggerTrackId: item.track_id,
-        diggerFileId: payload.fileId ?? null,
-        // Reset to the deck default (1.0) unless Digger supplies one — mirrors the
-        // bpm/downbeat pull-on-load pattern above.
-        gain: payload.gain ?? 1.0,
-        ...(hasGrid ? { bpm, downbeat } : {}),
-      });
-      // Synchronous with updateDeck above, so this lands before App.svelte's rAF-deferred
-      // syncVideoElements next inspects this deck — see gridSource.ts race-ordering note.
-      if (trusted) markGridSaved(deckId, payload.filePath);
+      await loadQueueItemToDeck(item, deckId);
     } catch (e) {
       error = String(e);
     }
@@ -203,6 +155,18 @@
 
   function trackLabel(item: { title: string; artist: string }): string {
     return item.artist ? `${item.title} — ${item.artist}` : item.title;
+  }
+
+  // Keeps the browse-encoder cursor visible when it's driven from the controller —
+  // without this, turning the knob past the visible rows leaves the highlight
+  // (and the fact that anything moved at all) off-screen.
+  function scrollSelectedIntoView(node: HTMLElement, selected: boolean) {
+    if (selected) node.scrollIntoView({ block: 'nearest' });
+    return {
+      update(sel: boolean) {
+        if (sel) node.scrollIntoView({ block: 'nearest' });
+      },
+    };
   }
 </script>
 
@@ -291,11 +255,15 @@
       </div>
     {:else}
       <div class="queue-list">
-        {#if queue.length === 0}
+        {#if $diggerQueue.length === 0}
           <div class="list-hint">Queue is empty — search or add random</div>
         {:else}
-          {#each queue as item (item.id)}
-            <div class="queue-row">
+          {#each $diggerQueue as item, i (item.id)}
+            <div
+              class="queue-row"
+              class:selected={i === $selectedQueueIndex}
+              use:scrollSelectedIntoView={i === $selectedQueueIndex}
+            >
               <span class="track-label">{trackLabel(item)}</span>
               {#if item.bpm != null}<span class="bpm-badge">{Math.round(item.bpm)}</span>{/if}
               <div class="queue-actions">
@@ -462,6 +430,14 @@
     gap: 8px;
     padding: 6px 0;
     border-bottom: 1px solid var(--divider);
+  }
+
+  /* Browse-encoder cursor position — MIDI-driven, not clickable-selection */
+  .queue-row.selected {
+    background: var(--accent-soft);
+    margin: 0 -8px;
+    padding: 6px 8px;
+    border-radius: var(--radius-sm);
   }
 
   .track-label {

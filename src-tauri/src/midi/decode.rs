@@ -64,6 +64,15 @@ pub enum MidiAction {
     DeckEqHigh { slot: u8, value: f32 },
     /// Sweep filter position, **−1…+1**.
     DeckFilter { slot: u8, value: f32 },
+    /// Browse-encoder turn, in raw signed ticks (±1 per detent) — not revolutions
+    /// like `JogTurn`, since a queue position has no natural per-revolution unit.
+    /// Raw wire sign, unflipped: clockwise = -1, counter-clockwise = +1 (confirmed
+    /// against the real app 2026-08-23 — see `resolve_relative()`'s comment).
+    /// docs/design/ddj-flx4-feature-gaps.md §6.
+    QueueCursor { delta: i32 },
+    /// Physical LOAD button — loads whatever the queue cursor currently selects
+    /// into this slot's deck.
+    QueueLoad { slot: u8 },
 }
 
 const EQ_MIN_DB: f32 = crate::audio::pipeline::EQ_MIN_DB;
@@ -145,6 +154,7 @@ fn resolve_button(c: &Control, data2: u8) -> Option<MidiAction> {
         ActionId::PhaseNudge => Some(MidiAction::PhaseNudge { slot }),
         ActionId::HotCue => Some(MidiAction::HotCue { slot, index: c.index }),
         ActionId::HotCueSet => Some(MidiAction::HotCueSet { slot, index: c.index }),
+        ActionId::QueueLoad => Some(MidiAction::QueueLoad { slot }),
         _ => None,
     }
 }
@@ -192,6 +202,13 @@ fn resolve_relative(c: &Control, data2: u8, encoding: Encoding, jog_ticks_per_re
     };
     match c.action {
         ActionId::JogTurn => Some(MidiAction::JogTurn { slot: c.slot, value: ticks as f32 / jog_ticks_per_rev }),
+        // No sign flip: a live capture (capture-1787503280692.json, 2026-08-23) showed the
+        // FLX4's browse encoder sends raw ticks=-1 (twos7-encoded 127) for a clockwise turn
+        // and +1 (raw 1) for counter-clockwise. A first pass negated this to make CW read as
+        // +1/forward on the (unverified) assumption that CW should mean "next" — live
+        // feedback on the real app (2026-08-23) said that read backward, so this is raw
+        // ticks, unflipped: CW = -1, CCW = +1.
+        ActionId::QueueCursor => Some(MidiAction::QueueCursor { delta: ticks }),
         _ => None,
     }
 }

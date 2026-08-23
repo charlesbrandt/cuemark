@@ -44,6 +44,7 @@
   import { installDebugHook } from "./lib/debug/debugHook";
   import { debugLog } from "./lib/debugLog";
   import { getDiggerFileUrl } from "./lib/digger/api";
+  import { showDiggerQueue } from "./lib/digger/queueStore";
 
   function openOutputWindow() {
     invoke('open_output_window').catch(console.error);
@@ -60,7 +61,6 @@
   // three separately-toggled panels. MidiMonitor (one of those tabs) still mounts/unmounts
   // its Rust raw-MIDI feed gate on tab switch — see its own doc comment, unchanged by this.
   let showSettings = $state(false);
-  let showDiggerQueue = $state(true);
   let showVisualizationPanel = $state(false);
 
   const QUEUE_SIDEBAR_MIN_WIDTH = 220;
@@ -806,8 +806,8 @@
     <button class="add-deck" onclick={addDeck}>+ Deck</button>
     <button
       class="output-btn"
-      class:active={showDiggerQueue}
-      onclick={() => { showDiggerQueue = !showDiggerQueue; }}
+      class:active={$showDiggerQueue}
+      onclick={() => { showDiggerQueue.set(!$showDiggerQueue); }}
     >Queue</button>
     <button
       class="output-btn"
@@ -939,7 +939,7 @@
       />
     </div>
 
-    {#if showDiggerQueue}
+    {#if $showDiggerQueue}
       <div
         class="queue-sidebar-resizer"
         role="separator"
