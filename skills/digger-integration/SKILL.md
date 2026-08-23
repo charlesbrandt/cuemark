@@ -17,6 +17,7 @@ FastAPI REST at `http://localhost:8200` by default:
 | `GET /queue/next` | Weighted-random track suggestion to push to the cuemark queue |
 | `GET /search?q=` | Quick track search from the cuemark toolbar |
 | `GET /tracks/{id}/cuemark` | Deck-ready payload: `filePath`, `cuePoint`, `hotCues[]`, `gain` |
+| `GET /tracks/{id}/waveform` | Cached decode (peaks 30/s + envelope 210/s, binary) — see "Beat-grid precision" below |
 | `POST /tracks/{id}/markers` | Write cue/hot-cue positions back after editing in cuemark |
 | `PATCH /tracks/{id}` | Generic scalar-field patch — `bpm` (SET BEAT) and `gain` (gain slider) both go through this, `{k: v}` body |
 | `POST /plays/start`, `PATCH /plays/{id}/heartbeat`, `PATCH /plays/{id}/finish` | Session/play-history reporting — see below |
@@ -25,8 +26,12 @@ FastAPI REST at `http://localhost:8200` by default:
 The `/cuemark` payload maps directly to cuemark's `Deck` source interface:
 ```json
 { "filePath": "/media/charles/music/artist/track.mp4", "fileId": 16167, "cuePoint": 4.2,
-  "hotCues": [32.0, 128.5], "bpm": 123.4, "downbeat": 0.812, "gain": 1.5 }
+  "hotCues": [32.0, 128.5], "bpm": 123.4, "bpmSource": "detected", "downbeat": 0.812,
+  "beatGridAlgo": "comb-v1", "beatGridConfidence": 0.33, "gain": 1.5 }
 ```
+`bpmSource`/`beatGridAlgo`/`beatGridConfidence` (added 2026-08-23) are what
+`DiggerQueue.svelte`'s `trusted` check reads before calling `markGridSaved()` — see
+"Beat-grid precision" below. `beatGridAlgo` is `null` for a legacy librosa-only value.
 `gain` (added 2026-08-12) is a per-track pre-fader trim default (0–4): `loadToDeck()` resets the
 deck to 1.0 unless Digger supplies a value, mirroring the bpm/downbeat pull; `DeckCard`'s gain
 slider pushes changes back via `setTrackGain()` on the range input's `change` event (fires once on
@@ -124,6 +129,34 @@ migrate.py --dry-run` first (prints what it would do; matched against `_columns(
 run repeatedly), then without `--dry-run` to apply. The `api` service isn't always up —
 `docker compose ps` to check, `docker compose up -d api` to start it (host port **8200**, maps
 to the container's 8000; `docker compose logs api` to confirm it's serving before hitting it).
+
+## Beat-grid precision + waveform cache (added 2026-08-23)
+
+`bpm.ts`'s comb-fit algorithm is now ported to Digger (`importers/beatgrid.py`) so
+Digger's own `bpm`/`beat_anchor_ms` get the same precision cuemark computes locally,
+and Digger also caches the decoded peaks/envelope (`waveform_cache` table, served via
+`GET /tracks/{id}/waveform`) so cuemark can skip its own Rust decode for a
+Digger-loaded track. Full detail, including the exact trust rule and the binary
+wire format: `docs/design/beatmatching.md` "Root cause #2" (cuemark side) and
+`~/repos/digger/docs/design/beat-grid-precision.md` (Digger side, the source of
+truth for the algorithm/schema detail). **If `bpm.ts`'s algorithm ever changes,
+`importers/beatgrid.py` needs a matching re-port** — it's a separate implementation
+in a separate language, not a shared module, and the two have already drifted once
+(the port fixed nothing, it just needed to exist).
+
+⚠️ **Local dev Digger (this machine, port 8200 — what the Vite dev proxy's
+`/digger-api` target points at) is a different database from the live production
+instance (192.168.2.99), and this is already documented convention** — see the
+`digger` skill's "Important conventions" section ("192.168.2.99 is the only
+production instance") before assuming a local test proves anything about the real
+library. Concretely hit while building this feature: the local dev DB has the same
+track *catalog* as production (same row count) but had **zero** tracks with `bpm`
+set — analysis had simply never been run against its locally-mounted media, so
+don't assume a track visible in the local Digger UI/queue has real bpm/waveform
+data just because production does. Verify a schema/algorithm change locally
+(pytest, `analyze_audio.py --track-id <id> --force`, curl), then still treat it as
+undeployed until pushed and rolled out to .99 per that skill's sequence — local
+`docker compose exec api python migrate.py` only ever touches the local copy.
 
 ## Queue panel live updates
 

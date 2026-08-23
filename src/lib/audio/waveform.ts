@@ -72,8 +72,16 @@ export async function analyzeFile(filePath: string, fallbackUrl?: string): Promi
   // Rust decodes audio with video decoders disabled, avoiding the vaav1dec VA-API
   // corruption that decodeAudioData triggers on video+audio containers in WebKitGTK.
   const raw = await audioAnalyzeFile(filePath, fallbackUrl);
-  const peaks = new Float32Array(raw.peaks);
-  const envelope = new Float32Array(raw.envelope);
+  return analyzeArrays(new Float32Array(raw.peaks), new Float32Array(raw.envelope));
+}
+
+/**
+ * Runs the same beat-grid fit (falling back to the coarse integer BPM detector) that
+ * `analyzeFile` does, on already-decoded peaks/envelope arrays — e.g. Digger's cached
+ * waveform (`getWaveformCache` in `lib/digger/api.ts`), skipping the Rust decode
+ * entirely. See docs/design/beatmatching.md "Root cause #2".
+ */
+export async function analyzeArrays(peaks: Float32Array, envelope: Float32Array): Promise<AnalysisResult> {
   const { detectBeatGrid, detectBpm } = await import('./bpm');
   const grid = detectBeatGrid(envelope, ENVELOPE_RATE);
   if (grid) return { peaks, bpm: grid.bpm, gridOffset: grid.gridOffset, onsets: grid.onsets };

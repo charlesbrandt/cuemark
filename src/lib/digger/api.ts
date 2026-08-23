@@ -28,8 +28,24 @@ export interface CuemarkPayload {
   cuePoint: number | null;
   hotCues: number[];
   bpm: number | null;
+  bpmSource: string | null;        // 'detected' | 'manual' | 'imported' | null
   downbeat: number | null;
+  // Precision provenance for bpm/downbeat — see docs/design/beatmatching.md
+  // "Root cause #2". 'comb-v1' means Digger ran the same comb-fit algorithm
+  // cuemark's own bpm.ts uses (ported to Python); anything else is a coarse
+  // librosa-only estimate that's a hint, not a trusted grid.
+  beatGridAlgo: string | null;
+  beatGridConfidence: number | null;
   gain: number | null;
+}
+
+/** A cached decode from Digger's waveform_cache table (see beat-grid-precision.md) —
+ * the same peaks(30/s)/envelope(210/s) arrays cuemark's own Rust decoder would
+ * produce, letting cuemark skip that decode for a Digger-loaded track. */
+export interface WaveformCache {
+  peaks: Float32Array;
+  envelope: Float32Array;
+  durationS: number;
 }
 
 const STORAGE_KEY = 'cuemark:diggerBaseUrl';
@@ -148,6 +164,34 @@ export async function getCuemarkPayload(trackId: number): Promise<CuemarkPayload
   const r = await fetch(`${_baseUrl}/tracks/${trackId}/cuemark`);
   if (!r.ok) throw new Error(`cuemark ${r.status}`);
   return r.json();
+}
+
+// Rates are a fixed cross-repo contract, not sent per-request — see
+// src-tauri/src/audio/analysis.rs / src/lib/audio/waveform.ts / Digger's
+// importers/analyze_audio.py, all of which must agree on 30/210.
+const WAVEFORM_HEADER_BYTES = 8; // two little-endian u32s: peaksCount, envelopeCount
+
+/**
+ * Fetches Digger's pre-decoded peaks/envelope for a track, if cached — see
+ * docs/design/beatmatching.md "Root cause #2" / GET /tracks/{id}/waveform's own
+ * docstring in the Digger repo for the binary layout. Returns null on a 404 (not
+ * cached yet) so callers can fall back to a local decode without treating "not
+ * cached" as an error.
+ */
+export async function getWaveformCache(trackId: number): Promise<WaveformCache | null> {
+  const r = await fetch(`${_baseUrl}/tracks/${trackId}/waveform`);
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(`waveform ${r.status}`);
+  const buf = await r.arrayBuffer();
+  const header = new DataView(buf, 0, WAVEFORM_HEADER_BYTES);
+  const peaksCount = header.getUint32(0, true);
+  const envelopeCount = header.getUint32(4, true);
+  const peaksStart = WAVEFORM_HEADER_BYTES;
+  const envelopeStart = peaksStart + peaksCount * 4;
+  const peaks = new Float32Array(buf.slice(peaksStart, envelopeStart));
+  const envelope = new Float32Array(buf.slice(envelopeStart, envelopeStart + envelopeCount * 4));
+  const durationS = Number(r.headers.get('X-Duration-Seconds') ?? 'NaN');
+  return { peaks, envelope, durationS };
 }
 
 // Pushes from Digger's /queue/ws so the panel updates when the queue changes from

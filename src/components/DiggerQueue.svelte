@@ -152,6 +152,19 @@
       // Only apply bpm/downbeat as a pair — a downbeat is only meaningful relative to
       // the bpm it was set against, so a partial grid would produce an inconsistent one.
       const hasGrid = bpm !== null && downbeat !== null;
+      // A pair being present isn't the same as it being TRUSTWORTHY (see
+      // docs/design/beatmatching.md "Root cause #2"): Digger's legacy librosa-only
+      // detection rounds bpm to 0.1, which compounds into visible beat-grid drift
+      // over a track's length. Only a human-confirmed value (manual/imported) or
+      // Digger's own precise comb-fit ('comb-v1', ported from cuemark's bpm.ts) is
+      // trusted enough to suppress cuemark's own re-fit via markGridSaved below —
+      // anything else still seeds the deck immediately (better than nothing while
+      // waiting) but is left as a hint cuemark's own WaveformCanvas analysis can
+      // still overwrite once it lands, same as the non-Digger fallback path.
+      const trusted = hasGrid && (
+        payload.bpmSource === 'manual' || payload.bpmSource === 'imported' ||
+        payload.beatGridAlgo === 'comb-v1'
+      );
       // Deck has no title/artist fields — stash them for history.ts's session-store
       // subscriber to pick up right after this updateDeck() call lands.
       setPendingTrackMeta(deckId, item.title, item.artist);
@@ -169,7 +182,7 @@
       });
       // Synchronous with updateDeck above, so this lands before App.svelte's rAF-deferred
       // syncVideoElements next inspects this deck — see gridSource.ts race-ordering note.
-      if (hasGrid) markGridSaved(deckId, payload.filePath);
+      if (trusted) markGridSaved(deckId, payload.filePath);
     } catch (e) {
       error = String(e);
     }

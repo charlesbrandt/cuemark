@@ -255,6 +255,10 @@ VA-API investigation (MacBook-Pro-scoped), debugging tips and env-var override p
 to fit a fractional BPM and beat-level grid anchor, auto-populating `deck.bpm`/`deck.downbeat` on load.
 A saved grid (DeckCard SET BEAT button) beats the auto-fit — see `gridSource.ts`. `Session.snapToBeat`
 (SNAP toolbar toggle) routes seeks/hot-cues/loop points through `quantizeToGrid()` in `seekBus.ts`.
+A Digger-loaded deck may instead fetch a cached `{peaks, envelope}` from Digger's `waveform_cache`
+(`getWaveformCache()`, `WaveformCanvas.svelte`) and run the same `detectBeatGrid()` on that, skipping
+the Rust decode entirely — see `docs/design/beatmatching.md` "Root cause #2" for the trust rule that
+decides when Digger's own `bpm`/`downbeat` are precise enough to skip cuemark's re-fit altogether.
 
 **Direct manipulation (waveform drag, vinyl jog) drives the scratch feeder by absolute
 *position*, never by rate** — `scratch_to()` in `pipeline.rs`, the scrub bus in `seekBus.ts`.

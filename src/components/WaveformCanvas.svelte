@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { analyzeFile, COLOR_UPCOMING, COLOR_PLAYED } from '../lib/audio/waveform';
+  import { analyzeFile, analyzeArrays, type AnalysisResult, COLOR_UPCOMING, COLOR_PLAYED } from '../lib/audio/waveform';
   import { seekDeckExitingLoop, getDeckTime, quantizeToGrid, scratchingDecks, seekVersions, beginScrub, updateScrub, endScrub, cancelScrub } from '../lib/renderer/seekBus';
-  import { getDiggerFileUrl } from '../lib/digger/api';
+  import { getDiggerFileUrl, getWaveformCache } from '../lib/digger/api';
   import { recordAuxLoop } from '../lib/audio/pollStats';
   import { noteScrubInput } from '../lib/audio/scrubStats';
   import { suppressWaveformDraw } from '../lib/audio/perfArm';
@@ -69,7 +69,29 @@
     analyzedPath = filePath;
     loading = true;
     const fallbackUrl = deck.diggerFileId != null ? getDiggerFileUrl(deck.diggerFileId) : undefined;
-    analyzeFile(filePath, fallbackUrl).then((result) => {
+    const diggerTrackId = deck.diggerTrackId;
+
+    // librosa.load(..., duration=600) caps Digger's analysis at 10 minutes (see
+    // importers/analyze_audio.py) — a cache landing suspiciously at that exact
+    // boundary means a longer file got truncated, so fall back to a full local
+    // decode rather than showing a waveform/grid that stops 10 minutes in.
+    const DIGGER_ANALYSIS_CAP_S = 600;
+
+    async function runAnalysis(): Promise<AnalysisResult> {
+      if (diggerTrackId != null) {
+        try {
+          const cache = await getWaveformCache(diggerTrackId);
+          if (cache && Math.abs(cache.durationS - DIGGER_ANALYSIS_CAP_S) > 1) {
+            return analyzeArrays(cache.peaks, cache.envelope);
+          }
+        } catch (err) {
+          console.warn('[waveform] Digger cache fetch failed, falling back to local decode:', err);
+        }
+      }
+      return analyzeFile(filePath, fallbackUrl);
+    }
+
+    runAnalysis().then((result) => {
       if (analyzedPath === filePath) {
         peaks = result.peaks;
         loading = false;

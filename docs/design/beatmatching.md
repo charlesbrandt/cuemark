@@ -136,7 +136,7 @@ about something else. `acc4167`, which introduced the defect, is the same patter
 
 ---
 
-## Root cause #2 (NOT FIXED): Digger's coarse grid outranks cuemark's better one
+## Root cause #2 (FIXED 2026-08-23): Digger's coarse grid outranks cuemark's better one
 
 `DiggerQueue.svelte:143` calls `markGridSaved()` for any Digger track that carries both
 `bpm` and `downbeat`, which marks the grid **trusted** in `gridSource.ts` and suppresses
@@ -174,29 +174,50 @@ Digger's rounding floor before accounting for estimator accuracy at all.
 So a track loaded from the Digger queue currently gets a **worse** grid than the same file
 dragged in from disk, with nothing in the UI to indicate it.
 
-### Proposed fix: make trust provenance-aware
+### The fix that shipped: provenance-aware trust, PLUS a precise Digger algorithm
 
-Digger already tracks provenance — `tracks.bpm_source` is one of `detected` / `manual` /
-`imported`, and markers carry `source` with the same convention
-(`analyze_audio.py:67-96`). cuemark's `getCuemarkPayload` currently flattens that away.
+The user's ask went beyond the minimal provenance fix originally proposed here:
+Digger should do the precision work ahead of time, not just get out of cuemark's way.
+What actually shipped (both repos, full detail in Digger's
+`docs/design/beat-grid-precision.md`):
 
-The rule should be:
+- **`importers/beatgrid.py`** (Digger) — a line-by-line port of this file's own
+  `detectOnsets`/`tempoPrior`/`coarseGridBpm`/`refineGrid`/`detectBeatGrid`, so
+  Digger's own stored `bpm`/`beat_anchor_ms` get the same ~20-25ms/0.01 BPM precision
+  cuemark computes locally, not just librosa's 0.1-BPM-rounded estimate. Cross-checked
+  bit-for-bit against this file on the same synthetic fixtures `bpm.test.ts` uses.
+- **`tracks.beat_grid_algo`/`beat_grid_confidence`** (Digger, new columns) —
+  orthogonal to `bpm_source`: `NULL` = legacy librosa-only value, `'comb-v1'` = the
+  ported fit succeeded. A manual bpm edit clears both.
+- **`getCuemarkPayload` now returns `bpmSource`/`beatGridAlgo`/`beatGridConfidence`**,
+  and `DiggerQueue.svelte`'s `loadToDeck` computes a `trusted` boolean instead of
+  reusing `hasGrid`:
+  ```ts
+  const trusted = hasGrid && (
+    payload.bpmSource === 'manual' || payload.bpmSource === 'imported' ||
+    payload.beatGridAlgo === 'comb-v1'
+  );
+  ```
+  `hasGrid` (any pair present) still seeds the deck immediately as before; only
+  `trusted` calls `markGridSaved()`. An untrusted (legacy, no `comb-v1` tag) pair is
+  left as a hint — cuemark's own fit still overwrites it once it lands, exactly like
+  the non-Digger fallback path always has.
+- **Waveform caching, the other half of the user's ask**: Digger now also caches the
+  decoded `peaks`(30/s)/`envelope`(210/s) arrays (`waveform_cache` table) and serves
+  them via `GET /tracks/{id}/waveform` (binary). `WaveformCanvas.svelte` tries
+  `getWaveformCache()` first for a Digger-loaded deck and runs cuemark's **existing,
+  unchanged** `detectBeatGrid`/`detectBpm` on that cached envelope — skipping the
+  Rust decode (`audio_analyze_file`) entirely on a cache hit — falling back to the
+  normal local decode on a miss, an insufficient/truncated cache (Digger's
+  `librosa.load(duration=600)` cap), or no `diggerTrackId` at all. This means the
+  comb-fit math itself was never duplicated as cuemark's actual trust surface for
+  display — only the *decode* moved to Digger, which is what was actually expensive.
 
-- `bpm_source` in (`manual`, `imported`), or a user-placed `downbeat` marker → **trusted**,
-  suppress the local fit (a human's answer wins, as SET BEAT already does).
-- `bpm_source = 'detected'` with no manual marker → **hint, not truth**. Use it to seed the
-  UI immediately (so the deck shows a BPM before analysis finishes) but let the local comb
-  fit overwrite it when it lands.
-
-This needs `getCuemarkPayload` to return the source fields, and `DiggerQueue.svelte:129`'s
-`hasGrid` to become a three-state decision rather than a boolean. `gridSource.ts`'s
-`markGridSaved` is already keyed by `(deckId, filePath)` and doesn't need to change shape.
-
-Open question: if Digger's downbeat comes from a manual marker but its BPM is only
-`detected`, is that pair trustworthy? A downbeat is only meaningful against the BPM it was
-set against — which is the reasoning behind the existing all-or-nothing `hasGrid` pair
-check (`DiggerQueue.svelte:127-129`). Probably: trust the manual anchor, re-fit the BPM,
-and snap the anchor to the nearest beat of the new grid.
+The original open question below (manual downbeat marker + `detected`-only bpm) is
+still open in the same form — SET BEAT's real path sets `bpm_source='manual'` and
+pushes the marker together, so it doesn't hit this edge case in practice, but a
+marker placed by some other route without an accompanying manual bpm still isn't
+specially handled.
 
 ---
 
@@ -402,8 +423,10 @@ Carried over from the beat-grid handoff spec (`todo.md`) once all five of its st
 
 1. **Live-confirm root cause #1's fix.** Everything below assumes a trustworthy anchor;
    if it doesn't hold up by ear, nothing else is worth starting.
-2. **Digger trust rule** (root cause #2). Small, self-contained, and it is actively
-   degrading the best-analyzed tracks in the library right now.
+2. ~~**Digger trust rule** (root cause #2).~~ **Done 2026-08-23** — see the "fix that
+   shipped" section above and `digger/docs/design/beat-grid-precision.md`. Not yet
+   deployed to the live Digger instance (192.168.2.99) or run against the real
+   library — that doc's "Deployment"/"Rollout" sections cover what's left.
 3. **Quantized play**, beat-level first.
 4. **Phase lock (PLL).**
 5. **Bar detection in Digger** (option A), then phrase alignment.
