@@ -1,5 +1,7 @@
 # todo
 
+tray icon dependency -- is this still needed? 
+
 Way to record a session
 
 Combine all of the MIDI and Record Settings to be switchable via a tabbed menu option at the top of the open Settings menu. That way everything can be managed directly in the settings panel without cluttering up the main nav. That will also allow us to change the function of the record button itself (in the main nav) to become the on off toggle for the recording. The animation to indicate that recording is active can be much more subtle. We can keep the button itself filled in red (current toggle functionality), but then there can be a subtle circle to the left of the word "Record" that fades in and out (soothingly) to indicate that recording is active. Then there is no need to open the settings menu once the recording settings have been configured. 
@@ -84,6 +86,23 @@ todo format.
    backend or a real deck — unlike phase 1, this needs an actual `GET /queue`/
    `/queue/next` round-trip and a real load to trust in practice. Phases 3-4
    (tempo/phase sync, a real per-track outro marker) remain.
+
+   **Follow-up — two fixes 2026-08-24, both from the same live-session report.** (1) A DJ
+   manually loaded a track, Auto DJ crossfaded to it correctly, but the *following* track's
+   end produced no new load — the crossfade ramp's completion branch only set `playing:
+   false` on the outgoing deck, leaving its just-finished `source` populated, which made
+   `checkAutoPreloadTrigger`'s "already loaded — don't clobber" guard treat it as
+   permanently occupied forever after. Fixed by also clearing `source: null`, which drives
+   the existing `syncVideoElements()` teardown path. (2) Separately, the DJ asked that queue
+   entries stop being deleted (`DELETE /queue/{id}`) as Auto DJ consumes them — the queue is
+   a set list that should stay visible and match Digger's own web UI, not a work stack.
+   `autoDj.ts`'s `pickAndConsumeNext()` is now `pickNextTrack()`: it never deletes, instead
+   leaning on the already-built (same day, separately) `playedTracks.ts` session-local
+   "played" tracking to find the next *unplayed* entry after the outgoing deck's current
+   track's position in the queue (falling back to the first unplayed entry with no anchor,
+   then `queueNext()` once nothing unplayed remains) — see the design doc's Status line and
+   `pickNextTrack`'s own comment. `npm run check`/`npm test` clean (138/138). **Neither fix
+   is live-verified yet** — both are unit-tested only so far.
 
 **"Transition points for auto-DJ training" — deliberately not built here.** Digger's own
 `mix_transitions` table already reserves `source='play_history'` for transitions *mined from* the

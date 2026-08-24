@@ -1,7 +1,43 @@
 # Auto DJ: automated transitions
 
 Status: 🟡 **Phase 1 DONE + live-verified 2026-08-24. Phase 2 (auto-preload) built +
-unit-tested 2026-08-24, NOT yet live-verified** — see "Proposed phased plan" below.
+unit-tested 2026-08-24, fixed one live bug 2026-08-24, still NOT re-verified live** — see
+"Proposed phased plan" below.
+
+**Live-session bug found + fixed 2026-08-24 (same day as phase 2's build):** a DJ manually
+loaded a track onto one of the two mapped decks; Auto DJ correctly crossfaded to it, but the
+*next* cycle never loaded a new track onto the deck that had just faded out. Root cause: the
+ramp driver's `t >= 1` completion branch (`startCrossfadeRamp` in `autoMix.ts`) only set
+`playing: false` on the outgoing deck, leaving its now-fully-played `source` in place.
+`checkAutoPreloadTrigger`'s "already loaded (by anyone) — don't clobber" guard
+(`incoming.source !== null`) and `checkAutoMixTrigger`'s incoming-readiness check
+(`source.duration > 0`) both treat any non-null source as a valid loaded track, with no way to
+distinguish "freshly loaded" from "already played out" — so a deck that had just finished its
+turn looked permanently occupied and was silently skipped by every later preload/crossfade
+cycle. Not specific to a manual load — it would have reproduced identically with a
+fully-automated pair of tracks; the manual load in the report just happened to be what was on
+the deck when it was noticed. **Fix**: the completion branch now also sets `source: null`,
+which additionally drives `App.svelte`'s `syncVideoElements()` to tear down that deck's video
+backend + audio pipeline, same as a deck being removed — so the freed deck looks genuinely
+idle to both trigger functions. Regression test added in `autoMix.test.ts` ("frees the
+outgoing deck for a fresh preload after it fades out, even if it was manually loaded").
+`npm test`/`npm run check` clean. **Not yet re-verified in a live session** — the original
+report was live, the fix is unit-tested only so far.
+
+**Sourcing changed 2026-08-24, same live-session feedback:** queue entries are no longer
+deleted (`DELETE /queue/{id}`) as Auto DJ consumes them. The DJ wants the queue to stay put
+and read as a set list — matching what Digger's own web UI shows on another screen — not
+shrink as a work stack. `autoDj.ts`'s `pickAndConsumeNext()` (now `pickNextTrack()`) instead
+leans on `playedTracks.ts`'s already-built session-local "played" tracking (a track counts
+once it's been audible on the main output, not just cued, for 15s+) to walk the queue in
+order: anchor on the deck-being-replaced's `diggerTrackId` position in the queue and take the
+next *unplayed* entry after it; no anchor (first track of the set, or a manually/search-
+loaded track never queued) falls back to the first unplayed entry; nothing unplayed left
+falls back to `GET /queue/next` same as before. Both `handleDeckEos` and
+`checkAutoPreloadTrigger` were updated to pass their outgoing deck's `diggerTrackId` as the
+anchor. `pickNextTrack`'s own doc comment in `autoDj.ts` has the full three-step rule. New
+regression coverage in both test files; `npm test`/`npm run check` clean. **Not live-verified.**
+
 Written 2026-08-24 as a scoping handoff; phase 1 was implemented and verified the same
 day in `src/lib/digger/autoMix.ts`. The `Auto` toggle in `DiggerQueue.svelte` now gates
 *both* this near-end crossfade path and the older cold-reload EOS fallback (`autoDj.ts`,

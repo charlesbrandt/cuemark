@@ -25,7 +25,7 @@
  */
 import { writable, get } from "svelte/store";
 import { session, getDeck, updateDeck, setCrossfader } from "../state/session";
-import { autoDjEnabled, pickAndConsumeNext } from "./autoDj";
+import { autoDjEnabled, pickNextTrack } from "./autoDj";
 import { loadQueueItemToDeck } from "./queueStore";
 import { currentDj, currentDjOrNull } from "./djSelector";
 
@@ -126,9 +126,15 @@ function startCrossfadeRamp(outgoingId: string, incomingId: string, target: 0 | 
     setCrossfader(startValue + (target - startValue) * t);
 
     if (t >= 1) {
-      // Fully faded out — free the deck for its next load rather than leaving it playing
-      // silently until its own (now-irrelevant) EOS fires.
-      updateDeck(outgoingId, { playing: false });
+      // Fully faded out — free the deck for its next load. Clearing source (not just
+      // playing) is load-bearing: checkAutoPreloadTrigger and checkAutoMixTrigger both
+      // treat a non-null source as "already has a track" (the "manual wins, never clobber"
+      // rule), so leaving the just-played file in place made this deck look permanently
+      // loaded and silently starved every subsequent preload/crossfade cycle — the second
+      // mapped deck never got a new track after the first swap. source: null also drives
+      // App.svelte's syncVideoElements to tear the backend + audio pipeline down, same as
+      // a deck being removed.
+      updateDeck(outgoingId, { playing: false, source: null });
       cancel();
       return;
     }
@@ -182,9 +188,10 @@ const preloadedFor = new Map<string, string>();
  * `checkAutoMixTrigger`. Cheap no-op unless Auto DJ is on, this deck is the currently-audible
  * half of `crossfaderMapping` closing in on its end, and the *other* half is genuinely empty
  * (no source at all — never overwrites a deck the DJ, or a previous auto-preload, already put
- * a track on). Fires the same queue-first/`queueNext()`-fallback sourcing `handleDeckEos` uses,
- * just earlier and onto the idle deck rather than the one that just ended — see the design
- * doc's phase 2.
+ * a track on). Fires the same queue-order/`queueNext()`-fallback sourcing `handleDeckEos` uses,
+ * anchored on the *outgoing* deck's current track so a multi-lap set keeps advancing through
+ * the queue in order — just earlier and onto the idle deck rather than the one that just
+ * ended. See the design doc's phase 2 and `pickNextTrack`'s own comment.
  */
 export function checkAutoPreloadTrigger(deckId: string, contentPos: number): void {
   if (!get(autoDjEnabled)) return;
@@ -206,7 +213,7 @@ export function checkAutoPreloadTrigger(deckId: string, contentPos: number): voi
 
   preloadedFor.set(deckId, outgoing.source.filePath);
   const owner = currentDjOrNull(get(currentDj));
-  pickAndConsumeNext(owner)
+  pickNextTrack(owner, outgoing.diggerTrackId ?? null)
     .then((next) => {
       // Re-check: the DJ may have loaded something onto this deck (or unloaded the outgoing
       // one) while the fetch was in flight.
