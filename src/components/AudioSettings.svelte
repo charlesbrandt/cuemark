@@ -5,6 +5,7 @@
   import { listAudioDevices, type AudioDevice } from "../lib/audio/pipeline";
   import { mainOutputDeviceIds, cueOutputDeviceId, tempoRange, scratchMode, jogSecondsPerRev, scrubInertiaMs, SCRUB_INERTIA_MAX_MS, networkOutputs, outputAttachStatus } from "../lib/audio/audioSettings";
   import { fontScale } from "../lib/settings/displaySettings";
+  import { autoMixThresholdSec, crossfadeDurationMs } from "../lib/digger/autoMix";
   import { session, setMidiSlot } from "../lib/state/session";
 
   interface ControllerInfo {
@@ -356,6 +357,41 @@
     being pushed on change, so it takes effect mid-gesture with no extra IPC.
   -->
 
+
+  <!--
+    Auto DJ phase 1 (docs/design/auto-dj-transitions.md) — only takes effect once the Auto
+    button (DiggerQueue.svelte) is on. Threshold is remaining-time-to-start, not fade length;
+    both are fixed constants for phase 1, no per-track outro marker yet.
+  -->
+  <div class="settings-row">
+    <span class="row-label">Auto Mix</span>
+    <input
+      type="range"
+      min="3"
+      max="45"
+      step="1"
+      bind:value={$autoMixThresholdSec}
+    />
+    <span class="jog-scale-value">{$autoMixThresholdSec}s before end</span>
+    <input
+      type="range"
+      min="1"
+      max="15"
+      step="0.5"
+      value={$crossfadeDurationMs / 1000}
+      oninput={(e) => crossfadeDurationMs.set(+e.currentTarget.value * 1000)}
+    />
+    <span class="jog-scale-value">{($crossfadeDurationMs / 1000).toFixed(1)}s fade</span>
+    <button
+      type="button"
+      class="font-scale-reset"
+      onclick={() => { autoMixThresholdSec.set(15); crossfadeDurationMs.set(6000); }}
+    >Reset</button>
+    <span class="hint-inline">
+      when Auto DJ is on, starts crossfading to the other crossfader-mapped deck this far
+      from the end — only if it's already loaded
+    </span>
+  </div>
 
   <div class="settings-row">
     <span class="row-label">Display</span>

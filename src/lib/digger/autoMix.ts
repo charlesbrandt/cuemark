@@ -1,0 +1,156 @@
+/**
+ * Auto DJ, phase 1: near-end crossfade automation between the two decks named in
+ * `Session.crossfaderMapping` — see docs/design/auto-dj-transitions.md. This is the "real"
+ * auto-mix (fade *as a track approaches its end*), distinct from `autoDj.ts`'s `handleDeckEos()`
+ * (cold reload *after* a track has already finished), which stays in place as a safety net —
+ * see the interaction rule at the bottom of this file.
+ *
+ * Phase 1 scope, deliberately not more (see the design doc's phased plan):
+ *  - Fixed remaining-time threshold only, no per-track outro marker (gap 1).
+ *  - Exactly the two decks in `crossfaderMapping`, no N-deck auto-mixing (gap 2).
+ *  - No auto-preload (gap 3 / phase 2) — the incoming deck must already be loaded, with a
+ *    known duration, before the near-end trigger will do anything. If it isn't, this module
+ *    does nothing and `autoDj.ts`'s existing EOS fallback still applies when the track ends.
+ *  - No tempo/phase sync (gap 5 / phase 3) — cuts between tracks at their native tempo.
+ *
+ * Gated on the same `autoDjEnabled` toggle as the EOS fallback — this is what makes the
+ * `Auto` button in DiggerQueue.svelte "the real thing" rather than the cold-reload stand-in.
+ */
+import { writable, get } from "svelte/store";
+import { session, getDeck, updateDeck, setCrossfader } from "../state/session";
+import { autoDjEnabled } from "./autoDj";
+
+function persistentWritable<T>(key: string, defaultValue: T) {
+  let initial: T;
+  try {
+    const raw = localStorage.getItem(key);
+    initial = raw !== null ? (JSON.parse(raw) as T) : defaultValue;
+  } catch {
+    initial = defaultValue;
+  }
+
+  const store = writable<T>(initial);
+
+  return {
+    subscribe: store.subscribe,
+    set(value: T) {
+      try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+      store.set(value);
+    },
+  };
+}
+
+/** How many seconds of remaining playback trigger the automated crossfade. Settings-configurable
+ *  per the design doc ("likely Settings-configurable, not hardcoded") — see AudioSettings.svelte. */
+export const autoMixThresholdSec = persistentWritable<number>("cuemark:autoMixThresholdSec", 15);
+
+/** Duration of the automated crossfade ramp, in milliseconds. */
+export const crossfadeDurationMs = persistentWritable<number>("cuemark:crossfadeDurationMs", 6000);
+
+// Bumped by notifyManualCrossfaderTouch() on every manual crossfader input (on-screen fader,
+// MIDI CC) — never by the ramp driver's own setCrossfader() calls. A ramp captures the counter
+// at start and aborts the instant it changes, mirroring the syncLocked convention: manual input
+// wins immediately, no negotiation. See Crossfader.svelte and midi/handler.ts's queueCrossfader.
+const manualTouch = writable(0);
+export function notifyManualCrossfaderTouch(): void {
+  manualTouch.update((n) => n + 1);
+}
+
+// deckId -> the source filePath whose near-end trigger already started (or completed) a
+// crossfade away from it. Lets autoDj.ts's handleDeckEos() (the EOS fallback) tell "this
+// track's transition was already handled by the lookahead path" from "lookahead never fired,
+// this is the genuine EOS case" — see the design doc's "Interaction with the existing EOS
+// fallback" section. Keyed by filePath (not just deckId) so a *later* track loaded onto the
+// same deck gets a fresh chance at the EOS fallback.
+const handledOutgoing = new Map<string, string>();
+
+export function wasAutoMixTriggered(deckId: string, filePath: string | undefined): boolean {
+  return filePath !== undefined && handledOutgoing.get(deckId) === filePath;
+}
+
+// Only one auto-mix transition in flight at a time — correct for the phase-1 two-deck scope
+// (crossfaderMapping never names more than two decks), and simpler than tracking one ramp per
+// deck pair for a case that can't currently arise.
+let activeRamp: { cancel: () => void } | null = null;
+
+// requestAnimationFrame doesn't exist under vitest's node test environment; degrade to a 16ms
+// setTimeout there so this module works the same (just not frame-synced) under `npm test`.
+const raf: (cb: (t: number) => void) => number =
+  typeof requestAnimationFrame !== "undefined"
+    ? requestAnimationFrame
+    : (cb) => setTimeout(() => cb(performance.now()), 16) as unknown as number;
+const cancelRaf: (id: number) => void =
+  typeof cancelAnimationFrame !== "undefined" ? cancelAnimationFrame : clearTimeout;
+
+function startCrossfadeRamp(outgoingId: string, incomingId: string, target: 0 | 1): void {
+  activeRamp?.cancel();
+
+  const touchAtStart = get(manualTouch);
+  const startValue = get(session).crossfaderValue;
+  const durationMs = get(crossfadeDurationMs);
+  const startTime = performance.now();
+  let rafId = 0;
+  let done = false;
+
+  function cancel() {
+    if (done) return;
+    done = true;
+    cancelRaf(rafId);
+    activeRamp = null;
+  }
+
+  function step() {
+    if (done) return;
+    // Deck removed mid-fade (gap 4) — abandon cleanly, no dangling loop.
+    if (!getDeck(outgoingId) || !getDeck(incomingId)) { cancel(); return; }
+    // DJ grabbed the fader — hand control back immediately, at whatever position it's at.
+    if (get(manualTouch) !== touchAtStart) { cancel(); return; }
+
+    const elapsed = performance.now() - startTime;
+    const t = durationMs <= 0 ? 1 : Math.min(1, elapsed / durationMs);
+    setCrossfader(startValue + (target - startValue) * t);
+
+    if (t >= 1) {
+      // Fully faded out — free the deck for its next load rather than leaving it playing
+      // silently until its own (now-irrelevant) EOS fires.
+      updateDeck(outgoingId, { playing: false });
+      cancel();
+      return;
+    }
+    rafId = raf(step);
+  }
+
+  activeRamp = { cancel };
+  rafId = raf(step);
+}
+
+/**
+ * Call on every position-poll resolution for a playing deck (positionPoll.ts). Cheap no-op
+ * unless Auto DJ is on and this exact deck is the currently-audible half of `crossfaderMapping`
+ * closing in on its end with the other half already loaded and idle.
+ */
+export function checkAutoMixTrigger(deckId: string, contentPos: number): void {
+  if (!get(autoDjEnabled) || activeRamp) return;
+
+  const s = get(session);
+  const { left, right } = s.crossfaderMapping;
+  if (deckId !== left && deckId !== right) return;
+
+  const outgoing = s.decks.find((d) => d.id === deckId);
+  if (!outgoing || !outgoing.playing || outgoing.source?.type !== "video" || !(outgoing.source.duration > 0)) return;
+
+  const incomingId = deckId === left ? right : left;
+  const incoming = s.decks.find((d) => d.id === incomingId);
+  // Only handles the "one deck live, the other idle" case — a manual overlap already in
+  // progress (both playing) is left alone. Phase 1 also has no auto-preload: an incoming
+  // deck with no loaded/measured track is left for the DJ (or the EOS fallback) to handle.
+  if (!incoming || incoming.playing || incoming.source?.type !== "video" || !(incoming.source.duration > 0)) return;
+
+  const remaining = outgoing.source.duration - contentPos;
+  if (remaining > get(autoMixThresholdSec) || remaining <= 0) return;
+  if (wasAutoMixTriggered(deckId, outgoing.source.filePath)) return;
+
+  handledOutgoing.set(deckId, outgoing.source.filePath);
+  updateDeck(incomingId, { playing: true });
+  startCrossfadeRamp(deckId, incomingId, deckId === left ? 1 : 0);
+}

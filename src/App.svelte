@@ -46,6 +46,7 @@
   import { getDiggerFileUrl } from "./lib/digger/api";
   import { showDiggerQueue } from "./lib/digger/queueStore";
   import { currentDj, setCurrentDj, getDjHistory } from "./lib/digger/djSelector";
+  import { handleDeckEos } from "./lib/digger/autoDj";
 
   function openOutputWindow() {
     invoke('open_output_window').catch(console.error);
@@ -286,8 +287,12 @@
     rafId = requestAnimationFrame(frame);
 
     // When a deck reaches EOS, mark it stopped so syncVideoElements doesn't auto-restart it.
+    // handleDeckEos is a no-op unless Auto DJ is on (see autoDj.ts); updateDeck above runs
+    // first so it sees deck.playing already false and never pops the "deck is playing,
+    // load anyway?" confirmation for what is, from the user's perspective, an empty deck.
     eosUnlisten = await listen<string>('deck-eos', (event) => {
       updateDeck(event.payload, { playing: false });
+      handleDeckEos(event.payload).catch((e) => console.error('[auto-dj]', e));
     });
 
     // Surfaces a network/local output that failed to attach (e.g. an unreachable Snapcast

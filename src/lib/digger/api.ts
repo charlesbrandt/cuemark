@@ -127,13 +127,6 @@ export async function search(q: string, hasFile = true, limit = 50): Promise<Dig
   return r.json();
 }
 
-export async function randomTrack(hasFile = true): Promise<DiggerTrack> {
-  const params = new URLSearchParams({ has_file: String(hasFile) });
-  const r = await fetch(`${_baseUrl}/random?${params}`);
-  if (!r.ok) throw new Error(`random ${r.status}`);
-  return r.json();
-}
-
 // `owner` throughout this section is Digger's queue-scoping param (see
 // docs/design/guest-djs.md "Changes, by side → Cuemark" item 3, in the digger
 // repo) — null/omitted means the owner's (Charles's) queue, matching

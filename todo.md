@@ -31,11 +31,53 @@ a starting point for whoever picks it up, not a committed design. Digger-side re
 same review live in `~/repos/digger/todo.md` instead — different repo, different (chronological)
 todo format.
 
-1. **[MEDIUM] Auto DJ toggle.** Replace the "Rnd"/"Next" buttons (reportedly unused in
-   practice) with a single "Auto" toggle. This is really the existing unbuilt "Auto-advance
-   option" from the play-queue section below (auto-load `GET /queue/next` when a deck's clip
-   ends) exposed as a toggle instead of two buttons nobody uses. Scope: UI swap plus wiring
-   actual auto-advance logic — medium.
+1. ~~**[MEDIUM] Auto DJ toggle.**~~ **DONE 2026-08-23.** `Rnd`/`Nxt` buttons in
+   `DiggerQueue.svelte` replaced with a single persisted `Auto` toggle
+   (`src/lib/digger/autoDj.ts`, `cuemark:autoDj`). On `deck-eos`, if enabled: loads and
+   consumes the front of the current DJ's queue if non-empty, else falls back to
+   `GET /queue/next` so it never just stops — see the digger-integration skill's new
+   "Auto DJ" section for the source-order reasoning and the "fetch fresh, don't read the
+   `diggerQueue` store" gotcha (the store only stays live while the queue panel is
+   mounted). `npm run check`/`npm test` clean (105/105, incl. new `autoDj.test.ts`
+   covering the branching), and the button swap/toggle/persistence live-verified headless
+   on `mele` (`skills/verify-ui`). **Not yet verified**: the actual auto-advance firing
+   during a real track ending in a live set (needs a running Digger backend + waiting out
+   a real EOS) — the unit tests mock `loadQueueItemToDeck`/the Digger API calls, they
+   don't exercise a real `deck-eos` event end to end.
+
+   **Follow-up — phase 1 DONE 2026-08-24.** `src/lib/digger/autoMix.ts` adds the real
+   near-end crossfade: while `Auto` is on, whichever `crossfaderMapping`-named deck is
+   playing and closes within `autoMixThresholdSec` (Settings → Audio → Auto Mix, default
+   15s) of its end starts the other mapped deck playing and ramps `setCrossfader()` toward
+   it over `crossfadeDurationMs` (default 6s), pausing the outgoing deck once the fade
+   completes. Requires the incoming deck to already be loaded (with a known duration) —
+   phase 1 deliberately has no auto-preload (that's phase 2) — and yields immediately, mid-
+   fade, to any manual crossfader touch (on-screen or MIDI), same "manual wins" convention
+   as `syncLocked`. The EOS fallback above (`handleDeckEos`) now no-ops for a track this
+   path already handled (`wasAutoMixTriggered`), so a track that finishes mid- or post-fade
+   doesn't also get cold-reloaded. `npm run check`/`npm test` clean (117/117, incl. new
+   `autoMix.test.ts` — 12 tests covering the gating logic, ramp progression in both
+   crossfader directions, manual-touch interruption, and mid-fade deck removal).
+   **Live-verified headless** the same day (real GStreamer pipeline, tauri-driver + Xvfb,
+   isolated build): incoming deck auto-started, crossfader ramped continuously to 1 over
+   the configured duration, outgoing deck paused at the exact instant the ramp completed —
+   see the design doc's Status line for the full numbers and one bounded edge case found
+   (a reciprocal bounce-back when the test threshold was set larger than the clip's
+   duration; capped at one extra bounce by the per-file trigger latch, unreachable at
+   normal threshold/track-length ratios). Phases 2-4 (auto-preload, tempo/phase sync, a
+   real per-track outro marker) remain per `docs/design/auto-dj-transitions.md`.
+
+**"Transition points for auto-DJ training" — deliberately not built here.** Digger's own
+`mix_transitions` table already reserves `source='play_history'` for transitions *mined from* the
+plays log server-side, and its router docstring explicitly scopes that mining job as "out of scope
+for this router" (i.e., separate future work, not something a client asserts live). So the
+scoped-here piece is exactly the substrate that job will need — accurate `plays` rows with real
+start times and durations — not the mining itself. Follow-up, when wanted: a Digger-side batch job
+over `plays` (context='cuemark', ordered by started_at) that inserts `mix_transitions` rows for
+consecutive tracks. Not blocked on the Auto DJ toggle above, contrary to what this list previously
+assumed — real transitions get logged whenever tracks are actually played back-to-back, autoloaded
+or not.
+
 
 2. **[EXPLORE] Other streaming destinations from within the app (OBS, direct RTMP, …).** The
    Snapcast target (docs/design/network-audio-output.md) is one destination; a gig stream
@@ -57,16 +99,8 @@ todo format.
    questions. Start with audio-only SRT as a proof, decide video after measuring.
 
 
-**"Transition points for auto-DJ training" — deliberately not built here.** Digger's own
-`mix_transitions` table already reserves `source='play_history'` for transitions *mined from* the
-plays log server-side, and its router docstring explicitly scopes that mining job as "out of scope
-for this router" (i.e., separate future work, not something a client asserts live). So the
-scoped-here piece is exactly the substrate that job will need — accurate `plays` rows with real
-start times and durations — not the mining itself. Follow-up, when wanted: a Digger-side batch job
-over `plays` (context='cuemark', ordered by started_at) that inserts `mix_transitions` rows for
-consecutive tracks. Not blocked on the Auto DJ toggle above, contrary to what this list previously
-assumed — real transitions get logged whenever tracks are actually played back-to-back, autoloaded
-or not.
+
+
 
 ## Beat grid + snap-to-beat + phase nudge — DONE (2026-07-05 through 2026-08-12)
 

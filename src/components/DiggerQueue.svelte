@@ -3,13 +3,14 @@
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { session } from '../lib/state/session';
   import {
-    search, randomTrack, getQueue, addToQueue, removeFromQueue, queueNext,
+    search, getQueue, addToQueue, removeFromQueue,
     setDiggerBaseUrl, getDiggerBaseUrl, getDiggerBaseUrlHistory, getDiggerWebUrl,
     subscribeQueueChanges,
     type DiggerTrack, type DiggerQueueItem,
   } from '../lib/digger/api';
   import { diggerQueue, selectedQueueIndex, loadQueueItemToDeck } from '../lib/digger/queueStore';
   import { currentDj, currentDjOrNull } from '../lib/digger/djSelector';
+  import { autoDjEnabled } from '../lib/digger/autoDj';
   import HistoryPanel from './HistoryPanel.svelte';
 
   let activeTab = $state<'tracks' | 'history'>('tracks');
@@ -102,27 +103,6 @@
       searchResults = [];
     } finally {
       loading = false;
-    }
-  }
-
-  async function addRandom() {
-    try {
-      const track = await randomTrack(true);
-      await addToQueue(track.id, currentDjOrNull($currentDj));
-      await refreshQueue();
-    } catch (e) {
-      error = String(e);
-    }
-  }
-
-  async function addSuggested() {
-    try {
-      const owner = currentDjOrNull($currentDj);
-      const track = await queueNext(owner);
-      await addToQueue(track.id, owner);
-      await refreshQueue();
-    } catch (e) {
-      error = String(e);
     }
   }
 
@@ -248,8 +228,12 @@
         oninput={onSearchInput}
         onkeydown={(e) => { if (e.key === 'Enter') runSearch(); }}
       />
-      <button class="small-btn" onclick={addRandom} title="Add random track">Rnd</button>
-      <button class="small-btn" onclick={addSuggested} title="Add suggested track">Nxt</button>
+      <button
+        class="small-btn"
+        class:active={$autoDjEnabled}
+        onclick={() => autoDjEnabled.set(!$autoDjEnabled)}
+        title="Auto DJ — when a deck's clip ends, auto-load the next queued track (or a suggestion if the queue is empty) and play it"
+      >Auto</button>
     </div>
 
     {#if searchQuery.length >= 2}
@@ -401,6 +385,12 @@
     border-radius: var(--radius-sm);
   }
   .small-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  .small-btn.active {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
 
   .preset-btn.active {
     background: #3a5a3a;

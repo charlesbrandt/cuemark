@@ -9,6 +9,7 @@ import { noteScrubInput } from "../audio/scrubStats";
 import { debugLog } from "../debugLog";
 import { pushMarker } from "../digger/api";
 import { moveQueueSelection, loadSelectedQueueItem, showDiggerQueue } from "../digger/queueStore";
+import { notifyManualCrossfaderTouch } from "../digger/autoMix";
 import { get } from "svelte/store";
 
 // Beat Loop pad ladder — index 0-7 (plain pad 1-4, then shift+pad 1-4). Longer lengths
@@ -44,6 +45,7 @@ let _pendingCrossfader: number | undefined;
 let _crossfaderFlushPending = false;
 
 function queueCrossfader(value: number) {
+  notifyManualCrossfaderTouch();
   _pendingCrossfader = value;
   if (!_crossfaderFlushPending) {
     _crossfaderFlushPending = true;

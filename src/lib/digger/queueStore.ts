@@ -31,8 +31,16 @@ export function moveQueueSelection(delta: number) {
  * `loadToDeck()`, extracted so the panel's click-to-load buttons and the
  * MIDI-driven LOAD buttons share one implementation instead of drifting.
  * Throws on failure; callers decide how to surface that.
+ *
+ * Takes only the three fields it actually reads, not the full `DiggerQueueItem`
+ * shape (which carries queue-entry-only fields like `id`/`position` that don't
+ * exist for a track pulled straight from `GET /queue/next` or `/random` rather
+ * than off the queue) — see autoDj.ts's fallback-to-suggestion path.
  */
-export async function loadQueueItemToDeck(item: DiggerQueueItem, deckId: string): Promise<void> {
+export async function loadQueueItemToDeck(
+  item: Pick<DiggerQueueItem, 'track_id' | 'title' | 'artist'>,
+  deckId: string,
+): Promise<void> {
   const deck = get(session).decks.find((d) => d.id === deckId);
   if (deck?.playing && deck?.source) {
     const label = deck.source.type === 'video'

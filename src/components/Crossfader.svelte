@@ -6,6 +6,7 @@
     setCrossfaderAudioCurve,
     setCrossfaderVisualCurve,
   } from "../lib/state/session";
+  import { notifyManualCrossfaderTouch } from "../lib/digger/autoMix";
   import type { Deck, CrossfaderTarget, CrossfaderCurve } from "../lib/state/types";
 
   let {
@@ -50,7 +51,7 @@
     max="1"
     step="0.001"
     value={crossfaderValue}
-    oninput={(e) => setCrossfader(+e.currentTarget.value)}
+    oninput={(e) => { notifyManualCrossfaderTouch(); setCrossfader(+e.currentTarget.value); }}
   />
   <select
     class="cf-select"

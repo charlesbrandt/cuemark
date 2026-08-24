@@ -14,7 +14,7 @@ FastAPI REST at `http://localhost:8200` by default:
 
 | Endpoint | Used for |
 |---|---|
-| `GET /queue/next` | Weighted-random track suggestion to push to the cuemark queue |
+| `GET /queue/next` | Weighted-random track suggestion; Auto DJ's fallback source when the queue is empty (see "Auto DJ" below) |
 | `GET /search?q=` | Quick track search from the cuemark toolbar |
 | `GET /tracks/{id}/cuemark` | Deck-ready payload: `filePath`, `cuePoint`, `hotCues[]`, `gain` |
 | `GET /tracks/{id}/waveform` | Cached decode (peaks 30/s + envelope 210/s, binary) — see "Beat-grid precision" below |
@@ -157,6 +157,47 @@ data just because production does. Verify a schema/algorithm change locally
 (pytest, `analyze_audio.py --track-id <id> --force`, curl), then still treat it as
 undeployed until pushed and rolled out to .99 per that skill's sequence — local
 `docker compose exec api python migrate.py` only ever touches the local copy.
+
+## Auto DJ (added 2026-08-23)
+
+`src/lib/digger/autoDj.ts` — a single toggle (the `Auto` button in `DiggerQueue.svelte`'s
+search row, replacing the old unused `Rnd`/`Nxt` add-to-queue buttons) that auto-loads and
+plays the next track whenever a deck reaches EOS (`deck-eos`, wired in `App.svelte`).
+Persisted as `cuemark:autoDj` in localStorage.
+
+Source order: **(1)** the front of the current DJ's queue (`GET /queue`, consumed via
+`DELETE /queue/{id}`) — a human-curated queue should get played through before Auto DJ
+starts improvising; **(2)** `GET /queue/next` (weighted-random) as a backstop once the
+queue is empty, so Auto DJ never just stops.
+
+⚠️ **`handleDeckEos()` fetches the queue directly rather than reading the `diggerQueue`
+store** — that store is only kept live while `DiggerQueue.svelte` is mounted
+(`{#if $showDiggerQueue}` in `App.svelte`), and a DJ closing the sidebar mid-set to
+reclaim screen space is normal. Reading the store instead would make Auto DJ silently
+stop consuming the queue the moment the panel is hidden. If you ever refactor this to
+read the store for efficiency, keep it working with the panel closed.
+
+Not built: transition-mining for auto-DJ training (deliberately out of scope — see
+"Session/play history reporting" above, `mix_transitions.source='play_history'` is a
+server-side Digger job over the `plays` log, not something this toggle should compute).
+
+**Phase 1 of the real auto-mixing version is built + live-verified** (2026-08-24,
+`src/lib/digger/autoMix.ts`, gated on the same `Auto` toggle): while a
+`crossfaderMapping`-named deck plays, once it's within `autoMixThresholdSec` (Settings →
+Audio → Auto Mix, default 15s) of its end **and** the other mapped deck is already loaded
+with a known duration, it starts that deck playing and ramps `setCrossfader()` toward it
+over `crossfadeDurationMs` (default 6s), then pauses the outgoing deck. No auto-preload yet
+— the incoming deck has to already be loaded (DJ queued/loaded it manually) — and no
+tempo/phase sync. A manual crossfader touch (on-screen or MIDI) aborts the ramp immediately,
+handing control back at wherever it stopped; a `wasAutoMixTriggered()` per-file flag stops
+`handleDeckEos()` above from also cold-reloading a deck this path already handled — bounds
+even the degenerate case of a threshold larger than the track (both decks looking
+"near-end" at once) to one extra reciprocal bounce, not a sustained oscillation; unreachable
+at normal threshold/track-length ratios. Live-verified headless via `tauri-driver` against a
+real GStreamer pipeline: incoming deck auto-starts within ~0.3s, crossfader ramps
+continuously over the configured duration, outgoing deck pauses at the exact instant the
+ramp completes. Full design + remaining phases (auto-preload, tempo sync, a real per-track
+outro marker): `docs/design/auto-dj-transitions.md`.
 
 ## Queue panel live updates
 
