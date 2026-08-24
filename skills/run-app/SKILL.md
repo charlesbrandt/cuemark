@@ -15,6 +15,29 @@ description: Launch the cuemark Tauri dev app and monitor its output. Use when a
 - **No screenshot tool available** on the machines checked so far (grim, scrot, gnome-screenshot, spectacle all absent — see `docs/environment.md` for which machines that covers). Verify the app is running by checking for `WebKitWebProcess` in `ps aux` and confirming log lines (see "Confirm it's up" below). The app window will appear on the user's desktop.
 - **`pactl` is not installed** on the machines checked so far — for any live PipeWire/audio-routing inspection (sink volumes, mute state, which client streams are actually active) use `wpctl status` or `pw-dump` instead. See "HMR cascade → orphaned PipeWire streams" below for a concrete use case.
 
+## Check for an already-running instance first
+
+**Before launching, check whether a `cargo tauri dev` session is already up** —
+launching a second one collides on the MIDI port (real controllers only accept one
+client) and the audio device. Cheap check:
+
+```bash
+pgrep -af "target/debug/cuemark" && aconnect -l | grep -A1 cuemark
+```
+
+If one's already running, **don't launch a second one** — attach to its existing
+log instead (`/tmp/cuemark-dev.log`, or find the log path from its cmdline/cwd if
+it wasn't started by this convention) and remember that any frontend edit you make
+will HMR straight into that live session, real hardware and all. Confirmed useful
+2026-08-23: a live session turned out to already be running with a real Hercules
+DJControl Starlight attached and receiving LED updates — editing App.svelte during
+a guest-DJ feature build landed changes in that same real-hardware session via HMR
+without a restart, which is exactly the kind of live verification "test with real
+hardware" is asking for, and launching a second `cargo tauri dev` would have broken
+it. If it's plausibly the *user's* active session (not a leftover debug instance),
+don't touch its lifecycle (kill/restart) without asking first, either — you may not
+know what state they have it in.
+
 ## Prerequisites check
 
 Before launching, verify cargo is on PATH:

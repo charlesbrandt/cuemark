@@ -233,6 +233,20 @@ body {
   width: 90px;
 }
 .dj-input:focus { outline: none; border-color: var(--accent); }
+.dj-clear {
+  background: none;
+  border: 1px solid var(--divider);
+  color: color-mix(in srgb, var(--text) 60%, transparent);
+  cursor: pointer;
+  font-family: var(--font-body);
+  font-size: calc(10px * var(--font-scale));
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: normal;
+  padding: 4px 7px;
+  border-radius: var(--radius-sm);
+}
+.dj-clear:hover { color: var(--text); border-color: var(--accent); }
 
 
 /* ── Deck grid (decks — indigo accent) ─────────────────── */
