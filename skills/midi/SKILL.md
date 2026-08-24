@@ -210,17 +210,49 @@ up via `Profile::led_control(slot, action)`. **Never set `led = true` on a row t
 actually been sent and watched light up** — a button accepting input on a byte pair says
 nothing about whether the same bytes accept output; see `Control::led`'s doc comment.
 First control done this way: the FLX4's headphone-Cue toggle
-(`midi_set_headphone_cue_led` Tauri command, `src/lib/midi/ledSync.ts` mirroring
-`deck.cueEnabled`) — confirmed live on both decks, **no SysEx handshake needed**, unlike
-the hot-cue pads below. That is a genuine per-control-group difference, not a discrepancy
-to resolve — the design doc's §11 already predicted this ("assume capture-before-designing
-applies per-control-group rather than generalizing from pads") and it held.
+(`src/lib/midi/ledSync.ts` mirroring `deck.cueEnabled`) — confirmed live on both decks,
+**no SysEx handshake needed**, unlike the hot-cue pads below. That is a genuine
+per-control-group difference, not a discrepancy to resolve — the design doc's §11 already
+predicted this ("assume capture-before-designing applies per-control-group rather than
+generalizing from pads") and it held.
+
+**Generalized to any action, same session.** The Rust side (`send_led`,
+`Profile::led_control`) always took a generic `ActionId`, so the only FLX4-specific part
+was the Tauri command — `midi_set_headphone_cue_led(profile_id, slot, on)` is now
+`midi_set_led(profile_id, slot, action, on)`, `action` deserializing from the same
+snake_case strings the TOML `action = "..."` rows use. `ledSync.ts`'s `syncLed()` is the
+one JS→Rust call site; `syncHeadphoneCueLed`/`syncPlayLed`/`syncSyncLed` are thin named
+wrappers over it. **Adding a new LED-mirrored control is now a bench-verify + one `led =
+true` TOML row + one wrapper function — no new Rust needed**, unless the control turns
+out to need a handshake like the pads do.
+
+**Cross-controller confirmation (2026-08-23): the Starlight's headphone-Cue, Play, and
+Sync buttons all use the identical plain Note On/Off echo, no handshake** — same bytes
+as each button's own input, tested with the dev server stopped (see below) before any
+app code was written, live-confirmed by the operator for all three actions on both
+decks. This is a second controller and a third/fourth action confirming the same
+protocol the FLX4 established for one action — reassuring, but per the rule above it's
+still a per-control-group finding, not license to assume the *next* control (e.g. loop
+toggle, or the Starlight's loop-preset pads) works the same way without its own test.
 
 **Testing LED output before wiring app code — send raw bytes directly**
-to the ALSA raw device with `amidi -p hw:X,0,0 -S "<status> <note-hex> <velocity-hex>"`. This
-works *while cuemark holds the input connection* — confirmed live, exit 0, no conflict — because
-cuemark connects via the sequencer (multi-subscriber) rather than opening the raw device
-exclusively. Sweep across notes/channels and ask the operator what lit, from a **known blank
+to the ALSA raw device with `amidi -p hw:X,0,0 -S "<status> <note-hex> <velocity-hex>"`.
+🔴 **This stopped working once cuemark's own MIDI output plumbing landed (2026-08-23).**
+The original claim below ("works while cuemark holds the input connection") was true
+only when cuemark had no output connection of its own — confirmed true on the FLX4
+2026-08-22, confirmed **false** on the Starlight 2026-08-23 the moment the generic
+`connect_output()` in `mod.rs` started opening the raw device for every matched
+controller, not just as FLX4-specific code. `amidi -S` now fails with "Device or
+resource busy" for any controller cuemark is currently connected to, because *two*
+processes are trying to hold the same raw output device. **Stop the dev server first**
+(`kill` the `cargo-tauri`/`target/debug/cuemark` pids — see the run-app skill), test with
+`amidi -S` as before, then restart. The historical text below (multi-subscriber
+sequencer, `-d` blocked but `-S` fine) is still correct for *input-only* testing on a
+build that predates this controller's output plumbing — it is simply no longer true for
+a controller cuemark currently has an open output connection to, which by 2026-08-23 is
+every profiled controller, always, whenever the app is running.
+
+Sweep across notes/channels and ask the operator what lit, from a **known blank
 state** (send velocity `00` to every candidate first and confirm dark) — an already-lit pad
 shows no visible change when re-sent, which reads as a false negative for the wrong channel.
 🛑 **Sending raw bytes at a pad LED can knock the controller into a stuck standalone

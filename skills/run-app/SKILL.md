@@ -38,6 +38,17 @@ it. If it's plausibly the *user's* active session (not a leftover debug instance
 don't touch its lifecycle (kill/restart) without asking first, either — you may not
 know what state they have it in.
 
+⚠️ **A Rust-side change forces a real stop+restart, which breaks that sharing.** The
+guest-DJ session above rode a running instance purely via frontend HMR, no restart
+needed. A same-day LED-generalization session (Starlight play/sync LEDs) needed a
+**Rust** change plus a raw-`amidi` bench test that requires the raw MIDI device free
+(see the midi skill's "Testing LED output" section) — both mean actually killing and
+relaunching the process, not just editing a `.svelte` file. Before doing that to a
+session you didn't start, run `ListAgents` to check whether another peer session is
+plausibly using it live right now, and prefer asking over guessing — killing it mid
+test-cycle for another session (even briefly) drops its MIDI/output connections and
+forces *that* session to notice and recover, which it may not be watching for.
+
 ## Prerequisites check
 
 Before launching, verify cargo is on PATH:
