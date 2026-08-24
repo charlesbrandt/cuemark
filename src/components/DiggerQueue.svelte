@@ -11,6 +11,7 @@
   import { diggerQueue, selectedQueueIndex, loadQueueItemToDeck } from '../lib/digger/queueStore';
   import { currentDj, currentDjOrNull } from '../lib/digger/djSelector';
   import { autoDjEnabled } from '../lib/digger/autoDj';
+  import { playedTrackIds, clearPlayed, clearAllPlayed } from '../lib/digger/playedTracks';
   import HistoryPanel from './HistoryPanel.svelte';
 
   let activeTab = $state<'tracks' | 'history'>('tracks');
@@ -212,6 +213,14 @@
         {/each}
       </div>
     {/if}
+    <div class="played-row">
+      <button
+        class="small-btn"
+        disabled={$playedTrackIds.size === 0}
+        onclick={() => clearAllPlayed()}
+        title="Clear the played marker from every track tracked this session"
+      >Clear played ({$playedTrackIds.size})</button>
+    </div>
   {/if}
 
   {#if error}
@@ -245,6 +254,13 @@
         {:else}
           {#each searchResults as track (track.id)}
             <div class="result-row">
+              <button
+                class="played-mark"
+                class:played={$playedTrackIds.has(track.id)}
+                disabled={!$playedTrackIds.has(track.id)}
+                onclick={(e) => { e.stopPropagation(); clearPlayed(track.id); }}
+                title={$playedTrackIds.has(track.id) ? 'Played this session — click to clear' : 'Not played this session'}
+              >✓</button>
               <span class="track-label">{trackLabel(track)}</span>
               <button class="add-btn" onclick={() => addSearchResult(track)}>+</button>
             </div>
@@ -262,6 +278,13 @@
               class:selected={i === $selectedQueueIndex}
               use:scrollSelectedIntoView={i === $selectedQueueIndex}
             >
+              <button
+                class="played-mark"
+                class:played={$playedTrackIds.has(item.track_id)}
+                disabled={!$playedTrackIds.has(item.track_id)}
+                onclick={(e) => { e.stopPropagation(); clearPlayed(item.track_id); }}
+                title={$playedTrackIds.has(item.track_id) ? 'Played this session — click to clear' : 'Not played this session'}
+              >✓</button>
               <span class="track-label">{trackLabel(item)}</span>
               {#if item.bpm != null}<span class="bpm-badge">{Math.round(item.bpm)}</span>{/if}
               <div class="queue-actions">
@@ -412,6 +435,29 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .played-row {
+    margin-bottom: 8px;
+    flex-shrink: 0;
+  }
+
+  .played-mark {
+    flex-shrink: 0;
+    width: 16px;
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: calc(11px * var(--font-scale));
+    color: transparent;
+    cursor: default;
+  }
+  .played-mark.played {
+    color: var(--accent);
+    cursor: pointer;
+  }
+  .played-mark.played:hover {
+    color: #ff6b6b;
   }
 
   .results-list,
