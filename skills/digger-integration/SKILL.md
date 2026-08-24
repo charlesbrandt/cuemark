@@ -165,17 +165,25 @@ search row, replacing the old unused `Rnd`/`Nxt` add-to-queue buttons) that auto
 plays the next track whenever a deck reaches EOS (`deck-eos`, wired in `App.svelte`).
 Persisted as `cuemark:autoDj` in localStorage.
 
-Source order: **(1)** the front of the current DJ's queue (`GET /queue`, consumed via
-`DELETE /queue/{id}`) — a human-curated queue should get played through before Auto DJ
-starts improvising; **(2)** `GET /queue/next` (weighted-random) as a backstop once the
-queue is empty, so Auto DJ never just stops.
+Source order (`pickNextTrack()` in `autoDj.ts`), **changed 2026-08-24 — no longer deletes
+queue entries**: **(1)** if the deck being replaced has a `diggerTrackId` that's itself a
+queue entry, the next *unplayed* entry after its position in `GET /queue` (queue order is
+the human-curated one, so Auto DJ should walk through it in order rather than restart from
+the front every time); **(2)** no anchor (first track of the set, or a manually/search-
+loaded track that was never queued) — the first unplayed entry, queue order; **(3)**
+`GET /queue/next` (weighted-random) once nothing unplayed remains, so Auto DJ never just
+stops. "Unplayed" is `playedTracks.ts`'s session-local tracking (`isPlayed()` — a track is
+audible on the main output, not just cued, for 15s+ accumulated; see that file). Entries
+stay in the queue permanently now — a DJ wants it to read as a set list matching Digger's
+own web UI, not shrink as a work stack; the queue panel's played checkmark (same
+`playedTracks.ts`) is what shows progress instead.
 
-⚠️ **`handleDeckEos()` fetches the queue directly rather than reading the `diggerQueue`
-store** — that store is only kept live while `DiggerQueue.svelte` is mounted
-(`{#if $showDiggerQueue}` in `App.svelte`), and a DJ closing the sidebar mid-set to
-reclaim screen space is normal. Reading the store instead would make Auto DJ silently
-stop consuming the queue the moment the panel is hidden. If you ever refactor this to
-read the store for efficiency, keep it working with the panel closed.
+⚠️ **`handleDeckEos()`/`checkAutoPreloadTrigger()` fetch the queue directly rather than
+reading the `diggerQueue` store** — that store is only kept live while `DiggerQueue.svelte`
+is mounted (`{#if $showDiggerQueue}` in `App.svelte`), and a DJ closing the sidebar mid-set
+to reclaim screen space is normal. Reading the store instead would make Auto DJ silently
+stop advancing the moment the panel is hidden. If you ever refactor this to read the store
+for efficiency, keep it working with the panel closed.
 
 Not built: transition-mining for auto-DJ training (deliberately out of scope — see
 "Session/play history reporting" above, `mix_transitions.source='play_history'` is a
@@ -200,16 +208,58 @@ over the configured duration, outgoing deck pauses at the exact instant the ramp
 same file): `checkAutoPreloadTrigger()`, wired from `positionPoll.ts` right alongside the
 phase-1 trigger, fires at an earlier `autoPreloadThresholdSec` (Settings → Audio → Auto
 Preload, default 45s) and auto-loads (never plays) the next track onto the mapped deck
-that's genuinely empty (`source === null`) — reusing the same queue-first/`queueNext()`-
-fallback sourcing as `handleDeckEos`, now extracted into `autoDj.ts`'s
-`pickAndConsumeNext()` so the two call sites can't drift. Never overwrites a deck the DJ
+that's genuinely empty (`source === null`) — reusing the same `pickNextTrack()` sourcing
+as `handleDeckEos` (see "Auto DJ" above), anchored on the *outgoing* deck's current track so
+a multi-lap set keeps advancing through the queue in order. Never overwrites a deck the DJ
 (or an earlier preload) already put a track on, and re-checks after the fetch resolves in
 case the DJ loaded something manually while it was in flight. Only `autoMix.test.ts`'s
 mocked-API unit tests have exercised this path — it has not been run against a real
 Digger backend or a real deck.
 
+⚠️ **The crossfade ramp's completion branch must clear the outgoing deck's `source`, not
+just `playing`** (fixed 2026-08-24, `autoMix.ts`'s `startCrossfadeRamp`) — leaving a
+just-finished track's `source` in place made it look permanently "already loaded" to both
+this trigger and the mix trigger, so a deck that had just faded out never got a new track
+on the next cycle. `source: null` also drives `App.svelte`'s `syncVideoElements()` to tear
+the backend/audio pipeline down, same as a deck being removed.
+
 Full design + remaining phases (tempo sync, a real per-track outro marker):
 `docs/design/auto-dj-transitions.md`.
+
+## Queue played-tracking (added 2026-08-24)
+
+`src/lib/digger/playedTracks.ts` — a session-local ✓ shown left of the track label in
+`DiggerQueue.svelte`'s queue rows and search-result rows, marking a `track_id` "played"
+once a deck has been both `playing` **and** audible on the main output
+(`deck.volume > 0.05`, accumulated 15s+) — not just loaded. Clicking a lit checkmark
+clears that one track (`clearPlayed`); a "Clear played (N)" button in the panel's own
+gear/settings dropdown clears the whole set (`clearAllPlayed`). Persisted to
+`localStorage['cuemark:playedTrackIds']`.
+
+**Deliberately separate from `history.ts`'s `plays` API reporting above, not a
+repurposing of it.** `history.ts` marks a track "started" the instant it's *loaded*
+onto a deck, which already fires for a track cued in headphones and never faded in —
+correct for its own purpose (Digger's `plays` log wants every attempt, "record raw,
+interpret at read" per `play-tracking.md`), wrong for a live-set "have I already
+played this tonight" glance. **Gating on `deck.volume`** (the one field both the
+crossfader `setCrossfader()` and the per-deck fader in `DeckCard.svelte` write to) is
+the best available proxy for "actually in the main mix" — there's no lower-level
+GStreamer output-tee instrumentation to observe this more precisely. If a future
+feature needs the same "really audible" signal, reuse this heuristic rather than
+re-deriving it or reaching for the Rust side.
+
+⚠️ **Testing a `session.subscribe()`-driven module like this (or `history.ts`) under
+`vi.useFakeTimers()`**: a module-level `setInterval(...)` fallback (both files have
+one, for a deck left sitting past a threshold with no other store change to re-trigger
+the subscriber) registers against **real** timers the moment the module is first
+imported — which happens before any test's `beforeEach` calls `vi.useFakeTimers()`.
+Advancing the fake clock afterward does not fire it. Don't chase this by trying to
+install fake timers earlier (ESM import evaluation order makes that unreachable from
+a static import); instead drive the subscriber directly with a harmless no-op
+`updateDeck(deckId, {})` after advancing time — the subscriber recomputes on *every*
+store tick regardless of whether anything actually changed, so this reliably
+re-triggers the threshold check without depending on the interval at all. See
+`playedTracks.test.ts`'s `tick()` helper for the pattern.
 
 ## Queue panel live updates
 
