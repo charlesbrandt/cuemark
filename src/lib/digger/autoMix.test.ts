@@ -6,9 +6,19 @@
  * `loadSweep()` pattern, needed here because the ramp driver self-schedules its own frames
  * rather than being stepped by an external caller like perfArm's `advanceSweep` is.
  */
-import { describe, expect, it, vi, afterEach } from 'vitest';
+import { describe, expect, it, vi, afterEach, beforeEach } from 'vitest';
 import { get } from 'svelte/store';
 import type { Session, Deck } from '../state/types';
+
+// checkAutoPreloadTrigger's network/side-effect calls, isolated the same way
+// autoDj.test.ts isolates handleDeckEos's — see that file's header comment.
+const getQueue = vi.fn();
+const queueNext = vi.fn();
+const removeFromQueue = vi.fn().mockResolvedValue(undefined);
+vi.mock('./api', () => ({ getQueue: (...a: unknown[]) => getQueue(...a), queueNext: (...a: unknown[]) => queueNext(...a), removeFromQueue: (...a: unknown[]) => removeFromQueue(...a) }));
+
+const loadQueueItemToDeck = vi.fn().mockResolvedValue(undefined);
+vi.mock('./queueStore', () => ({ loadQueueItemToDeck: (...a: unknown[]) => loadQueueItemToDeck(...a) }));
 
 function baseDeck(id: string, overrides: Partial<Deck> = {}): Deck {
   return {
@@ -92,6 +102,17 @@ async function setup() {
 
   return { sessionMod, autoDjMod, autoMixMod, resetSession, driveFrame, runToCompletion, now, rafQueue };
 }
+
+// vi.restoreAllMocks() below clears implementations (not just call history) off the plain
+// vi.fn() mocks too, not just the raf/performance.now spies it was written for — re-arm the
+// network mocks' resolved-value defaults before every test rather than relying on the
+// module-level .mockResolvedValue() calls above surviving past the first test.
+beforeEach(() => {
+  getQueue.mockReset();
+  queueNext.mockReset();
+  removeFromQueue.mockReset().mockResolvedValue(undefined);
+  loadQueueItemToDeck.mockReset().mockResolvedValue(undefined);
+});
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -291,5 +312,141 @@ describe('crossfade ramp', () => {
     driveFrame(50);
 
     expect(rafQueue.length).toBe(0); // loop stopped, nothing left dangling
+  });
+});
+
+describe('checkAutoPreloadTrigger', () => {
+  it('does nothing when Auto DJ is off', async () => {
+    const { autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(false);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100) }),
+      baseDeck('deck-1', { source: null }),
+    ]);
+
+    autoMixMod.checkAutoPreloadTrigger('deck-0', 60); // well inside any reasonable threshold
+
+    expect(getQueue).not.toHaveBeenCalled();
+  });
+
+  it('ignores a deck not named in crossfaderMapping', async () => {
+    const { autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100) }),
+      baseDeck('deck-1', { source: null }),
+      baseDeck('deck-2', { playing: true, source: videoSource('c.mp4', 100) }),
+    ]);
+
+    autoMixMod.checkAutoPreloadTrigger('deck-2', 95);
+
+    expect(getQueue).not.toHaveBeenCalled();
+  });
+
+  it('never clobbers a deck that already has a source loaded', async () => {
+    const { autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100) }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 50) }), // DJ (or a prior preload) already loaded this
+    ]);
+
+    autoMixMod.checkAutoPreloadTrigger('deck-0', 90); // 10s remaining
+
+    expect(getQueue).not.toHaveBeenCalled();
+  });
+
+  it('does nothing while remaining time is above the preload threshold', async () => {
+    const { autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoPreloadThresholdSec.set(45);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100) }),
+      baseDeck('deck-1', { source: null }),
+    ]);
+
+    autoMixMod.checkAutoPreloadTrigger('deck-0', 10); // 90s remaining, above the 45s threshold
+
+    expect(getQueue).not.toHaveBeenCalled();
+  });
+
+  it('loads the front of the queue onto the idle deck once inside the threshold', async () => {
+    const { autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoPreloadThresholdSec.set(45);
+    getQueue.mockResolvedValue([{ id: 1, track_id: 7, title: 'T', artist: 'A' }]);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100) }),
+      baseDeck('deck-1', { source: null }),
+    ]);
+
+    autoMixMod.checkAutoPreloadTrigger('deck-0', 60); // 40s remaining, inside the 45s threshold
+
+    await vi.waitFor(() => expect(loadQueueItemToDeck).toHaveBeenCalled());
+    expect(loadQueueItemToDeck).toHaveBeenCalledWith(
+      { id: 1, track_id: 7, title: 'T', artist: 'A' },
+      'deck-1',
+    );
+    expect(removeFromQueue).toHaveBeenCalledWith(1, null);
+    expect(queueNext).not.toHaveBeenCalled();
+  });
+
+  it('falls back to queueNext() when the queue is empty', async () => {
+    const { autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoPreloadThresholdSec.set(45);
+    getQueue.mockResolvedValue([]);
+    queueNext.mockResolvedValue({ id: 9, title: 'Suggested', artist: 'Someone' });
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100) }),
+      baseDeck('deck-1', { source: null }),
+    ]);
+
+    autoMixMod.checkAutoPreloadTrigger('deck-0', 60);
+
+    await vi.waitFor(() => expect(loadQueueItemToDeck).toHaveBeenCalled());
+    expect(loadQueueItemToDeck).toHaveBeenCalledWith(
+      { track_id: 9, title: 'Suggested', artist: 'Someone' },
+      'deck-1',
+    );
+    expect(removeFromQueue).not.toHaveBeenCalled();
+  });
+
+  it('only fetches once while still inside the threshold for the same track', async () => {
+    const { autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoPreloadThresholdSec.set(45);
+    getQueue.mockResolvedValue([{ id: 1, track_id: 7, title: 'T', artist: 'A' }]);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100) }),
+      baseDeck('deck-1', { source: null }),
+    ]);
+
+    autoMixMod.checkAutoPreloadTrigger('deck-0', 60);
+    autoMixMod.checkAutoPreloadTrigger('deck-0', 61);
+    autoMixMod.checkAutoPreloadTrigger('deck-0', 62);
+
+    await vi.waitFor(() => expect(loadQueueItemToDeck).toHaveBeenCalledTimes(1));
+    expect(getQueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not overwrite a deck the DJ loaded manually while the fetch was in flight', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoPreloadThresholdSec.set(45);
+    let resolveGetQueue!: (v: unknown) => void;
+    getQueue.mockImplementation(() => new Promise((res) => { resolveGetQueue = res; }));
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100) }),
+      baseDeck('deck-1', { source: null }),
+    ]);
+
+    autoMixMod.checkAutoPreloadTrigger('deck-0', 60);
+    sessionMod.updateDeck('deck-1', { source: videoSource('manual.mp4', 30) }); // DJ beats the fetch
+    resolveGetQueue([{ id: 1, track_id: 7, title: 'T', artist: 'A' }]);
+
+    await vi.waitFor(() => expect(getQueue).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 0)); // let the .then chain settle
+    expect(loadQueueItemToDeck).not.toHaveBeenCalled();
   });
 });

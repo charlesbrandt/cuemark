@@ -20,7 +20,7 @@
  * is normal, and Auto DJ must keep working with the panel hidden.
  */
 import { writable, get } from "svelte/store";
-import { getQueue, queueNext, removeFromQueue } from "./api";
+import { getQueue, queueNext, removeFromQueue, type DiggerQueueItem } from "./api";
 import { loadQueueItemToDeck } from "./queueStore";
 import { currentDj, currentDjOrNull } from "./djSelector";
 import { updateDeck, getDeck } from "../state/session";
@@ -50,6 +50,29 @@ function persistentWritable<T>(key: string, defaultValue: T) {
 export const autoDjEnabled = persistentWritable<boolean>("cuemark:autoDj", false);
 
 /**
+ * The queue-first/`queueNext()`-fallback sourcing rule described in this module's doc
+ * comment, without touching any deck — shared by `handleDeckEos` (fires at EOS) and
+ * `autoMix.ts`'s auto-preload (fires ahead of EOS, onto whichever deck `crossfaderMapping`
+ * isn't currently favoring). Consumes the queue entry (fire-and-forget `DELETE`) when it
+ * pulled from the queue. Throws on failure (network error, empty queue *and* no suggestion
+ * available) — callers decide how to handle that.
+ */
+export async function pickAndConsumeNext(
+  owner: string | null,
+): Promise<Pick<DiggerQueueItem, "track_id" | "title" | "artist">> {
+  const queued = await getQueue(owner);
+  const next = queued[0];
+  if (next) {
+    // Fire-and-forget: the deck is already loaded and about to play, and Digger
+    // broadcasts queue_changed to reconcile every client's view either way.
+    removeFromQueue(next.id, owner).catch((e) => console.error("[auto-dj] queue/remove failed", e));
+    return next;
+  }
+  const track = await queueNext(owner);
+  return { track_id: track.id, title: track.title, artist: track.artist };
+}
+
+/**
  * Call on every `deck-eos`. No-ops immediately if Auto DJ is off. Best-effort —
  * logs and gives up on failure (e.g. Digger unreachable) rather than throwing,
  * matching the fire-and-forget convention of the other Digger side-effect calls
@@ -65,17 +88,8 @@ export async function handleDeckEos(deckId: string): Promise<void> {
   if (wasAutoMixTriggered(deckId, outgoingSource?.type === "video" ? outgoingSource.filePath : undefined)) return;
   const owner = currentDjOrNull(get(currentDj));
   try {
-    const queued = await getQueue(owner);
-    const next = queued[0];
-    if (next) {
-      await loadQueueItemToDeck(next, deckId);
-      // Fire-and-forget: the deck is already loaded and about to play, and Digger
-      // broadcasts queue_changed to reconcile every client's view either way.
-      removeFromQueue(next.id, owner).catch((e) => console.error("[auto-dj] queue/remove failed", e));
-    } else {
-      const track = await queueNext(owner);
-      await loadQueueItemToDeck({ track_id: track.id, title: track.title, artist: track.artist }, deckId);
-    }
+    const next = await pickAndConsumeNext(owner);
+    await loadQueueItemToDeck(next, deckId);
     updateDeck(deckId, { playing: true });
   } catch (e) {
     console.error("[auto-dj] advance failed", e);

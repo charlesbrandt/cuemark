@@ -1,26 +1,31 @@
 # Auto DJ: automated transitions
 
-Status: 🟢 **Phase 1 DONE + live-verified 2026-08-24** (lookahead + crossfade ramp, fixed
-threshold, no auto-preload — see "Proposed phased plan" below). Written 2026-08-24 as a
-scoping handoff; phase 1 was implemented and verified the same day in
-`src/lib/digger/autoMix.ts`. The `Auto` toggle in `DiggerQueue.svelte` now gates *both*
-this near-end crossfade path and the older cold-reload EOS fallback (`autoDj.ts`, "What
-already exists" below), which stays in place as a safety net for tracks the lookahead
-never caught. `npm run check`/`npm test` clean (117/117, incl. `autoMix.test.ts`'s 12
-tests). **Live-verified headless** (`tauri-driver` + Xvfb, isolated build, real GStreamer
-pipeline, two decks loaded with the same 49s cached test clip): deck-1 started on its own
-0.26s after deck-0 began playing (threshold set above the clip's duration to trigger
-immediately), `crossfaderValue` ramped continuously 0→1 over ~2.2s against a configured
-2000ms duration, and deck-0 was paused at the exact instant the ramp hit 1, staying
-stable for 7.7s of further polling while deck-1 kept advancing normally. One real edge
-case surfaced and is bounded, not a bug: with an unrealistically large threshold relative
-to track length (as used to force a fast test), the *incoming* deck can itself already be
-"near its end" under the same threshold, producing one legitimate reciprocal trigger back
-toward the original deck once its ramp completes — `wasAutoMixTriggered`'s per-file latch
-correctly caps this at one extra bounce, never a sustained oscillation. Normal thresholds
-(15s default vs. multi-minute tracks) can't reach this condition. Phases 2-4
-(auto-preload, tempo/phase sync, a real per-track outro marker) are **not built** — see
-"Proposed phased plan".
+Status: 🟡 **Phase 1 DONE + live-verified 2026-08-24. Phase 2 (auto-preload) built +
+unit-tested 2026-08-24, NOT yet live-verified** — see "Proposed phased plan" below.
+Written 2026-08-24 as a scoping handoff; phase 1 was implemented and verified the same
+day in `src/lib/digger/autoMix.ts`. The `Auto` toggle in `DiggerQueue.svelte` now gates
+*both* this near-end crossfade path and the older cold-reload EOS fallback (`autoDj.ts`,
+"What already exists" below), which stays in place as a safety net for tracks the
+lookahead never caught. `npm run check`/`npm test` clean (125/125, incl.
+`autoMix.test.ts`'s 20 tests — 8 new ones cover phase 2's gating: never clobbering a
+loaded deck, threshold gating, queue-first/`queueNext()`-fallback sourcing, no re-fetch
+while still inside the threshold, and a DJ manually loading the deck while the fetch is
+in flight). **Live-verified headless** (`tauri-driver` + Xvfb, isolated build, real
+GStreamer pipeline, two decks loaded with the same 49s cached test clip) for **phase 1
+only**: deck-1 started on its own 0.26s after deck-0 began playing (threshold set above
+the clip's duration to trigger immediately), `crossfaderValue` ramped continuously 0→1
+over ~2.2s against a configured 2000ms duration, and deck-0 was paused at the exact
+instant the ramp hit 1, staying stable for 7.7s of further polling while deck-1 kept
+advancing normally. One real edge case surfaced and is bounded, not a bug: with an
+unrealistically large threshold relative to track length (as used to force a fast test),
+the *incoming* deck can itself already be "near its end" under the same threshold,
+producing one legitimate reciprocal trigger back toward the original deck once its ramp
+completes — `wasAutoMixTriggered`'s per-file latch correctly caps this at one extra
+bounce, never a sustained oscillation. Normal thresholds (15s default vs. multi-minute
+tracks) can't reach this condition. **Phase 2 has only unit-test coverage (mocked
+Digger API/`loadQueueItemToDeck`) — it has not been driven against a real running
+Digger backend or a real deck in a live/headless session.** Phases 3-4 (tempo/phase
+sync, a real per-track outro marker) are **not built** — see "Proposed phased plan".
 
 ## Problem
 
@@ -130,10 +135,20 @@ still catching the genuine case where lookahead never triggered.
    yet) and the crossfade-ramp driver with interruption handling — assuming the incoming
    deck is already loaded (manually, or by the DJ having queued it). This is the smallest
    slice that's actually a different feature from what exists.
-2. **Auto-preload.** Retarget `autoDj.ts`'s existing sourcing (queue-first, `/queue/next`
-   fallback) to fire at an earlier "start preloading" threshold than the crossfade-start
-   threshold, targeting the deck `crossfaderMapping` isn't currently favoring. Needs the
-   real-readiness fix from gap 3, not a fixed timeout.
+2. 🟡 **BUILT + unit-tested 2026-08-24, not yet live-verified — Auto-preload.**
+   `checkAutoPreloadTrigger()` in `autoMix.ts` (wired from `positionPoll.ts` alongside
+   `checkAutoMixTrigger`) fires at an earlier `autoPreloadThresholdSec` (Settings → Audio
+   → Auto Preload, default 45s vs. Auto Mix's 15s) than the crossfade-start threshold,
+   and only onto the mapped deck that's genuinely empty (`source === null` — never
+   overwrites a DJ's manual load or an earlier preload). Reuses `autoDj.ts`'s existing
+   sourcing, extracted into `pickAndConsumeNext()` so `handleDeckEos` and the preload
+   trigger share one implementation instead of drifting. Readiness signal is
+   `source.duration > 0` — the same one the crossfade trigger already gates the incoming
+   deck on, not a fixed timeout (gap 3) — so no new readiness primitive was needed; a
+   preload threshold set too close to the crossfade threshold for a given track's demux
+   time just means the crossfade trigger waits, same as it always has when nothing is
+   loaded yet. **Not yet exercised against a real running Digger backend or a real deck**
+   — only `autoMix.test.ts`'s mocked-API unit tests have run this path.
 3. **Optional tempo/phase sync**, toggleable, reusing existing `syncLocked`/
    `nudgePhaseToMaster` machinery — gap 5.
 4. **Per-track fade-out/outro marker**, only if the fixed-threshold version proves

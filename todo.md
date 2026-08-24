@@ -67,6 +67,24 @@ todo format.
    normal threshold/track-length ratios). Phases 2-4 (auto-preload, tempo/phase sync, a
    real per-track outro marker) remain per `docs/design/auto-dj-transitions.md`.
 
+   **Follow-up — phase 2 (auto-preload) BUILT + unit-tested 2026-08-24, NOT yet
+   live-verified.** `checkAutoPreloadTrigger()` (`autoMix.ts`, wired from
+   `positionPoll.ts` next to the phase-1 trigger) fires at an earlier
+   `autoPreloadThresholdSec` (Settings → Audio → Auto Preload, default 45s) and
+   auto-loads the next track onto whichever mapped deck is genuinely empty
+   (`source === null` — never overwrites a DJ's manual load), reusing the same
+   queue-first/`queueNext()`-fallback sourcing as `handleDeckEos`, now shared via
+   `autoDj.ts`'s extracted `pickAndConsumeNext()`. Readiness is the same
+   `source.duration > 0` signal the crossfade trigger already used — no new
+   fixed-timeout guess needed (gap 3 closed without inventing a mechanism for it).
+   `npm run check`/`npm test` clean (125/125, incl. 8 new `autoMix.test.ts` cases:
+   never-clobber, threshold gating, queue-first/fallback sourcing, no re-fetch inside
+   the threshold, and a manual-load-race during the in-flight fetch). **Not yet
+   live-verified**: only mocked-API unit tests have exercised this, not a real Digger
+   backend or a real deck — unlike phase 1, this needs an actual `GET /queue`/
+   `/queue/next` round-trip and a real load to trust in practice. Phases 3-4
+   (tempo/phase sync, a real per-track outro marker) remain.
+
 **"Transition points for auto-DJ training" — deliberately not built here.** Digger's own
 `mix_transitions` table already reserves `source='play_history'` for transitions *mined from* the
 plays log server-side, and its router docstring explicitly scopes that mining job as "out of scope

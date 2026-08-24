@@ -186,18 +186,30 @@ server-side Digger job over the `plays` log, not something this toggle should co
 `crossfaderMapping`-named deck plays, once it's within `autoMixThresholdSec` (Settings →
 Audio → Auto Mix, default 15s) of its end **and** the other mapped deck is already loaded
 with a known duration, it starts that deck playing and ramps `setCrossfader()` toward it
-over `crossfadeDurationMs` (default 6s), then pauses the outgoing deck. No auto-preload yet
-— the incoming deck has to already be loaded (DJ queued/loaded it manually) — and no
-tempo/phase sync. A manual crossfader touch (on-screen or MIDI) aborts the ramp immediately,
-handing control back at wherever it stopped; a `wasAutoMixTriggered()` per-file flag stops
-`handleDeckEos()` above from also cold-reloading a deck this path already handled — bounds
-even the degenerate case of a threshold larger than the track (both decks looking
-"near-end" at once) to one extra reciprocal bounce, not a sustained oscillation; unreachable
-at normal threshold/track-length ratios. Live-verified headless via `tauri-driver` against a
-real GStreamer pipeline: incoming deck auto-starts within ~0.3s, crossfader ramps
-continuously over the configured duration, outgoing deck pauses at the exact instant the
-ramp completes. Full design + remaining phases (auto-preload, tempo sync, a real per-track
-outro marker): `docs/design/auto-dj-transitions.md`.
+over `crossfadeDurationMs` (default 6s), then pauses the outgoing deck. No tempo/phase sync.
+A manual crossfader touch (on-screen or MIDI) aborts the ramp immediately, handing control
+back at wherever it stopped; a `wasAutoMixTriggered()` per-file flag stops `handleDeckEos()`
+above from also cold-reloading a deck this path already handled — bounds even the degenerate
+case of a threshold larger than the track (both decks looking "near-end" at once) to one
+extra reciprocal bounce, not a sustained oscillation; unreachable at normal
+threshold/track-length ratios. Live-verified headless via `tauri-driver` against a real
+GStreamer pipeline: incoming deck auto-starts within ~0.3s, crossfader ramps continuously
+over the configured duration, outgoing deck pauses at the exact instant the ramp completes.
+
+**Phase 2 (auto-preload) is built + unit-tested, NOT yet live-verified** (2026-08-24,
+same file): `checkAutoPreloadTrigger()`, wired from `positionPoll.ts` right alongside the
+phase-1 trigger, fires at an earlier `autoPreloadThresholdSec` (Settings → Audio → Auto
+Preload, default 45s) and auto-loads (never plays) the next track onto the mapped deck
+that's genuinely empty (`source === null`) — reusing the same queue-first/`queueNext()`-
+fallback sourcing as `handleDeckEos`, now extracted into `autoDj.ts`'s
+`pickAndConsumeNext()` so the two call sites can't drift. Never overwrites a deck the DJ
+(or an earlier preload) already put a track on, and re-checks after the fetch resolves in
+case the DJ loaded something manually while it was in flight. Only `autoMix.test.ts`'s
+mocked-API unit tests have exercised this path — it has not been run against a real
+Digger backend or a real deck.
+
+Full design + remaining phases (tempo sync, a real per-track outro marker):
+`docs/design/auto-dj-transitions.md`.
 
 ## Queue panel live updates
 

@@ -1,24 +1,33 @@
 /**
- * Auto DJ, phase 1: near-end crossfade automation between the two decks named in
- * `Session.crossfaderMapping` — see docs/design/auto-dj-transitions.md. This is the "real"
- * auto-mix (fade *as a track approaches its end*), distinct from `autoDj.ts`'s `handleDeckEos()`
- * (cold reload *after* a track has already finished), which stays in place as a safety net —
- * see the interaction rule at the bottom of this file.
+ * Auto DJ, phases 1-2: near-end crossfade automation between the two decks named in
+ * `Session.crossfaderMapping`, plus auto-preload of the idle one ahead of time — see
+ * docs/design/auto-dj-transitions.md. This is the "real" auto-mix (fade *as a track
+ * approaches its end*), distinct from `autoDj.ts`'s `handleDeckEos()` (cold reload *after*
+ * a track has already finished), which stays in place as a safety net — see the
+ * interaction rule at the bottom of this file.
  *
- * Phase 1 scope, deliberately not more (see the design doc's phased plan):
- *  - Fixed remaining-time threshold only, no per-track outro marker (gap 1).
+ * Phase 1 (near-end crossfade) + phase 2 (auto-preload) scope, deliberately not more (see
+ * the design doc's phased plan):
+ *  - Fixed remaining-time thresholds only, no per-track outro marker (gap 1).
  *  - Exactly the two decks in `crossfaderMapping`, no N-deck auto-mixing (gap 2).
- *  - No auto-preload (gap 3 / phase 2) — the incoming deck must already be loaded, with a
- *    known duration, before the near-end trigger will do anything. If it isn't, this module
- *    does nothing and `autoDj.ts`'s existing EOS fallback still applies when the track ends.
+ *  - Preload readiness is `source.duration > 0` (the same signal the crossfade trigger
+ *    already gates on, not a fixed timeout — gap 3) rather than any deeper preroll check;
+ *    if the preload threshold is set too close to the crossfade threshold for a given
+ *    track's demux time, the crossfade trigger still just waits for a loaded deck as it
+ *    always has, and `autoDj.ts`'s EOS fallback remains the backstop either way.
  *  - No tempo/phase sync (gap 5 / phase 3) — cuts between tracks at their native tempo.
+ *  - Preload never overwrites a deck the DJ (or a previous load) already put a track on —
+ *    it only fires onto a genuinely empty (`source === null`) deck, same "manual wins"
+ *    posture as the crossfade ramp's interruption handling.
  *
  * Gated on the same `autoDjEnabled` toggle as the EOS fallback — this is what makes the
  * `Auto` button in DiggerQueue.svelte "the real thing" rather than the cold-reload stand-in.
  */
 import { writable, get } from "svelte/store";
 import { session, getDeck, updateDeck, setCrossfader } from "../state/session";
-import { autoDjEnabled } from "./autoDj";
+import { autoDjEnabled, pickAndConsumeNext } from "./autoDj";
+import { loadQueueItemToDeck } from "./queueStore";
+import { currentDj, currentDjOrNull } from "./djSelector";
 
 function persistentWritable<T>(key: string, defaultValue: T) {
   let initial: T;
@@ -46,6 +55,12 @@ export const autoMixThresholdSec = persistentWritable<number>("cuemark:autoMixTh
 
 /** Duration of the automated crossfade ramp, in milliseconds. */
 export const crossfadeDurationMs = persistentWritable<number>("cuemark:crossfadeDurationMs", 6000);
+
+/** How many seconds of remaining playback trigger auto-preloading the next track onto the
+ *  idle mapped deck (phase 2, gap 3) — deliberately larger than `autoMixThresholdSec` so the
+ *  incoming deck has time to demux and report a real `source.duration` before the crossfade
+ *  trigger goes looking for one. Settings-configurable — see AudioSettings.svelte. */
+export const autoPreloadThresholdSec = persistentWritable<number>("cuemark:autoPreloadThresholdSec", 45);
 
 // Bumped by notifyManualCrossfaderTouch() on every manual crossfader input (on-screen fader,
 // MIDI CC) — never by the ramp driver's own setCrossfader() calls. A ramp captures the counter
@@ -142,8 +157,9 @@ export function checkAutoMixTrigger(deckId: string, contentPos: number): void {
   const incomingId = deckId === left ? right : left;
   const incoming = s.decks.find((d) => d.id === incomingId);
   // Only handles the "one deck live, the other idle" case — a manual overlap already in
-  // progress (both playing) is left alone. Phase 1 also has no auto-preload: an incoming
-  // deck with no loaded/measured track is left for the DJ (or the EOS fallback) to handle.
+  // progress (both playing) is left alone. An incoming deck with no loaded/measured track
+  // yet is left for checkAutoPreloadTrigger (below) to have filled in ahead of time, or —
+  // failing that — for the DJ or the EOS fallback to handle.
   if (!incoming || incoming.playing || incoming.source?.type !== "video" || !(incoming.source.duration > 0)) return;
 
   const remaining = outgoing.source.duration - contentPos;
@@ -153,4 +169,49 @@ export function checkAutoMixTrigger(deckId: string, contentPos: number): void {
   handledOutgoing.set(deckId, outgoing.source.filePath);
   updateDeck(incomingId, { playing: true });
   startCrossfadeRamp(deckId, incomingId, deckId === left ? 1 : 0);
+}
+
+// deckId -> the outgoing-track filePath a preload was already triggered for. Prevents
+// re-fetching every polled frame while remaining time stays inside the threshold and the
+// async load is still in flight (or already landed) — same keying rationale as
+// `handledOutgoing` above: a later track on the same deck gets a fresh chance.
+const preloadedFor = new Map<string, string>();
+
+/**
+ * Call on every position-poll resolution for a playing deck (positionPoll.ts), alongside
+ * `checkAutoMixTrigger`. Cheap no-op unless Auto DJ is on, this deck is the currently-audible
+ * half of `crossfaderMapping` closing in on its end, and the *other* half is genuinely empty
+ * (no source at all — never overwrites a deck the DJ, or a previous auto-preload, already put
+ * a track on). Fires the same queue-first/`queueNext()`-fallback sourcing `handleDeckEos` uses,
+ * just earlier and onto the idle deck rather than the one that just ended — see the design
+ * doc's phase 2.
+ */
+export function checkAutoPreloadTrigger(deckId: string, contentPos: number): void {
+  if (!get(autoDjEnabled)) return;
+
+  const s = get(session);
+  const { left, right } = s.crossfaderMapping;
+  if (deckId !== left && deckId !== right) return;
+
+  const outgoing = s.decks.find((d) => d.id === deckId);
+  if (!outgoing || !outgoing.playing || outgoing.source?.type !== "video" || !(outgoing.source.duration > 0)) return;
+
+  const incomingId = deckId === left ? right : left;
+  const incoming = s.decks.find((d) => d.id === incomingId);
+  if (!incoming || incoming.source !== null) return; // already loaded (by anyone) — don't clobber
+
+  const remaining = outgoing.source.duration - contentPos;
+  if (remaining > get(autoPreloadThresholdSec) || remaining <= 0) return;
+  if (preloadedFor.get(deckId) === outgoing.source.filePath) return;
+
+  preloadedFor.set(deckId, outgoing.source.filePath);
+  const owner = currentDjOrNull(get(currentDj));
+  pickAndConsumeNext(owner)
+    .then((next) => {
+      // Re-check: the DJ may have loaded something onto this deck (or unloaded the outgoing
+      // one) while the fetch was in flight.
+      if (getDeck(incomingId)?.source !== null) return;
+      return loadQueueItemToDeck(next, incomingId);
+    })
+    .catch((e) => console.error("[auto-dj] preload failed", e));
 }

@@ -17,7 +17,7 @@ import {
 } from "../renderer/seekBus";
 import { isAudioOnlyDeck } from "../video/backendRegistry";
 import { resyncLegacyVideoClock } from "../video/legacyVideo";
-import { checkAutoMixTrigger } from "../digger/autoMix";
+import { checkAutoMixTrigger, checkAutoPreloadTrigger } from "../digger/autoMix";
 import type { Deck } from "../state/types";
 
 // One in-flight audioGetPosition IPC per deck. Prevents stale out-of-order responses
@@ -132,7 +132,12 @@ export function pollDeckPosition(
     setDeckAudioTime(capturedDeckId, contentPos); // feeds waveform playhead — cheap, no WebKit cost
     // Auto DJ near-end lookahead (docs/design/auto-dj-transitions.md) — cheap no-op unless
     // enabled and this deck is actually closing in on its end; not meaningful mid-scratch.
-    if (!scratching) checkAutoMixTrigger(capturedDeckId, contentPos);
+    // Preload fires first (earlier threshold) so the incoming deck has a chance to report a
+    // real duration before the crossfade trigger goes looking for one.
+    if (!scratching) {
+      checkAutoPreloadTrigger(capturedDeckId, contentPos);
+      checkAutoMixTrigger(capturedDeckId, contentPos);
+    }
     // No v.currentTime writes at all during scratch — see the scratch-freeze
     // investigation in docs/design/pcm-buffer-playback.md, 2026-07-23. A 150ms
     // throttle (tried first) didn't help and measurably made a live-hardware

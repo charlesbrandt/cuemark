@@ -5,7 +5,7 @@
   import { listAudioDevices, type AudioDevice } from "../lib/audio/pipeline";
   import { mainOutputDeviceIds, cueOutputDeviceId, tempoRange, scratchMode, jogSecondsPerRev, scrubInertiaMs, SCRUB_INERTIA_MAX_MS, networkOutputs, outputAttachStatus } from "../lib/audio/audioSettings";
   import { fontScale } from "../lib/settings/displaySettings";
-  import { autoMixThresholdSec, crossfadeDurationMs } from "../lib/digger/autoMix";
+  import { autoMixThresholdSec, crossfadeDurationMs, autoPreloadThresholdSec } from "../lib/digger/autoMix";
   import { session, setMidiSlot } from "../lib/state/session";
 
   interface ControllerInfo {
@@ -359,9 +359,9 @@
 
 
   <!--
-    Auto DJ phase 1 (docs/design/auto-dj-transitions.md) — only takes effect once the Auto
-    button (DiggerQueue.svelte) is on. Threshold is remaining-time-to-start, not fade length;
-    both are fixed constants for phase 1, no per-track outro marker yet.
+    Auto DJ phases 1-2 (docs/design/auto-dj-transitions.md) — only take effect once the Auto
+    button (DiggerQueue.svelte) is on. Fixed remaining-time thresholds, no per-track outro
+    marker yet (phase 4).
   -->
   <div class="settings-row">
     <span class="row-label">Auto Mix</span>
@@ -390,6 +390,28 @@
     <span class="hint-inline">
       when Auto DJ is on, starts crossfading to the other crossfader-mapped deck this far
       from the end — only if it's already loaded
+    </span>
+  </div>
+
+  <div class="settings-row">
+    <span class="row-label">Auto Preload</span>
+    <input
+      type="range"
+      min="20"
+      max="120"
+      step="5"
+      bind:value={$autoPreloadThresholdSec}
+    />
+    <span class="jog-scale-value">{$autoPreloadThresholdSec}s before end</span>
+    <button
+      type="button"
+      class="font-scale-reset"
+      onclick={() => autoPreloadThresholdSec.set(45)}
+    >Reset</button>
+    <span class="hint-inline">
+      when Auto DJ is on and the other crossfader-mapped deck is empty, auto-loads (but
+      doesn't play) the next queued track this far from the end — keep this above Auto Mix's
+      threshold so the load has time to finish first
     </span>
   </div>
 
