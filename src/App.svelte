@@ -847,14 +847,14 @@
     <div class="toolbar-divider"></div>
     <label
       class="dj-selector"
-      title="Who's on the decks — attributes Digger plays and scopes which queue is shown/edited. Empty = you, NOT your own name — typing your own name creates a separate, always-empty guest queue."
+      title="Who's on the decks — attributes Digger plays and scopes which queue is shown/edited. Empty = unclaimed, for everyone including you — type your own configured name (Digger's Settings → Identity) to claim it."
     >
       DJ
       <input
         type="text"
         class="dj-input"
         list="dj-recent-list"
-        placeholder="you"
+        placeholder="unclaimed"
         bind:value={djInput}
         onkeydown={(e) => { if (e.key === 'Enter') applyDj(); }}
         onblur={() => applyDj()}
@@ -862,9 +862,9 @@
       {#if $currentDj !== ''}
         <button
           class="dj-clear"
-          title="Back to you (blank) — a typed name, even your own, is a separate guest queue"
+          title="Clear back to unclaimed"
           onclick={() => applyDj('')}
-        >You</button>
+        >Clear</button>
       {/if}
       <datalist id="dj-recent-list">
         {#each djHistory as name (name)}
