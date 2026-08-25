@@ -114,6 +114,24 @@ reserves `'play_history'` for a transition-mining job that reads the `plays` log
 cuemark owns is making sure `plays` rows are accurate (real start times, real durations) so that
 job has good raw material later — not deriving transitions itself.
 
+## DJ selector / guest attribution (added 2026-08-23, case-insensitive 2026-08-24)
+
+`src/lib/digger/djSelector.ts` — free-text "who's on the decks" (no accounts, no managed
+list; see `docs/design/guest-djs.md` in the digger repo). `currentDj` feeds two things:
+`playStart()`'s `listener` field (read at **load** time, captured for that play's whole
+lifetime — a mid-track handoff must not retroactively reassign an in-progress play) and
+`queueStore.ts`/`DiggerQueue.svelte`'s queue scoping (read reactively at **call** time).
+Empty string → `null` (`currentDjOrNull()`) means unclaimed, matching Digger's
+`queue_items.owner`/`plays.listener` NULL convention.
+
+Digger matches these names **case-insensitively** (`COLLATE NOCASE` on every
+`owner`/`listener` comparison, added 2026-08-24 so "Tessa" typed as "tessa" doesn't fork
+into a second guest) — `djSelector.ts`'s own recent-values MRU (`pushDjHistory`) mirrors
+that: dedup is case-insensitive too, so the toolbar's quick-pick list doesn't show the
+same DJ twice under different casing. If you add another Digger-attribution field that
+reuses this free-text-name pattern, match this case-insensitivity on both sides rather
+than assuming exact-string matching.
+
 ## Digger-side schema changes (added 2026-08-12)
 
 Adding a column to Digger's schema for cuemark to read/write (like `tracks.gain`) needs **two**
