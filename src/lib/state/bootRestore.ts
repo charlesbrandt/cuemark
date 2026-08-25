@@ -97,14 +97,34 @@ export async function restoreSessionOnBoot(): Promise<BootRestoreResult> {
       session.set(restored);
     } else if (recovery.snapshot) {
       // Not a recovery boot — no live pipeline to adopt, so decks stay at their fresh
-      // defaults (the ghost-restore risk above is real for per-deck state). But global,
-      // non-deck settings (master volume, bpm, crossfader position, curves, snap-to-beat,
-      // visualization) carry none of that risk — they're just numbers/toggles, safe to
-      // apply regardless of whether any deck has audio loaded. Without this, any such
-      // setting last changed via the on-screen UI (rather than a physical MIDI control,
-      // which separately persists through midi_state.json below) silently reset to its
+      // defaults (the ghost-restore risk above is real for per-deck state). Most global,
+      // non-deck settings (master volume, bpm, curves, snap-to-beat, visualization) carry
+      // none of that risk — they're just numbers/toggles, safe to apply regardless of
+      // whether any deck has audio loaded. Without restoring them, any such setting last
+      // changed via the on-screen UI (rather than a physical MIDI control, which
+      // separately persists through midi_state.json below) would silently reset to its
       // default on every full app restart, even though it was faithfully written to
       // session-recovery.json the whole time.
+      //
+      // `crossfaderValue` is deliberately excluded from that list — it's the one field
+      // here that actively mutes a deck, and a persisted value for it cannot be trusted
+      // the way the others can. Two ways were tried and both failed live 2026-08-25: (1)
+      // restoring it as inert state left it silently out of sync with the freshly-defaulted
+      // decks' actual volume/opacity until the *next* setCrossfader() call — a manual touch
+      // or Auto DJ's near-end ramp — applied the curve for the first time since boot and
+      // slammed both decks straight to their curve position in one frame, not gradually
+      // (crossfaderValue had been restored to 1.0 from a prior session; deck-0 played at
+      // its native full volume the whole track, then cut to silence the instant the first
+      // setCrossfader() call landed). (2) Applying it immediately at boot instead avoids
+      // that deferred jump, but is worse: it silently mutes whichever deck the DJ loads
+      // next with zero action on their part, for no reason visible in the UI — hit
+      // immediately on the very next restart, one deck loaded and playing, volume/opacity
+      // both pinned at 0.00. Root cause of both: an unmotorized fader's *physical*
+      // position can drift from whatever was last read electronically (session-recovery.json
+      // or midi_state.json alike) just by being touched by hand while the app is closed —
+      // no persisted value can be trusted to reflect where the hardware currently sits, so
+      // none is applied. `crossfaderValue` simply stays at the module's own default (0.5,
+      // both decks live) until a real signal — a physical touch or Auto DJ — moves it.
       const restored = recovery.snapshot as Session;
       session.update((s) => ({
         ...s,
@@ -113,7 +133,6 @@ export async function restoreSessionOnBoot(): Promise<BootRestoreResult> {
         masterDeckId: restored.masterDeckId,
         crossfaderMapping: restored.crossfaderMapping,
         midiMapping: migrateMidiMapping(restored.midiMapping),
-        crossfaderValue: restored.crossfaderValue,
         crossfaderTargets: restored.crossfaderTargets,
         audioCurve: restored.audioCurve,
         visualCurve: restored.visualCurve,

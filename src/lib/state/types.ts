@@ -55,6 +55,14 @@ export interface Deck {
   hotCues: number[];      // up to 4 time markers
   bpm: number | null;      // detected or tapped BPM for this deck
   downbeat: number | null; // absolute playback position (seconds) of beat 1; null = unset
+  // Per-track outro/mix-out point (content seconds), pulled from Digger's `mixOut` —
+  // auto-derived during BPM analysis as 16 bars before the last detected beat (or ~30s
+  // before the end as a fallback), manually overridable there via the generic markers
+  // API. Auto DJ's near-end trigger (autoMix.ts) measures against this instead of
+  // source.duration when set; null (no analysis run yet, or Digger not the source)
+  // falls back to the fixed Settings threshold measured from the literal end, same as
+  // before this field existed. See docs/design/auto-dj-transitions.md "Phase 4".
+  outroPoint: number | null;
   diggerTrackId: number | null; // Digger track id if loaded from the Digger queue; null = local file
   diggerFileId: number | null; // Digger `files.id` behind the loaded track — used as a
                                 // remote-fetch fallback (media_cache.rs) when the local

@@ -77,6 +77,9 @@ export async function loadQueueItemToDeck(
     hotCues: payload.hotCues ?? [],
     diggerTrackId: item.track_id,
     diggerFileId: payload.fileId ?? null,
+    // Same omitted-when-unset gotcha as bpm/downbeat above (api.ts's CuemarkPayload
+    // doc comment) — normalize here rather than trust the JSON to carry `null`.
+    outroPoint: payload.mixOut ?? null,
     // Reset to the deck default (1.0) unless Digger supplies one — mirrors the
     // bpm/downbeat pull-on-load pattern above.
     gain: payload.gain ?? 1.0,

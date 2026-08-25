@@ -26,6 +26,8 @@ vi.mock('./playedTracks', () => ({ isPlayed: (...a: unknown[]) => isPlayed(...a)
 const nudgePhaseToMaster = vi.fn();
 vi.mock('../audio/phaseNudge', () => ({ nudgePhaseToMaster: (...a: unknown[]) => nudgePhaseToMaster(...a) }));
 
+vi.mock('../debugLog', () => ({ debugLog: vi.fn() }));
+
 function baseDeck(id: string, overrides: Partial<Deck> = {}): Deck {
   return {
     id,
@@ -40,6 +42,7 @@ function baseDeck(id: string, overrides: Partial<Deck> = {}): Deck {
     hotCues: [],
     bpm: null,
     downbeat: null,
+    outroPoint: null,
     diggerTrackId: null,
     diggerFileId: null,
     loopIn: null,
@@ -246,6 +249,85 @@ describe('checkAutoMixTrigger', () => {
   });
 });
 
+describe('checkAutoMixTrigger / checkAutoPreloadTrigger with outroPoint (Phase 4)', () => {
+  it('measures the threshold from outroPoint, not track duration, when set', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixThresholdSec.set(15);
+    resetSession([
+      // outroPoint at 60s, well before the 100s duration — the fixed threshold alone
+      // (100 - 90 = 10s remaining) would fire here too, so use a position that's only
+      // inside the threshold relative to the marker (60 - 50 = 10s) to actually
+      // distinguish the two references.
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: 60 }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
+    ]);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 50); // 50s remaining to literal end, 10s to the marker
+
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+  });
+
+  it('does not fire early just because outroPoint is still far off', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixThresholdSec.set(15);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: 90 }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
+    ]);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 50); // 40s to the marker, above the 15s threshold
+
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
+  });
+
+  it('clamps an outroPoint past the actual duration instead of trusting it', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixThresholdSec.set(15);
+    resetSession([
+      // A stale/bad marker beyond duration must not push the trigger point past EOS.
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: 500 }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
+    ]);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90); // 10s remaining to the clamped (=duration) end
+
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+  });
+
+  it('preload also measures its lead time from outroPoint when set', async () => {
+    const { autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoPreloadThresholdSec.set(45);
+    getQueue.mockResolvedValue([]);
+    queueNext.mockResolvedValue({ id: 1, track_id: 7, title: 'T', artist: 'A' });
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: 60 }),
+      baseDeck('deck-1', { source: null }),
+    ]);
+
+    autoMixMod.checkAutoPreloadTrigger('deck-0', 20); // 40s to the marker, inside the 45s preload threshold
+
+    expect(getQueue).toHaveBeenCalled();
+  });
+
+  it('falls back to track duration when outroPoint is unset, exactly as before this field existed', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixThresholdSec.set(15);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: null }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
+    ]);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90); // 10s remaining to the literal end
+
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+  });
+});
+
 describe('crossfade ramp', () => {
   it('drives the crossfader from the outgoing side to the incoming side and pauses the outgoing deck', async () => {
     const { sessionMod, autoDjMod, autoMixMod, resetSession, runToCompletion } = await setup();
@@ -377,12 +459,42 @@ describe('checkAutoMixTrigger with autoMixSyncEnabled', () => {
     expect(locked.playing).toBe(false); // not yet — waiting out the settle window
     expect(nudgePhaseToMaster).not.toHaveBeenCalled();
 
-    await new Promise((r) => setTimeout(r, 250)); // past the 200ms settle
+    await new Promise((r) => setTimeout(r, 250)); // past the first 200ms (rate) settle
     expect(nudgePhaseToMaster).toHaveBeenCalledWith('deck-1');
+    // Nudging seeks the still-paused deck via a fire-and-forget IPC call that hasn't landed
+    // yet — playback must wait out a second settle window before starting, or it audibly
+    // starts from the pre-nudge position (the bug reported live 2026-08-24).
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
+
+    await new Promise((r) => setTimeout(r, 250)); // past the second (seek) settle
     expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
 
     runToCompletion(100);
     expect(get(sessionMod.session).crossfaderValue).toBe(1); // the ramp still ran to completion
+  });
+
+  it('abandons the sync+crossfade if the DJ touches the fader during the post-nudge seek settle', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, rafQueue } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixSyncEnabled.set(true);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    resetSession(
+      [
+        baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), bpm: 120, downbeat: 0 }),
+        baseDeck('deck-1', { source: videoSource('b.mp4', 100), bpm: 128, downbeat: 0 }),
+      ],
+      { bpm: 120, masterDeckId: 'deck-0' },
+    );
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90);
+
+    await new Promise((r) => setTimeout(r, 250)); // past the rate settle, nudge has fired
+    expect(nudgePhaseToMaster).toHaveBeenCalledWith('deck-1');
+    autoMixMod.notifyManualCrossfaderTouch(); // DJ grabs the fader during the seek settle
+
+    await new Promise((r) => setTimeout(r, 250));
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
+    expect(rafQueue.length).toBe(0); // no ramp was ever scheduled
   });
 
   it('skips the sync step and mixes at native tempo when the incoming deck has no bpm', async () => {
