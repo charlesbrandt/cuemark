@@ -177,6 +177,17 @@ impl Profile {
             _ => None,
         })
     }
+
+    /// The (status, note) wire bytes of every bench-verified LED-capable control on
+    /// this profile, regardless of slot/action — used to blank every LED this
+    /// controller has right after connecting, without needing to enumerate `ActionId`
+    /// or know how many slots are actually in use. See mod.rs's `blank_all_leds`.
+    pub fn all_led_bytes(&self) -> impl Iterator<Item = (u8, u8)> + '_ {
+        self.map.values().filter_map(|binding| match binding {
+            Binding::Simple(c) if c.led => Some((c.status, c.d1)),
+            _ => None,
+        })
+    }
 }
 
 /// Compile a parsed `ProfileFile` into a lookup-ready `Profile`, validating structural
@@ -429,6 +440,29 @@ mod tests {
             action = "jog_turn"
         "#;
         assert!(parse("noenc", src).is_err());
+    }
+
+    /// `all_led_bytes()` (used to blank every LED at connect time — mod.rs's
+    /// `blank_all_leds`) must agree with `led_control()` (used for the frontend's
+    /// per-action LED mirror): every LED-capable row on a builtin profile shows up in
+    /// both, and nothing else does.
+    #[test]
+    fn all_led_bytes_matches_led_control_rows() {
+        for p in builtins() {
+            let mut expected: Vec<(u8, u8)> = p
+                .map
+                .values()
+                .filter_map(|b| match b {
+                    Binding::Simple(c) if c.led => Some((c.status, c.d1)),
+                    _ => None,
+                })
+                .collect();
+            expected.sort();
+            let mut got: Vec<(u8, u8)> = p.all_led_bytes().collect();
+            got.sort();
+            assert_eq!(got, expected, "{}: all_led_bytes() mismatch", p.id);
+            assert!(!expected.is_empty(), "{}: expected at least one LED-capable control", p.id);
+        }
     }
 
     #[test]

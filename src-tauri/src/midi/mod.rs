@@ -93,6 +93,31 @@ fn send_led(conn: &mut Conn, slot: u8, action: ActionId, on: bool) {
     }
 }
 
+/// Sends Note Off to every bench-verified LED-capable control on this profile, right
+/// after its output port connects. Cuemark has no shutdown hook that turns LEDs back
+/// off when the app quits or crashes (or loses power) — a controller's LED is a plain
+/// latched Note On, not something that times out on its own, so a play/cue/sync LED
+/// left lit when the app closed while a deck was live stays lit indefinitely on the
+/// hardware until *something* sends the matching Note Off. Blanking here means every
+/// launch starts from a known-off state regardless of how the previous run ended,
+/// rather than relying on the frontend's reactive LED sync (`ledSync.ts`) to happen to
+/// touch that exact control again — which it only does when a deck's boolean actually
+/// changes, so a control whose state doesn't change this session would otherwise stay
+/// however the previous session left it. Runs once per connect (initial + hotplug
+/// reconnect), independent of any frontend/session state, so it can't race the
+/// frontend's async controller-list fetch the way a purely JS-side reset would.
+fn blank_all_leds(output: &mut MidiOutputConnection, profile: &Profile, port_name: &str) {
+    let mut n = 0;
+    for (status, note) in profile.all_led_bytes() {
+        if output.send(&[status, note, 0x00]).is_ok() {
+            n += 1;
+        }
+    }
+    if n > 0 {
+        log::info!("[midi] blanked {n} LED(s) on {port_name} ({})", profile.id);
+    }
+}
+
 /// Generic LED-mirror command — any deck-state boolean (headphone cue, play, sync
 /// lock, …) that has a bench-verified `led = true` row for `(slot, action)` on the
 /// named profile. `action` deserializes from the same snake_case strings the TOML
@@ -291,9 +316,10 @@ fn connect_port(app: &AppHandle, name: &str, profile: &Profile, persist: &midi_s
     let profile_arc = Arc::new(profile.clone());
     let profile2 = Arc::clone(&profile_arc);
     let port_name = name.to_string();
-    let output = connect_output(name);
-    if output.is_some() {
+    let mut output = connect_output(name);
+    if let Some(out) = output.as_mut() {
         log::info!("[midi] opened output port: {name}");
+        blank_all_leds(out, &profile, name);
     }
     let mut decoder = Decoder::new();
     let mut log_throttle: HashMap<(u8, u8), Instant> = HashMap::new();
