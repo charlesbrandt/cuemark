@@ -216,6 +216,20 @@ case the DJ loaded something manually while it was in flight. Only `autoMix.test
 mocked-API unit tests have exercised this path — it has not been run against a real
 Digger backend or a real deck.
 
+**Phase 3 (optional tempo/phase sync) is built + unit-tested, NOT yet live-verified**
+(2026-08-24, same file): `autoMixSyncEnabled` toggle (Settings → Audio → Auto Mix →
+"Beatmatch before mixing", default off). When on and both decks have a detected/set `bpm`,
+the phase-1 trigger rate-locks the incoming deck (`syncLocked: true`, rate = main-beat-ref /
+incoming.bpm) and, after a 200ms settle, calls `nudgePhaseToMaster()` to align phase before
+starting play + the crossfade ramp — the exact two-step sequence (and the same 200ms delay)
+DeckCard.svelte's manual **Lock** button already uses; reused rather than reinvented. Missing
+bpm on either deck silently falls through to the native-tempo cut, same as with the toggle
+off. ⚠️ **A deferred step ahead of an interruptible ramp needs its own interruption check,
+not just the ramp's** — the manual-crossfader-touch abort (`manualTouch` counter) is captured
+before the 200ms `setTimeout` and re-checked inside it, or a DJ grabbing the fader during the
+settle window would still get overridden a moment later when the deferred callback fired and
+started playing anyway.
+
 ⚠️ **The crossfade ramp's completion branch must clear the outgoing deck's `source`, not
 just `playing`** (fixed 2026-08-24, `autoMix.ts`'s `startCrossfadeRamp`) — leaving a
 just-finished track's `source` in place made it look permanently "already loaded" to both

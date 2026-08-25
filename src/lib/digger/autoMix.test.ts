@@ -23,6 +23,9 @@ vi.mock('./queueStore', () => ({ loadQueueItemToDeck: (...a: unknown[]) => loadQ
 const isPlayed = vi.fn().mockReturnValue(false);
 vi.mock('./playedTracks', () => ({ isPlayed: (...a: unknown[]) => isPlayed(...a) }));
 
+const nudgePhaseToMaster = vi.fn();
+vi.mock('../audio/phaseNudge', () => ({ nudgePhaseToMaster: (...a: unknown[]) => nudgePhaseToMaster(...a) }));
+
 function baseDeck(id: string, overrides: Partial<Deck> = {}): Deck {
   return {
     id,
@@ -67,7 +70,7 @@ async function setup() {
   const autoDjMod = await import('./autoDj');
   const autoMixMod = await import('./autoMix');
 
-  function resetSession(decks: Deck[]) {
+  function resetSession(decks: Deck[], overrides: Partial<Session> = {}) {
     const s: Session = {
       decks,
       masterVolume: 1.0,
@@ -83,6 +86,7 @@ async function setup() {
       effects: [],
       visualization: null,
       visualizationOpacity: 0.5,
+      ...overrides,
     };
     sessionMod.session.set(s);
   }
@@ -116,6 +120,7 @@ beforeEach(() => {
   removeFromQueue.mockReset().mockResolvedValue(undefined);
   loadQueueItemToDeck.mockReset().mockResolvedValue(undefined);
   isPlayed.mockReset().mockReturnValue(false);
+  nudgePhaseToMaster.mockReset();
 });
 
 afterEach(() => {
@@ -346,6 +351,81 @@ describe('crossfade ramp', () => {
     driveFrame(50);
 
     expect(rafQueue.length).toBe(0); // loop stopped, nothing left dangling
+  });
+});
+
+describe('checkAutoMixTrigger with autoMixSyncEnabled', () => {
+  it('rate-locks and phase-nudges the incoming deck before the crossfade starts, when a bpm reference exists', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, runToCompletion } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixSyncEnabled.set(true);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    resetSession(
+      [
+        baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), bpm: 120, downbeat: 0 }),
+        baseDeck('deck-1', { source: videoSource('b.mp4', 100), bpm: 128, downbeat: 0 }),
+      ],
+      { bpm: 120, masterDeckId: 'deck-0' },
+    );
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90);
+
+    // Rate lock applies immediately, synchronously — before the 200ms settle.
+    const locked = get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!;
+    expect(locked.syncLocked).toBe(true);
+    expect(locked.playbackRate).toBeCloseTo(120 / 128);
+    expect(locked.playing).toBe(false); // not yet — waiting out the settle window
+    expect(nudgePhaseToMaster).not.toHaveBeenCalled();
+
+    await new Promise((r) => setTimeout(r, 250)); // past the 200ms settle
+    expect(nudgePhaseToMaster).toHaveBeenCalledWith('deck-1');
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+
+    runToCompletion(100);
+    expect(get(sessionMod.session).crossfaderValue).toBe(1); // the ramp still ran to completion
+  });
+
+  it('skips the sync step and mixes at native tempo when the incoming deck has no bpm', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, runToCompletion } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixSyncEnabled.set(true);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    resetSession(
+      [
+        baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), bpm: 120, downbeat: 0 }),
+        baseDeck('deck-1', { source: videoSource('b.mp4', 100) }), // no bpm detected/set
+      ],
+      { bpm: 120, masterDeckId: 'deck-0' },
+    );
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90);
+
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true); // starts right away
+    expect(nudgePhaseToMaster).not.toHaveBeenCalled();
+    runToCompletion(100);
+    expect(get(sessionMod.session).crossfaderValue).toBe(1);
+  });
+
+  it('abandons the deferred sync+crossfade if the DJ touches the fader during the settle window', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, rafQueue } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixSyncEnabled.set(true);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    resetSession(
+      [
+        baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), bpm: 120, downbeat: 0 }),
+        baseDeck('deck-1', { source: videoSource('b.mp4', 100), bpm: 128, downbeat: 0 }),
+      ],
+      { bpm: 120, masterDeckId: 'deck-0' },
+    );
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90);
+    autoMixMod.notifyManualCrossfaderTouch(); // DJ grabs the fader during the settle window
+
+    await new Promise((r) => setTimeout(r, 250));
+    expect(nudgePhaseToMaster).not.toHaveBeenCalled();
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
+    expect(rafQueue.length).toBe(0); // no ramp was ever scheduled
   });
 });
 

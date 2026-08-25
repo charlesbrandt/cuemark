@@ -15,7 +15,8 @@
  *    if the preload threshold is set too close to the crossfade threshold for a given
  *    track's demux time, the crossfade trigger still just waits for a loaded deck as it
  *    always has, and `autoDj.ts`'s EOS fallback remains the backstop either way.
- *  - No tempo/phase sync (gap 5 / phase 3) — cuts between tracks at their native tempo.
+ *  - Tempo/phase sync (gap 5 / phase 3) is optional, gated on `autoMixSyncEnabled` (default
+ *    off) — with it off, still cuts between tracks at their native tempo exactly as before.
  *  - Preload never overwrites a deck the DJ (or a previous load) already put a track on —
  *    it only fires onto a genuinely empty (`source === null`) deck, same "manual wins"
  *    posture as the crossfade ramp's interruption handling.
@@ -28,6 +29,7 @@ import { session, getDeck, updateDeck, setCrossfader } from "../state/session";
 import { autoDjEnabled, pickNextTrack } from "./autoDj";
 import { loadQueueItemToDeck } from "./queueStore";
 import { currentDj, currentDjOrNull } from "./djSelector";
+import { nudgePhaseToMaster } from "../audio/phaseNudge";
 
 function persistentWritable<T>(key: string, defaultValue: T) {
   let initial: T;
@@ -61,6 +63,13 @@ export const crossfadeDurationMs = persistentWritable<number>("cuemark:crossfade
  *  incoming deck has time to demux and report a real `source.duration` before the crossfade
  *  trigger goes looking for one. Settings-configurable — see AudioSettings.svelte. */
 export const autoPreloadThresholdSec = persistentWritable<number>("cuemark:autoPreloadThresholdSec", 45);
+
+/** Phase 3 (gap 5): when on, beatmatches the incoming deck — rate-locks it to the current
+ *  main-beat reference and aligns its phase — before starting the crossfade ramp, reusing
+ *  the same Lock+NUDGE machinery a DJ can trigger manually from DeckCard.svelte. Off by
+ *  default and a separate toggle from Auto DJ itself, per the design doc's phase 3: with it
+ *  off, Auto DJ keeps cutting between tracks at their native tempo exactly as phases 1-2 did. */
+export const autoMixSyncEnabled = persistentWritable<boolean>("cuemark:autoMixSyncEnabled", false);
 
 // Bumped by notifyManualCrossfaderTouch() on every manual crossfader input (on-screen fader,
 // MIDI CC) — never by the ramp driver's own setCrossfader() calls. A ramp captures the counter
@@ -173,8 +182,27 @@ export function checkAutoMixTrigger(deckId: string, contentPos: number): void {
   if (wasAutoMixTriggered(deckId, outgoing.source.filePath)) return;
 
   handledOutgoing.set(deckId, outgoing.source.filePath);
-  updateDeck(incomingId, { playing: true });
-  startCrossfadeRamp(deckId, incomingId, deckId === left ? 1 : 0);
+  const target: 0 | 1 = deckId === left ? 1 : 0;
+
+  if (get(autoMixSyncEnabled) && incoming.bpm !== null && s.bpm !== null) {
+    // Lock the incoming deck's rate to the main beat, then align its phase, before it
+    // starts playing — the same two-step the Lock button does (DeckCard.svelte). The 200ms
+    // settle mirrors that button's own comment: writing playbackRate rebuilds the legacy
+    // <video> pipeline, and seeking into that rebuild lands stale — see CLAUDE.md
+    // "Rate-then-seek ordering".
+    const touchAtStart = get(manualTouch);
+    updateDeck(incomingId, { syncLocked: true, playbackRate: s.bpm / incoming.bpm });
+    setTimeout(() => {
+      if (get(manualTouch) !== touchAtStart) return; // DJ grabbed the fader during the settle window
+      if (!getDeck(deckId) || !getDeck(incomingId)) return; // a deck vanished during the settle window
+      nudgePhaseToMaster(incomingId);
+      updateDeck(incomingId, { playing: true });
+      startCrossfadeRamp(deckId, incomingId, target);
+    }, 200);
+  } else {
+    updateDeck(incomingId, { playing: true });
+    startCrossfadeRamp(deckId, incomingId, target);
+  }
 }
 
 // deckId -> the outgoing-track filePath a preload was already triggered for. Prevents

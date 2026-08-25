@@ -1,8 +1,31 @@
 # Auto DJ: automated transitions
 
 Status: 🟡 **Phase 1 DONE + live-verified 2026-08-24. Phase 2 (auto-preload) built +
-unit-tested 2026-08-24, fixed one live bug 2026-08-24, still NOT re-verified live** — see
+unit-tested 2026-08-24, fixed one live bug 2026-08-24, still NOT re-verified live. Phase 3
+(optional tempo/phase sync) built + unit-tested 2026-08-24, NOT live-verified** — see
 "Proposed phased plan" below.
+
+**Phase 3, same day:** `autoMixSyncEnabled` (Settings → Audio → Auto Mix → "Beatmatch before
+mixing", default **off**) gates a beatmatch step inserted into `checkAutoMixTrigger`
+(`autoMix.ts`) right before the crossfade would otherwise start. When on, and only when both
+decks have a detected/set `bpm` and a main-beat reference exists (`session.bpm`, normally the
+outgoing deck via the existing solo-playing auto-promotion in `session.ts`): rate-locks the
+incoming deck (`syncLocked: true`, `playbackRate = session.bpm / incoming.bpm`) and, after a
+200ms settle, calls `nudgePhaseToMaster()` to align its phase, *then* sets it playing and
+starts the crossfade ramp — deliberately the same two-step sequence (and the same 200ms delay)
+DeckCard.svelte's manual **Lock** button already uses, reusing existing machinery rather than
+inventing new sync code (gap 5's whole premise). The 200ms settle exists for the same reason
+it exists there: writing `playbackRate` rebuilds the legacy `<video>` pipeline, and seeking
+into that rebuild lands stale (CLAUDE.md "Rate-then-seek ordering") — nudging phase
+immediately would risk landing at a pre-rebuild position. A manual crossfader touch during
+that settle window aborts the whole deferred step (checked via the same `manualTouch` counter
+the ramp's own interruption handling uses), so the "DJ wins immediately" rule holds through
+the sync step too, not just the ramp. Missing bpm on either deck (or no bpm reference at all)
+silently falls through to the phase-1/2 native-tempo cut — no separate code path, just an
+`if`. `autoMix.test.ts` covers: rate-lock + deferred nudge + deferred play/ramp start when a
+bpm reference exists; the native-tempo fallback when the incoming deck has no bpm; and the
+manual-touch-during-settle abort. `npm test`/`npm run check` clean. **Not yet live-verified**
+— unit-tested only, same caveat as phase 2.
 
 **Live-session bug found + fixed 2026-08-24 (same day as phase 2's build):** a DJ manually
 loaded a track onto one of the two mapped decks; Auto DJ correctly crossfaded to it, but the
@@ -60,8 +83,9 @@ completes — `wasAutoMixTriggered`'s per-file latch correctly caps this at one 
 bounce, never a sustained oscillation. Normal thresholds (15s default vs. multi-minute
 tracks) can't reach this condition. **Phase 2 has only unit-test coverage (mocked
 Digger API/`loadQueueItemToDeck`) — it has not been driven against a real running
-Digger backend or a real deck in a live/headless session.** Phases 3-4 (tempo/phase
-sync, a real per-track outro marker) are **not built** — see "Proposed phased plan".
+Digger backend or a real deck in a live/headless session.** Phase 3 (tempo/phase sync) is
+built + unit-tested, not live-verified — see the phase-3 note above. Phase 4 (a real
+per-track outro marker) is **not built** — see "Proposed phased plan".
 
 ## Problem
 
@@ -185,8 +209,9 @@ still catching the genuine case where lookahead never triggered.
    time just means the crossfade trigger waits, same as it always has when nothing is
    loaded yet. **Not yet exercised against a real running Digger backend or a real deck**
    — only `autoMix.test.ts`'s mocked-API unit tests have run this path.
-3. **Optional tempo/phase sync**, toggleable, reusing existing `syncLocked`/
-   `nudgePhaseToMaster` machinery — gap 5.
+3. 🟡 **BUILT + unit-tested 2026-08-24, not yet live-verified — Optional tempo/phase sync.**
+   `autoMixSyncEnabled` toggle, reusing existing `syncLocked`/`nudgePhaseToMaster` machinery —
+   gap 5. See the phase-3 note above.
 4. **Per-track fade-out/outro marker**, only if the fixed-threshold version proves
    insufficient in practice — this is the one phase with real cross-repo schema cost
    (gap 1), so it should be justified by lived experience with phases 1–3, not assumed

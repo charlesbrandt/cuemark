@@ -5,7 +5,7 @@
   import { listAudioDevices, type AudioDevice } from "../lib/audio/pipeline";
   import { mainOutputDeviceIds, cueOutputDeviceId, tempoRange, scratchMode, jogSecondsPerRev, scrubInertiaMs, SCRUB_INERTIA_MAX_MS, networkOutputs, outputAttachStatus } from "../lib/audio/audioSettings";
   import { fontScale } from "../lib/settings/displaySettings";
-  import { autoMixThresholdSec, crossfadeDurationMs, autoPreloadThresholdSec } from "../lib/digger/autoMix";
+  import { autoMixThresholdSec, crossfadeDurationMs, autoPreloadThresholdSec, autoMixSyncEnabled } from "../lib/digger/autoMix";
   import { session, setMidiSlot } from "../lib/state/session";
 
   interface ControllerInfo {
@@ -390,6 +390,18 @@
     <span class="hint-inline">
       when Auto DJ is on, starts crossfading to the other crossfader-mapped deck this far
       from the end — only if it's already loaded
+    </span>
+  </div>
+
+  <div class="settings-row">
+    <span class="row-label"></span>
+    <label class="device-check">
+      <input type="checkbox" bind:checked={$autoMixSyncEnabled} />
+      Beatmatch before mixing
+    </label>
+    <span class="hint-inline">
+      when on, rate-locks the incoming deck to the main beat and aligns its phase before the
+      crossfade starts (needs bpm detected/set on both decks) — off cuts at native tempo
     </span>
   </div>
 
