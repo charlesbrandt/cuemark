@@ -38,6 +38,7 @@ const initial: Session = {
   audioCurve: "equal-power",
   visualCurve: "linear",
   snapToBeat: false,
+  compactControls: false,
   effects: [],
   visualization: null,
   visualizationOpacity: 0.5,
@@ -199,6 +200,10 @@ export function setMasterBpm(bpm: number | null) {
 
 export function setSnapToBeat(value: boolean) {
   session.update((s) => ({ ...s, snapToBeat: value }));
+}
+
+export function setCompactControls(value: boolean) {
+  session.update((s) => ({ ...s, compactControls: value }));
 }
 
 /**

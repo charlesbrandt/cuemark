@@ -713,100 +713,102 @@
     {/each}
   </div>
 
-  <div class="sliders">
-    <label>
-      <span>Opacity <strong>{deck.opacity.toFixed(2)}</strong></span>
-      <input
-        type="range"
-        min="0"
-        max="1"
-        step="0.01"
-        value={deck.opacity}
-        oninput={(e) => updateDeck(deck.id, { opacity: +e.currentTarget.value })}
-      />
-    </label>
-    <label title="Post-fader level — driven by crossfader">
-      <span>Volume <strong>{deck.volume.toFixed(2)}</strong></span>
-      <input
-        type="range"
-        min="0"
-        max="1"
-        step="0.01"
-        value={deck.volume}
-        oninput={(e) => updateDeck(deck.id, { volume: +e.currentTarget.value })}
-      />
-    </label>
-    <label>
-      <span>Rate <strong>{deck.playbackRate.toFixed(3)}×</strong></span>
-      <input
-        type="range"
-        min={1 - $tempoRange / 100}
-        max={1 + $tempoRange / 100}
-        step="0.001"
-        value={deck.playbackRate}
-        oninput={(e) => updateDeck(deck.id, { playbackRate: +e.currentTarget.value, syncLocked: false })}
-      />
-    </label>
-  </div>
+  {#if !$session.compactControls}
+    <div class="sliders">
+      <label>
+        <span>Opacity <strong>{deck.opacity.toFixed(2)}</strong></span>
+        <input
+          type="range"
+          min="0"
+          max="1"
+          step="0.01"
+          value={deck.opacity}
+          oninput={(e) => updateDeck(deck.id, { opacity: +e.currentTarget.value })}
+        />
+      </label>
+      <label title="Post-fader level — driven by crossfader">
+        <span>Volume <strong>{deck.volume.toFixed(2)}</strong></span>
+        <input
+          type="range"
+          min="0"
+          max="1"
+          step="0.01"
+          value={deck.volume}
+          oninput={(e) => updateDeck(deck.id, { volume: +e.currentTarget.value })}
+        />
+      </label>
+      <label>
+        <span>Rate <strong>{deck.playbackRate.toFixed(3)}×</strong></span>
+        <input
+          type="range"
+          min={1 - $tempoRange / 100}
+          max={1 + $tempoRange / 100}
+          step="0.001"
+          value={deck.playbackRate}
+          oninput={(e) => updateDeck(deck.id, { playbackRate: +e.currentTarget.value, syncLocked: false })}
+        />
+      </label>
+    </div>
 
-  <!--
-    Range is −24…+12, matching `equalizer-nbands`' own clamp (EQ_KILL_DB/EQ_MAX_DB in
-    state/types.ts). A wider slider would look like it worked and do nothing past the
-    edge. The bottom of the travel IS the kill, so the per-band button below just jumps
-    there rather than engaging a separate mechanism.
-  -->
-  <div class="eq-row">
-    <!-- The kill button is a sibling of the label, not a child of it: a <button> inside a
-         <label> is interactive content nested in interactive content, and clicking it
-         would also activate the label's range input. -->
-    {#each EQ_BANDS as band (band.key)}
-      <div class="eq-band">
-        <label title={band.title}>
-          <span>
-            {band.label}
-            <strong class:eq-active={deck.eq[band.key] !== 0}>
-              {deck.eq[band.key] <= EQ_KILL_DB
-                ? 'KILL'
-                : `${deck.eq[band.key] >= 0 ? '+' : ''}${deck.eq[band.key].toFixed(0)}`}
-            </strong>
-          </span>
-          <input type="range" min={EQ_KILL_DB} max={EQ_MAX_DB} step="0.5" value={deck.eq[band.key]}
-            oninput={(e) => updateDeck(deck.id, { eq: { ...deck.eq, [band.key]: +e.currentTarget.value } })} />
-        </label>
-        <button
-          class="eq-kill"
-          class:killed={deck.eq[band.key] <= EQ_KILL_DB}
-          onclick={() => updateDeck(deck.id, {
-            eq: { ...deck.eq, [band.key]: deck.eq[band.key] <= EQ_KILL_DB ? 0 : EQ_KILL_DB },
-          })}
-          title={`Kill ${band.label} (${EQ_KILL_DB} dB) — click again to restore`}
-        >×</button>
-      </div>
-    {/each}
-    <button
-      class="eq-reset"
-      onclick={() => updateDeck(deck.id, { eq: { low: 0, mid: 0, high: 0 }, filter: 0 })}
-      title="Reset EQ and filter"
-      disabled={deck.eq.low === 0 && deck.eq.mid === 0 && deck.eq.high === 0 && deck.filter === 0}
-    >↺</button>
-  </div>
+    <!--
+      Range is −24…+12, matching `equalizer-nbands`' own clamp (EQ_KILL_DB/EQ_MAX_DB in
+      state/types.ts). A wider slider would look like it worked and do nothing past the
+      edge. The bottom of the travel IS the kill, so the per-band button below just jumps
+      there rather than engaging a separate mechanism.
+    -->
+    <div class="eq-row">
+      <!-- The kill button is a sibling of the label, not a child of it: a <button> inside a
+           <label> is interactive content nested in interactive content, and clicking it
+           would also activate the label's range input. -->
+      {#each EQ_BANDS as band (band.key)}
+        <div class="eq-band">
+          <label title={band.title}>
+            <span>
+              {band.label}
+              <strong class:eq-active={deck.eq[band.key] !== 0}>
+                {deck.eq[band.key] <= EQ_KILL_DB
+                  ? 'KILL'
+                  : `${deck.eq[band.key] >= 0 ? '+' : ''}${deck.eq[band.key].toFixed(0)}`}
+              </strong>
+            </span>
+            <input type="range" min={EQ_KILL_DB} max={EQ_MAX_DB} step="0.5" value={deck.eq[band.key]}
+              oninput={(e) => updateDeck(deck.id, { eq: { ...deck.eq, [band.key]: +e.currentTarget.value } })} />
+          </label>
+          <button
+            class="eq-kill"
+            class:killed={deck.eq[band.key] <= EQ_KILL_DB}
+            onclick={() => updateDeck(deck.id, {
+              eq: { ...deck.eq, [band.key]: deck.eq[band.key] <= EQ_KILL_DB ? 0 : EQ_KILL_DB },
+            })}
+            title={`Kill ${band.label} (${EQ_KILL_DB} dB) — click again to restore`}
+          >×</button>
+        </div>
+      {/each}
+      <button
+        class="eq-reset"
+        onclick={() => updateDeck(deck.id, { eq: { low: 0, mid: 0, high: 0 }, filter: 0 })}
+        title="Reset EQ and filter"
+        disabled={deck.eq.low === 0 && deck.eq.mid === 0 && deck.eq.high === 0 && deck.filter === 0}
+      >↺</button>
+    </div>
 
-  <!--
-    One knob, two filters: left of centre sweeps a low-pass down, right sweeps a
-    high-pass up (see filter_cutoffs() in pipeline.rs). Centre is a real detent — the
-    backend deadbands ±0.02 — so releasing near the middle parks both filters rather
-    than leaving the signal permanently, inaudibly filtered.
-  -->
-  <div class="filter-row">
-    <label title="Filter sweep — left: low-pass down to 200 Hz, right: high-pass up to 8 kHz">
-      <span>Filter <strong class:eq-active={deck.filter !== 0}>{filterLabel(deck.filter)}</strong></span>
-      <input
-        type="range" min="-1" max="1" step="0.01" value={deck.filter}
-        oninput={(e) => updateDeck(deck.id, { filter: +e.currentTarget.value })}
-        ondblclick={() => updateDeck(deck.id, { filter: 0 })}
-      />
-    </label>
-  </div>
+    <!--
+      One knob, two filters: left of centre sweeps a low-pass down, right sweeps a
+      high-pass up (see filter_cutoffs() in pipeline.rs). Centre is a real detent — the
+      backend deadbands ±0.02 — so releasing near the middle parks both filters rather
+      than leaving the signal permanently, inaudibly filtered.
+    -->
+    <div class="filter-row">
+      <label title="Filter sweep — left: low-pass down to 200 Hz, right: high-pass up to 8 kHz">
+        <span>Filter <strong class:eq-active={deck.filter !== 0}>{filterLabel(deck.filter)}</strong></span>
+        <input
+          type="range" min="-1" max="1" step="0.01" value={deck.filter}
+          oninput={(e) => updateDeck(deck.id, { filter: +e.currentTarget.value })}
+          ondblclick={() => updateDeck(deck.id, { filter: 0 })}
+        />
+      </label>
+    </div>
+  {/if}
 </div>
 
 <style>

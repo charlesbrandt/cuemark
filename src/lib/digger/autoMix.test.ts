@@ -80,6 +80,7 @@ async function setup() {
       audioCurve: 'linear',
       visualCurve: 'linear',
       snapToBeat: false,
+      compactControls: false,
       effects: [],
       visualization: null,
       visualizationOpacity: 0.5,

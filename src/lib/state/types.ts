@@ -118,6 +118,9 @@ export interface Session {
   audioCurve: CrossfaderCurve;
   visualCurve: CrossfaderCurve;
   snapToBeat: boolean;    // when true, seek/cue/loop actions quantize to the nearest beat
+  // Hides per-deck opacity/volume/rate/EQ/filter sliders — for when an external MIDI
+  // controller drives those and the onscreen sliders just cost screen space.
+  compactControls: boolean;
   effects: Effect[];      // global post-process chain
   visualization: Visualization | null; // global layer, composited above all decks
   visualizationOpacity: number;        // 0–1 — how it blends over the deck output

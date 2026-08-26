@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { get } from "svelte/store";
-  import { session, addDeck, updateDeck, setSnapToBeat } from "./lib/state/session";
+  import { session, addDeck, updateDeck, setSnapToBeat, setCompactControls } from "./lib/state/session";
   import VisualizationPanel from "./components/VisualizationPanel.svelte";
   import { startMidiListener } from "./lib/midi/handler";
   import { syncHeadphoneCueLed, syncPlayLed, syncSyncLed } from "./lib/midi/ledSync";
@@ -884,6 +884,12 @@
       onclick={() => setSnapToBeat(!$session.snapToBeat)}
       title="Snap seeks, hot cues, and loop points to the nearest beat"
     >SNAP</button>
+    <button
+      class="output-btn"
+      class:active={$session.compactControls}
+      onclick={() => setCompactControls(!$session.compactControls)}
+      title="Hide per-deck opacity/volume/rate/EQ/filter sliders (useful when a MIDI controller drives them)"
+    >COMPACT</button>
     <div class="toolbar-divider"></div>
     <label class="master-vol">
       Main Volume

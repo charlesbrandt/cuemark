@@ -118,6 +118,7 @@ export async function restoreSessionOnBoot(): Promise<BootRestoreResult> {
         audioCurve: restored.audioCurve,
         visualCurve: restored.visualCurve,
         snapToBeat: restored.snapToBeat,
+        compactControls: restored.compactControls ?? false,
         visualization: restored.visualization,
         visualizationOpacity: restored.visualizationOpacity,
       }));

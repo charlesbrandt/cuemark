@@ -48,6 +48,7 @@ function resetSession(decks: ReturnType<typeof baseDeck>[], midiMapping: Session
     audioCurve: 'equal-power',
     visualCurve: 'linear',
     snapToBeat: false,
+    compactControls: false,
     effects: [],
     visualization: null,
     visualizationOpacity: 0.5,
