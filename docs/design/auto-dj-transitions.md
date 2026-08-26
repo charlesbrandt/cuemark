@@ -7,6 +7,8 @@ audible beat change, root-caused to a fire-and-forget seek racing playback start
 log coverage on the whole path — both fixed same day (see "Live-session bug found + fixed"
 below), still NOT re-verified live. Phase 4 (per-track outro marker) built + unit-tested
 2026-08-24 — turned out to need zero Digger schema/endpoint changes, see "Phase 4" below —
+NOT yet live-verified. 2026-08-26: "Manual/auto interaction" tier system (see that section)
+and an `outroPoint` low-end sanity floor built + unit-tested, both root-caused from live logs,
 NOT yet live-verified.** — see "Proposed phased plan" below.
 
 **2026-08-25: live test reported an abrupt transition, log had zero `[auto-dj]` lines to
@@ -222,6 +224,91 @@ manual override control is trustworthy — separate work, in the digger repo, an
 scope for this pass (a different session was actively working in that repo's shared
 checkout while this one ran).
 
+**2026-08-26, two more live reports, both root-caused from `cuemark.log` alone (no
+reproduction needed — the debugLog instrumentation from the entry above was enough):**
+
+1. **A track got loaded onto two decks at once.** Full timeline: an automated crossfade
+   completed normally, freeing deck-0 (`source: null`). The DJ then manually loaded and
+   played an older track back onto deck-0, and pulled the crossfader to `0.0` to hear it —
+   silencing deck-1, which kept playing its own (automatically-advanced) track unattended
+   the whole time. `checkAutoMixTrigger` correctly refused to touch that pair (it bails
+   whenever the incoming deck is already playing — "manual overlap in progress, leave it
+   alone"), but nothing recorded that the transition had, in effect, already happened. When
+   deck-0's manually-driven track reached its own real EOS ~4 minutes later, `handleDeckEos`
+   saw an *unhandled* transition and picked "the next unplayed track" — which was still
+   technically unplayed because `playedTracks.ts` gates on **audible** volume, not just
+   `playing`, and deck-1's crossfader-driven volume had been `0` the entire time. Same file
+   loaded onto both decks. Confirmed end-to-end from `[bus/deck-N] EOS`, `detached-pipeline
+   IPC received`, `video_demux`, and `Crossfader` log lines — no missing case, no ambiguity.
+2. **A track auto-mixed in and was replaced again within ~8 seconds.** "Baddy On The Floor"
+   (measured `duration=222.889s`) crossfaded in per the phase-4 `outroPoint` reference, then
+   `checkAutoPreloadTrigger` reported it had "12.5s remaining" **12ms after the ramp
+   completed**. Digger's auto-derived marker ("16 bars before the last detected beat") was
+   wrong for this specific file — a bad beat-grid fit put it at ~18s into a 223s track.
+   `nearEndReference()`'s clamp only ever protected the high end (never past EOS); nothing
+   protected the low end. Unrelated to a tempo-slider change the DJ had made two minutes
+   earlier on the *other* deck — remaining-time is computed purely from the incoming deck's
+   own duration/outroPoint/content-position.
+
+**Both fixed the same day.** (1) is the "Manual/auto interaction" design below —
+`notifyManualPlay()` now marks both decks in a manually-overlapped pair as handled, closing
+the exact gap the incident hit; `queueStore.ts`'s `loadQueueItemToDeck()` gained an `origin:
+'manual' | 'auto'` parameter so a manual load also marks whatever it displaced as "skipped"
+(new `playedTracks.ts` state, distinct from "played") rather than leaving it dangling as
+foreverunplayed. (2) is a one-line floor in `nearEndReference()`: an `outroPoint` inside the
+first third of a track's duration is now treated as untrustworthy and ignored in favor of raw
+duration, same as no marker at all — see "What's missing" §1/§3 below for where that
+function lives. `npm test`/`npm run check` clean (161/161, up from 148). **Neither
+live-verified yet** — both are log-forensics fixes for one-off incidents, not yet re-run
+against a real set.
+
+## Manual/auto interaction
+
+**Problem this section answers**: what should a manual action (play/pause, load, crossfader
+touch, tempo change, hot cue, …) do to Auto DJ while it's running? Incident 1 above is what
+happens with no answer at all — Auto DJ silently mis-modeled a deck a human had taken over.
+
+**Principle**: hand back control of exactly the thing touched, automatically, no negotiation
+— the same convention `syncLocked` and `manualTouch` (this doc, "Hand-back-control-at-
+current-position") already use. A blanket "turn Auto DJ off the moment a human does
+anything" was considered and rejected: incident 1 wasn't caused by needing an off switch, it
+was Auto DJ having no bookkeeping for a human quietly taking over one deck. Three tiers:
+
+- **Tier 1 — pass through, Auto DJ never notices.** No code changes needed — these already
+  don't touch anything Auto DJ reads: volume/gain faders, EQ, filters, tempo/pitch, seek/
+  scrub/hot-cues within the currently-loaded track, headphone cue.
+- **Tier 2 — local override ("park"), silent, Auto DJ stays on.** `notifyManualPlay(deckId)`
+  (`autoMix.ts`) — called from every manual play-toggle site (`DeckCard.svelte`, the MIDI
+  `deck_play_toggle` handler) right after a deck flips to playing — marks both decks in a
+  mapped pair "handled" (`markHandledOutgoing`, the same bookkeeping `checkAutoMixTrigger`'s
+  own ramp uses) the instant a manual play overlaps the other mapped deck already playing.
+  `loadQueueItemToDeck(item, deckId, origin)` — the shared load path (DiggerQueue's click-to-
+  load, the MIDI browse-encoder LOAD button) and the two non-Digger manual-load sites
+  (`DeckCard.svelte`'s file picker, `App.svelte`'s drag-and-drop) all mark whatever they
+  displace as **skipped** (`playedTracks.ts`'s `markSkipped`/`isSkipped`, a new state
+  distinct from "played" — the track never actually sounded, but the DJ deliberately moved
+  past it) so `pickNextTrack` doesn't loop back to it later. `skipUpcomingTrack()` is the
+  explicit **Skip** control (DiggerQueue.svelte, next to the Auto toggle, visible only when
+  Auto DJ is on) — advances whichever mapped deck isn't currently audible past its current
+  pick (marking it skipped) and loads a fresh one with `origin: 'auto'`, without touching the
+  toggle or the crossfader.
+- **Tier 3 — disengage + alert.** Reserved for cases where Auto DJ's model of the mix is
+  structurally broken, not just "a human did something": (a) a `crossfaderMapping` deck no
+  longer exists in the session (`session.subscribe` guard in `autoMix.ts`) — e.g. removed via
+  the toolbar's deck-remove button; (b) `handleDeckEos`'s advance genuinely fails (Digger
+  unreachable, empty queue and no suggestion available) — every subsequent EOS would fail the
+  same way, so leaving the toggle "on" but silently non-functional is worse than disengaging
+  and saying so. Both call `autoDjEnabled.set(false)` and `showToast()` (`src/lib/ui/toast.ts`
+  + `ToastHost.svelte`, new — no toast/status-bar primitive existed anywhere in the app before
+  this). **Deliberately the only two triggers** — a usage-pattern-based one ("N manual
+  takeovers in a row disengages") was considered and declined: a heuristic that turns the
+  toggle off on its own judgement is more likely to surprise a DJ mid-set than help one.
+
+**Not built**: any UI to review/clear the skipped-track set (the existing "Clear played"
+button in DiggerQueue's settings row only clears `playedTrackIds`) — low priority since
+`skippedTrackIds` only ever grows by a DJ's own deliberate action and a stale entry just means
+one track doesn't get re-offered, not a hang or a crash.
+
 ## Problem
 
 `autoDj.ts`'s `handleDeckEos()` reacts to a deck's full EOS (GStreamer's `deck-eos` event,
@@ -321,7 +408,9 @@ never fired (unknown/zero duration, a corrupted file, etc.). **`handleDeckEos()`
 cold-reload behavior must not also fire once a crossfade to that deck's replacement has
 already started or finished** — needs an in-flight-transition flag (per deck pair, or per
 deck) that makes `handleDeckEos` a no-op when the near-end path already handled it, while
-still catching the genuine case where lookahead never triggered.
+still catching the genuine case where lookahead never triggered. Built as `handledOutgoing`/
+`wasAutoMixTriggered` in `autoMix.ts`; extended 2026-08-26 to also cover a **manual** takeover
+of one deck, not just the automated ramp — see "Manual/auto interaction" above.
 
 ## Proposed phased plan
 

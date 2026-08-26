@@ -308,6 +308,31 @@ position across restarts" back, it needs a way to distinguish "last touched on-s
 "last touched by a hardware fader that may have moved since" — don't just restore the field
 again without solving that.
 
+**Manual/auto interaction (added 2026-08-26)** — what a human touching a deck should do to
+Auto DJ while it's running. Full tier design in `docs/design/auto-dj-transitions.md`
+("Manual/auto interaction"); short version: most manual actions (volume, EQ, tempo, seek,
+headphone cue) pass through untouched, a manual play/load on a mapped deck silently "parks"
+just that deck (`notifyManualPlay()`, `loadQueueItemToDeck(..., origin)`,
+`playedTracks.ts`'s new `markSkipped`/`isSkipped`), and only a structurally-broken mix
+(a mapped deck removed, or `handleDeckEos` genuinely failing to advance) disengages the
+toggle with a toast (`src/lib/ui/toast.ts`, new). Built after two live incidents the same
+day — **both root-caused entirely from `cuemark.log`, no reproduction needed**, by
+correlating `autoMix.ts`'s own `[auto-dj]` debugLog lines with the Rust-side deck lifecycle
+(`[bus/deck-N] EOS`, `video_demux`, `detached-pipeline IPC received: play/pause`, and the raw
+`Crossfader` MIDI values). That correlation is the reusable technique for the next "Auto DJ
+did something weird" report: **`autoDj.ts`'s `handleDeckEos()` had (and still has) no
+`debugLog()` calls at all** — only `console.error` on failure, which never reaches
+`cuemark.log` (the frontend's only bridge to the log file is `debugLog()`'s `frontend_log`
+IPC call; `console.*` output stays in the WebKit inspector). So a duplicate/cold-reload via
+the EOS fallback is *silent* in the log; what you can see is everything around it —
+`checkAutoMixTrigger`/`checkAutoPreloadTrigger`'s own `[auto-dj]` lines telling you what the
+lookahead path did or didn't do, and the Rust-side lines telling you what actually happened
+to each deck's pipeline. The second incident (a track that auto-mixed in and was replaced
+again within 8 seconds) was a **data** bug, not a logic one: `nearEndReference()`'s clamp on
+`Deck.outroPoint` only ever protected the high end (never past EOS) — a Digger-derived
+marker sitting suspiciously early in the track (a bad beat-grid fit) was never sanity-checked
+on the low end until this fix.
+
 ## Queue played-tracking (added 2026-08-24)
 
 `src/lib/digger/playedTracks.ts` — a session-local ✓ shown left of the track label in
@@ -342,6 +367,13 @@ a static import); instead drive the subscriber directly with a harmless no-op
 store tick regardless of whether anything actually changed, so this reliably
 re-triggers the threshold check without depending on the interval at all. See
 `playedTracks.test.ts`'s `tick()` helper for the pattern.
+
+**`skippedTrackIds` (added 2026-08-26), same file, same storage pattern** — a track a manual
+load displaced before it ever played. Distinct from "played" on purpose: `pickNextTrack()`
+(`autoDj.ts`) must not offer it again (the DJ deliberately moved past it), but it never
+actually sounded, so it shouldn't earn the played checkmark either. No UI to review/clear it
+yet (unlike "Clear played") — low priority, since it only grows from a DJ's own deliberate
+action. See "Manual/auto interaction" above.
 
 ## Queue panel live updates
 

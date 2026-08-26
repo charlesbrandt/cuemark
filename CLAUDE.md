@@ -708,6 +708,20 @@ the exact window being diagnosed, including the build-provenance line this file 
 first. Rotated files are date-stamped, so a report from last week is still readable. If a log looks
 suspiciously short, check whether it rotated before theorizing about what is missing.
 
+⚠️ **The frontend's only bridge into this log file is `debugLog()`** (`src/lib/debugLog.ts`,
+an `invoke("frontend_log")` call) — plain `console.log`/`console.error` in TypeScript/Svelte
+code stays in the WebKit inspector and never reaches `cuemark.log`, no matter how the app was
+launched. A frontend-only code path (most of `src/lib/digger/*`, MIDI action handlers, Svelte
+components) is invisible here unless it explicitly calls `debugLog()`. Live-hit 2026-08-26:
+`autoDj.ts`'s `handleDeckEos()` only ever had `console.error` on failure, so its cold-reload
+path was silent in the log while everything *around* it — `autoMix.ts`'s own `[auto-dj]`
+lines and the Rust-side deck lifecycle (`[bus/deck-N] EOS`, `video_demux`,
+`detached-pipeline IPC received`) — was fully visible, which was still enough to root-cause
+two live Auto DJ bugs from the log alone with zero reproduction (see the digger-integration
+skill's "Manual/auto interaction" section). Before concluding a frontend feature "didn't do
+anything," check whether its own code path has any `debugLog()` calls at all, rather than
+trusting an empty grep as proof of inaction.
+
 See the `perf-log-reading` skill for the standing performance-log line formats
 ([poll-stats], [raf], [aux-loop], [deliver-tel], [scrub-deliver]/[scrub-sec]) and how to read them —
 load it when investigating a performance regression, not every session.
