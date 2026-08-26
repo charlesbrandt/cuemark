@@ -9,6 +9,15 @@ Combine all of the MIDI and Record Settings to be switchable via a tabbed menu o
 stem support
 loop support
 
+Idea, not scoped yet (2026-08-25): split a "Controls" tab out of Settings, alongside
+Audio/MIDI/Record, for non-audio-device options that don't really belong under "Audio" — it's
+turning into a catch-all. Candidates already identified: `Display` (UI text scale) and
+`Compact controls` (hides per-deck opacity/volume/rate/EQ/filter sliders — both currently live
+in the Audio tab, `AudioSettings.svelte`, right next to each other, as an interim home), plus
+Tempo/Jog/Platter and the Auto Mix/Auto Preload timing rows, which are DJ-behavior settings
+rather than audio-routing ones. Explicitly deferred — don't start without going through Audio
+and MIDI tabs first and proposing which rows move where.
+
 I want to update the app so that it has the potential to recognize and use any number of controllers. We should set up a job to convert mappings from Mixxx to what is needed here. Can we leverage those directly? (Allowing for local updates, as needed). 
 the real cause is in src-tauri/src/midi.rs: run_midi_loop only opens a port whose name contains "hercules" or "starlight" (midi.rs:500), matched once at startup, never rescanned. That's exactly the phase-1 gap your own docs/design/controller-mapping.md §5 describes ("find one port by substring, or give up... plugging a controller in after launch does nothing until the app restarts"). The "MIDI settings" list you're seeing is the raw monitor's Rescan ports panel — it enumerates ports live and shows a ● next to whichever one cuemark actually opened, but it's read-only status, not a picker; there's no "choose this port" control built yet.
 
@@ -25,6 +34,33 @@ dual-function tone knob mapped in both its modes. See `docs/design/deck-eq-and-f
 §8 maps each "feels wrong" complaint to the constant that fixes it.
 
 What is necessary to build for mac or windows machines. Is that possible?
+
+Task: audit the media library for AV1 files and get them converted, so nobody loads one live.
+Not started — flagging, not running anything yet. Context (2026-08-25): a file that "worked on
+`mele`" showed up as `LEGACY` on the MacBook Pro; turned out to be genuinely AV1
+(`gst-discoverer-1.0` confirmed), which has never worked over WebCodecs on either machine
+(`isConfigSupported` lies, decodes zero frames — see todo.md's "AV1 renders zero video frames
+on the legacy `<video>` path" above) and is additionally unusably slow/broken on the legacy
+`<video>` fallback on this machine specifically (`docs/design/legacy-video-fallback-cost.md`).
+`mele`'s real VA-API stack likely just makes its own legacy-path fallback tolerable — different
+machine, not a fix.
+
+- A partial census already exists: as of 2026-08-05 the library had **3 known AV1 files**, two
+  high-frame-rate — see the AV1 entry above. No full scan has been run since, and Digger keeps
+  pulling more from YouTube, which serves AV1 by default. Needs an actual scan script; none
+  exists yet (`gst-discoverer-1.0 <file> | grep AV1` in a loop is the quick-and-dirty version).
+- The conversion approach is already designed but never built: transcode to an H.264 proxy at
+  ingest, measured ~1.0× realtime for 1080p30 AV1 — see `docs/design/legacy-video-fallback-cost.md`
+  (§ "Retiring the legacy path") and `docs/design/native-output-pipeline.md:72-75`. **No `ffmpeg`
+  on this machine** — the prototype pipelines there use `gst-launch-1.0` (`av1dec ! x264enc
+  ultrafast`), not ffmpeg.
+- Open question, not decided: should the legacy `<video>` path stop being an automatic silent
+  fallback at all (Settings-gated "debug only" instead), refusing/blocking an AV1 load outright
+  during normal use? It's still needed as *some* codec's fallback path in general, so fully
+  removing it isn't free — but a loud warning (or a hard refusal) specifically when the fallback
+  reason is AV1 seems like the lower-risk first step, before touching the fallback mechanism
+  itself. No toast/alert component exists in the app yet (checked); the closest thing today is
+  `DeckCard.svelte`'s inline `LEGACY` badge, which is easy to miss mid-set.
 
 ## Feature requests — prioritized
 

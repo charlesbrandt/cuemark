@@ -18,6 +18,16 @@
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
+  import { session, setMidiSlot } from "../lib/state/session";
+
+  interface ControllerInfo {
+    source: number;
+    port: string;
+    profile_id: string;
+    profile_name: string;
+    slots: number;
+    jog_ticks_per_rev: number;
+  }
 
   interface MidiRaw {
     source: number;
@@ -96,6 +106,22 @@
 
   let unlisten: (() => void) | null = null;
   let flushTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Which live controller the L/R selects below edit. Deliberately not a full
+  // per-controller routing UI (deferred — see docs/design/controller-mapping.md):
+  // with two controllers live at once this can only edit one at a time, but default
+  // slot-i -> decks[i] routing (session.ts) covers the common case regardless, and a
+  // real multi-controller UI is a bigger redesign than this trimmed pass covers.
+  let controllers = $state<ControllerInfo[]>([]);
+  let activeProfileId = $derived(
+    controllers.find((c) => c.slots >= 2)?.profile_id ?? "hercules-starlight"
+  );
+  let unlistenControllers: (() => void) | undefined;
+
+  let decks = $derived($session.decks);
+  let midiSlots = $derived($session.midiMapping[activeProfileId] ?? []);
+  let midiLeft = $derived(midiSlots[0] ?? decks[0]?.id ?? "");
+  let midiRight = $derived(midiSlots[1] ?? decks[1]?.id ?? "");
 
   const hex2 = (v: number) => v.toString(16).toUpperCase().padStart(2, "0");
 
@@ -263,11 +289,21 @@
     unlisten = await listen<MidiRaw>("midi-raw", ({ payload }) => record(payload));
     flushTimer = setInterval(flush, FLUSH_MS);
     await refreshPorts();
+
+    try {
+      controllers = await invoke<ControllerInfo[]>("midi_list_controllers");
+    } catch (e) {
+      console.error("[MidiMonitor] midi_list_controllers failed:", e);
+    }
+    unlistenControllers = await listen<ControllerInfo[]>("midi-controllers", ({ payload }) => {
+      controllers = payload;
+    });
   });
 
   onDestroy(() => {
     if (flushTimer) clearInterval(flushTimer);
     unlisten?.();
+    unlistenControllers?.();
     invoke("midi_monitor_set", { enabled: false }).catch(() => {});
   });
 </script>
@@ -313,6 +349,36 @@
       ● = the port cuemark opened. A port listed without it is enumerating but unclaimed —
       cuemark connects to one port, chosen by name at startup, and does not rescan.
     </span>
+  </div>
+
+  <div class="settings-row">
+    <span class="row-label">Deck routing</span>
+    <span class="side-label">L</span>
+    <select
+      value={midiLeft}
+      onchange={(e) => setMidiSlot(activeProfileId, 0, e.currentTarget.value)}
+    >
+      {#each decks as d (d.id)}
+        <option value={d.id}>{d.id}</option>
+      {/each}
+    </select>
+    <span class="side-label" style="margin-left:8px">R</span>
+    <select
+      value={midiRight}
+      onchange={(e) => setMidiSlot(activeProfileId, 1, e.currentTarget.value)}
+    >
+      {#each decks as d (d.id)}
+        <option value={d.id}>{d.id}</option>
+      {/each}
+    </select>
+    {#if controllers.length > 0}
+      <span class="hint-inline">
+        editing {controllers.find((c) => c.profile_id === activeProfileId)?.profile_name ?? activeProfileId}
+        {#if controllers.length > 1}(other live controllers use default slot routing){/if}
+      </span>
+    {:else}
+      <span class="hint-inline">no controller connected — showing default routing</span>
+    {/if}
   </div>
 
   {#if rows.length > 0}

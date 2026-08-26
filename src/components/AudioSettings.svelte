@@ -1,32 +1,10 @@
 <script lang="ts">
-  import { onMount, onDestroy } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
+  import { onMount } from "svelte";
   import { listAudioDevices, type AudioDevice } from "../lib/audio/pipeline";
   import { mainOutputDeviceIds, cueOutputDeviceId, tempoRange, scratchMode, jogSecondsPerRev, scrubInertiaMs, SCRUB_INERTIA_MAX_MS, networkOutputs, outputAttachStatus } from "../lib/audio/audioSettings";
   import { fontScale } from "../lib/settings/displaySettings";
   import { autoMixThresholdSec, crossfadeDurationMs, autoPreloadThresholdSec, autoMixSyncEnabled } from "../lib/digger/autoMix";
-  import { session, setMidiSlot } from "../lib/state/session";
-
-  interface ControllerInfo {
-    source: number;
-    port: string;
-    profile_id: string;
-    profile_name: string;
-    slots: number;
-    jog_ticks_per_rev: number;
-  }
-
-  // Which live controller the L/R selects below edit. Deliberately not a full
-  // per-controller routing UI (deferred — see docs/design/controller-mapping.md):
-  // with two controllers live at once this can only edit one at a time, but default
-  // slot-i -> decks[i] routing (session.ts) covers the common case regardless, and a
-  // real multi-controller UI is a bigger redesign than this trimmed pass covers.
-  let controllers = $state<ControllerInfo[]>([]);
-  let activeProfileId = $derived(
-    controllers.find((c) => c.slots >= 2)?.profile_id ?? "hercules-starlight"
-  );
-  let unlistenControllers: (() => void) | undefined;
+  import { session, setCompactControls } from "../lib/state/session";
 
   let localDevices = $state<AudioDevice[]>([]);
   let error = $state("");
@@ -129,19 +107,6 @@
       console.warn("[AudioSettings] dropped stale cue device id:", $cueOutputDeviceId);
       cueOutputDeviceId.set("");
     }
-
-    try {
-      controllers = await invoke<ControllerInfo[]>("midi_list_controllers");
-    } catch (e) {
-      console.error("[AudioSettings] midi_list_controllers failed:", e);
-    }
-    unlistenControllers = await listen<ControllerInfo[]>("midi-controllers", ({ payload }) => {
-      controllers = payload;
-    });
-  });
-
-  onDestroy(() => {
-    unlistenControllers?.();
   });
 
   function toggleMainDevice(id: string, checked: boolean) {
@@ -149,11 +114,6 @@
       checked ? [...ids, id] : ids.filter(x => x !== id)
     );
   }
-
-  let decks = $derived($session.decks);
-  let midiSlots = $derived($session.midiMapping[activeProfileId] ?? []);
-  let midiLeft = $derived(midiSlots[0] ?? decks[0]?.id ?? "");
-  let midiRight = $derived(midiSlots[1] ?? decks[1]?.id ?? "");
 </script>
 
 <div class="audio-settings">
@@ -442,34 +402,21 @@
   </div>
 
   <div class="settings-row">
-    <span class="row-label">MIDI</span>
-    <span class="side-label">L</span>
-    <select
-      value={midiLeft}
-      onchange={(e) => setMidiSlot(activeProfileId, 0, e.currentTarget.value)}
-    >
-      {#each decks as d (d.id)}
-        <option value={d.id}>{d.id}</option>
-      {/each}
-    </select>
-    <span class="side-label" style="margin-left:8px">R</span>
-    <select
-      value={midiRight}
-      onchange={(e) => setMidiSlot(activeProfileId, 1, e.currentTarget.value)}
-    >
-      {#each decks as d (d.id)}
-        <option value={d.id}>{d.id}</option>
-      {/each}
-    </select>
-    {#if controllers.length > 0}
-      <span class="hint-inline">
-        editing {controllers.find((c) => c.profile_id === activeProfileId)?.profile_name ?? activeProfileId}
-        {#if controllers.length > 1}(other live controllers use default slot routing){/if}
-      </span>
-    {:else}
-      <span class="hint-inline">no controller connected — showing default routing</span>
-    {/if}
+    <span class="row-label"></span>
+    <label class="device-check">
+      <input
+        type="checkbox"
+        checked={$session.compactControls}
+        onchange={(e) => setCompactControls(e.currentTarget.checked)}
+      />
+      Compact controls
+    </label>
+    <span class="hint-inline">
+      hides per-deck opacity/volume/rate/EQ/filter sliders — for when a MIDI controller
+      drives those and the onscreen sliders just cost screen space
+    </span>
   </div>
+
 </div>
 
 <style>
