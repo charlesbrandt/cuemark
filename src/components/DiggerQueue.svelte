@@ -190,7 +190,7 @@
       class:active={activeTab === 'history'}
       onclick={() => { activeTab = activeTab === 'history' ? 'tracks' : 'history'; }}
       title={activeTab === 'history' ? 'Back to tracks' : 'This session\'s play history'}
-    >🕓</button>
+    >◷</button>
     <button class="icon-btn" onclick={openDiggerWeb} title="Open Digger in browser">↗</button>
     <button class="icon-btn" onclick={refreshQueue} title="Refresh">↻</button>
     <button class="icon-btn" onclick={() => { showUrlInput = !showUrlInput; }} title="Settings">⚙</button>
