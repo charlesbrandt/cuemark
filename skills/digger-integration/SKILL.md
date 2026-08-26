@@ -224,7 +224,7 @@ over the configured duration, outgoing deck pauses at the exact instant the ramp
 
 **Phase 2 (auto-preload) is built + unit-tested, NOT yet live-verified** (2026-08-24,
 same file): `checkAutoPreloadTrigger()`, wired from `positionPoll.ts` right alongside the
-phase-1 trigger, fires at an earlier `autoPreloadThresholdSec` (Settings → Audio → Auto
+phase-1 trigger, fires at an earlier `autoPreloadThresholdSec` (Settings → Controls → Auto
 Preload, default 45s) and auto-loads (never plays) the next track onto the mapped deck
 that's genuinely empty (`source === null`) — reusing the same `pickNextTrack()` sourcing
 as `handleDeckEos` (see "Auto DJ" above), anchored on the *outgoing* deck's current track so
@@ -235,7 +235,7 @@ mocked-API unit tests have exercised this path — it has not been run against a
 Digger backend or a real deck.
 
 **Phase 3 (optional tempo/phase sync) is built + unit-tested, NOT yet live-verified**
-(2026-08-24, same file): `autoMixSyncEnabled` toggle (Settings → Audio → Auto Mix →
+(2026-08-24, same file): `autoMixSyncEnabled` toggle (Settings → Controls → Auto Mix →
 "Beatmatch before mixing", default off). When on and both decks have a detected/set `bpm`,
 the phase-1 trigger rate-locks the incoming deck (`syncLocked: true`, rate = main-beat-ref /
 incoming.bpm) and, after a 200ms settle, calls `nudgePhaseToMaster()` to align phase before

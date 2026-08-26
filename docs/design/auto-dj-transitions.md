@@ -19,7 +19,7 @@ silent — indistinguishable from Auto DJ never triggering at all. Fixed by addi
 calls mirroring the sync path's existing pattern: trigger fired (remaining/threshold/target),
 ramp start (duration/from-value), ramp abort (with reason: manual touch or a deck vanishing),
 ramp complete, and the preload trigger's fetch/load/skip outcomes. `crossfadeDurationMs` was
-already Settings-configurable (Settings → Audio → Auto Mix, default 6.0s) before this — the
+already Settings-configurable (Settings → Controls → Auto Mix, default 6.0s) before this — the
 abruptness report is more likely explained by that 6s default itself, or a threshold/duration
 mismatch, than by the feature being non-configurable; the new log lines are what will actually
 tell us which on the next test. **The running launcher binary at the time of the report
@@ -69,7 +69,7 @@ fields with no muting side effect on their own). `npm run check`/`npm test` clea
 shows both decks audible with no fader touched, then a real Auto DJ crossfade to confirm the
 original abrupt-transition report is actually resolved end to end.
 
-**Phase 3, same day:** `autoMixSyncEnabled` (Settings → Audio → Auto Mix → "Beatmatch before
+**Phase 3, same day:** `autoMixSyncEnabled` (Settings → Controls → Auto Mix → "Beatmatch before
 mixing", default **off**) gates a beatmatch step inserted into `checkAutoMixTrigger`
 (`autoMix.ts`) right before the crossfade would otherwise start. When on, and only when both
 decks have a detected/set `bpm` and a main-beat reference exists (`session.bpm`, normally the
@@ -332,7 +332,7 @@ still catching the genuine case where lookahead never triggered.
    slice that's actually a different feature from what exists.
 2. 🟡 **BUILT + unit-tested 2026-08-24, not yet live-verified — Auto-preload.**
    `checkAutoPreloadTrigger()` in `autoMix.ts` (wired from `positionPoll.ts` alongside
-   `checkAutoMixTrigger`) fires at an earlier `autoPreloadThresholdSec` (Settings → Audio
+   `checkAutoMixTrigger`) fires at an earlier `autoPreloadThresholdSec` (Settings → Controls
    → Auto Preload, default 45s vs. Auto Mix's 15s) than the crossfade-start threshold,
    and only onto the mapped deck that's genuinely empty (`source === null` — never
    overwrites a DJ's manual load or an earlier preload). Reuses `autoDj.ts`'s existing
@@ -363,7 +363,7 @@ section); this doc is about executing transitions live, not learning from past o
 ## Open questions for whoever picks this up
 
 - ✅ Fixed crossfade duration (a Settings number), not BPM/genre-aware — `crossfadeDurationMs`,
-  Settings → Audio → Auto Mix, default 6s. Answered as part of phase 1.
+  Settings → Controls → Auto Mix, default 6s. Answered as part of phase 1.
 - ✅ **Hand-back-control-at-current-position**, not cancel-in-place, when the DJ grabs the
   fader mid-auto-fade: `autoMix.ts`'s ramp aborts the instant `notifyManualCrossfaderTouch()`
   fires (from `Crossfader.svelte`'s `oninput` or the MIDI handler's `queueCrossfader`) and

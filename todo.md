@@ -76,7 +76,7 @@ todo format.
 
    **Follow-up — phase 1 DONE 2026-08-24.** `src/lib/digger/autoMix.ts` adds the real
    near-end crossfade: while `Auto` is on, whichever `crossfaderMapping`-named deck is
-   playing and closes within `autoMixThresholdSec` (Settings → Audio → Auto Mix, default
+   playing and closes within `autoMixThresholdSec` (Settings → Controls → Auto Mix, default
    15s) of its end starts the other mapped deck playing and ramps `setCrossfader()` toward
    it over `crossfadeDurationMs` (default 6s), pausing the outgoing deck once the fade
    completes. Requires the incoming deck to already be loaded (with a known duration) —
@@ -99,7 +99,7 @@ todo format.
    **Follow-up — phase 2 (auto-preload) BUILT + unit-tested 2026-08-24, NOT yet
    live-verified.** `checkAutoPreloadTrigger()` (`autoMix.ts`, wired from
    `positionPoll.ts` next to the phase-1 trigger) fires at an earlier
-   `autoPreloadThresholdSec` (Settings → Audio → Auto Preload, default 45s) and
+   `autoPreloadThresholdSec` (Settings → Controls → Auto Preload, default 45s) and
    auto-loads the next track onto whichever mapped deck is genuinely empty
    (`source === null` — never overwrites a DJ's manual load), reusing the same
    queue-first/`queueNext()`-fallback sourcing as `handleDeckEos`, now shared via

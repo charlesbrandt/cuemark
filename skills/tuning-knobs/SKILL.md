@@ -97,7 +97,7 @@ numbers for comparison: `fills req=15 done=15 aus=720 decode=1007ms` over 43.9s 
 | | |
 |---|---|
 | **Symptom** | Scratching or jogging *works*, at the right speed and with no dropouts, but the sound is rough, buzzy or "frantic" — the pitch audibly jumps with each MIDI detent instead of gliding. Worst at the slow speeds cueing actually uses; barely noticeable above ~0.5x. |
-| **Where** | **Settings → Audio → Platter** (0–90ms, default 40). `cuemark:scrubInertiaMs`; `SCRATCH_RATE_INERTIA_MS` in `pipeline.rs` is the default only. |
+| **Where** | **Settings → Controls → Platter** (0–90ms, default 40; moved out of Audio 2026-08-26). `cuemark:scrubInertiaMs`; `SCRATCH_RATE_INERTIA_MS` in `pipeline.rs` is the default only. |
 | **Log line** | `[scratch-tel/deck-0] … rate mean=0.152 max=0.31 jerk=0.029 (inertia 40ms, lag 5.3ch)` |
 | **Read `jerk`** | Mean chunk-to-chunk change in playback speed as a fraction of the mean speed. **~0.17 is the un-smoothed behaviour at cueing speed; ~0.03 is the shipping default.** Compare two gestures at the same `rate mean` — that is the only fair comparison, since the metric is normalised but the *input* jitter is not. |
 | **Why it exists** | A jog wheel delivers **detents**, not a hand: one fixed 7.0ms of content at a time, which at 0.15x is 3 chunks' worth of cursor travel arriving at once every 47ms. The servo answered each with a rate spike, so pitch ran as a ~21Hz sawtooth peaking at twice its own mean. `docs/design/waveform-scrub.md`, "Platter mass". |

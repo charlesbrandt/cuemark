@@ -276,7 +276,7 @@ accumulate nor persist. Per-gesture delivery legs are instrumented by
 `src/lib/audio/scrubStats.ts` (`[scrub-deliver]`/`[scrub-sec]`) — read them before blaming the
 servo, which three sessions did by mistake.
 **The platter has mass** (2026-08-14): a one-pole lag on the servo's commanded rate,
-per output frame, `SCRATCH_RATE_INERTIA_MS` (default 40ms, **Settings → Audio → Platter**,
+per output frame, `SCRATCH_RATE_INERTIA_MS` (default 40ms, **Settings → Controls → Platter**,
 0 = exactly the old path). A jog wheel delivers **detents, not a hand** — one fixed 7.0ms of
 content, which at cueing speed is 3 chunks' worth of travel arriving at once every 47ms — so
 the servo answered each with a rate spike and pitch ran as a ~21Hz sawtooth peaking at twice

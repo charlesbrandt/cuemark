@@ -33,8 +33,9 @@ const range = get(tempoRange) / 100;         // e.g. 0.20 for ±20%
 const scaled = 1.0 + delta * range;          // full fader throw = ±tempoRange%
 ```
 The `tempoRange` setting is persisted via `persistentWritable("cuemark:tempoRange", 20)` and
-exposed in the Audio Settings panel (`AudioSettings.svelte`) as a `<select>` with preset values
-(±4/6/8/10/16/20/50/100%). The DeckCard rate slider `min`/`max` are reactive to `$tempoRange`
+exposed in the Settings panel's **Controls tab** (`ControlsSettings.svelte`, split out of
+`AudioSettings.svelte` 2026-08-26) as a `<select>` with preset values (±4/6/8/10/16/20/50/100%).
+The DeckCard rate slider `min`/`max` are reactive to `$tempoRange`
 so the UI slider and MIDI fader always agree on range. **Do not change `rate_from_14bit` in Rust**
 to implement different ranges — the rescaling lives in `handler.ts` `deck_playback_rate` case.
 

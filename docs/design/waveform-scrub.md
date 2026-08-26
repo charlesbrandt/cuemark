@@ -677,7 +677,7 @@ connecting it to what a listener would hear.
 A one-pole lag on the servo's commanded rate, applied **per output frame** (not per chunk — a
 chunk-rate filter would still step the pitch 66.7 times a second, just by less each time),
 before it is used to advance the cursor. `SCRATCH_RATE_INERTIA_MS`, default 40ms, exposed as
-**Settings → Audio → Platter** and sent along with every `scratch_to` call so it can be moved
+**Settings → Controls → Platter** and sent along with every `scratch_to` call so it can be moved
 mid-gesture and judged by ear.
 
 **Why this is the platter and not just a filter.** It smooths the *velocity*, never the
