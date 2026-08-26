@@ -161,8 +161,11 @@ function startCrossfadeRamp(outgoingId: string, incomingId: string, target: 0 | 
       // loaded and silently starved every subsequent preload/crossfade cycle — the second
       // mapped deck never got a new track after the first swap. source: null also drives
       // App.svelte's syncVideoElements to tear the backend + audio pipeline down, same as
-      // a deck being removed.
-      updateDeck(outgoingId, { playing: false, source: null });
+      // a deck being removed. syncLocked must be cleared here too — it's what drives both
+      // the Lock button's `active` class and the controller's sync LED (App.svelte), and
+      // nothing else resets it once the deck goes empty, so it stayed lit on a track that
+      // no longer exists (found 2026-08-26).
+      updateDeck(outgoingId, { playing: false, source: null, syncLocked: false });
       cancel();
       return;
     }

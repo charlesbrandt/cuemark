@@ -350,6 +350,24 @@ describe('crossfade ramp', () => {
     expect(s.decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
   });
 
+  it('clears syncLocked on the outgoing deck once it unloads, so the Lock button/LED don\'t stay lit', async () => {
+    // Regression: source: null used to leave syncLocked (and thus DeckCard's Lock button
+    // `active` class + the controller sync LED, both driven off this flag) stuck on an
+    // empty deck — found 2026-08-26.
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, runToCompletion } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), syncLocked: true }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
+    ]);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90);
+    runToCompletion(100);
+
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-0')!.syncLocked).toBe(false);
+  });
+
   it('frees the outgoing deck for a fresh preload after it fades out, even if it was manually loaded', async () => {
     // Regression for the live-session report (2026-08-24): a DJ manually loaded a track
     // several queue slots ahead onto deck-0; Auto DJ correctly auto-picked+crossfaded deck-1
