@@ -9,7 +9,7 @@ import { noteScrubInput } from "../audio/scrubStats";
 import { debugLog } from "../debugLog";
 import { pushMarker } from "../digger/api";
 import { moveQueueSelection, loadSelectedQueueItem, showDiggerQueue } from "../digger/queueStore";
-import { notifyManualCrossfaderTouch } from "../digger/autoMix";
+import { notifyManualCrossfaderTouch, notifyManualPlay } from "../digger/autoMix";
 import { get } from "svelte/store";
 
 // Beat Loop pad ladder — index 0-7 (plain pad 1-4, then shift+pad 1-4). Longer lengths
@@ -394,8 +394,10 @@ export async function startMidiListener(): Promise<() => void> {
           // feeder thread still driving output instead of switching back to the normal
           // branch. Not defensive and not rare: the UI's own play button lacked this and
           // lost a play outright on 2026-08-13 — see flushScratch().
-          if (!d.playing) flushScratch(deckId);
-          updateDeck(d.id, { playing: !d.playing });
+          const wasPlaying = d.playing;
+          if (!wasPlaying) flushScratch(deckId);
+          updateDeck(d.id, { playing: !wasPlaying });
+          if (!wasPlaying) notifyManualPlay(d.id);
         }
         break;
       }

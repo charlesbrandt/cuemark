@@ -13,6 +13,8 @@
   // Scratch gesture lifecycle lives in the MIDI handler for both input routes (jog wheel
   // and, via the scrub bus, waveform drag) — so the play button has to go through it too.
   import { flushScratch } from "../lib/midi/handler";
+  import { notifyManualPlay } from "../lib/digger/autoMix";
+  import { notifyManualLoadDisplaced } from "../lib/digger/playedTracks";
   import { debugLog } from "../lib/debugLog";
   import { suppressPhaseText, suppressTimestampText } from "../lib/audio/perfArm";
   import { videoPathOverrides, videoPathDefault, setVideoPathOverride, resolveVideoPath, activeVideoBackend } from "../lib/video/videoPathSettings";
@@ -345,7 +347,9 @@
       // loading a local file over a deck that previously held a Digger track would
       // otherwise leave marker pushes (SET BEAT, cue, hot cues) silently writing to the
       // old track, and the old fileId as a stale remote-fetch fallback for this new path.
+      const previousDiggerTrackId = deck.diggerTrackId;
       updateDeck(deck.id, { source: { type: "video", filePath: file, duration: 0 }, playing: false, diggerTrackId: null, diggerFileId: null });
+      notifyManualLoadDisplaced(previousDiggerTrackId);
     }
   }
 
@@ -449,7 +453,12 @@
   <div class="transport">
     <button
       class="play-btn"
-      onclick={() => { if (!deck.playing) flushScratch(deck.id); updateDeck(deck.id, { playing: !deck.playing }); }}
+      onclick={() => {
+        const wasPlaying = deck.playing;
+        if (!wasPlaying) flushScratch(deck.id);
+        updateDeck(deck.id, { playing: !wasPlaying });
+        if (!wasPlaying) notifyManualPlay(deck.id);
+      }}
       disabled={!deck.source}
     >
       {deck.playing ? "⏸" : "▶"}

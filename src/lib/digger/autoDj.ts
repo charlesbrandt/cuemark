@@ -26,7 +26,8 @@ import { loadQueueItemToDeck } from "./queueStore";
 import { currentDj, currentDjOrNull } from "./djSelector";
 import { updateDeck, getDeck } from "../state/session";
 import { wasAutoMixTriggered } from "./autoMix";
-import { isPlayed } from "./playedTracks";
+import { isPlayed, isSkipped } from "./playedTracks";
+import { showToast } from "../ui/toast";
 
 function persistentWritable<T>(key: string, defaultValue: T) {
   let initial: T;
@@ -84,12 +85,12 @@ export async function pickNextTrack(
   if (currentTrackId !== null) {
     const idx = queued.findIndex((item) => item.track_id === currentTrackId);
     if (idx !== -1) {
-      const after = queued.slice(idx + 1).find((item) => !isPlayed(item.track_id));
+      const after = queued.slice(idx + 1).find((item) => !isPlayed(item.track_id) && !isSkipped(item.track_id));
       if (after) return after;
     }
   }
 
-  const first = queued.find((item) => !isPlayed(item.track_id));
+  const first = queued.find((item) => !isPlayed(item.track_id) && !isSkipped(item.track_id));
   if (first) return first;
 
   const track = await queueNext(owner);
@@ -116,9 +117,15 @@ export async function handleDeckEos(deckId: string): Promise<void> {
   const currentTrackId = outgoingDeck?.diggerTrackId ?? null;
   try {
     const next = await pickNextTrack(owner, currentTrackId);
-    await loadQueueItemToDeck(next, deckId);
+    await loadQueueItemToDeck(next, deckId, "auto");
     updateDeck(deckId, { playing: true });
   } catch (e) {
+    // Tier 3: every subsequent EOS will fail the same way (network down, Digger
+    // unreachable, empty queue with no suggestion available either) — leaving the
+    // toggle "on" but silently non-functional is worse than disengaging and saying so,
+    // since a DJ has no other way to notice a deck just stopped instead of advancing.
     console.error("[auto-dj] advance failed", e);
+    autoDjEnabled.set(false);
+    showToast(`Auto DJ disengaged — couldn't advance deck-${deckId}: ${e}`, "warning");
   }
 }

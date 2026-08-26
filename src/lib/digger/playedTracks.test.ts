@@ -6,7 +6,10 @@
  */
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { updateDeck } from "../state/session";
-import { playedTrackIds, isPlayed, clearPlayed, clearAllPlayed } from "./playedTracks";
+import {
+  playedTrackIds, isPlayed, clearPlayed, clearAllPlayed,
+  skippedTrackIds, isSkipped, markSkipped, notifyManualLoadDisplaced,
+} from "./playedTracks";
 
 const DECK = "deck-0";
 const TRACK = 101;
@@ -101,5 +104,28 @@ describe("played-track tracking", () => {
     clearAllPlayed();
 
     expect(isPlayed(TRACK)).toBe(false);
+  });
+});
+
+describe("skipped-track tracking (manual/auto interaction, see autoMix.ts)", () => {
+  beforeEach(() => {
+    skippedTrackIds.set(new Set());
+  });
+
+  it("markSkipped/isSkipped round-trip, independent of played state", () => {
+    expect(isSkipped(TRACK)).toBe(false);
+    markSkipped(TRACK);
+    expect(isSkipped(TRACK)).toBe(true);
+    expect(isPlayed(TRACK)).toBe(false); // skipped is not the same as played
+  });
+
+  it("notifyManualLoadDisplaced marks the previous track skipped", () => {
+    notifyManualLoadDisplaced(TRACK);
+    expect(isSkipped(TRACK)).toBe(true);
+  });
+
+  it("notifyManualLoadDisplaced no-ops for a local-file load (null previous id)", () => {
+    notifyManualLoadDisplaced(null);
+    expect(isSkipped(TRACK)).toBe(false);
   });
 });

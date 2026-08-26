@@ -11,6 +11,7 @@
   import { diggerQueue, selectedQueueIndex, loadQueueItemToDeck } from '../lib/digger/queueStore';
   import { currentDj, currentDjOrNull } from '../lib/digger/djSelector';
   import { autoDjEnabled } from '../lib/digger/autoDj';
+  import { skipUpcomingTrack } from '../lib/digger/autoMix';
   import { playedTrackIds, clearPlayed, clearAllPlayed } from '../lib/digger/playedTracks';
   import HistoryPanel from './HistoryPanel.svelte';
 
@@ -147,6 +148,10 @@
     }
   }
 
+  function skipUpcoming() {
+    skipUpcomingTrack().catch((e) => { error = String(e); });
+  }
+
   function openDiggerWeb() {
     openUrl(getDiggerWebUrl()).catch((e) => { error = String(e); });
   }
@@ -256,6 +261,13 @@
         onclick={() => autoDjEnabled.set(!$autoDjEnabled)}
         title="Auto DJ — when a deck's clip ends, auto-load the next queued track (or a suggestion if the queue is empty) and play it"
       >Auto</button>
+      {#if $autoDjEnabled}
+        <button
+          class="small-btn icon-btn"
+          onclick={skipUpcoming}
+          title="Skip — swap the upcoming/preloaded track for a different one, without turning Auto DJ off"
+        >⏭</button>
+      {/if}
     </div>
 
     {#if searchQuery.length >= 2}

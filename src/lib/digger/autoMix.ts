@@ -30,6 +30,8 @@ import { autoDjEnabled, pickNextTrack } from "./autoDj";
 import { loadQueueItemToDeck } from "./queueStore";
 import { currentDj, currentDjOrNull } from "./djSelector";
 import { nudgePhaseToMaster } from "../audio/phaseNudge";
+import { markSkipped } from "./playedTracks";
+import { showToast } from "../ui/toast";
 import { debugLog } from "../debugLog";
 
 function persistentWritable<T>(key: string, defaultValue: T) {
@@ -93,6 +95,94 @@ export function wasAutoMixTriggered(deckId: string, filePath: string | undefined
   return filePath !== undefined && handledOutgoing.get(deckId) === filePath;
 }
 
+/** Exported for the manual/auto interaction rules (see below) — lets a manual action
+ *  mark a deck's current track as "already handled" the same way the ramp trigger does,
+ *  so handleDeckEos() doesn't treat a manually-managed transition as an unhandled EOS. */
+export function markHandledOutgoing(deckId: string, filePath: string | undefined): void {
+  if (filePath !== undefined) handledOutgoing.set(deckId, filePath);
+}
+
+// ── Manual/auto interaction — see docs/design/auto-dj-transitions.md "Manual/auto
+// interaction" ────────────────────────────────────────────────────────────────────
+//
+// Principle: hand back control of exactly the thing touched, automatically, no
+// negotiation — the same convention `syncLocked` and `manualTouch` already use.
+// A blanket "turn Auto DJ off the moment a human does anything" was considered and
+// rejected: the live-session bug this was built for wasn't caused by needing an off
+// switch, it was Auto DJ having no bookkeeping for a human quietly taking over one
+// deck. So most manual actions "park" (silent, Auto DJ stays on) rather than
+// disengage (alert, Auto DJ turns off) — see the tiers below.
+
+/**
+ * Tier 2, silent — call right after a manual play-toggle flips a deck to playing
+ * (DeckCard's Play button, the MIDI deck_play_toggle handler). Never called from an
+ * automated path — startCrossfadeRamp already does its own bookkeeping.
+ *
+ * Live-session bug (2026-08-26): a DJ manually loaded+played an older track back onto
+ * an idle mapped deck while its counterpart kept playing unattended. checkAutoMixTrigger
+ * correctly refused to touch that pair (it bails whenever the incoming deck is already
+ * playing — see below), but nothing recorded that the transition had, in effect, already
+ * happened. When the manually-driven deck later reached its own real EOS, handleDeckEos
+ * saw an unhandled transition and picked "the next unplayed track" — which was still
+ * technically unplayed because the OTHER deck's crossfader-driven volume had been at
+ * 0 the whole time it played (isPlayed() gates on audible volume, not just `playing`).
+ * Same file loaded onto both decks. Marking both sides here as soon as the manual
+ * takeover happens closes that gap without touching the crossfader or the toggle at all.
+ */
+export function notifyManualPlay(deckId: string): void {
+  if (!get(autoDjEnabled)) return;
+  const s = get(session);
+  const { left, right } = s.crossfaderMapping;
+  if (deckId !== left && deckId !== right) return;
+  const otherId = deckId === left ? right : left;
+  const other = getDeck(otherId);
+  if (!other?.playing) return; // no overlap in progress — nothing to park
+  const deck = getDeck(deckId);
+  const deckPath = deck?.source?.type === "video" ? deck.source.filePath : undefined;
+  const otherPath = other.source?.type === "video" ? other.source.filePath : undefined;
+  markHandledOutgoing(deckId, deckPath);
+  markHandledOutgoing(otherId, otherPath);
+}
+
+/**
+ * Tier 2 (your ask, 2026-08-26) — advances the mapped deck that isn't currently the
+ * audible one past whatever it's holding (preloaded-but-idle, or genuinely empty),
+ * without touching autoDjEnabled or the crossfader. Marks the displaced track skipped
+ * (playedTracks.ts) so pickNextTrack doesn't loop back to a track that was chosen but
+ * never actually played, then loads a fresh pick with `origin: 'auto'` so the new track
+ * stays eligible for the ordinary near-end crossfade — this is "give me a different next
+ * track", not a manual takeover of the deck.
+ */
+export async function skipUpcomingTrack(): Promise<void> {
+  const s = get(session);
+  const { left, right } = s.crossfaderMapping;
+  const leftDeck = getDeck(left);
+  const rightDeck = getDeck(right);
+  const incoming = !leftDeck?.playing ? leftDeck : !rightDeck?.playing ? rightDeck : undefined;
+  if (!incoming) return; // both mapped decks playing — nothing idle to advance
+  const outgoing = incoming.id === left ? rightDeck : leftDeck;
+  if (incoming.diggerTrackId !== null) markSkipped(incoming.diggerTrackId);
+  const owner = currentDjOrNull(get(currentDj));
+  debugLog(`[auto-dj] skip: advancing deck-${incoming.id} past its current pick`);
+  const next = await pickNextTrack(owner, outgoing?.diggerTrackId ?? null);
+  await loadQueueItemToDeck(next, incoming.id, "auto");
+}
+
+// Tier 3, alert + disengage — Auto DJ's model of the mix is structurally broken, not
+// just "a human did something": one of the two decks it's driving no longer exists.
+// Deliberately the *only* structural trigger for now (see the design doc's open
+// question about a usage-pattern-based one — declined: a heuristic that turns the
+// toggle off on its own judgement is more likely to surprise a DJ than help one).
+session.subscribe((s) => {
+  if (!get(autoDjEnabled)) return;
+  const { left, right } = s.crossfaderMapping;
+  const stillExist = s.decks.some((d) => d.id === left) && s.decks.some((d) => d.id === right);
+  if (!stillExist) {
+    autoDjEnabled.set(false);
+    showToast("Auto DJ disengaged — a mapped deck was removed", "warning");
+  }
+});
+
 // Only one auto-mix transition in flight at a time — correct for the phase-1 two-deck scope
 // (crossfaderMapping never names more than two decks), and simpler than tracking one ramp per
 // deck pair for a case that can't currently arise.
@@ -105,8 +195,16 @@ let activeRamp: { cancel: () => void } | null = null;
 // whichever point applies, so a DJ with no marker data sees identical behavior to before
 // this field existed. Clamped to duration defensively — Digger already does this
 // server-side, but a stale/bad value here must never push the trigger point past EOS.
+// Sanity floor: Digger's auto-derived marker ("16 bars before the last detected beat")
+// is occasionally wrong for a specific track — a bad beat-grid fit landed one at ~18s
+// into a 223s track live on 2026-08-26 ("Baddy On The Floor"), making the very next
+// preload/crossfade pair fire within 8s of the track starting, right after it had just
+// been mixed in. The doc's own clamp above only ever protected the high end (never past
+// EOS); a marker inside the first third of the track is equally untrustworthy and is
+// now ignored in favor of raw duration, same as no marker at all.
 function nearEndReference(outroPoint: number | null, duration: number): number {
-  return outroPoint !== null ? Math.min(outroPoint, duration) : duration;
+  if (outroPoint !== null && outroPoint >= duration / 3) return Math.min(outroPoint, duration);
+  return duration;
 }
 
 // requestAnimationFrame doesn't exist under vitest's node test environment; degrade to a 16ms
@@ -293,7 +391,7 @@ export function checkAutoPreloadTrigger(deckId: string, contentPos: number): voi
         return;
       }
       debugLog(`[auto-dj] preload: loading "${next.title}" onto deck-${incomingId}`);
-      return loadQueueItemToDeck(next, incomingId);
+      return loadQueueItemToDeck(next, incomingId, "auto");
     })
     .catch((e) => {
       debugLog(`[auto-dj] preload failed: ${e}`);

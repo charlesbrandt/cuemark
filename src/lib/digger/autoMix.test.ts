@@ -21,7 +21,13 @@ const loadQueueItemToDeck = vi.fn().mockResolvedValue(undefined);
 vi.mock('./queueStore', () => ({ loadQueueItemToDeck: (...a: unknown[]) => loadQueueItemToDeck(...a) }));
 
 const isPlayed = vi.fn().mockReturnValue(false);
-vi.mock('./playedTracks', () => ({ isPlayed: (...a: unknown[]) => isPlayed(...a) }));
+const isSkipped = vi.fn().mockReturnValue(false);
+const markSkipped = vi.fn();
+vi.mock('./playedTracks', () => ({
+  isPlayed: (...a: unknown[]) => isPlayed(...a),
+  isSkipped: (...a: unknown[]) => isSkipped(...a),
+  markSkipped: (...a: unknown[]) => markSkipped(...a),
+}));
 
 const nudgePhaseToMaster = vi.fn();
 vi.mock('../audio/phaseNudge', () => ({ nudgePhaseToMaster: (...a: unknown[]) => nudgePhaseToMaster(...a) }));
@@ -124,6 +130,8 @@ beforeEach(() => {
   removeFromQueue.mockReset().mockResolvedValue(undefined);
   loadQueueItemToDeck.mockReset().mockResolvedValue(undefined);
   isPlayed.mockReset().mockReturnValue(false);
+  isSkipped.mockReset().mockReturnValue(false);
+  markSkipped.mockReset();
   nudgePhaseToMaster.mockReset();
 });
 
@@ -298,6 +306,26 @@ describe('checkAutoMixTrigger / checkAutoPreloadTrigger with outroPoint (Phase 4
     expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
   });
 
+  it('ignores an outroPoint suspiciously close to the start, falling back to duration', async () => {
+    // Regression: "Baddy On The Floor", 2026-08-26 — a bad Digger beat-grid fit put
+    // outroPoint at ~18s into a 223s track, making the very next preload/crossfade
+    // pair fire within 8s of the track being mixed in. A marker inside the first
+    // third of the track is untrustworthy, same treatment as no marker at all.
+    const { sessionMod, autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixThresholdSec.set(15);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: 10 }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
+    ]);
+
+    // 10s remaining to the (untrustworthy, ignored) marker, but 80s remaining to the
+    // real duration — must NOT fire.
+    autoMixMod.checkAutoMixTrigger('deck-0', 0);
+
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
+  });
+
   it('preload also measures its lead time from outroPoint when set', async () => {
     const { autoDjMod, autoMixMod, resetSession } = await setup();
     autoDjMod.autoDjEnabled.set(true);
@@ -394,6 +422,7 @@ describe('crossfade ramp', () => {
     await vi.waitFor(() => expect(loadQueueItemToDeck).toHaveBeenCalledWith(
       { id: 1, track_id: 7, title: 'T', artist: 'A' },
       'deck-0',
+      'auto',
     ));
   });
 
@@ -631,6 +660,7 @@ describe('checkAutoPreloadTrigger', () => {
     expect(loadQueueItemToDeck).toHaveBeenCalledWith(
       { id: 1, track_id: 7, title: 'T', artist: 'A' },
       'deck-1',
+      'auto',
     );
     expect(removeFromQueue).not.toHaveBeenCalled(); // stays in the queue (changed 2026-08-24)
     expect(queueNext).not.toHaveBeenCalled();
@@ -651,7 +681,7 @@ describe('checkAutoPreloadTrigger', () => {
     autoMixMod.checkAutoPreloadTrigger('deck-0', 60);
 
     await vi.waitFor(() => expect(loadQueueItemToDeck).toHaveBeenCalled());
-    expect(loadQueueItemToDeck).toHaveBeenCalledWith(upNext, 'deck-1'); // not `current`
+    expect(loadQueueItemToDeck).toHaveBeenCalledWith(upNext, 'deck-1', 'auto'); // not `current`
   });
 
   it('skips a queue entry already marked played', async () => {
@@ -670,7 +700,7 @@ describe('checkAutoPreloadTrigger', () => {
     autoMixMod.checkAutoPreloadTrigger('deck-0', 60);
 
     await vi.waitFor(() => expect(loadQueueItemToDeck).toHaveBeenCalled());
-    expect(loadQueueItemToDeck).toHaveBeenCalledWith(fresh, 'deck-1');
+    expect(loadQueueItemToDeck).toHaveBeenCalledWith(fresh, 'deck-1', 'auto');
   });
 
   it('falls back to queueNext() when the queue is empty', async () => {
@@ -690,6 +720,7 @@ describe('checkAutoPreloadTrigger', () => {
     expect(loadQueueItemToDeck).toHaveBeenCalledWith(
       { track_id: 9, title: 'Suggested', artist: 'Someone' },
       'deck-1',
+      'auto',
     );
     expect(removeFromQueue).not.toHaveBeenCalled();
   });
@@ -730,5 +761,130 @@ describe('checkAutoPreloadTrigger', () => {
     await vi.waitFor(() => expect(getQueue).toHaveBeenCalled());
     await new Promise((r) => setTimeout(r, 0)); // let the .then chain settle
     expect(loadQueueItemToDeck).not.toHaveBeenCalled();
+  });
+});
+
+// docs/design/auto-dj-transitions.md "Manual/auto interaction" — see autoMix.ts's own
+// comment above notifyManualPlay/skipUpcomingTrack for the live-session bug (2026-08-26)
+// this closes: a manual play on a mapped deck while its counterpart already plays left
+// the transition permanently unhandled, and the deck's later real EOS re-picked a track
+// that was still (inaudibly) playing on the other deck.
+describe('notifyManualPlay (Tier 2, silent)', () => {
+  it('marks both decks in the pair handled once a manual play overlaps the other playing deck', async () => {
+    const { autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('manual.mp4', 100) }),
+      baseDeck('deck-1', { playing: true, source: videoSource('b.mp4', 100) }),
+    ]);
+
+    autoMixMod.notifyManualPlay('deck-0');
+
+    // Both filePaths are now "handled" — a real EOS on either deck must not re-pick.
+    expect(autoMixMod.wasAutoMixTriggered('deck-0', 'manual.mp4')).toBe(true);
+    expect(autoMixMod.wasAutoMixTriggered('deck-1', 'b.mp4')).toBe(true);
+  });
+
+  it('does nothing when the other mapped deck is not playing (no overlap to park)', async () => {
+    const { autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('manual.mp4', 100) }),
+      baseDeck('deck-1', { playing: false, source: null }),
+    ]);
+
+    autoMixMod.notifyManualPlay('deck-0');
+
+    expect(autoMixMod.wasAutoMixTriggered('deck-0', 'manual.mp4')).toBe(false);
+  });
+
+  it('does nothing when Auto DJ is off', async () => {
+    const { autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(false);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('manual.mp4', 100) }),
+      baseDeck('deck-1', { playing: true, source: videoSource('b.mp4', 100) }),
+    ]);
+
+    autoMixMod.notifyManualPlay('deck-0');
+
+    expect(autoMixMod.wasAutoMixTriggered('deck-0', 'manual.mp4')).toBe(false);
+  });
+});
+
+describe('skipUpcomingTrack (Tier 2, silent — the explicit Skip control)', () => {
+  it('marks the currently-preloaded track skipped and loads a fresh pick with origin "auto"', async () => {
+    const { autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    const fresh = { id: 2, track_id: 8, title: 'Fresh', artist: 'B' };
+    getQueue.mockResolvedValue([{ id: 1, track_id: 7, title: 'Current', artist: 'A' }, fresh]);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), diggerTrackId: 7 }),
+      baseDeck('deck-1', { source: videoSource('preloaded.mp4', 200), diggerTrackId: 20 }),
+    ]);
+
+    await autoMixMod.skipUpcomingTrack();
+
+    expect(markSkipped).toHaveBeenCalledWith(20);
+    expect(loadQueueItemToDeck).toHaveBeenCalledWith(fresh, 'deck-1', 'auto');
+  });
+
+  it('loads a fresh pick onto whichever mapped deck is genuinely empty, without marking anything skipped', async () => {
+    const { autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    const next = { id: 1, track_id: 7, title: 'T', artist: 'A' };
+    getQueue.mockResolvedValue([next]);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), diggerTrackId: 5 }),
+      baseDeck('deck-1', { source: null }),
+    ]);
+
+    await autoMixMod.skipUpcomingTrack();
+
+    expect(markSkipped).not.toHaveBeenCalled();
+    expect(loadQueueItemToDeck).toHaveBeenCalledWith(next, 'deck-1', 'auto');
+  });
+
+  it('does nothing when both mapped decks are already playing', async () => {
+    const { autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100) }),
+      baseDeck('deck-1', { playing: true, source: videoSource('b.mp4', 100) }),
+    ]);
+
+    await autoMixMod.skipUpcomingTrack();
+
+    expect(loadQueueItemToDeck).not.toHaveBeenCalled();
+  });
+});
+
+describe('structural disengage (Tier 3, alert)', () => {
+  it('disengages Auto DJ and alerts when a mapped deck is removed from the session', async () => {
+    const { autoDjMod, sessionMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100) }),
+      baseDeck('deck-1', { source: null }),
+    ]);
+    expect(get(autoDjMod.autoDjEnabled)).toBe(true);
+
+    sessionMod.removeDeck('deck-1');
+
+    expect(get(autoDjMod.autoDjEnabled)).toBe(false);
+  });
+
+  it('leaves Auto DJ on when an unrelated (non-mapped) deck is removed', async () => {
+    const { autoDjMod, sessionMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100) }),
+      baseDeck('deck-1', { source: null }),
+      baseDeck('deck-2', { source: null }),
+    ]);
+
+    sessionMod.removeDeck('deck-2');
+
+    expect(get(autoDjMod.autoDjEnabled)).toBe(true);
   });
 });

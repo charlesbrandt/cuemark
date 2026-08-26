@@ -8,6 +8,7 @@ import { session, updateDeck } from '../state/session';
 import { getCuemarkPayload, type DiggerQueueItem } from './api';
 import { markGridSaved } from '../audio/gridSource';
 import { setPendingTrackMeta } from '../state/history';
+import { notifyManualLoadDisplaced } from './playedTracks';
 
 export const diggerQueue = writable<DiggerQueueItem[]>([]);
 export const selectedQueueIndex = writable(0);
@@ -36,12 +37,21 @@ export function moveQueueSelection(delta: number) {
  * shape (which carries queue-entry-only fields like `id`/`position` that don't
  * exist for a track pulled straight from `GET /queue/next` or `/random` rather
  * than off the queue) — see autoDj.ts's fallback-to-suggestion path.
+ *
+ * `origin` distinguishes a human-driven load (search/queue click, the MIDI browse-encoder
+ * LOAD button) from one Auto DJ made itself (autoDj.ts/autoMix.ts) — see
+ * docs/design/auto-dj-transitions.md "Manual/auto interaction". A manual load marks
+ * whatever it displaces as skipped (playedTracks.ts) so the queue picker doesn't loop
+ * back to a track that was chosen but never actually played; default 'manual' since
+ * most callers are UI-driven and the two automated call sites pass 'auto' explicitly.
  */
 export async function loadQueueItemToDeck(
   item: Pick<DiggerQueueItem, 'track_id' | 'title' | 'artist'>,
   deckId: string,
+  origin: 'manual' | 'auto' = 'manual',
 ): Promise<void> {
   const deck = get(session).decks.find((d) => d.id === deckId);
+  const previousDiggerTrackId = deck?.diggerTrackId ?? null;
   if (deck?.playing && deck?.source) {
     const label = deck.source.type === 'video'
       ? deck.source.filePath.split('/').pop()
@@ -88,6 +98,7 @@ export async function loadQueueItemToDeck(
   // Synchronous with updateDeck above, so this lands before App.svelte's rAF-deferred
   // syncVideoElements next inspects this deck — see gridSource.ts race-ordering note.
   if (trusted) markGridSaved(deckId, payload.filePath);
+  if (origin === 'manual') notifyManualLoadDisplaced(previousDiggerTrackId);
 }
 
 /** MIDI queue_load — loads whatever the browse-encoder cursor currently selects.

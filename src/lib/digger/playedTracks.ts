@@ -16,35 +16,64 @@ import { session } from "../state/session";
 import type { Deck } from "../state/types";
 
 const STORAGE_KEY = "cuemark:playedTrackIds";
+const SKIPPED_STORAGE_KEY = "cuemark:skippedTrackIds";
 const AUDIBLE_VOLUME_THRESHOLD = 0.05;
 const PLAYED_THRESHOLD_MS = 15_000;
 
-function load(): Set<number> {
+function loadSet(key: string): Set<number> {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = localStorage.getItem(key);
     return raw ? new Set(JSON.parse(raw)) : new Set();
   } catch {
     return new Set();
   }
 }
 
-function persist(ids: Set<number>) {
+function persistSet(key: string, ids: Set<number>) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify([...ids]));
+    localStorage.setItem(key, JSON.stringify([...ids]));
   } catch {
     // best-effort — a private/full localStorage just loses session persistence
   }
 }
 
-export const playedTrackIds = writable<Set<number>>(load());
+export const playedTrackIds = writable<Set<number>>(loadSet(STORAGE_KEY));
 
 export function isPlayed(trackId: number): boolean {
   return get(playedTrackIds).has(trackId);
 }
 
+// A track a manual load displaced before it ever played — see queueStore.ts's
+// notifyManualLoadDisplaced(). Distinct from "played": pickNextTrack() must not offer
+// it again (the DJ deliberately moved past it), but it never actually sounded, so it
+// shouldn't show a played checkmark either. Session-local, same persistence pattern as
+// playedTrackIds — see docs/design/auto-dj-transitions.md "Manual/auto interaction".
+export const skippedTrackIds = writable<Set<number>>(loadSet(SKIPPED_STORAGE_KEY));
+
+export function isSkipped(trackId: number): boolean {
+  return get(skippedTrackIds).has(trackId);
+}
+
+export function markSkipped(trackId: number): void {
+  skippedTrackIds.update((s) => {
+    if (s.has(trackId)) return s;
+    const next = new Set(s);
+    next.add(trackId);
+    persistSet(SKIPPED_STORAGE_KEY, next);
+    return next;
+  });
+}
+
+/** Call right after a manual load lands on a deck, with the deck's *previous*
+ *  diggerTrackId (read before the load overwrote it). No-op for a local file load
+ *  (null) or when the deck was already empty. */
+export function notifyManualLoadDisplaced(previousTrackId: number | null): void {
+  if (previousTrackId !== null) markSkipped(previousTrackId);
+}
+
 export function clearAllPlayed(): void {
   playedTrackIds.set(new Set());
-  persist(new Set());
+  persistSet(STORAGE_KEY, new Set());
 }
 
 export function clearPlayed(trackId: number): void {
@@ -52,7 +81,7 @@ export function clearPlayed(trackId: number): void {
     if (!s.has(trackId)) return s;
     const next = new Set(s);
     next.delete(trackId);
-    persist(next);
+    persistSet(STORAGE_KEY, next);
     return next;
   });
 }
@@ -62,7 +91,7 @@ function markPlayed(trackId: number) {
     if (s.has(trackId)) return s;
     const next = new Set(s);
     next.add(trackId);
-    persist(next);
+    persistSet(STORAGE_KEY, next);
     return next;
   });
 }

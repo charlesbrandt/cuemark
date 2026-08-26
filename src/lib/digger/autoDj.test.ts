@@ -8,6 +8,7 @@
  * (2026-08-24 — the queue is a set list a DJ wants to stay visible, not a work stack).
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { get } from 'svelte/store';
 
 const getQueue = vi.fn();
 const queueNext = vi.fn();
@@ -28,7 +29,11 @@ const wasAutoMixTriggered = vi.fn().mockReturnValue(false);
 vi.mock('./autoMix', () => ({ wasAutoMixTriggered: (...a: unknown[]) => wasAutoMixTriggered(...a) }));
 
 const isPlayed = vi.fn().mockReturnValue(false);
-vi.mock('./playedTracks', () => ({ isPlayed: (...a: unknown[]) => isPlayed(...a) }));
+const isSkipped = vi.fn().mockReturnValue(false);
+vi.mock('./playedTracks', () => ({
+  isPlayed: (...a: unknown[]) => isPlayed(...a),
+  isSkipped: (...a: unknown[]) => isSkipped(...a),
+}));
 
 import { autoDjEnabled, handleDeckEos } from './autoDj';
 import { currentDj } from './djSelector';
@@ -38,6 +43,7 @@ beforeEach(() => {
   getDeck.mockReturnValue(undefined);
   wasAutoMixTriggered.mockReturnValue(false);
   isPlayed.mockReturnValue(false);
+  isSkipped.mockReturnValue(false);
   autoDjEnabled.set(false);
   currentDj.set('');
 });
@@ -58,7 +64,7 @@ describe('handleDeckEos', () => {
     await handleDeckEos('deck-0');
 
     expect(getQueue).toHaveBeenCalledWith(null);
-    expect(loadQueueItemToDeck).toHaveBeenCalledWith(item, 'deck-0');
+    expect(loadQueueItemToDeck).toHaveBeenCalledWith(item, 'deck-0', 'auto');
     expect(removeFromQueue).not.toHaveBeenCalled(); // stays in the queue
     expect(queueNext).not.toHaveBeenCalled();
     expect(updateDeck).toHaveBeenCalledWith('deck-0', { playing: true });
@@ -73,7 +79,19 @@ describe('handleDeckEos', () => {
 
     await handleDeckEos('deck-0');
 
-    expect(loadQueueItemToDeck).toHaveBeenCalledWith(fresh, 'deck-0');
+    expect(loadQueueItemToDeck).toHaveBeenCalledWith(fresh, 'deck-0', 'auto');
+  });
+
+  it('skips entries a manual load displaced (markSkipped/isSkipped), same as already-played ones', async () => {
+    autoDjEnabled.set(true);
+    const displaced = { id: 1, track_id: 7, title: 'Displaced', artist: 'A' };
+    const fresh = { id: 2, track_id: 8, title: 'Fresh', artist: 'B' };
+    getQueue.mockResolvedValue([displaced, fresh]);
+    isSkipped.mockImplementation((id: number) => id === 7);
+
+    await handleDeckEos('deck-0');
+
+    expect(loadQueueItemToDeck).toHaveBeenCalledWith(fresh, 'deck-0', 'auto');
   });
 
   it('anchors on the outgoing deck\'s current track and picks the next unplayed entry after it', async () => {
@@ -87,7 +105,7 @@ describe('handleDeckEos', () => {
     await handleDeckEos('deck-0');
 
     // Not the front of the queue (current) — the entry after it in queue order.
-    expect(loadQueueItemToDeck).toHaveBeenCalledWith(upNext, 'deck-0');
+    expect(loadQueueItemToDeck).toHaveBeenCalledWith(upNext, 'deck-0', 'auto');
   });
 
   it('falls back to the front of the queue when the current track has no anchor position', async () => {
@@ -98,7 +116,7 @@ describe('handleDeckEos', () => {
 
     await handleDeckEos('deck-0');
 
-    expect(loadQueueItemToDeck).toHaveBeenCalledWith(item, 'deck-0');
+    expect(loadQueueItemToDeck).toHaveBeenCalledWith(item, 'deck-0', 'auto');
   });
 
   it('falls back to queueNext() when the queue is empty', async () => {
@@ -112,6 +130,7 @@ describe('handleDeckEos', () => {
     expect(loadQueueItemToDeck).toHaveBeenCalledWith(
       { track_id: 9, title: 'Suggested', artist: 'Someone' },
       'deck-1',
+      'auto',
     );
     expect(removeFromQueue).not.toHaveBeenCalled();
     expect(updateDeck).toHaveBeenCalledWith('deck-1', { playing: true });
@@ -128,6 +147,7 @@ describe('handleDeckEos', () => {
     expect(loadQueueItemToDeck).toHaveBeenCalledWith(
       { track_id: 9, title: 'Suggested', artist: 'Someone' },
       'deck-1',
+      'auto',
     );
   });
 
@@ -143,13 +163,17 @@ describe('handleDeckEos', () => {
     expect(queueNext).toHaveBeenCalledWith('Guest');
   });
 
-  it('logs and does not throw when Digger is unreachable', async () => {
+  it('logs, does not throw, and disengages (Tier 3) when Digger is unreachable', async () => {
     autoDjEnabled.set(true);
     getQueue.mockRejectedValue(new Error('network error'));
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     await expect(handleDeckEos('deck-0')).resolves.toBeUndefined();
     expect(updateDeck).not.toHaveBeenCalled();
+    // Every subsequent EOS would fail the same way — leaving the toggle silently
+    // non-functional is worse than disengaging and saying so (docs/design/
+    // auto-dj-transitions.md "Manual/auto interaction", Tier 3).
+    expect(get(autoDjEnabled)).toBe(false);
 
     errSpy.mockRestore();
   });

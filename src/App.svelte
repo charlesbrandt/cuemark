@@ -24,6 +24,8 @@
   import WaveformCanvas from "./components/WaveformCanvas.svelte";
   import SettingsPanel from "./components/SettingsPanel.svelte";
   import DiggerQueue from "./components/DiggerQueue.svelte";
+  import ToastHost from "./components/ToastHost.svelte";
+  import { notifyManualLoadDisplaced } from "./lib/digger/playedTracks";
   import { isRecording } from "./lib/audio/recordState";
   import { toggleRecording } from "./lib/audio/recordControl";
   import { mainOutputDeviceIds, cueOutputDeviceId, cueGain, networkOutputs, outputAttachStatus } from "./lib/audio/audioSettings";
@@ -315,10 +317,13 @@
       const el = document.elementFromPoint(position.x, position.y);
       const card = el?.closest<HTMLElement>('[data-deck-id]');
       if (card?.dataset.deckId) {
-        updateDeck(card.dataset.deckId, {
+        const deckId = card.dataset.deckId;
+        const previousDiggerTrackId = get(session).decks.find((d) => d.id === deckId)?.diggerTrackId ?? null;
+        updateDeck(deckId, {
           source: { type: 'video', filePath: paths[0], duration: 0, loadSeq: Date.now() },
           playing: false,
         });
+        notifyManualLoadDisplaced(previousDiggerTrackId);
       }
     });
 
@@ -823,6 +828,7 @@
 </script>
 
 <div class="app">
+  <ToastHost />
   <header class="toolbar">
     <span class="logo">CUEMARK</span>
     <div class="toolbar-divider"></div>
