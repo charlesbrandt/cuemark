@@ -31,6 +31,15 @@
   const ZOOM_LEAD_RATIO = 0.25;
   const HOT_COLORS = ['#00e8ff', '#ffcc00', '#ff44cc', '#44ff88'];
   const PLAYHEAD_COLOR = '#7c8cff'; // matches --accent-deck (app.css)
+  // Must match .waveform-canvas's `height: 72px` below exactly — kept as a literal
+  // constant, not read via getComputedStyle(), on purpose: a canvas mounting during a
+  // window resize/maximize transition can catch WebKitGTK's un-styled default canvas
+  // height (150px) from that read, which then parses as a valid number and skips the
+  // NaN-only fallback that used to guard it — permanently sizing that canvas at 150px
+  // (300px buffer at dpr=2) until the deck is removed and re-added. Live-diagnosed
+  // 2026-08-25 (see also the full-window skew on un-maximize — same class of
+  // resize-triggered instability, tracked separately).
+  const WAVEFORM_HEIGHT_PX = 72;
 
   // Pre-rasterized overview bars, one offscreen canvas per colour scheme.
   //
@@ -118,11 +127,13 @@
   function autoSize(node: HTMLCanvasElement, _filePath: string | null | undefined) {
     const wrapper = node.parentElement!;
     const dpr = window.devicePixelRatio || 1;
-    // Read CSS height once at setup. The waveform canvas height is fixed by CSS
-    // (height: 72px). We must NOT set node.style.height inside the ResizeObserver
-    // callback because the wrapper height is derived from the canvas height —
-    // setting it would resize the wrapper, firing the observer again → infinite loop.
-    const cssH = parseFloat(getComputedStyle(node).height) || 72;
+    // The waveform canvas height is fixed by CSS (height: 72px) — use the same literal
+    // constant rather than reading it back via getComputedStyle(). See
+    // WAVEFORM_HEIGHT_PX's doc comment for why that read is unsafe. We must NOT set
+    // node.style.height inside the ResizeObserver callback because the wrapper height
+    // is derived from the canvas height — setting it would resize the wrapper, firing
+    // the observer again → infinite loop.
+    const cssH = WAVEFORM_HEIGHT_PX;
     let rafId = 0;
 
     function resize() {
@@ -683,7 +694,8 @@
     /* width is always set via c.style.width in resize() — do not put width:100% here.
        WebKitGTK does not reliably apply scoped CSS width to canvas elements inside
        flex children, causing the canvas to render at 300px default width.
-       height:72px is a pre-JS fallback only; resize() overwrites it via c.style.height. */
+       height:72px is a pre-JS fallback only; resize() overwrites it via c.style.height,
+       using the WAVEFORM_HEIGHT_PX constant in <script> — keep the two in sync. */
     height: 72px;
     cursor: grab;
     /* Without this a touch/pen drag is claimed by the browser as a pan gesture and the
