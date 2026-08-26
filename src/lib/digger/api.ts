@@ -18,6 +18,7 @@ export interface DiggerQueueItem {
   artist: string;
   album: string | null;
   bpm: number | null;
+  duration_ms: number | null;
   source: string;
   era: string;
 }

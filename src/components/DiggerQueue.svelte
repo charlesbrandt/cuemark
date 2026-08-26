@@ -15,6 +15,18 @@
   import HistoryPanel from './HistoryPanel.svelte';
 
   let activeTab = $state<'tracks' | 'history'>('tracks');
+
+  const totalQueueMs = $derived(
+    $diggerQueue.reduce((sum, item) => sum + (item.duration_ms ?? 0), 0)
+  );
+
+  function formatTotalDuration(ms: number): string {
+    const totalSec = Math.floor(ms / 1000);
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = (totalSec % 60).toString().padStart(2, '0');
+    return h > 0 ? `${h}:${m.toString().padStart(2, '0')}:${s}` : `${m}:${s}`;
+  }
   let searchResults = $state<DiggerTrack[]>([]);
   let searchQuery = $state('');
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -168,14 +180,15 @@
 <div class="digger-panel">
   <div class="digger-header">
     <span class="digger-title">Digger Queue</span>
+    <button
+      class="icon-btn"
+      class:active={activeTab === 'history'}
+      onclick={() => { activeTab = activeTab === 'history' ? 'tracks' : 'history'; }}
+      title={activeTab === 'history' ? 'Back to tracks' : 'This session\'s play history'}
+    >🕓</button>
     <button class="icon-btn" onclick={openDiggerWeb} title="Open Digger in browser">↗</button>
     <button class="icon-btn" onclick={refreshQueue} title="Refresh">↻</button>
     <button class="icon-btn" onclick={() => { showUrlInput = !showUrlInput; }} title="Settings">⚙</button>
-  </div>
-
-  <div class="seg tab-seg" role="radiogroup">
-    <button type="button" class="seg-opt" class:on={activeTab === 'tracks'} onclick={() => { activeTab = 'tracks'; }}>Tracks</button>
-    <button type="button" class="seg-opt" class:on={activeTab === 'history'} onclick={() => { activeTab = 'history'; }}>History</button>
   </div>
 
   {#if showUrlInput}
@@ -268,6 +281,9 @@
         {/if}
       </div>
     {:else}
+      {#if $diggerQueue.length > 0}
+        <div class="queue-summary">{$diggerQueue.length} track{$diggerQueue.length === 1 ? '' : 's'} · {formatTotalDuration(totalQueueMs)}</div>
+      {/if}
       <div class="queue-list">
         {#if $diggerQueue.length === 0}
           <div class="list-hint">Queue is empty — search or add random</div>
@@ -347,9 +363,12 @@
     border-radius: var(--radius-sm);
   }
   .icon-btn:hover { color: var(--accent); }
+  .icon-btn.active { color: var(--accent); }
 
-  .tab-seg {
-    margin-bottom: 12px;
+  .queue-summary {
+    color: color-mix(in srgb, var(--text) 45%, transparent);
+    font-size: calc(10px * var(--font-scale));
+    margin-bottom: 4px;
     flex-shrink: 0;
   }
 
