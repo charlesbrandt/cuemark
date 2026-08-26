@@ -9,15 +9,6 @@ Combine all of the MIDI and Record Settings to be switchable via a tabbed menu o
 stem support
 loop support
 
-Idea, not scoped yet (2026-08-25): split a "Controls" tab out of Settings, alongside
-Audio/MIDI/Record, for non-audio-device options that don't really belong under "Audio" — it's
-turning into a catch-all. Candidates already identified: `Display` (UI text scale) and
-`Compact controls` (hides per-deck opacity/volume/rate/EQ/filter sliders — both currently live
-in the Audio tab, `AudioSettings.svelte`, right next to each other, as an interim home), plus
-Tempo/Jog/Platter and the Auto Mix/Auto Preload timing rows, which are DJ-behavior settings
-rather than audio-routing ones. Explicitly deferred — don't start without going through Audio
-and MIDI tabs first and proposing which rows move where.
-
 I want to update the app so that it has the potential to recognize and use any number of controllers. We should set up a job to convert mappings from Mixxx to what is needed here. Can we leverage those directly? (Allowing for local updates, as needed). 
 the real cause is in src-tauri/src/midi.rs: run_midi_loop only opens a port whose name contains "hercules" or "starlight" (midi.rs:500), matched once at startup, never rescanned. That's exactly the phase-1 gap your own docs/design/controller-mapping.md §5 describes ("find one port by substring, or give up... plugging a controller in after launch does nothing until the app restarts"). The "MIDI settings" list you're seeing is the raw monitor's Rescan ports panel — it enumerates ports live and shows a ● next to whichever one cuemark actually opened, but it's read-only status, not a picker; there's no "choose this port" control built yet.
 

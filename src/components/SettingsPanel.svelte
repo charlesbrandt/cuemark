@@ -6,16 +6,18 @@
    * the toolbar Record button become a plain on/off toggle once these tabs are configured.
    */
   import AudioSettings from "./AudioSettings.svelte";
+  import ControlsSettings from "./ControlsSettings.svelte";
   import MidiMonitor from "./MidiMonitor.svelte";
   import RecordPanel from "./RecordPanel.svelte";
 
-  type Tab = "audio" | "midi" | "record";
+  type Tab = "audio" | "controls" | "midi" | "record";
   let tab = $state<Tab>("audio");
 </script>
 
 <div class="settings-panel">
   <div class="settings-tabs">
     <button class:active={tab === "audio"} onclick={() => (tab = "audio")}>Audio</button>
+    <button class:active={tab === "controls"} onclick={() => (tab = "controls")}>Controls</button>
     <button class:active={tab === "midi"} onclick={() => (tab = "midi")}>MIDI</button>
     <button class:active={tab === "record"} onclick={() => (tab = "record")}>Record</button>
   </div>
@@ -25,6 +27,8 @@
        tab must actually unmount it or the feed keeps running with the tab hidden. -->
   {#if tab === "audio"}
     <AudioSettings />
+  {:else if tab === "controls"}
+    <ControlsSettings />
   {:else if tab === "midi"}
     <MidiMonitor />
   {:else}
