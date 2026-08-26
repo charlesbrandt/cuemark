@@ -1,8 +1,95 @@
 # Auto DJ: automated transitions
 
 Status: 🟡 **Phase 1 DONE + live-verified 2026-08-24. Phase 2 (auto-preload) built +
-unit-tested 2026-08-24, fixed one live bug 2026-08-24, still NOT re-verified live** — see
-"Proposed phased plan" below.
+unit-tested 2026-08-24, fixed one live bug 2026-08-24, still NOT re-verified live. Phase 3
+(optional tempo/phase sync) built + unit-tested 2026-08-24; a first live test found no
+audible beat change, root-caused to a fire-and-forget seek racing playback start plus zero
+log coverage on the whole path — both fixed same day (see "Live-session bug found + fixed"
+below), still NOT re-verified live. Phase 4 (per-track outro marker) built + unit-tested
+2026-08-24 — turned out to need zero Digger schema/endpoint changes, see "Phase 4" below —
+NOT yet live-verified.** — see "Proposed phased plan" below.
+
+**2026-08-25: live test reported an abrupt transition, log had zero `[auto-dj]` lines to
+explain it.** Root cause: the base (non-sync) crossfade path — the one that actually runs
+by default, since `autoMixSyncEnabled` is off — had **no `debugLog()` calls at all**, in
+either `checkAutoMixTrigger`'s trigger decision or `startCrossfadeRamp` (start/abort/
+complete). Only phase 3's beatmatch-sync branch got instrumented when it was built. So a
+transition firing, running to completion, or being aborted by a manual fader touch were all
+silent — indistinguishable from Auto DJ never triggering at all. Fixed by adding `debugLog()`
+calls mirroring the sync path's existing pattern: trigger fired (remaining/threshold/target),
+ramp start (duration/from-value), ramp abort (with reason: manual touch or a deck vanishing),
+ramp complete, and the preload trigger's fetch/load/skip outcomes. `crossfadeDurationMs` was
+already Settings-configurable (Settings → Audio → Auto Mix, default 6.0s) before this — the
+abruptness report is more likely explained by that 6s default itself, or a threshold/duration
+mismatch, than by the feature being non-configurable; the new log lines are what will actually
+tell us which on the next test. **The running launcher binary at the time of the report
+(`~/.local/bin/cuemark`, built from `6551e35`) matched committed `autoMix.ts` exactly — the
+logging gap was real code behavior, not staleness.**
+
+**Root-caused on the re-test, same day, with the new logging.** The rebuilt launcher's log
+showed the preload and trigger firing exactly on schedule, and the ramp itself: `ramp start:
+deck-deck-0 -> deck-deck-1, target=1, from=1.000, duration=6000ms` — **`from=1.000` is already
+equal to `target=1`, a zero-length interpolation.** Root cause was in `bootRestore.ts`'s
+ordinary-restart path (`restoreSessionOnBoot()`'s non-recovery branch), not `autoMix.ts`:
+that branch restores `crossfaderValue` from the previous session's `session-recovery.json`
+straight into session state, but never calls `setCrossfader()` to actually apply the curve to
+the (freshly-defaulted) decks' `volume`/`opacity`. So after a plain app restart,
+`session.crossfaderValue` and the decks' actual audible volume silently disagree until the
+*next* `setCrossfader()` call — a manual touch, or Auto DJ's own near-end ramp — applies the
+curve for the first time since boot. In the reported test, `crossfaderValue` had been
+restored to `1.0` from a prior session; deck-0 played at its own fresh-default volume (fully
+audible, decoupled from the fader) for the whole track, and the ramp's `startValue` read that
+same stale `1.0` — so its first frame, not its last, was the first time the curve was ever
+applied: deck-0 cut to near-silence and deck-1 jumped to full volume in one frame, not over
+the configured 6s. **Not a crossfade-duration problem at all** — the ramp had nowhere to
+move. **Fix**: `bootRestore.ts` now calls `setCrossfader(restored.crossfaderValue)` right
+after restoring the other globals in the non-recovery branch, reconciling deck
+volume/opacity with the restored fader position immediately at boot, before any track loads.
+`npm run check`/`npm test` clean (147/147).
+
+**That fix was itself wrong, live-hit on the very next restart, 2026-08-25.** Eagerly
+applying the restored `crossfaderValue` avoided the deferred-jump symptom but is worse: on
+the next ordinary restart the DJ loaded one deck and pressed play, and got **no audio at
+all** — `VOLUME`/`OPACITY` both `0.00` in the UI, with nothing the DJ had done to cause it.
+The DJ's own hardware crossfader was sitting physically at full-left the whole time; the
+restored value that got applied was `1.0` (full-right) from whatever the software had last
+electronically read. **Root cause of both failed fixes**: an unmotorized fader's physical
+position can drift from any persisted value — `session-recovery.json`'s `crossfaderValue`
+or `midi_state.json`'s last-seen MIDI state alike — simply by being touched by hand while
+the app is closed; neither can be trusted to reflect where the hardware currently sits.
+Restoring either one and forcing it onto freshly-loaded (and therefore audible-by-default)
+decks makes a silent, plausible-looking software value override what's actually true. Per
+the DJ's own stated expectation, the actual fix is **don't restore or apply `crossfaderValue`
+at all on an ordinary restart** — leave it at the module's own default (`0.5`, both decks
+live) exactly like decks reset to their own fresh defaults, and let the first real signal —
+a physical fader touch, or Auto DJ itself — establish it from there. `crossfaderMapping`/
+`crossfaderTargets`/`audioCurve`/`visualCurve` are still restored (harmless preference
+fields with no muting side effect on their own). `npm run check`/`npm test` clean (147/147).
+**Not yet re-verified live** — needs a third restart + test: single deck loaded, `SETTLE`
+shows both decks audible with no fader touched, then a real Auto DJ crossfade to confirm the
+original abrupt-transition report is actually resolved end to end.
+
+**Phase 3, same day:** `autoMixSyncEnabled` (Settings → Audio → Auto Mix → "Beatmatch before
+mixing", default **off**) gates a beatmatch step inserted into `checkAutoMixTrigger`
+(`autoMix.ts`) right before the crossfade would otherwise start. When on, and only when both
+decks have a detected/set `bpm` and a main-beat reference exists (`session.bpm`, normally the
+outgoing deck via the existing solo-playing auto-promotion in `session.ts`): rate-locks the
+incoming deck (`syncLocked: true`, `playbackRate = session.bpm / incoming.bpm`) and, after a
+200ms settle, calls `nudgePhaseToMaster()` to align its phase, *then* sets it playing and
+starts the crossfade ramp — deliberately the same two-step sequence (and the same 200ms delay)
+DeckCard.svelte's manual **Lock** button already uses, reusing existing machinery rather than
+inventing new sync code (gap 5's whole premise). The 200ms settle exists for the same reason
+it exists there: writing `playbackRate` rebuilds the legacy `<video>` pipeline, and seeking
+into that rebuild lands stale (CLAUDE.md "Rate-then-seek ordering") — nudging phase
+immediately would risk landing at a pre-rebuild position. A manual crossfader touch during
+that settle window aborts the whole deferred step (checked via the same `manualTouch` counter
+the ramp's own interruption handling uses), so the "DJ wins immediately" rule holds through
+the sync step too, not just the ramp. Missing bpm on either deck (or no bpm reference at all)
+silently falls through to the phase-1/2 native-tempo cut — no separate code path, just an
+`if`. `autoMix.test.ts` covers: rate-lock + deferred nudge + deferred play/ramp start when a
+bpm reference exists; the native-tempo fallback when the incoming deck has no bpm; and the
+manual-touch-during-settle abort. `npm test`/`npm run check` clean. **Not yet live-verified**
+— unit-tested only, same caveat as phase 2.
 
 **Live-session bug found + fixed 2026-08-24 (same day as phase 2's build):** a DJ manually
 loaded a track onto one of the two mapped decks; Auto DJ correctly crossfaded to it, but the
@@ -23,6 +110,39 @@ idle to both trigger functions. Regression test added in `autoMix.test.ts` ("fre
 outgoing deck for a fresh preload after it fades out, even if it was manually loaded").
 `npm test`/`npm run check` clean. **Not yet re-verified in a live session** — the original
 report was live, the fix is unit-tested only so far.
+
+**Live-session bug found + fixed 2026-08-24 (Phase 3's own first live test):** the DJ reported
+no audible beat change on the incoming deck despite Beatmatch-before-mixing being on. Two
+compounding problems, both fixed:
+- **No log trail at all.** Every state change on the phase-3 path (`updateDeck`,
+  `nudgePhaseToMaster`) is a pure frontend Svelte-store write with zero output to
+  `cuemark.log` — only the two pre-existing `console.error` failure paths logged anything,
+  and neither fired. `debugLog()` (the existing `frontend_log` IPC bridge other modules like
+  `midi/handler.ts` and `scrubStats.ts` already use to get JS-side timing onto the Rust log
+  timeline) was never wired into this path, so there was no way to tell "sync fired and did
+  nothing audible" from "sync never fired (no bpm reference)" from the log — both looked
+  identical: nothing. Added `debugLog()` calls at every branch (rate-lock, each settle-window
+  abort, the bpm-missing skip, the seek fired, play started) so a re-test's log actually shows
+  which of those happened.
+- **The real race**: at the moment `nudgePhaseToMaster(incomingId)` is called, the incoming
+  deck is still paused (`playing: true` is set on the very next line), so it takes the
+  function's "paused: seek to the in-phase position immediately" branch rather than the
+  playing rate-spike branch DeckCard's manual Lock/NUDGE buttons exercise (those are only ever
+  pressed on an already-playing deck). That seek's `audio_seek` IPC call is fire-and-forget
+  (`seekBus.ts`'s `seekDeck()` — `.catch(console.error)`, not awaited) and does not land in
+  GStreamer synchronously. The old code called `updateDeck(incomingId, { playing: true })` on
+  the very next line with no settle at all, so playback could start from the pre-nudge position
+  before the seek landed — silence where a beat change should have been audible, with nothing
+  in any log to say so. **Fix**: a second 200ms settle window (mirroring the existing
+  rate-change settle immediately above it) now sits between the phase nudge and setting
+  `playing: true`, with the same `manualTouch`/deck-vanished abort checks. New regression test
+  in `autoMix.test.ts` ("abandons the sync+crossfade if the DJ touches the fader during the
+  post-nudge seek settle"); the existing happy-path test now asserts `playing` stays `false`
+  through the first settle and only flips after the second. `npm test`/`npm run check` clean
+  (142/142). **Not yet re-verified live** — this is a reasoned fix for a real race identified
+  by code inspection (the seek IPC is genuinely fire-and-forget), not a live-confirmed root
+  cause; the next live test should watch for `[auto-dj] sync:` lines in `cuemark.log` to
+  confirm the sequence actually happens and that the beat is now audibly locking.
 
 **Sourcing changed 2026-08-24, same live-session feedback:** queue entries are no longer
 deleted (`DELETE /queue/{id}`) as Auto DJ consumes them. The DJ wants the queue to stay put
@@ -60,8 +180,47 @@ completes — `wasAutoMixTriggered`'s per-file latch correctly caps this at one 
 bounce, never a sustained oscillation. Normal thresholds (15s default vs. multi-minute
 tracks) can't reach this condition. **Phase 2 has only unit-test coverage (mocked
 Digger API/`loadQueueItemToDeck`) — it has not been driven against a real running
-Digger backend or a real deck in a live/headless session.** Phases 3-4 (tempo/phase
-sync, a real per-track outro marker) are **not built** — see "Proposed phased plan".
+Digger backend or a real deck in a live/headless session.** Phase 3 (tempo/phase sync) is
+built + unit-tested, not live-verified — see the phase-3 note above.
+
+**Phase 4 (per-track outro marker), built + unit-tested 2026-08-24, same day the user asked
+for it right after Phase 3's own first live test.** Gap 1's original framing assumed this
+would need a Digger schema migration and a new endpoint (`Deck.outroPoint` + `POST
+/tracks/{id}/markers` support) — checking `~/repos/digger/routers/tracks.py` first found
+that work already done, just unconsumed: Digger's `analyze_audio.py` already derives a
+`mix_out` marker automatically during BPM analysis (16 bars before the last detected beat,
+falling back to ~30s before the end — see `_derive_mix_points`, and
+`docs/design/playlist-management.md` "Mix points" in the digger repo for the reasoning),
+manually-overridable there via the existing generic markers API, and `GET
+/tracks/{id}/cuemark` already returns it as `mixOut` — cuemark just never read the field.
+**No digger-repo change was made or needed.** `Deck.outroPoint` (`types.ts`) is populated
+from `payload.mixOut ?? null` in `queueStore.ts`'s `loadQueueItemToDeck()` (same
+omitted-vs-null normalization the bpm/downbeat pull already needs — see the
+digger-integration skill). `nearEndReference()` in `autoMix.ts` is the one seam both
+triggers go through: `Math.min(outroPoint, duration)` when set (clamped defensively —
+Digger already clamps server-side, but a stale value here must never land past EOS), else
+`duration` exactly as before. The existing `autoMixThresholdSec`/`autoPreloadThresholdSec`
+settings still measure their lead time from whichever reference applies, so a track with no
+analysis run yet (or a local, non-Digger load) behaves identically to before this field
+existed. `autoMix.test.ts` covers: triggering off the marker instead of duration, *not*
+triggering early just because the marker is still far off, clamping an out-of-range marker,
+the preload trigger also using the marker, and the duration-fallback case. `npm
+test`/`npm run check` clean (147/147). **Not yet live-verified** — and specifically not
+verified against a track where Digger's BPM analysis has actually run, since (per the
+digger-integration skill) the local dev Digger database may have zero tracks with `bpm` set
+depending on when analysis was last run there, which means zero tracks with a derived
+`mixOut` either.
+
+⚠️ **Deliberately not built alongside this**: a manual "SET OUTRO" UI control in cuemark
+that would `pushMarker(trackId, ms, 'mix_out')`. Digger's `track_cuemark()` picks the
+*first* marker of a type by `position_ms`, not "most recent" the way it does for
+`downbeat` — so if a track already has an auto-derived `mix_out` row and a DJ manually adds
+a second one, whichever sits at the lower position wins, not necessarily the manual one.
+That's a pre-existing ambiguity in Digger's own endpoint, not something this session
+introduced, and it should be fixed there (most-recent-wins, matching `downbeat`) before a
+manual override control is trustworthy — separate work, in the digger repo, and out of
+scope for this pass (a different session was actively working in that repo's shared
+checkout while this one ran).
 
 ## Problem
 
@@ -185,12 +344,14 @@ still catching the genuine case where lookahead never triggered.
    time just means the crossfade trigger waits, same as it always has when nothing is
    loaded yet. **Not yet exercised against a real running Digger backend or a real deck**
    — only `autoMix.test.ts`'s mocked-API unit tests have run this path.
-3. **Optional tempo/phase sync**, toggleable, reusing existing `syncLocked`/
-   `nudgePhaseToMaster` machinery — gap 5.
-4. **Per-track fade-out/outro marker**, only if the fixed-threshold version proves
-   insufficient in practice — this is the one phase with real cross-repo schema cost
-   (gap 1), so it should be justified by lived experience with phases 1–3, not assumed
-   up front.
+3. 🟡 **BUILT + unit-tested 2026-08-24, not yet live-verified — Optional tempo/phase sync.**
+   `autoMixSyncEnabled` toggle, reusing existing `syncLocked`/`nudgePhaseToMaster` machinery —
+   gap 5. See the phase-3 note above.
+4. 🟡 **BUILT + unit-tested 2026-08-24, not yet live-verified — Per-track outro marker.**
+   Turned out to need **no** cross-repo schema/endpoint cost at all — see "Phase 4" note
+   below. `nearEndReference()` in `autoMix.ts` swaps in `Deck.outroPoint` for
+   `source.duration` as what "near-end" is measured from, in both the crossfade and
+   preload triggers, when a track has one.
 
 ## Explicitly out of scope
 
@@ -211,7 +372,9 @@ section); this doc is about executing transitions live, not learning from past o
   convention. Chosen because a from-scratch re-take (cancel-in-place, wait, resume) has no
   precedent anywhere else in the codebase and adds a second state machine for a case (the
   DJ actively touching the fader) that should just mean "the DJ has it now."
-- Is a real per-track fade-out marker (Digger schema change) actually wanted, or is
-  "N seconds before end" good enough long-term? Don't assume — ask before phase 4.
+- ✅ **Real per-track outro marker, built 2026-08-24** — see "Phase 4" note below. It
+  reuses a field (`mixOut`) Digger was already computing during BPM analysis and already
+  returning from `/tracks/{id}/cuemark`, unconsumed by cuemark until now — no schema
+  change, no migration, no new endpoint, and (deliberately) no digger-repo edit at all.
 - Confirm the two-deck-only scope (gap 2) is acceptable, or whether N-deck auto-mixing is
   actually needed before starting. Phase 1 ships with the two-deck scope as recommended.

@@ -37,6 +37,12 @@ export interface CuemarkPayload {
   beatGridAlgo: string | null;
   beatGridConfidence: number | null;
   gain: number | null;
+  // Automix transition window's out point — auto-derived by Digger's analyze_audio.py
+  // (16 bars before the last detected beat, ~30s-before-end fallback) or manually set
+  // there via the markers API. Consumed as Deck.outroPoint's source — see
+  // docs/design/auto-dj-transitions.md "Phase 4". `mixIn` exists on the Digger side too
+  // but nothing in cuemark reads it yet, so it's deliberately not declared here.
+  mixOut: number | null;
 }
 
 /** A cached decode from Digger's waveform_cache table (see beat-grid-precision.md) —

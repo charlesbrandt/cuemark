@@ -15,6 +15,7 @@ function makeDeck(index: number): Deck {
     hotCues: [],
     bpm: null,
     downbeat: null,
+    outroPoint: null,
     diggerTrackId: null,
     diggerFileId: null,
     loopIn: null,

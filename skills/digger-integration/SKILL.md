@@ -114,6 +114,24 @@ reserves `'play_history'` for a transition-mining job that reads the `plays` log
 cuemark owns is making sure `plays` rows are accurate (real start times, real durations) so that
 job has good raw material later — not deriving transitions itself.
 
+## DJ selector / guest attribution (added 2026-08-23, case-insensitive 2026-08-24)
+
+`src/lib/digger/djSelector.ts` — free-text "who's on the decks" (no accounts, no managed
+list; see `docs/design/guest-djs.md` in the digger repo). `currentDj` feeds two things:
+`playStart()`'s `listener` field (read at **load** time, captured for that play's whole
+lifetime — a mid-track handoff must not retroactively reassign an in-progress play) and
+`queueStore.ts`/`DiggerQueue.svelte`'s queue scoping (read reactively at **call** time).
+Empty string → `null` (`currentDjOrNull()`) means unclaimed, matching Digger's
+`queue_items.owner`/`plays.listener` NULL convention.
+
+Digger matches these names **case-insensitively** (`COLLATE NOCASE` on every
+`owner`/`listener` comparison, added 2026-08-24 so "Tessa" typed as "tessa" doesn't fork
+into a second guest) — `djSelector.ts`'s own recent-values MRU (`pushDjHistory`) mirrors
+that: dedup is case-insensitive too, so the toolbar's quick-pick list doesn't show the
+same DJ twice under different casing. If you add another Digger-attribution field that
+reuses this free-text-name pattern, match this case-insensitivity on both sides rather
+than assuming exact-string matching.
+
 ## Digger-side schema changes (added 2026-08-12)
 
 Adding a column to Digger's schema for cuemark to read/write (like `tracks.gain`) needs **two**
@@ -216,6 +234,43 @@ case the DJ loaded something manually while it was in flight. Only `autoMix.test
 mocked-API unit tests have exercised this path — it has not been run against a real
 Digger backend or a real deck.
 
+**Phase 3 (optional tempo/phase sync) is built + unit-tested, NOT yet live-verified**
+(2026-08-24, same file): `autoMixSyncEnabled` toggle (Settings → Audio → Auto Mix →
+"Beatmatch before mixing", default off). When on and both decks have a detected/set `bpm`,
+the phase-1 trigger rate-locks the incoming deck (`syncLocked: true`, rate = main-beat-ref /
+incoming.bpm) and, after a 200ms settle, calls `nudgePhaseToMaster()` to align phase before
+starting play + the crossfade ramp — the exact two-step sequence (and the same 200ms delay)
+DeckCard.svelte's manual **Lock** button already uses; reused rather than reinvented. Missing
+bpm on either deck silently falls through to the native-tempo cut, same as with the toggle
+off. ⚠️ **A deferred step ahead of an interruptible ramp needs its own interruption check,
+not just the ramp's** — the manual-crossfader-touch abort (`manualTouch` counter) is captured
+before the 200ms `setTimeout` and re-checked inside it, or a DJ grabbing the fader during the
+settle window would still get overridden a moment later when the deferred callback fired and
+started playing anyway. ⚠️ **A live test found no audible beat change** — root cause: at the
+moment `nudgePhaseToMaster()` runs the incoming deck is still paused, so it takes the
+"paused: seek immediately" branch (`phaseNudge.ts`), and that seek's `audio_seek` IPC is
+fire-and-forget — `updateDeck(incomingId, {playing:true})` used to fire right after with no
+settle, so playback could start before the seek landed. Fixed with a second 200ms settle
+window (same shape as the rate one above) between the nudge and setting `playing: true`; also
+added `debugLog()` calls through the whole sync branch (`[auto-dj] sync: …`), since none of
+this path logged anything to `cuemark.log` before — every state change was a pure Svelte-store
+write. Both fixed 2026-08-24, still not live-reverified.
+
+**Phase 4 (per-track outro marker), built + unit-tested 2026-08-24 — no digger-repo change
+needed.** Digger's `analyze_audio.py` already derives a `mix_out` marker automatically during
+BPM analysis and already returns it from `/tracks/{id}/cuemark` as `mixOut` (see
+`_derive_mix_points` in the digger repo) — cuemark just never consumed it. Now pulled into
+`Deck.outroPoint` (`queueStore.ts`'s `loadQueueItemToDeck`, same omitted-vs-null
+normalization as bpm/downbeat above) and used by both triggers via `nearEndReference()` in
+`autoMix.ts` in place of `source.duration` whenever a track has one — the existing
+threshold settings still measure their lead time from whichever reference applies. Falls
+back to duration exactly as before when unset (no analysis run yet, or a non-Digger load).
+⚠️ **No manual "set outro" control was added** — Digger's `track_cuemark()` picks the
+*first* marker of a type by `position_ms`, not most-recent like it does for `downbeat`, so a
+manually-pushed second `mix_out` marker isn't guaranteed to win over an auto-derived one.
+Fix that in the digger repo (most-recent-wins, matching `downbeat`) before adding a manual
+override control.
+
 ⚠️ **The crossfade ramp's completion branch must clear the outgoing deck's `source`, not
 just `playing`** (fixed 2026-08-24, `autoMix.ts`'s `startCrossfadeRamp`) — leaving a
 just-finished track's `source` in place made it look permanently "already loaded" to both
@@ -223,8 +278,35 @@ this trigger and the mix trigger, so a deck that had just faded out never got a 
 on the next cycle. `source: null` also drives `App.svelte`'s `syncVideoElements()` to tear
 the backend/audio pipeline down, same as a deck being removed.
 
-Full design + remaining phases (tempo sync, a real per-track outro marker):
-`docs/design/auto-dj-transitions.md`.
+Full design and live-verification status for all four phases: `docs/design/auto-dj-transitions.md`.
+
+⚠️ **"The transition was abrupt" is not automatically a `crossfadeDurationMs` problem —
+check `cuemark.log` for `[auto-dj]` lines before touching that setting** (fixed
+2026-08-25). Until that date the base (non-sync) crossfade path — the one that actually
+runs, since `autoMixSyncEnabled` defaults off — had **zero** `debugLog()` calls anywhere:
+not the trigger firing, not the ramp starting/aborting/completing. A silent log there is
+expected on an unpatched build, not evidence Auto DJ never ran. Now instrumented (`[auto-dj]
+trigger:`, `ramp start:`/`ramp aborted:`/`ramp complete:`, `[auto-dj] preload:`) — read the
+`from=`/`target=` values on `ramp start` first: if they're equal, the "ramp" was a
+zero-length no-op regardless of `crossfadeDurationMs`, which is exactly what the
+`crossfaderValue` bug below produces.
+
+⚠️ **`session.crossfaderValue` restored from a prior session on an ordinary app restart can
+silently desync from what the decks actually play at, producing a hard one-frame cut instead
+of a fade** (root-caused + fixed 2026-08-25, `bootRestore.ts`). On a non-recovery boot decks
+reset to fresh defaults (audible), but the old fix path restored `crossfaderValue` as inert
+session state — so a value left at, say, `1.0` from a previous set sat unapplied until the
+*next* `setCrossfader()` call (a manual touch, or Auto DJ's own ramp) finally pushed the
+curve onto the decks, snapping volumes in one frame instead of gradually. The next fix
+(eagerly applying the restored value at boot) was worse — it silently muted whichever deck
+loaded next, with no on-screen cause, because an unmotorized fader's *physical* position
+can drift from any persisted value just by being touched by hand while the app is closed.
+**Current behavior: `crossfaderValue` is not restored or applied at all on an ordinary
+restart** — it stays at the default (`0.5`, both decks live) until a real signal (physical
+touch or Auto DJ) moves it. If a future session wants "remember my on-screen crossfader
+position across restarts" back, it needs a way to distinguish "last touched on-screen" from
+"last touched by a hardware fader that may have moved since" — don't just restore the field
+again without solving that.
 
 ## Queue played-tracking (added 2026-08-24)
 

@@ -15,7 +15,8 @@
  *    if the preload threshold is set too close to the crossfade threshold for a given
  *    track's demux time, the crossfade trigger still just waits for a loaded deck as it
  *    always has, and `autoDj.ts`'s EOS fallback remains the backstop either way.
- *  - No tempo/phase sync (gap 5 / phase 3) — cuts between tracks at their native tempo.
+ *  - Tempo/phase sync (gap 5 / phase 3) is optional, gated on `autoMixSyncEnabled` (default
+ *    off) — with it off, still cuts between tracks at their native tempo exactly as before.
  *  - Preload never overwrites a deck the DJ (or a previous load) already put a track on —
  *    it only fires onto a genuinely empty (`source === null`) deck, same "manual wins"
  *    posture as the crossfade ramp's interruption handling.
@@ -28,6 +29,8 @@ import { session, getDeck, updateDeck, setCrossfader } from "../state/session";
 import { autoDjEnabled, pickNextTrack } from "./autoDj";
 import { loadQueueItemToDeck } from "./queueStore";
 import { currentDj, currentDjOrNull } from "./djSelector";
+import { nudgePhaseToMaster } from "../audio/phaseNudge";
+import { debugLog } from "../debugLog";
 
 function persistentWritable<T>(key: string, defaultValue: T) {
   let initial: T;
@@ -62,6 +65,13 @@ export const crossfadeDurationMs = persistentWritable<number>("cuemark:crossfade
  *  trigger goes looking for one. Settings-configurable — see AudioSettings.svelte. */
 export const autoPreloadThresholdSec = persistentWritable<number>("cuemark:autoPreloadThresholdSec", 45);
 
+/** Phase 3 (gap 5): when on, beatmatches the incoming deck — rate-locks it to the current
+ *  main-beat reference and aligns its phase — before starting the crossfade ramp, reusing
+ *  the same Lock+NUDGE machinery a DJ can trigger manually from DeckCard.svelte. Off by
+ *  default and a separate toggle from Auto DJ itself, per the design doc's phase 3: with it
+ *  off, Auto DJ keeps cutting between tracks at their native tempo exactly as phases 1-2 did. */
+export const autoMixSyncEnabled = persistentWritable<boolean>("cuemark:autoMixSyncEnabled", false);
+
 // Bumped by notifyManualCrossfaderTouch() on every manual crossfader input (on-screen fader,
 // MIDI CC) — never by the ramp driver's own setCrossfader() calls. A ramp captures the counter
 // at start and aborts the instant it changes, mirroring the syncLocked convention: manual input
@@ -88,6 +98,17 @@ export function wasAutoMixTriggered(deckId: string, filePath: string | undefined
 // deck pair for a case that can't currently arise.
 let activeRamp: { cancel: () => void } | null = null;
 
+// Phase 4 (gap 1): where "near-end" is measured from. A set `outroPoint` (Digger's
+// auto-derived or manually-placed mix-out marker — see the Deck.outroPoint doc comment
+// in types.ts) takes over from the literal track end; the existing threshold settings
+// (autoMixThresholdSec / autoPreloadThresholdSec) still measure their lead time from
+// whichever point applies, so a DJ with no marker data sees identical behavior to before
+// this field existed. Clamped to duration defensively — Digger already does this
+// server-side, but a stale/bad value here must never push the trigger point past EOS.
+function nearEndReference(outroPoint: number | null, duration: number): number {
+  return outroPoint !== null ? Math.min(outroPoint, duration) : duration;
+}
+
 // requestAnimationFrame doesn't exist under vitest's node test environment; degrade to a 16ms
 // setTimeout there so this module works the same (just not frame-synced) under `npm test`.
 const raf: (cb: (t: number) => void) => number =
@@ -107,19 +128,26 @@ function startCrossfadeRamp(outgoingId: string, incomingId: string, target: 0 | 
   let rafId = 0;
   let done = false;
 
-  function cancel() {
+  debugLog(`[auto-dj] ramp start: deck-${outgoingId} -> deck-${incomingId}, target=${target}, from=${startValue.toFixed(3)}, duration=${durationMs}ms`);
+
+  function cancel(reason?: string) {
     if (done) return;
     done = true;
     cancelRaf(rafId);
     activeRamp = null;
+    if (reason) {
+      debugLog(`[auto-dj] ramp aborted: deck-${outgoingId} -> deck-${incomingId} (${reason})`);
+    } else {
+      debugLog(`[auto-dj] ramp complete: deck-${outgoingId} faded out, deck-${incomingId} at target=${target}`);
+    }
   }
 
   function step() {
     if (done) return;
     // Deck removed mid-fade (gap 4) — abandon cleanly, no dangling loop.
-    if (!getDeck(outgoingId) || !getDeck(incomingId)) { cancel(); return; }
+    if (!getDeck(outgoingId) || !getDeck(incomingId)) { cancel("a deck vanished"); return; }
     // DJ grabbed the fader — hand control back immediately, at whatever position it's at.
-    if (get(manualTouch) !== touchAtStart) { cancel(); return; }
+    if (get(manualTouch) !== touchAtStart) { cancel("manual crossfader touch"); return; }
 
     const elapsed = performance.now() - startTime;
     const t = durationMs <= 0 ? 1 : Math.min(1, elapsed / durationMs);
@@ -168,13 +196,52 @@ export function checkAutoMixTrigger(deckId: string, contentPos: number): void {
   // failing that — for the DJ or the EOS fallback to handle.
   if (!incoming || incoming.playing || incoming.source?.type !== "video" || !(incoming.source.duration > 0)) return;
 
-  const remaining = outgoing.source.duration - contentPos;
+  const remaining = nearEndReference(outgoing.outroPoint, outgoing.source.duration) - contentPos;
   if (remaining > get(autoMixThresholdSec) || remaining <= 0) return;
   if (wasAutoMixTriggered(deckId, outgoing.source.filePath)) return;
 
   handledOutgoing.set(deckId, outgoing.source.filePath);
-  updateDeck(incomingId, { playing: true });
-  startCrossfadeRamp(deckId, incomingId, deckId === left ? 1 : 0);
+  const target: 0 | 1 = deckId === left ? 1 : 0;
+  debugLog(`[auto-dj] trigger: deck-${deckId} has ${remaining.toFixed(1)}s remaining (threshold ${get(autoMixThresholdSec)}s) -> crossfading to deck-${incomingId}, sync=${get(autoMixSyncEnabled)}`);
+
+  if (get(autoMixSyncEnabled) && incoming.bpm !== null && s.bpm !== null) {
+    // Lock the incoming deck's rate to the main beat, then align its phase, before it
+    // starts playing — the same two-step the Lock button does (DeckCard.svelte). The 200ms
+    // settle mirrors that button's own comment: writing playbackRate rebuilds the legacy
+    // <video> pipeline, and seeking into that rebuild lands stale — see CLAUDE.md
+    // "Rate-then-seek ordering".
+    const rate = s.bpm / incoming.bpm;
+    debugLog(`[auto-dj] sync: locking deck-${incomingId} to ${s.bpm.toFixed(1)}bpm (rate ${rate.toFixed(4)})`);
+    const touchAtStart = get(manualTouch);
+    updateDeck(incomingId, { syncLocked: true, playbackRate: rate });
+    setTimeout(() => {
+      if (get(manualTouch) !== touchAtStart) { debugLog(`[auto-dj] sync: aborted, fader touched during rate settle`); return; }
+      if (!getDeck(deckId) || !getDeck(incomingId)) { debugLog(`[auto-dj] sync: aborted, a deck vanished during rate settle`); return; }
+      // Here the incoming deck is still paused, so nudgePhaseToMaster() takes its "seek to
+      // the in-phase position" branch (see phaseNudge.ts) — an immediate seekDeck() call
+      // whose audio_seek IPC is fire-and-forget (seekBus.ts). That seek has not landed in
+      // GStreamer by the time this function returns; setting playing:true right after it
+      // used to race that landing, so the deck audibly started from its pre-nudge position
+      // and the beat never appeared to change (reported live 2026-08-24). Give the seek the
+      // same kind of settle window the rate change above already gets, before starting
+      // playback and the crossfade.
+      nudgePhaseToMaster(incomingId);
+      debugLog(`[auto-dj] sync: phase-nudged deck-${incomingId}, settling seek before play`);
+      setTimeout(() => {
+        if (get(manualTouch) !== touchAtStart) { debugLog(`[auto-dj] sync: aborted, fader touched during seek settle`); return; }
+        if (!getDeck(deckId) || !getDeck(incomingId)) { debugLog(`[auto-dj] sync: aborted, a deck vanished during seek settle`); return; }
+        updateDeck(incomingId, { playing: true });
+        debugLog(`[auto-dj] sync: deck-${incomingId} playing, starting crossfade`);
+        startCrossfadeRamp(deckId, incomingId, target);
+      }, 200);
+    }, 200);
+  } else {
+    if (get(autoMixSyncEnabled)) {
+      debugLog(`[auto-dj] sync skipped (no bpm reference): incoming.bpm=${incoming.bpm} session.bpm=${s.bpm}`);
+    }
+    updateDeck(incomingId, { playing: true });
+    startCrossfadeRamp(deckId, incomingId, target);
+  }
 }
 
 // deckId -> the outgoing-track filePath a preload was already triggered for. Prevents
@@ -207,18 +274,26 @@ export function checkAutoPreloadTrigger(deckId: string, contentPos: number): voi
   const incoming = s.decks.find((d) => d.id === incomingId);
   if (!incoming || incoming.source !== null) return; // already loaded (by anyone) — don't clobber
 
-  const remaining = outgoing.source.duration - contentPos;
+  const remaining = nearEndReference(outgoing.outroPoint, outgoing.source.duration) - contentPos;
   if (remaining > get(autoPreloadThresholdSec) || remaining <= 0) return;
   if (preloadedFor.get(deckId) === outgoing.source.filePath) return;
 
   preloadedFor.set(deckId, outgoing.source.filePath);
   const owner = currentDjOrNull(get(currentDj));
+  debugLog(`[auto-dj] preload: deck-${deckId} has ${remaining.toFixed(1)}s remaining (threshold ${get(autoPreloadThresholdSec)}s) -> fetching next track for deck-${incomingId}`);
   pickNextTrack(owner, outgoing.diggerTrackId ?? null)
     .then((next) => {
       // Re-check: the DJ may have loaded something onto this deck (or unloaded the outgoing
       // one) while the fetch was in flight.
-      if (getDeck(incomingId)?.source !== null) return;
+      if (getDeck(incomingId)?.source !== null) {
+        debugLog(`[auto-dj] preload: deck-${incomingId} no longer empty, skipping load`);
+        return;
+      }
+      debugLog(`[auto-dj] preload: loading "${next.title}" onto deck-${incomingId}`);
       return loadQueueItemToDeck(next, incomingId);
     })
-    .catch((e) => console.error("[auto-dj] preload failed", e));
+    .catch((e) => {
+      debugLog(`[auto-dj] preload failed: ${e}`);
+      console.error("[auto-dj] preload failed", e);
+    });
 }

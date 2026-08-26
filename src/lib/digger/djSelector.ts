@@ -78,7 +78,12 @@ function loadDjHistory(): string[] {
 function pushDjHistory(name: string) {
   if (!name) return;
   try {
-    const history = [name, ...loadDjHistory().filter((n) => n !== name)].slice(0, HISTORY_MAX);
+    // Case-insensitive de-dup: "Tessa" and "tessa" are the same DJ (Digger
+    // now matches owner/listener names case-insensitively too — see
+    // docs/design/guest-djs.md in the digger repo), so the MRU shouldn't
+    // show them as two separate chips.
+    const lower = name.toLowerCase();
+    const history = [name, ...loadDjHistory().filter((n) => n.toLowerCase() !== lower)].slice(0, HISTORY_MAX);
     localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
   } catch {}
 }

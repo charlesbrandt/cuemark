@@ -5,6 +5,25 @@ partially built.** Written 2026-08-17, prompted by a **Pioneer DJ DDJ-FLX4** on 
 **MIDI output landed 2026-08-23** (§11 update below) for one control — see there for what's
 built vs. still only captured-and-not-implemented.
 
+**LEDs blanked on connect, 2026-08-25.** Live report: the Play LED stayed lit on the
+hardware after the app was closed with a deck playing — expected, since a controller LED is
+a plain latched Note On with no timeout of its own, and cuemark had no shutdown hook to turn
+it back off (none is planned — closing/crashing/losing power can't be relied on to run one).
+The frontend's reactive LED mirror (`ledSync.ts`, §11/§12) only touches a control when the
+matching deck boolean *changes*, so a control whose state didn't change this session stayed
+however the previous session left it. Fixed structurally, not reactively:
+`Profile::all_led_bytes()` (`profile.rs`) lists every bench-verified LED-capable control's
+wire bytes regardless of slot/action, and `blank_all_leds()` (`mod.rs`) sends Note Off to
+all of them the moment a controller's output port connects — initial connect and hotplug
+reconnect alike — independent of any frontend/session state, so it can't race the
+frontend's async controller-list fetch the way a JS-side reset would. Every launch now
+starts every LED-capable control from a known-off state. Rust test
+`all_led_bytes_matches_led_control_rows` (`profile.rs`) keeps the blanket-reset list and the
+per-action mirror's rows in sync. **Not yet live-verified** — reasoned from the log evidence
+(`[midi] LED ... slot N -> off` should now appear once per connect on startup) and unit
+tests only; next connect should confirm a stuck-on LED from a prior abrupt quit clears
+immediately rather than "eventually."
+
 **2026-08-22 (build session): profiles-as-data + the FLX4 profile landed**, on top of
 the same-day capture session (§8/§11) and a scope call to trim what shipped now vs.
 defer. What's actually running:

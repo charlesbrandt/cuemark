@@ -226,6 +226,22 @@ wrappers over it. **Adding a new LED-mirrored control is now a bench-verify + on
 true` TOML row + one wrapper function — no new Rust needed**, unless the control turns
 out to need a handshake like the pads do.
 
+**A latched LED needs a boot-time blanket reset, not just the reactive mirror (fixed
+2026-08-25).** `ledSync.ts`'s per-action mirror only sends a control's LED byte when the
+*matching deck boolean changes* — so a control whose state doesn't change during a given
+session is left however the **previous** session left it. Live report: the Play LED stayed
+lit after the app was closed (or crashed) with a deck playing, because a controller LED is a
+plain latched Note On with no timeout of its own, and cuemark has no shutdown hook that could
+reliably send the matching Note Off (quitting via window-close, crash, or power loss can't be
+relied on to run one). The fix isn't in the reactive path at all: `Profile::all_led_bytes()`
+(`profile.rs`) lists every `led = true` control's wire bytes regardless of slot/action, and
+`blank_all_leds()` (`mod.rs`) sends Note Off to all of them the instant a controller's output
+port connects — initial connect and hotplug reconnect alike, independent of frontend/session
+state. Doing it Rust-side at connect time, rather than as a frontend boot effect, sidesteps a
+second trap: a frontend-side "reset all LEDs on mount" would itself race the async
+`midi_list_controllers` fetch `ledSync.ts` depends on — call too early and the controller list
+is still empty, so the reset silently no-ops.
+
 **Cross-controller confirmation (2026-08-23): the Starlight's headphone-Cue, Play, and
 Sync buttons all use the identical plain Note On/Off echo, no handshake** — same bytes
 as each button's own input, tested with the dev server stopped (see below) before any
