@@ -534,6 +534,88 @@ action = "loop_preset"
 index = 3
 slot = 1
 
+# Shift + Hot Cue pad — moves/overwrites an already-set hot cue to the current position
+# (same "hot_cue_set" action the Starlight's shift+pad rows already use). Captured live
+# 2026-08-26: unlike the Starlight (which shifts the *note* by +8 on the same channel),
+# this unit's firmware shifts the *channel* by +1 and keeps the same note — Shift+pad N
+# on deck 1 (plain 0x97) arrives as (0x98, N); on deck 2 (plain 0x99) as (0x9A, N). The
+# bare SHIFT button itself sends its own held note, (0x90/0x91, 0x3F) — same firmware
+# pattern already documented for SHIFT+CUE/quantize-toggle, confirmed unbound and not
+# needed; the shifted pad already arrives as a distinct channel. index 0/1 captured
+# directly on both decks; index 2/3 inferred by symmetry (same pattern this file already
+# uses for the deck-1 jog rows), not directly captured.
+[[control]]
+status = 0x98
+d1 = 0x00
+kind = "button"
+action = "hot_cue_set"
+index = 0
+slot = 0
+note = "live-verified 2026-08-26 — SHIFT+pad1 deck1"
+
+[[control]]
+status = 0x98
+d1 = 0x01
+kind = "button"
+action = "hot_cue_set"
+index = 1
+slot = 0
+note = "live-verified 2026-08-26 — SHIFT+pad2 deck1"
+
+[[control]]
+status = 0x98
+d1 = 0x02
+kind = "button"
+action = "hot_cue_set"
+index = 2
+slot = 0
+note = "inferred by symmetry from the captured index 0/1 rows, not directly captured"
+
+[[control]]
+status = 0x98
+d1 = 0x03
+kind = "button"
+action = "hot_cue_set"
+index = 3
+slot = 0
+note = "inferred by symmetry from the captured index 0/1 rows, not directly captured"
+
+[[control]]
+status = 0x9A
+d1 = 0x00
+kind = "button"
+action = "hot_cue_set"
+index = 0
+slot = 1
+note = "live-verified 2026-08-26 — SHIFT+pad1 deck2"
+
+[[control]]
+status = 0x9A
+d1 = 0x01
+kind = "button"
+action = "hot_cue_set"
+index = 1
+slot = 1
+note = "live-verified 2026-08-26 — SHIFT+pad2 deck2"
+
+[[control]]
+status = 0x9A
+d1 = 0x02
+kind = "button"
+action = "hot_cue_set"
+index = 2
+slot = 1
+note = "inferred by symmetry from the captured index 0/1 rows, not directly captured"
+
+[[control]]
+status = 0x9A
+d1 = 0x03
+kind = "button"
+action = "hot_cue_set"
+index = 3
+slot = 1
+note = "inferred by symmetry from the captured index 0/1 rows, not directly captured"
+
 # Sampler mode (0x30-0x37) is deliberately NOT bound — cuemark has no sample-slot
 # concept at all yet (docs/design/ddj-flx4-feature-gaps.md §4), so there is nothing
 # for these pads to drive.
