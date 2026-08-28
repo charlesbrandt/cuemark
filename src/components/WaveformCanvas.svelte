@@ -37,8 +37,10 @@
   // height (150px) from that read, which then parses as a valid number and skips the
   // NaN-only fallback that used to guard it — permanently sizing that canvas at 150px
   // (300px buffer at dpr=2) until the deck is removed and re-added. Live-diagnosed
-  // 2026-08-25 (see also the full-window skew on un-maximize — same class of
-  // resize-triggered instability, tracked separately).
+  // 2026-08-25. Same class of resize-triggered instability hit the output window's
+  // full-canvas sizing (squished-video-on-maximize, 2026-08-28) — see CLAUDE.md's
+  // "Canvas sizing rule" and `settleResize()` in `src/output.ts` for the reusable
+  // settle-poll fix, if a hardcoded constant like this one ever isn't an option.
   const WAVEFORM_HEIGHT_PX = 72;
 
   // Pre-rasterized overview bars, one offscreen canvas per colour scheme.

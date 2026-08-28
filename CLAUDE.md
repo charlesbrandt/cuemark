@@ -404,6 +404,19 @@ Every canvas must size its pixel buffer via a `ResizeObserver` + `c.style.width/
 `resize()` function — never via CSS `width:`. Reassigning `canvas.width`/`height` resets 2D context
 state (re-apply `imageSmoothingQuality` after every resize).
 
+⚠️ **A window-maximize/un-maximize transition can deliver a stale `contentRect` to that same
+`ResizeObserver`, with no later genuine resize event ever correcting it.** Two independent
+hits: `WaveformCanvas.svelte`'s `WAVEFORM_HEIGHT_PX` comment (a mount mid-transition caught
+WebKitGTK's un-styled 150px default, which parsed as valid so no NaN-fallback caught it) and
+the output window (`src/output.ts`, live-hit 2026-08-28 maximizing onto an external monitor —
+the fixed-aspect compositor canvas got stretched into a too-short CSS box, reading as video
+squished into the top of the window). The output window's fix (`resize()` + `settleResize()`
+in `src/output.ts`) is the reusable pattern: poll `document.body.getBoundingClientRect()`
+across rAFs until it stops moving, then re-apply the CSS size if it ends up differing from
+what the observer originally reported. Apply the same settle-poll if another canvas is ever
+seen mis-sizing after a maximize/fullscreen transition — don't just hardcode around it like
+`WAVEFORM_HEIGHT_PX` did.
+
 **Full gotchas and rationale** — the grid-persistence trust-flag bug, the RAF actual-change-check
 discipline, why MIDI-driven `syncVideoElements` must be rAF-throttled, the 14-bit fader tolerance fix,
 and the `audioSync.ts` Svelte-store-bypass pattern for continuous MIDI controls:
