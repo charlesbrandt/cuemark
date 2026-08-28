@@ -9,7 +9,12 @@
          "surface never initialised" — black cannot tell those apart, which is exactly what
          made the corrupt region ambiguous for three sessions. Keep both set to an opaque
          colour so an undrawn region is unambiguously undrawn. */
-      html, body { background: #000; overflow: hidden; }
+      /* height/width pinned to the viewport, not left to auto — body has no other sized
+         content, so without this its box is derived from the canvas's own CSS size below.
+         That circularity is what let the resize-settle fix in output.ts go blind: a bad
+         canvas height shrinks body to match, and every later poll of body's rect then
+         reports that same wrong height as "settled", with nothing left to detect as stale. */
+      html, body { background: #000; overflow: hidden; height: 100vh; width: 100vw; }
       /* Layout size comes from resize() in output.ts per CLAUDE.md's canvas rule; these are
          a fallback only, covering the window between first paint and first observe. The
          *drawing buffer* is fixed at the output resolution by the width/height attributes
