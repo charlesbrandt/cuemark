@@ -57,6 +57,26 @@ only resolvable in the browser, not from the separate Rust process. Set an absol
 `http://10.20.2.99:8200`) via the Home/Local toggle in `DiggerQueue.svelte` for this fallback to
 work.
 
+**Gotcha — a truncated remote fetch used to get cached as if it were complete, and then
+reused forever (FIXED 2026-08-28).** `ensure_cached()`'s remote-fetch branch used
+`std::io::copy` against the HTTP response body; a connection closed early by the network or
+Digger reads as a clean EOF to `io::copy`, not an error, so the (short) file got written and
+renamed into the cache with no complaint. Worse: once a corrupt file lands at a track's
+cache-key path, every *future* `ensure_cached()` call for that track — including after an app
+restart — finds it via the existing-file prefix scan and reuses it unconditionally, with no
+integrity check, so the failure never self-heals; only a deleted cache file or this fix
+breaks the loop. Live-hit 2026-08-27/28: a 536MB video fetch "succeeded" 3.6MB short of what
+its own MP4 container declared, and every subsequent load kept re-serving the same broken
+file, symptomatic as a WebCodecs demux timeout (see `docs/design/webcodecs-video-path.md`
+"Risks and open items" for the full chain — the timeout message itself was also misleading).
+Fixed by comparing bytes written against the response's `Content-Length` header and failing
+the fetch on a mismatch instead of caching it. If a Digger-fetched track won't load and the
+log shows a clean "fetched N bytes" line, check the cached file's integrity directly
+(`gst-launch-1.0 filesrc location=<cache file> ! parsebin ! fakesink` errors in milliseconds
+on a bad file) before assuming the demux/decode path itself is at fault — and delete the
+specific cache file under `~/.local/share/com.cuemark.app/media_cache/` if it predates this
+fix, since existing bad files are not retroactively re-validated.
+
 **Gotcha — every `MediaCache` consumer needs its own `fallback_url`, not just `audio_load`.**
 `audio_analyze_file` (waveform) and `video_demux_load` (webcodecs path) each race `audio_load` for
 the same file on a fresh track load — `WaveformCanvas.svelte`'s `$effect` fires off the same

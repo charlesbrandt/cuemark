@@ -1227,6 +1227,42 @@ adding either**.
 
 ## Risks and open items
 
+- ✅ **`demux_file`'s 10s pad-wait was blind to the pipeline bus — FIXED 2026-08-28.**
+  Symptom: a real H.264 1080p file (a Digger fetch, not a codec issue) failed with `deck-0
+  demux failed... timed out waiting for parsebin to expose a video stream`, fell back to
+  the legacy `<video>` element, and that element then drew **zero** frames for the rest of
+  the deck's playback (`[aux-loop] preview/deck-0 ... drew=0`, continuously) while audio
+  played normally — looks exactly like "video won't load" from the user's side. The 10s
+  timeout message was a red herring: reproduced the actual failure standalone
+  (`filesrc ! parsebin ! fakesink`) and it errors in **under 10ms** —
+  `qtdemux.c gst_qtdemux_pull_atom(): atom has bogus size <N>` — because the cached file
+  was genuinely corrupt (see the `media_cache.rs` bullet below). `demux_file` only waited
+  on the `pad-added` mpsc channel and never watched the bus, so that fast, accurate error
+  was silently dropped and replaced by the generic timeout 10 real seconds later. Fixed by
+  polling the bus for `MessageType::Error` in the same wait loop (mirrors the existing
+  pattern already used in the AU-pull loop just below it) — a genuinely bad/corrupt file
+  now fails in milliseconds with its real GStreamer error instead of after a 10s stall with
+  a misleading one. **Lesson**: "demux timed out" in this codebase does not mean "parsebin
+  was slow" — it can equally mean "the bus had a fast, correct answer that nothing was
+  listening for." Don't assume the timeout duration is the lever to pull; check whether the
+  wait is bus-blind first.
+- ✅ **`media_cache.rs`'s remote fetch silently cached a truncated download — FIXED
+  2026-08-28.** A Digger fetch completed with no I/O error (`io::copy` saw a clean EOF) but
+  the connection had closed 3.6MB early; the file was written and cached as if complete,
+  and — because `ensure_cached()`'s existing-file scan reuses whatever's already at a
+  path's cache-key prefix on every future call, with no integrity check — **every**
+  subsequent load of that track kept reusing the same corrupt file forever, never
+  re-fetching. Fixed by comparing bytes written against the response's `Content-Length`
+  header (when present) and failing the fetch instead of caching on a mismatch. Diagnosed
+  by directly reproducing the qtdemux error against the cached file on disk (see the
+  `demux_file` bullet above) and computing the exact byte gap; not something the app's own
+  logs pointed at (they show a clean "fetched N bytes" success line). If a track fails to
+  load with no obvious cause after a Digger fetch, checking the cached file's integrity
+  (`gst-launch-1.0 filesrc location=<cache file> ! parsebin ! fakesink` — a bad file errors
+  in milliseconds) is now worth doing before suspecting the demux path itself. **A cache
+  entry that was poisoned before this fix still needs manual deletion once** — the fix only
+  prevents *new* truncated files from being cached, it doesn't retroactively validate what's
+  already on disk in `~/.local/share/com.cuemark.app/media_cache/`.
 - ✅ **Phase 7 candidate — RESOLVED 2026-08-05, see "Phase 7 results" above.** VP9 ships
   through the demux gate (26 → 55 fps on the worst library file); AV1 is refused because
   `VideoDecoder` cannot decode it on this WebKitGTK despite reporting that it can.

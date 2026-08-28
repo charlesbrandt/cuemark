@@ -178,6 +178,17 @@ impl MediaCache {
                         .timeout(Duration::from_secs(30))
                         .call()
                         .map_err(|e| format!("fetch {url}: {e}"))?;
+                    // Read off before into_reader() consumes the response — an early
+                    // connection close reads as a clean EOF to io::copy below, not an
+                    // error, so without this a truncated transfer would be written to
+                    // disk and cached as if it were the complete file. Live-hit
+                    // 2026-08-28: a 536MB fetch "succeeded" 3.6MB short of what its own
+                    // MP4 moov atom declared, and — because ensure_cached()'s existing-
+                    // file scan above trusts any file already at this path's hash prefix
+                    // — every subsequent load kept reusing the same truncated file
+                    // forever, never re-fetching.
+                    let expected_len: Option<u64> =
+                        resp.header("Content-Length").and_then(|v| v.parse().ok());
 
                     fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
                     // Size isn't known up front for a remote fetch (unlike the local-stat
@@ -189,6 +200,15 @@ impl MediaCache {
                         .map_err(|e| format!("download {url}: {e}"))?;
                     file.flush().map_err(|e| e.to_string())?;
                     drop(file);
+
+                    if let Some(expected) = expected_len {
+                        if written != expected {
+                            let _ = fs::remove_file(&tmp_path);
+                            return Err(format!(
+                                "download {url}: truncated — got {written} bytes, server declared {expected}"
+                            ));
+                        }
+                    }
 
                     let cached_path = self.dir.join(format!("{:016x}-{}.{ext}", path_hash(original_path), written));
                     fs::rename(&tmp_path, &cached_path).map_err(|e| e.to_string())?;

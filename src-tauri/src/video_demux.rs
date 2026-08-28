@@ -362,10 +362,33 @@ fn demux_file(path: &str) -> Result<DemuxedVideo, String> {
         .set_state(gst::State::Playing)
         .map_err(|e| format!("set_state(Playing): {e}"))?;
 
-    let kind = match rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(PadResult::Supported(k)) => k,
-        Ok(PadResult::Unsupported(e)) => return Err(e),
-        Err(_) => return Err("timed out waiting for parsebin to expose a video stream".into()),
+    let bus = pipeline.bus().ok_or("no pipeline bus")?;
+    // Poll in short slices instead of one blocking 10s recv_timeout so a fast bus ERROR
+    // (e.g. a corrupt/truncated file — qtdemux reports a bad atom size in under 10ms)
+    // surfaces immediately with its real message, rather than being silently swallowed
+    // until the deadline and reported as a misleading "timed out". Found live: a Digger
+    // fetch that completed without a read error still produced a file 3.6MB short of
+    // what its own moov atom declared (media_cache.rs did not verify Content-Length),
+    // and every load of it burned the full 10s before wrongly blaming parsebin timing.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let kind = loop {
+        if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error]) {
+            if let gst::MessageView::Error(e) = msg.view() {
+                return Err(format!("gstreamer error: {} ({:?})", e.error(), e.debug()));
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("timed out waiting for parsebin to expose a video stream".into());
+        }
+        match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(PadResult::Supported(k)) => break k,
+            Ok(PadResult::Unsupported(e)) => return Err(e),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("parsebin pad-added sender dropped unexpectedly".into())
+            }
+        }
     };
 
     let mut coded_width = 0i32;
@@ -377,7 +400,6 @@ fn demux_file(path: &str) -> Result<DemuxedVideo, String> {
     let mut aus = Vec::new();
     let mut keyframes = Vec::new();
     let mut max_end_us = 0i64;
-    let bus = pipeline.bus().ok_or("no pipeline bus")?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if Instant::now() > deadline {

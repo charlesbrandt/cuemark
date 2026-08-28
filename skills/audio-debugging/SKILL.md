@@ -680,6 +680,46 @@ it is not centralized.**
 
 ## Known failure modes
 
+### A track "won't load" — audio plays fine, video never appears — FIXED 2026-08-28
+
+**Symptom**: a deck loads and plays audio normally (position advancing, levels present,
+duration reported), but no picture ever shows — `[aux-loop] preview/deck-N ... drew=0`
+continuously for the whole playback, not just a slow start. The log shows `[video-path]
+deck-N demux failed, falling back to legacy <video>: timed out waiting for parsebin to
+expose a video stream`.
+
+🔴 **Don't trust that message — it is frequently wrong about *why*.** It only means
+`video_demux.rs`'s `demux_file` didn't get a `pad-added` callback within its wait window;
+historically that function never watched the pipeline bus during the wait, so a fast,
+accurate GStreamer error arriving in milliseconds (a genuinely corrupt/truncated file, a
+missing codec, anything qtdemux/parsebin bails on) was silently swallowed and replaced by
+this generic timeout only after the full wait elapsed. Fixed 2026-08-28 — `demux_file` now
+polls the bus for `MessageType::Error` in the same loop, so a bad file fails in
+milliseconds with its real error instead. If you're on a build from before that fix, or
+want to confirm the real cause directly, reproduce standalone:
+```sh
+gst-launch-1.0 filesrc location=<the file, e.g. under media_cache/> ! parsebin ! fakesink -v
+```
+A genuinely fine file that's just slow to probe stays quiet past 10s; a corrupt one errors
+almost instantly (live example: `qtdemux.c gst_qtdemux_pull_atom(): atom has bogus size
+<N>` — the file's own container metadata claimed more bytes than the file actually has).
+
+**If the file came from a Digger fetch (`media_cache.rs`'s remote branch), a corrupt/short
+file used to get cached as complete and reused forever** — a connection that closes early
+reads as a clean EOF to `io::copy`, not an error, so the truncated file was written, cached,
+and (because the existing-file prefix scan in `ensure_cached()` trusts anything already at
+that cache path) re-served on every subsequent load with no re-fetch and no integrity
+check. Also fixed 2026-08-28 (bytes-written vs. `Content-Length` check on fetch) — see
+`skills/digger-integration/SKILL.md` and `docs/design/webcodecs-video-path.md` "Risks and
+open items" for the full chain. A cache entry poisoned before this fix is not retroactively
+validated — delete it manually from `~/.local/share/com.cuemark.app/media_cache/` to force
+a re-fetch.
+
+**Not this entry**: a file with no video track at all (e.g. an audio-only `.wav` loaded as
+a video-typed deck source) also produces the same "timed out waiting for parsebin" message,
+correctly — there's nothing for parsebin to find. That's a real, working demux path, not
+this bug — see the Twelfth mechanism in `docs/design/pcm-buffer-playback.md`.
+
 ### A network (Snapcast) output is silent while local outputs are fine
 
 **Symptom**: a `snapcast://…` target is ticked in Main, the deck plays normally on the booth
