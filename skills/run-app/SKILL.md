@@ -154,8 +154,9 @@ silently runs against the stale one.** Caught 2026-08-09: the relaunch logged
 anyway**, serving the frontend from the previous session's Vite. The codec worker failed to
 import (`[codecPlayer:deck-0] worker.onerror: undefined (undefined:undefined)`) and the user
 lost video entirely — reported as a regression in the Rust change that had just been made,
-which it was not. This is the "Vite serves a stale transform" hazard in CLAUDE.md with a
-louder failure mode.
+which it was not. This is the "Vite serves a stale transform" hazard below (see "Making sure
+a change actually reached the running app") with a louder failure mode: a whole dead process,
+not just one stale file.
 
 Kill both, and **scope the pattern to this repo** — there are unrelated Vite servers on this
 machine (ports 5173/5175, `/app/node_modules/...`) that a bare `pkill -f vite` would take out:
@@ -194,9 +195,10 @@ if a pid comes back, `kill <pid>` it directly and re-check until it prints `all 
 so a Rust change made while it runs can be picked up on its own — the app binary's age
 (`ps -eo pid,etime`) and the `[build]` line's `built=` stamp will show it. That does **not**
 make a restart pointless: a restart is still the only thing that guarantees a full page load,
-and HMR can silently skip a `.svelte` edit (see CLAUDE.md's disk → served → reload ladder).
+and HMR can silently skip a `.svelte` edit (see "Making sure a change actually reached the
+running app" below, case 6).
 
-## Lifecycle rules (from CLAUDE.md)
+## Lifecycle rules
 
 - Frontend changes (`.svelte`, `.ts`) → Vite hot-reloads instantly, no restart needed.
 - Rust changes (`src-tauri/`) → must stop + restart; the old binary keeps running until the rebuild finishes and wins, so edits silently have no effect if you skip the restart.
@@ -227,7 +229,47 @@ drawing conclusions about default behavior.
 
 **3. The binary that auto-rebuilds is not the binary being launched.** `cargo tauri dev` watches
 `src-tauri/` and rebuilds; the desktop-launcher release binary (`~/.local/bin/cuemark`) does not,
-and has been caught a *month* stale (see CLAUDE.md). A bug reproduced there may already be fixed.
+and has been caught a *month* stale (see "Desktop launcher" below). A bug reproduced there may
+already be fixed.
+
+**4. The frontend hot-reloaded but the backend was never restarted.** Live-hit 2026-08-14: the
+network-output feature (`c279488`) was committed. The frontend hot-reloaded its new Settings
+UI/IPC calls immediately; the dev server was never restarted, so the backend serving those
+calls was still the *previous* commit, with no `snapcast://` handling at all. It silently
+built a `pulsesink` from the literal device string, which failed to reach `PLAYING`, which
+took every other main/cue branch on that deck down with it in the same attach pass — no
+crash, no bus error, `raf`/`poll-stats`/position all read healthy. **The tell**:
+`grep '\[build\] cuemark' cuemark.log | tail -1` against `git log --oneline -1` — if the
+log's SHA is an ancestor of HEAD, the running binary predates whatever was just committed.
+Check this before trusting any runtime symptom right after a commit that touched both
+frontend and backend.
+
+**5. Vite served a stale transform of a file that's correct on disk.** Two rapid successive
+writes to one file in a single command (e.g. a `sed -i` followed by a rewrite) can leave the
+watcher holding the intermediate state, and its mtime-based dedupe then misses the second
+write. On 2026-08-03 this served an `outputBus.ts` missing one import, so `hasListener()`
+threw a `ReferenceError` every frame and the projector stayed black — while the source file
+was correct and `npm run check` passed. **Before trusting a measurement run, diff the served
+artifact against disk**, not just the source:
+```bash
+curl -s http://localhost:1420/src/lib/renderer/outputBus.ts | head -20   # what the app loaded
+```
+`touch`ing the file forces a re-transform. This project's failure modes are overwhelmingly
+silent, so make this diff a habit rather than a last resort.
+
+**6. That check proves the dev server is current; it says nothing about the webview.** HMR can
+silently skip a component edit — 2026-08-14, a new Settings row was correct on disk, correct
+in `curl`, no Vite error, and simply absent from the running window, because the `.svelte`
+edit landed after the last full page load and the panel was not mounted at the time. **A
+plain webview reload fixed it; no rebuild, no dev-server restart.** So when a frontend change
+seems absent, walk it in order — disk → served artifact → **reload the window** — and only
+then start theorising. The timeline check that settles it in one command is the edited
+files' mtimes against the last `[build]` stamp in the log:
+```bash
+ls -l --time-style=+%H:%M:%SZ <edited files>   # TZ=UTC, to compare against the stamp
+grep -a '\[build\]' ~/.local/share/com.cuemark.app/logs/cuemark.log | tail -1
+```
+An edit later than the last stamp reached HMR but never a page load.
 
 **Ground-truth checks — cheap, do them instead of assuming:**
 
@@ -253,6 +295,13 @@ scripts/check-launcher-staleness.sh    # exit 0 fresh · 1 stale · 2 not built
 this was `cargo tauri dev` or the launcher; `(dirty)` says the worktree had uncommitted
 edits, so the SHA alone does not identify the code; `built=` dates it. Old log files
 retain their own stamp, so a report from last week still identifies its build.
+
+⚠️ **`built=` is when `build.rs` last ran, not when the binary was last linked.** Cargo
+reruns `build.rs` on its own trigger conditions, so an ordinary source edit can recompile
+and relink while the stamp stays put — observed 2026-08-08 with the stamp 8s behind the
+exe's mtime. The SHA and dirty flag are still right, which is what usually matters. To
+settle "is this binary the current source", the reliable check is `cargo build` reporting
+`Finished` with no `Compiling` line.
 
 **Prefer logging effective config over trusting the build.** Any value worth tuning is worth
 printing at the point it is applied, with its source. That single habit converts all three
@@ -387,7 +436,8 @@ webcodecs) next to the badge.
 
 ### HMR hazard: landing a call site before its import kills the rAF loop
 
-Distinct from the stale-transform trap in CLAUDE.md — here Vite serves each write *correctly*,
+Distinct from the stale-transform trap above ("Making sure a change actually reached the
+running app", case 5) — here Vite serves each write *correctly*,
 but an intermediate state is briefly wrong. Adding `foo()` to a loop body and its `import` in a
 separate Edit means HMR fires on the intermediate file and throws
 `ReferenceError: Can't find variable: foo`. Inside a rAF loop that throw happens **before** the
@@ -555,7 +605,7 @@ RAF-loop functions before leaving them in place.
 
 ## Desktop launcher (GNOME — "Show Applications" / Super key)
 
-This mirrors the Fieldnote pattern (CLAUDE.md "Desktop launcher" section) — no `.deb`
+This mirrors the Fieldnote project's desktop-launcher pattern — no `.deb`
 packaging, just a release binary + symlink + hand-written `.desktop` entry. One-time setup,
 or repeat after any change meant for the launcher build (not needed for `cargo tauri dev`
 iteration — that's separate from this).

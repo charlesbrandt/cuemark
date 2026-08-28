@@ -605,101 +605,20 @@ cd src-tauri && cargo check   # Rust type check only
 cd src-tauri && cargo test    # includes analysis.rs decode smoke test (needs GStreamer)
 ```
 
-**Dev server lifecycle**: `cargo tauri dev` watches frontend files and hot-reloads them instantly.
-Rust changes (`src-tauri/`) require a full recompile — Tauri detects them and rebuilds automatically,
-but **the old binary keeps running until the rebuild finishes and the window restarts**.
-If managing the dev server from Claude Code: kill the background process before making Rust changes,
-then restart after. A change that was edited but never recompiled has no effect at runtime.
+**Dev server lifecycle**: stop `cargo tauri dev` before any `src-tauri/` change and restart
+after — the old binary keeps running until a restart, so a Rust edit with no restart silently
+has no effect at runtime. Frontend (`.svelte`/`.ts`) usually hot-reloads on its own.
+**Full gotchas — a network-output incident where the frontend hot-reloaded but the backend
+silently didn't, the Vite stale-transform trap, HMR silently skipping a mounted component,
+the `[build]` provenance line, and desktop-launcher staleness — are in
+`skills/run-app/SKILL.md`'s "Making sure a change actually reached the running app" and
+"Desktop launcher" sections, not here.** Read it before diagnosing any "my fix didn't take"
+or "the app looks healthy but is silent" symptom.
 
-🔴 **This failure mode can look like a healthy app producing total silence, not an obviously
-stale fix.** Live-hit 2026-08-14: the network-output feature (`c279488`) was committed, the
-frontend hot-reloaded its new Settings UI/IPC calls immediately, and the dev server was never
-restarted — so the backend serving those calls was still the *previous* commit, with no
-`snapcast://` handling at all. It silently built a `pulsesink` from the literal device string,
-which failed to reach `PLAYING`, which took every other main/cue branch on that deck down with
-it in the same attach pass. No crash, no bus error; raf/poll-stats/position all read healthy.
-The tell: `grep '\[build\] cuemark' cuemark.log | tail -1` against `git log --oneline -1` — if
-the log's sha is an ancestor of HEAD, the running binary predates whatever was just committed.
-Check this before trusting any runtime symptom right after a commit that touched both
-frontend and backend. See the audio-debugging skill's "network output silent" entry.
-
-⚠️ **An HMR update to `App.svelte` remounts it, which tears the deck down and pauses playback**
-— and repeated remounts can leave the GStreamer pipeline wedged (see the retry-storm tell under
-"Standing performance instrumentation"). This makes edit-driven A/B measurement expensive: every
-switch costs a remount, a re-play, and sometimes a track re-load. **Prefer an A/B switch that
-needs no further edits** — a wall-clock sweep driven from `frame()` that advances arms itself and
-stamps the arm on every log line, rearming on pause so each press of play is a fresh run
-(`docs/design/control-window-frame-budget.md` §5). Keyboard switching is a trap twice over: F7/F8
-never reach the webview on this desktop, and a raw `addEventListener` in `onMount` is not unwound
-by HMR, so handlers belonging to destroyed instances keep logging switches that never took effect.
-
-⚠️ **Vite can serve a stale transform of a file that is correct on disk.** Two rapid successive
-writes to one file in a single command (e.g. a `sed -i` followed by a rewrite) can leave the
-watcher holding the intermediate state, and its mtime-based dedupe then misses the second write.
-On 2026-08-03 this served an `outputBus.ts` missing one import, so `hasListener()` threw a
-`ReferenceError` every frame and the projector stayed black — while the source file was correct
-and `npm run check` passed. **Before trusting a measurement run, diff the served artifact against
-disk**, not just the source:
-```bash
-curl -s http://localhost:1420/src/lib/renderer/outputBus.ts | head -20   # what the app loaded
-```
-`touch`ing the file forces a re-transform. The built artifact is the thing under test, and this
-project's failure modes are overwhelmingly silent — see the "silent-ignore" note in `journal.md`.
-
-⚠️ **That check proves the dev server is current; it says nothing about the webview.** HMR can
-silently skip a component edit — 2026-08-14, a new Settings row was correct on disk, correct in
-`curl`, no Vite error, and simply absent from the running window, because the `.svelte` edit
-landed after the last full page load and the panel was not mounted at the time. **A plain
-webview reload fixed it; no rebuild, no dev-server restart.** So when a frontend change seems
-absent, walk it in order — disk → served artifact → **reload the window** — and only then start
-theorising. The timeline check that settles it in one command is the edited files' mtimes
-against the last `[build]` stamp in the log:
-```bash
-ls -l --time-style=+%H:%M:%SZ <edited files>   # TZ=UTC, to compare against the stamp
-grep -a '\[build\]' ~/.local/share/com.cuemark.app/logs/cuemark.log | tail -1
-```
-An edit later than the last stamp reached HMR but never a page load.
-
-**The desktop-launcher release binary is a separate build that never auto-rebuilds** — unlike
-`cargo tauri dev`, nothing watches `src-tauri/` for the launcher build (`~/.local/bin/cuemark`,
-see `run-app` skill's "Desktop launcher" section). It only updates when someone explicitly runs
-`npm run tauri build -- --no-bundle`. Caught stale by a month on 2026-07-26: a live-session freeze
-was diagnosed against a binary built 2026-06-22, missing the *entire* webcodecs-video-path effort
-(phases 1-5) and everything after — the freeze was old, already-fixed behavior, not a regression.
-**Rebuild the launcher binary periodically, and always after a troubleshooting/design-doc session
-that touched `src-tauri/`, before trusting a direct (non-`cargo tauri dev`) launch to reflect
-current code.** `scripts/check-launcher-staleness.sh` reports whether it is behind (exit 1 = stale)
-without forcing a slow release build.
-
-**Build provenance is stamped into every run.** `build.rs` emits the git SHA, worktree
-clean/dirty flag, and build timestamp as compile-time env vars; `lib.rs` logs them as the
-first line of `setup()`:
-```
-[build] cuemark e998273 (dirty) profile=debug built=2026-08-02 18:15:04Z exe=…/target/debug/cuemark
-```
-The real hazard is not a stale build, it is not knowing which build is running — `exe=`
-distinguishes the dev binary from the launcher one, and old log files keep their own stamp,
-so a report from last week still identifies its code. Check this line before diagnosing
-anything from a log.
-
-⚠️ **`built=` is when `build.rs` last ran, not when the binary was last linked.** Cargo reruns
-`build.rs` on its own trigger conditions, so an ordinary source edit can recompile and relink
-while the stamp stays put — observed 2026-08-08 with the stamp 8s behind the exe's mtime. The
-SHA and dirty flag are still right, which is what usually matters. To settle "is this binary
-the current source", the reliable check is `cargo build` reporting `Finished` with no
-`Compiling` line.
-
-**First-time / new machine setup** (in addition to Rust + Node toolchains):
-```bash
-# GStreamer dev headers — runtime packages alone aren't enough
-sudo apt install \
-  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-  gstreamer1.0-pipewire   # optional: enables device-specific routing
-
-npm install                              # JS deps (node_modules not committed)
-cargo install tauri-cli --version "^2"  # CLI subcommand; compiles from source (~5 min)
-```
+**First-time / new machine setup**: `skills/run-app/SKILL.md`'s "Prerequisites check" has the
+current package list and verification commands (GStreamer build + runtime packages, Tauri
+CLI) — it's kept current there, not duplicated here. Requires Rust + Node toolchains already
+present.
 
 ## Logging
 
