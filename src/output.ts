@@ -49,10 +49,60 @@ function resize(width: number, height: number) {
   canvas.style.height = `${height}px`;
   debugLog(`[output] resize: css=${width}x${height} dpr=${devicePixelRatio} buffer=${canvas.width}x${canvas.height}`);
 }
+
+// A maximize/un-maximize transition on WebKitGTK can deliver a transient, wrong
+// contentRect to the ResizeObserver callback below (live-hit 2026-08-28: maximizing this
+// window onto an external monitor left the video squished into the top of the window,
+// stretched into a too-short CSS box). Once the transition settles, WebKitGTK considers the
+// observed element's size unchanged from that stale reading, so no further genuine 'resize'
+// entry ever arrives to correct it — same class of bug as WaveformCanvas.svelte's
+// WAVEFORM_HEIGHT_PX (a mount mid-resize catching an un-settled default), referenced there
+// as "the full-window skew on un-maximize — tracked separately" but never actually written
+// up until now. Guard against it by polling document.body's real layout rect across rAFs
+// until it stops moving, then correcting the CSS size if it ends up differing from what the
+// observer reported.
+let settleToken = 0;
+function settleResize(observedWidth: number, observedHeight: number) {
+  const token = ++settleToken;
+  let last: { width: number; height: number } | null = null;
+  let stableFrames = 0;
+  let attempts = 0;
+  const MAX_ATTEMPTS = 30; // ~500ms at 60fps — generous for a window-manager transition
+  function tick() {
+    if (token !== settleToken) return; // superseded by a newer resize/settle pass
+    const rect = document.body.getBoundingClientRect();
+    const moved = !last || Math.abs(rect.width - last.width) >= 0.5 || Math.abs(rect.height - last.height) >= 0.5;
+    stableFrames = moved ? 0 : stableFrames + 1;
+    last = { width: rect.width, height: rect.height };
+    attempts++;
+    if (stableFrames >= 2 || attempts >= MAX_ATTEMPTS) {
+      if (Math.abs(rect.width - observedWidth) > 1 || Math.abs(rect.height - observedHeight) > 1) {
+        debugLog(
+          `[output] resize settle correction: observed=${observedWidth}x${observedHeight} settled=${rect.width}x${rect.height} attempts=${attempts}`,
+        );
+        resize(rect.width, rect.height);
+      }
+      return;
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+}
+
 new ResizeObserver((entries) => {
   const { width, height } = entries[0].contentRect;
   resize(width, height);
+  settleResize(width, height);
 }).observe(document.body);
+
+// Fullscreen toggling (the F-key handler below) is its own window-manager transition and
+// gets the same treatment — re-measure and correct once GTK has settled, rather than trusting
+// whatever the ResizeObserver happened to catch mid-transition.
+document.addEventListener('fullscreenchange', () => {
+  const rect = document.body.getBoundingClientRect();
+  resize(rect.width, rect.height);
+  settleResize(rect.width, rect.height);
+});
 
 let vizSrc: string | null = null;
 let lastFrameAt = performance.now();
