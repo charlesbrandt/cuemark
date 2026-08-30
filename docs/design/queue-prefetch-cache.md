@@ -1,6 +1,35 @@
 # Queue prefetch and local media cache management
 
-**Status:** design only, nothing built. Phase 1 (measurement) is the gate on everything else.
+**Status (2026-08-30):** Phase 1 + 1b built and live-verified (`[media_cache]`/`[audio_load]`/
+`[queue-load]` lines all firing correctly, both bug fixes and the waveform-cache lane in place).
+**The phase-1 gate has been read, and it says stop.** Real-set log data (7 cold loads +
+1 clean cold/warm reload A/B of the same file, 2026-08-30) shows `preroll` at 70–94% of
+`total` on every cold load, `cache` (the network/local-copy leg this feature would optimize)
+at only 6–30%. The one reload comparison available (Krust track, cold 3326.9ms → warm
+1535.3ms) looks superficially like the "network dominates" prediction, but the arithmetic
+doesn't support that: `cache` collapsed from 681.7ms→0.6ms (saving 681ms), yet `total` dropped
+by 1791.6ms — the other ~1110ms came from `preroll` *itself* getting faster on the warm re-read
+(2645.2ms→1534.7ms), which media_cache's hit/miss state does not control (most likely OS
+page-cache warmth on the now-resident local file, not anything this feature's Rust worker would
+change). `getCuemarkPayload` is negligible everywhere (7–28ms) — rules out the payload-batching
+branch too. **Conclusion: this is prediction #2 from §1 below, not #1.** Phase 2 (the prefetch
+worker, eviction, Settings UI) is **not being built** on this doc's current scope — building it
+would buy back only the `cache` leg, a few hundred ms out of multi-second totals, not the
+complaint that motivated this doc. The real lever is `preroll` — `uridecodebin` setup — which
+this doc explicitly named as the redirect target and never designed for. See the raw numbers
+and full reasoning in `skills/perf-log-reading/SKILL.md`'s `[media_cache]`/`[audio_load]`
+section. If preroll-path work starts, it deserves its own design doc, not a phase 2 rewrite of
+this one — the "warm this list of paths" prefetch primitive built here still stands and is
+correct as far as it goes; it's just answering a question that turned out not to be the
+dominant cost. **That doc now exists: `docs/design/preroll-latency.md`** (drafted 2026-08-30) —
+it splits the `preroll=` bucket itself into teardown/PCM-decode/build/GStreamer-preroll, since
+reading `pipeline.rs`'s `load()` showed that number already conflates a synchronous full-file
+scratch PCM decode with actual GStreamer negotiation, and nobody had separated the two. The
+other half of the original todo.md complaint (button-to-audio gap on an already-loaded deck) has
+its own exploration doc too: `docs/design/button-to-audio-latency.md`. Original design intent
+below, unedited except for this status block and §10.
+
+**Status (2026-08-29, original):** design only, nothing built. Phase 1 (measurement) is the gate on everything else.
 **Date:** 2026-08-29 (§4, the waveform-cache prefetch lane, added same day — Digger's own
 waveform-cache work is in active development in a parallel session as of this writing)
 **Origin:** todo.md, "Load-time / button-to-audio latency during live mixing" — first
@@ -686,6 +715,11 @@ more informative than a silent full wipe.
 ---
 
 ## 10. Phasing
+
+**Outcome (2026-08-30): 1 and 1b shipped, gate read, 2/3/4 not proceeding on this doc's scope.**
+See the Status block at the top. Phase 1's Storage tab (read-only usage/free-space display) was
+not built — it stopped being worth prioritizing once the gate came back negative, though it
+remains cheap and low-risk if wanted later purely as a "how big is this thing" readout.
 
 **1 — Nearly free, and worth doing whether or not the rest ever ships.**
 Timing instrumentation: `[media_cache]` line on every call including hits, `[audio_load]` phase

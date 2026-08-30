@@ -1,6 +1,6 @@
 ---
 name: perf-log-reading
-description: How to read cuemark's standing performance instrumentation log lines ([poll-stats], [raf], [aux-loop], [deliver-tel], [scrub-deliver]/[scrub-sec]) — field meanings, known-silence-by-design cases, and attribution pitfalls. Load this when investigating a performance regression or reading a perf log dump, not on every session.
+description: How to read cuemark's standing performance instrumentation log lines ([poll-stats], [raf], [aux-loop], [deliver-tel], [scrub-deliver]/[scrub-sec], [media_cache]/[audio_load]/[queue-load]) — field meanings, known-silence-by-design cases, and attribution pitfalls. Load this when investigating a performance regression or reading a perf log dump, not on every session.
 ---
 
 # Standing performance instrumentation
@@ -89,6 +89,39 @@ an interval) — buffered in memory for the whole gesture and flushed at the end
   field has not calibrated yet; discard it.
 - ⚠️ MIDI ticks carry no platform stamp, so a vinyl-jog gesture reports `evQueue —`. A gap there
   is an upper bound on delivery latency, not an attribution.
+
+`media_cache.rs`/`audio/mod.rs`/`queueStore.ts` add three more, one line per track load
+(docs/design/queue-prefetch-cache.md §1 — built + gate-read 2026-08-30):
+
+```
+[media_cache] hit  path=…                     ms=…               (in-memory map hit)
+[media_cache] copy path=… bytes=… ms=…                            (local-stat branch, real fs::copy)
+[media_cache] fetch path=… bytes=… ms=… url=…                     (remote/Digger fallback branch)
+[audio_load]  deck-0 total=… cache=… lock=… preroll=…
+[queue-load]  getCuemarkPayload track=… ms=…
+[queue-load]  deck=deck-0 updateDeck-to-audioLoad-resolved ms=…
+```
+
+- `[audio_load]`'s `cache` is the `ensure_cached()` call (network/local-copy leg); `preroll` is
+  GStreamer pipeline load/preroll; `lock` is `AudioManager` mutex acquisition (has been ~0 in
+  every sample so far — never the bottleneck). `total` is the whole spawned closure.
+- ⚠️ **`preroll` dominates `total` on every real-set sample so far — 70–94% cold, `cache` only
+  6–30%.** This settled docs/design/queue-prefetch-cache.md's phase-1 gate: the file-prefetch
+  feature that doc specs would only ever buy back the `cache` leg, which was never the dominant
+  cost. Read `preroll`, not `cache`, when someone reports load feeling slow.
+- ⚠️ **A warm reload's `total` drop is not proof `cache` (or a media-file prefetch) is what
+  helped.** One clean same-file A/B (cold 3326.9ms → warm 1535.3ms) had `cache` collapse
+  681.7ms→0.6ms — but `total` dropped 1791.6ms, nearly 3× that. The extra drop was `preroll`
+  itself getting faster on the re-read (2645.2ms→1534.7ms), most likely OS page-cache warmth on
+  the now-resident local file — a mechanism `media_cache.rs`'s hit/miss bookkeeping doesn't
+  control and a prefetch worker wouldn't reliably reproduce on a cold file. Attribute a reload
+  speedup to whichever leg actually shrank, never to "the cache" as a whole.
+- `[queue-load]`'s `getCuemarkPayload` (the Digger HTTP round trip before any Rust code runs)
+  has been negligible in every sample (7–28ms) — not a place to look for load latency.
+- `updateDeck-to-audioLoad-resolved` should track `[audio_load] total` plus a small constant
+  (~50–80ms measured) for IPC/JS overhead; a much larger gap between the two would point at
+  something stalling between the store update and the `audioLoad()` call itself, not inside
+  either measured phase.
 
 How to read them (full derivation in `docs/design/control-window-frame-budget.md`):
 

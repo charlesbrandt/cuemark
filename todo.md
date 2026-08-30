@@ -1,42 +1,41 @@
 # todo
 
-### Load-time / button-to-audio latency during live mixing [open]
+### Load-time / button-to-audio latency during live mixing [measured 2026-08-30, redirected]
 
 Surfaced during the first real multi-listener session, carried over from digger's todo.md
 (that repo's the wrong home for this — digger only serves files, cuemark plays them). Two
 related complaints from that session: track load time into cuemark felt slow, and a
 perceptible gap between pressing a button and hearing the effect, which made beat-matching
-hard to line up. Open question worth checking before assuming this is purely cuemark's own
-playback/audio-engine path: whether the *source* of the load latency is actually
-digger's file-serving (`GET /files/{id}`, range-request streaming — could be a CIFS T7
-round-trip on a cold read) rather than something in cuemark's own deck-load code. Not
-investigated yet either side.
+hard to line up.
 
-tray icon dependency -- is this still needed? 
+**Measured 2026-08-30** (see `docs/design/queue-prefetch-cache.md`'s Status block and
+`skills/perf-log-reading/SKILL.md`'s `[media_cache]`/`[audio_load]` section for the full
+numbers): the load-time half is **not** a network/file-serving problem. GStreamer `preroll`
+is 70–94% of total load time across every real-set sample; the media-file network/copy leg
+is only 6–30%. A queue-prefetch/local-cache feature was designed and gated on exactly this
+measurement — the gate came back negative, so that feature is **not being built**. The real
+lever is the `uridecodebin` preroll path itself — but reading `pipeline.rs`'s `load()` shows
+the `preroll=` number already conflates a synchronous full-file scratch PCM decode with actual
+GStreamer negotiation. **Design doc drafted 2026-08-30: `docs/design/preroll-latency.md`**,
+splitting that bucket into sub-phases before any tuning starts.
 
-Way to record a session
+The second complaint — perceptible gap between pressing a button and hearing the effect —
+is a different subsystem (output latency / IPC / pipeline response, not file residency) and
+is still **unmeasured**. **Exploration doc drafted 2026-08-30: `docs/design/
+button-to-audio-latency.md`** — traces the full MIDI-press → GStreamer-Playing → audible chain,
+link by link, and proposes reusing the codebase's existing `epoch_ms()` shared-clock convention
+to correlate timestamps across the Rust/JS boundary. Nothing built yet on either new doc; both
+are phase-1-instrumentation-only, gated the same way `queue-prefetch-cache.md` was.
 
-Combine all of the MIDI and Record Settings to be switchable via a tabbed menu option at the top of the open Settings menu. That way everything can be managed directly in the settings panel without cluttering up the main nav. That will also allow us to change the function of the record button itself (in the main nav) to become the on off toggle for the recording. The animation to indicate that recording is active can be much more subtle. We can keep the button itself filled in red (current toggle functionality), but then there can be a subtle circle to the left of the word "Record" that fades in and out (soothingly) to indicate that recording is active. Then there is no need to open the settings menu once the recording settings have been configured. 
 
 stem support
 loop support
 
 I want to update the app so that it has the potential to recognize and use any number of controllers. We should set up a job to convert mappings from Mixxx to what is needed here. Can we leverage those directly? (Allowing for local updates, as needed). 
-the real cause is in src-tauri/src/midi.rs: run_midi_loop only opens a port whose name contains "hercules" or "starlight" (midi.rs:500), matched once at startup, never rescanned. That's exactly the phase-1 gap your own docs/design/controller-mapping.md §5 describes ("find one port by substring, or give up... plugging a controller in after launch does nothing until the app restarts"). The "MIDI settings" list you're seeing is the raw monitor's Rescan ports panel — it enumerates ports live and shows a ● next to whichever one cuemark actually opened, but it's read-only status, not a picker; there's no "choose this port" control built yet.
 
-So two separate things are going on:
-1. Restarting alone won't help — even fresh, the FLX4's name wouldn't match "hercules"/"starlight".
-2. True hotplug (poll ports every ~2s, open new matches, drop disappeared ones) is real scope — §5 of the design doc, not a one-liner.
-
-docs/design/silent-failure-inventory.md's A1 catalogue entry for record.rs — it's part of a structured historical inventory doc, not a quick fix, so I didn't want to edit it without more context on how that doc wants to represent "since fixed" entries.
-Are there any active silent failures? Things feel stable. I don't want this to cause confusion if it is not providing helpful context now. 
-
-~~Bass / filter parameters should work.~~ **DONE 2026-08-17, live-verified** — 3-band EQ
-(`equalizer-nbands`, 250 Hz / 1 kHz / 4 kHz) plus a sweep filter, and the Starlight's
-dual-function tone knob mapped in both its modes. See `docs/design/deck-eq-and-filter.md`;
-§8 maps each "feels wrong" complaint to the constant that fixes it.
 
 What is necessary to build for mac or windows machines. Is that possible?
+
 
 Task: audit the media library for AV1 files and get them converted, so nobody loads one live.
 Not started — flagging, not running anything yet. Context (2026-08-25): a file that "worked on
@@ -488,15 +487,4 @@ window (scratch poll p50=39ms at ~25fps, idle timer fired 1ms late). First thing
 and how to reproduce: `docs/design/scratch-feeder-underruns.md`.
 
 
-
-### OVR waveform stutter [mostly explained, one thread open, 2026-08-08]
-
-Dragging a **paused** deck in OVR mode is *supposed* to sound choppy — `waveform-scrub.md`
-already documents the overview's coarse pixel-to-time scale (~24x coarser than the zoomed view)
-legitimately saturating the scratch servo's snap threshold, and snapping is deliberately silent.
-Don't touch `SCRATCH_TARGET_SNAP_SECS` or `secondsPerPixel()` over this — it's working as
-designed. What's still genuinely untested: dragging a **playing** deck in OVR goes through a
-different, throttled silent-seek path (`seekBus.ts`, `SILENT_SCRUB_SEEK_MS`) that the design
-doc itself flags as never live-verified — that's the more likely source of a real stutter.
-Next step: a `scratch-capture.sh` run against that specific scenario before touching anything.
 
