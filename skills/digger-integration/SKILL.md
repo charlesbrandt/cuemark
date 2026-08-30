@@ -285,11 +285,26 @@ normalization as bpm/downbeat above) and used by both triggers via `nearEndRefer
 `autoMix.ts` in place of `source.duration` whenever a track has one — the existing
 threshold settings still measure their lead time from whichever reference applies. Falls
 back to duration exactly as before when unset (no analysis run yet, or a non-Digger load).
-⚠️ **No manual "set outro" control was added** — Digger's `track_cuemark()` picks the
-*first* marker of a type by `position_ms`, not most-recent like it does for `downbeat`, so a
-manually-pushed second `mix_out` marker isn't guaranteed to win over an auto-derived one.
-Fix that in the digger repo (most-recent-wins, matching `downbeat`) before adding a manual
-override control.
+**Phase 5 (2026-08-30) pulled `mixIn` through the same way**, into `Deck.introPoint`, and
+derives each transition's *duration* from the two tracks' zone lengths (`duration −
+outroPoint` on the outgoing side, `introPoint` on the incoming side) —
+`computeTransitionDurationMs()` in `autoMix.ts`. Again **no digger-repo change**. ⚠️ Know
+this before reading a short transition as a bug: `_derive_mix_points()` sets `mix_in =
+beat_times[0]`, the **first tracked beat**, usually well under a second — it is not "the end
+of the intro", so on an auto-analysed track the intro side contributes nothing and the
+duration comes from the outro zone alone. A `MIN_ZONE_SEC = 2` floor is what keeps those
+sub-second values from collapsing every blend to the 2s minimum.
+
+⚠️ **Manual mix_in/mix_out writes must DELETE before they insert.** `track_cuemark()` picks
+the *first* marker of a type by `position_ms` — not most-recent like it does for `downbeat`,
+and not manual-first — so a manually-pushed second `mix_out` silently loses to an
+auto-derived one sitting earlier in the track. Phase 4 declined to ship a manual control for
+exactly this reason; phase 6 (2026-08-30) ships one and works around it: `setMixMarker()`
+(`api.ts`) deletes every existing marker of that type (`GET /tracks/{id}` for the ids —
+`/cuemark` flattens them away — then `DELETE /markers/{id}`) before POSTing, leaving one
+unambiguous row. 🔴 **Still worth fixing in the digger repo** (rank `source='manual'` first,
+or upsert): re-running `analyze_audio.py` re-creates a `detected` marker alongside the manual
+one and the ambiguity returns.
 
 ⚠️ **The crossfade ramp's completion branch must clear the outgoing deck's `source`, not
 just `playing`** (fixed 2026-08-24, `autoMix.ts`'s `startCrossfadeRamp`) — leaving a
@@ -327,6 +342,14 @@ touch or Auto DJ) moves it. If a future session wants "remember my on-screen cro
 position across restarts" back, it needs a way to distinguish "last touched on-screen" from
 "last touched by a hardware fader that may have moved since" — don't just restore the field
 again without solving that.
+
+**Two Skip controls since 2026-08-30** (DiggerQueue's toolbar, visible only with Auto DJ
+on): **⏭ Skip** (`skipCurrentTrack()`) starts the transition off the *playing* deck right
+now — the real ramp, not a re-pick — and **⤼** (`skipUpcomingTrack()`, the original and
+until then the only behavior) only swaps what's preloaded on the idle deck. The split
+exists because the single ⏭ button doing the latter read as broken live: "the next track
+loaded, but nothing happened". If a report says Skip did nothing, check which button and
+look for `[auto-dj] skip-now:` in the log.
 
 **Manual/auto interaction (added 2026-08-26)** — what a human touching a deck should do to
 Auto DJ while it's running. Full tier design in `docs/design/auto-dj-transitions.md`

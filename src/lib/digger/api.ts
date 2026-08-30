@@ -38,11 +38,15 @@ export interface CuemarkPayload {
   beatGridAlgo: string | null;
   beatGridConfidence: number | null;
   gain: number | null;
-  // Automix transition window's out point — auto-derived by Digger's analyze_audio.py
-  // (16 bars before the last detected beat, ~30s-before-end fallback) or manually set
-  // there via the markers API. Consumed as Deck.outroPoint's source — see
-  // docs/design/auto-dj-transitions.md "Phase 4". `mixIn` exists on the Digger side too
-  // but nothing in cuemark reads it yet, so it's deliberately not declared here.
+  // Automix transition window — both ends auto-derived by Digger's analyze_audio.py
+  // (`_derive_mix_points`) or manually set there via the markers API, and both returned
+  // by GET /tracks/{id}/cuemark. `mixOut` is 16 bars before the last detected beat
+  // (~30s-before-end fallback) and feeds Deck.outroPoint; `mixIn` is the first tracked
+  // beat and feeds Deck.introPoint. ⚠️ The auto-derived `mixIn` is the first beat of the
+  // track, not the end of its intro section — see Deck.introPoint's own comment and
+  // docs/design/auto-dj-transitions.md "Phase 4"/"Phase 5" before treating it as an
+  // intro *length*.
+  mixIn: number | null;
   mixOut: number | null;
 }
 
@@ -249,10 +253,25 @@ export function subscribeQueueChanges(onChange: () => void): () => void {
   };
 }
 
+export type MarkerType = 'cue' | 'hot_cue' | 'downbeat' | 'mix_in' | 'mix_out';
+
+export interface DiggerMarker {
+  id: number;
+  track_id: number;
+  position_ms: number;
+  type: string;
+  label: string | null;
+  color: string | null;
+  /** 'detected' (analyze_audio.py) or 'manual' (anything created through the API,
+   *  including cuemark). Digger's cuemark payload does NOT rank by this — see
+   *  `setMixMarker` below for why that matters. */
+  source: string | null;
+}
+
 export async function pushMarker(
   trackId: number,
   positionMs: number,
-  type: 'cue' | 'hot_cue' | 'downbeat' = 'cue',
+  type: MarkerType = 'cue',
   label?: string,
 ): Promise<void> {
   const r = await fetch(`${_baseUrl}/tracks/${trackId}/markers`, {
@@ -261,6 +280,58 @@ export async function pushMarker(
     body: JSON.stringify({ position_ms: positionMs, type, label: label ?? null }),
   });
   if (!r.ok) throw new Error(`push marker ${r.status}`);
+}
+
+/** Full marker rows (with ids) for a track — `GET /tracks/{id}`'s `markers` array. The
+ *  `/cuemark` payload deliberately flattens these to positions, so this is the only way
+ *  to get an id to DELETE or PATCH. */
+export async function getTrackMarkers(trackId: number): Promise<DiggerMarker[]> {
+  const r = await fetch(`${_baseUrl}/tracks/${trackId}`);
+  if (!r.ok) throw new Error(`track ${r.status}`);
+  const track = await r.json();
+  return (track.markers ?? []) as DiggerMarker[];
+}
+
+export async function deleteMarker(markerId: number): Promise<void> {
+  const r = await fetch(`${_baseUrl}/markers/${markerId}`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(`delete marker ${r.status}`);
+}
+
+/**
+ * Replace a track's mix_in / mix_out marker — **delete-then-insert, not append**.
+ *
+ * ⚠️ This is load-bearing, and it is the reason a manual "set the outro here" control was
+ * declined in phase 4 (see docs/design/auto-dj-transitions.md). Digger's
+ * `_build_cuemark_payload()` resolves mix_in/mix_out by taking the **first marker of that
+ * type ordered by `position_ms`** — not the most recent, and not `source='manual'` first,
+ * the way it does for `downbeat`. So simply POSTing a manual marker later in the track
+ * than the auto-derived 'detected' one silently loses to it, forever, with no error.
+ * Clearing every existing marker of the type first leaves exactly one row, which makes
+ * "first by position" unambiguous whatever cuemark writes.
+ *
+ * Note this is *within* Digger's existing API — no schema change, no endpoint change, and
+ * no dependence on Digger's resolution rule being fixed later (if it ever is, this still
+ * behaves identically). Re-running `analyze_audio.py` on the track will re-derive a
+ * 'detected' marker alongside the manual one, and the same ambiguity returns — flagged as
+ * an open decision in the design doc rather than worked around from this side.
+ */
+export async function setMixMarker(
+  trackId: number,
+  type: 'mix_in' | 'mix_out',
+  positionSec: number,
+): Promise<void> {
+  await clearMixMarker(trackId, type);
+  await pushMarker(trackId, Math.round(positionSec * 1000), type, type === 'mix_in' ? 'Mix in' : 'Mix out');
+}
+
+/** Removes every marker of this type from the track (usually one 'detected' row, plus a
+ *  'manual' one if cuemark has already overridden it). Leaves the track with no mix point
+ *  of that type at all, which cuemark reads as "no marker" and falls back to duration. */
+export async function clearMixMarker(trackId: number, type: 'mix_in' | 'mix_out'): Promise<void> {
+  const markers = await getTrackMarkers(trackId);
+  for (const m of markers) {
+    if (m.type === type) await deleteMarker(m.id);
+  }
 }
 
 export async function setTrackBpm(trackId: number, bpm: number): Promise<void> {

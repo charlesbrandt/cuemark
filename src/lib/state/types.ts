@@ -63,6 +63,16 @@ export interface Deck {
   // falls back to the fixed Settings threshold measured from the literal end, same as
   // before this field existed. See docs/design/auto-dj-transitions.md "Phase 4".
   outroPoint: number | null;
+  // Per-track intro/mix-in point (content seconds), pulled from Digger's `mixIn` — the
+  // mirror of outroPoint above, and derived by the same analysis pass (the first tracked
+  // beat; see _derive_mix_points in digger's importers/analyze_audio.py). Auto DJ reads
+  // it as the length of the incoming track's blendable intro zone when computing a
+  // transition duration (autoMix.ts's computeTransitionDurationMs). ⚠️ Digger's
+  // auto-derived value is "the first beat of the track", usually well under a second —
+  // NOT "the end of the intro section" — so in practice it only carries information when
+  // a DJ has placed a manual mix_in marker; a value shorter than MIN_ZONE_SEC is ignored.
+  // See docs/design/auto-dj-transitions.md "Phase 5".
+  introPoint: number | null;
   diggerTrackId: number | null; // Digger track id if loaded from the Digger queue; null = local file
   diggerFileId: number | null; // Digger `files.id` behind the loaded track — used as a
                                 // remote-fetch fallback (media_cache.rs) when the local
@@ -128,6 +138,9 @@ export interface Session {
   snapToBeat: boolean;    // when true, seek/cue/loop actions quantize to the nearest beat
   // Hides per-deck opacity/volume/rate/EQ/filter sliders — for when an external MIDI
   // controller drives those and the onscreen sliders just cost screen space.
+  // ⚠️ Defaults to `true` since 2026-08-30: that space now carries the per-deck marker /
+  // mix-zone panel (MarkerPanel.svelte), and the sliders are the opt-in. Turning them
+  // back on (Settings → Controls → "Mixer sliders") shows both.
   compactControls: boolean;
   effects: Effect[];      // global post-process chain
   visualization: Visualization | null; // global layer, composited above all decks

@@ -18,6 +18,7 @@
   import { debugLog } from "../lib/debugLog";
   import { suppressPhaseText, suppressTimestampText } from "../lib/audio/perfArm";
   import { videoPathOverrides, videoPathDefault, setVideoPathOverride, resolveVideoPath, activeVideoBackend } from "../lib/video/videoPathSettings";
+  import MarkerPanel from "./MarkerPanel.svelte";
   import { EQ_KILL_DB, EQ_MAX_DB } from "../lib/state/types";
   import type { Deck, DeckEQ } from "../lib/state/types";
 
@@ -721,6 +722,14 @@
       </button>
     {/each}
   </div>
+
+  <!--
+    Phase 6 (docs/design/auto-dj-transitions.md, 2026-08-30): always visible, and
+    deliberately above the now-opt-in slider block — these are the points a DJ workshopping
+    a mix reaches for, and until now the only way to move an intro/outro zone was Digger's
+    web UI on another screen.
+  -->
+  <MarkerPanel {deck} />
 
   {#if !$session.compactControls}
     <div class="sliders">

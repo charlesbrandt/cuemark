@@ -1,6 +1,8 @@
 # Auto DJ: automated transitions
 
-Status: 🟡 **Phase 1 DONE + live-verified 2026-08-24. Phase 2 (auto-preload) built +
+Status: 🟡 **Phases 5 + 6 built + unit-tested 2026-08-30, NOT live-verified — see the
+2026-08-30 entry and the four "Phase 5"/"Phase 6" sections. Phase 1 DONE + live-verified
+2026-08-24. Phase 2 (auto-preload) built +
 unit-tested 2026-08-24, fixed one live bug 2026-08-24, still NOT re-verified live. Phase 3
 (optional tempo/phase sync) built + unit-tested 2026-08-24; a first live test found no
 audible beat change, root-caused to a fire-and-forget seek racing playback start plus zero
@@ -10,6 +12,15 @@ below), still NOT re-verified live. Phase 4 (per-track outro marker) built + uni
 NOT yet live-verified. 2026-08-26: "Manual/auto interaction" tier system (see that section)
 and an `outroPoint` low-end sanity floor built + unit-tested, both root-caused from live logs,
 NOT yet live-verified.** — see "Proposed phased plan" below.
+
+**2026-08-30: phases 5 and 6 built + unit-tested (182/182), from three live asks and one
+UI ask. NONE of it is live-verified.** Phase 5 is three changes to how a transition is
+decided — its *duration* now comes from the two tracks' own mix markers rather than one
+flat setting, **Skip** actually skips, and a beatmatched deck's rate **drifts back to
+native** instead of compounding across a set. Phase 6 reclaims the deck card's slider
+space for a **mix-point panel** (with in-app Digger marker writes) and adds a
+**transition preview**, plus intro/outro zone shading on the waveform. See the four
+"Phase 5"/"Phase 6" sections below.
 
 **2026-08-25: live test reported an abrupt transition, log had zero `[auto-dj]` lines to
 explain it.** Root cause: the base (non-sync) crossfade path — the one that actually runs
@@ -262,6 +273,244 @@ function lives. `npm test`/`npm run check` clean (161/161, up from 148). **Neith
 live-verified yet** — both are log-forensics fixes for one-off incidents, not yet re-run
 against a real set.
 
+## Phase 5 — transition duration derived from the two tracks (2026-08-30)
+
+🟡 **Built + unit-tested, not live-verified.** The ask: "the duration should come from the
+two tracks, not one app-level number — a per-track fade-in zone and fade-out zone, so two
+tracks that both support it get a long musically interesting blend and ones that don't get
+a short one."
+
+**No Digger change was needed, again.** Same shape as phase 4: `_derive_mix_points()`
+(`~/repos/digger/importers/analyze_audio.py:109`) already writes **both** a `mix_in` and a
+`mix_out` marker per track, and `_build_cuemark_payload()`
+(`~/repos/digger/routers/tracks.py:313`) already returns both as `mixIn`/`mixOut` — cuemark
+consumed only `mixOut`. `Deck.introPoint` (`types.ts:75`) now mirrors `Deck.outroPoint`,
+populated from `payload.mixIn ?? null` in `queueStore.ts`'s `loadQueueItemToDeck()` with the
+same omitted-vs-null normalization.
+
+**What a "zone" is.** Two lengths, not two timestamps:
+- outgoing **outro zone** = `duration − outroPoint` — how much track sits after the mix-out
+  marker, i.e. the tail the DJ is happy to have another track playing over. Digger's
+  auto-derived marker makes this 16 bars (~30s at 128bpm).
+- incoming **intro zone** = `introPoint` — how much of its head is blendable before its
+  body starts.
+
+`computeTransitionDurationMs()` (`autoMix.ts:395`, pure and unit-tested directly) takes the
+**minimum** of the two usable zones — a blend can only be as long as the more constrained
+track supports — clamped to 2s…20s, and falls back to the flat `crossfadeDurationMs`
+setting when neither side has usable marker data. Same fallback discipline as
+`nearEndReference`: a track with no analysis run behaves exactly as it did before the field
+existed.
+
+⚠️ **The honest finding: Digger's `mix_in` is not an intro *length*.**
+`_derive_mix_points()` sets `mix_in_s = float(beat_times[0])` — the **first tracked beat of
+the track**, typically well under a second, with an explicit "no dedicated bar/downbeat
+detector yet" comment. So for an auto-analysed track the intro side carries no information,
+and `MIN_ZONE_SEC = 2` (`autoMix.ts:354`) is what keeps those sub-second values from
+collapsing every transition to the 2s floor. It becomes real the moment a DJ places a
+manual `mix_in` — which phase 6's marker panel now makes possible from inside cuemark — and
+would become real for the whole library if Digger learned to derive a genuine intro
+boundary (open decision below). Wiring the field through anyway is deliberate: it is the
+correct consumption point, it costs nothing, and it is inert rather than wrong until the
+data improves.
+
+**The trigger point moved too, and had to.** With a per-pair duration, a fixed
+`autoMixThresholdSec` can disagree with it — a 20s blend triggered 15s from the outro point
+would be cut off by the track ending 5s early. `transitionPlan()` (`autoMix.ts:425`) makes
+the lead `max(autoMixThresholdSec, durationMs/1000)`, so:
+- **no marker data** → derived duration is the 6s default, below the 15s threshold → the
+  trigger fires at exactly 15s and the ramp runs 6s. **Byte-identical to before phase 5.**
+- **a long derived blend** (say 20s) → the trigger fires 20s out and the fade lands exactly
+  on the outro reference.
+- **a short derived blend** (say 5s) → the DJ's "start mixing 15s out" setting still wins as
+  the trigger point; the fade just finishes early, as it always has.
+
+`autoMixThresholdSec` is therefore now a **floor**, and `crossfadeDurationMs` a
+**fallback** — the Settings copy (`ControlsSettings.svelte`) says so.
+
+The preload trigger got the same treatment from the outgoing side only (it can't see the
+incoming track — that's what it's for): `max(autoPreloadThresholdSec, plan.leadSec +
+PRELOAD_LEAD_MARGIN_SEC)`, where the 15s margin guarantees a long marker-derived blend can
+never start before the load has had time to finish. Over-estimating there only preloads
+*earlier*, never later. With the 45s default and the 20s duration ceiling this is a no-op
+today.
+
+**Tests**: 8 direct unit tests on `computeTransitionDurationMs` (fallback, outro-only,
+intro-only, min-of-both, the sub-second `mix_in`, an out-of-range `introPoint`, the
+"Baddy On The Floor" untrusted `outroPoint`, both clamps) plus 3 on the trigger (triggers
+earlier than the threshold for a long blend and runs for the derived duration; still waits
+for the threshold when the blend is shorter; uses the flat fallback with no markers).
+
+## Phase 5 — Skip now actually skips (2026-08-30)
+
+🟡 **Built + unit-tested, not live-verified.** Live report, verbatim: *"Something went wrong
+when I tried to skip a track. The next track loaded, but nothing happened. I expected it to
+start the transition automatically."*
+
+**Not a bug — a mismatch between what was built and what the control reads as.**
+`skipUpcomingTrack()` (`autoMix.ts:175`) did exactly what it was designed to do in the
+2026-08-26 tier-2 work: swap what's *preloaded* on the idle deck and let the playing deck's
+own near-end threshold fire the transition later. Its tooltip even said so. But ⏭ on a
+playing track means "get me off this track" on every other DJ tool, and a DJ mid-set does
+not read a tooltip.
+
+**Decision: keep both behaviors, separately labeled, and give ⏭ the one the DJ expects.**
+- **⏭ Skip** → `skipCurrentTrack()` (`autoMix.ts:232`) — starts the transition *now*.
+- **⤼ Change what's next** → the existing `skipUpcomingTrack()`, unchanged.
+
+Collapsing them into one was considered. Against: the "swap the upcoming pick" behavior is
+genuinely useful and already live-exercised (a DJ hearing what's cued and wanting a
+different one, without disturbing the floor), it is the only control that can reach a deck
+that isn't playing, and deleting it would silently change what an existing muscle-memory
+press does. Two adjacent icon buttons with distinct tooltips is a smaller surprise than one
+button that quietly changed meaning.
+
+`skipCurrentTrack()` runs the **same** transition the near-end trigger would have — the
+crossfade ramp was extracted into `beginTransition()` (`autoMix.ts:662`), shared by both,
+rather than duplicated, so the beatmatch step, the settle windows and the phase-5 duration
+all come along. Beyond that it:
+- picks + loads a track first when the idle deck is empty, then waits on the *real*
+  readiness signal (`source.duration > 0`, gap 3 — not a fixed delay), 15s bounded, with a
+  toast on timeout;
+- re-reads deck state after every await, and bails if a ramp started or a deck changed
+  underneath it;
+- marks the outgoing track **handled** (so its later EOS isn't treated as unhandled) and
+  **skipped** (`playedTracks.ts` — it may not have been audible long enough for the 15s
+  "played" rule, and it must not be re-offered);
+- **degrades to `skipUpcomingTrack()`** when there is no single playing mapped deck to skip
+  *from* — nothing playing yet, or a manual overlap where both are live. Pressing Skip
+  should always do the most useful available thing; silently doing nothing is the failure
+  mode this whole entry is about.
+- no-ops (with a log line) while a crossfade is already in flight.
+
+Every branch logs through `debugLog()` — `[auto-dj] skip-now: …`.
+
+## Phase 5 — tempo drift-back after a beatmatched transition (2026-08-30)
+
+🟡 **Built + unit-tested, not live-verified.** Live report: tempo "gets locked at some
+strange tempos over time" instead of returning to normal.
+
+**Root cause, traced through `session.ts`.** `checkAutoMixTrigger`'s sync branch locks the
+incoming deck with `playbackRate = session.bpm / incoming.bpm`. When the fade completes and
+that deck is the only one playing, `reconcileMaster()` (`session.ts:90`) promotes it to
+`masterDeckId` and sets `session.bpm = deck.bpm * deck.playbackRate` — its
+**already-adjusted** tempo. Nothing ever reset the rate: `syncLocked` is cleared only on the
+*outgoing* deck as it's freed, never on the one that keeps playing. So transition N+1
+locked deck C to deck B's adjusted rate, N+2 to C's, and so on — each reference derived
+from the previous transition's output, **with no anchor to any track's real tempo**. Over a
+set that walks in whichever direction the first few pairs pushed, without bound.
+
+**Fix: an anchor, not a clamp.** After a synced fade completes, `startRateDriftBack()`
+(`autoMix.ts:591`) eases the now-solo deck's `playbackRate` back to **1.0** over
+`autoMixDriftBackSec` (`autoMix.ts:79`, default 20s, Settings → Controls → Auto Mix, shown
+only when Beatmatch is on; **0 = off**, exactly the old behavior). `refreshMasterBpm()`
+recomputes `session.bpm` from `deck.bpm * playbackRate` on every `updateDeck`, so the
+reference walks back to the track's true bpm alongside it and the next transition starts
+anchored.
+
+**Why 1.0 and not "some configured rate".** The ask said "drift back to its configured
+rate"; checking `types.ts` there is no per-deck configured-rate concept — `playbackRate`
+*is* the deviation from native, and `deck.bpm` is measured at native. 1.0 is the only value
+that makes `session.bpm` mean "this track's real tempo", which is the property the whole
+compounding failure was missing.
+
+Three things are load-bearing and were each found by reasoning through `session.ts`:
+- **`syncLocked` is cleared at the START of the drift, not the end.** While it's set,
+  `applyLockedRates()` (`session.ts:101`) re-pins the deck to `session.bpm / deck.bpm` on
+  every session write, which would undo each easing step as it landed. Clearing it first is
+  also what the flag means here: the deck is no longer following a master.
+- **The ease writes in 0.005 rate steps, not every frame.** Both `syncRate()`
+  (`audioSync.ts`) and the legacy `<video>` path ignore rate changes below 0.005, so a
+  per-frame write would cost a Svelte store update (and a WebKit pipeline rebuild on the
+  legacy path) to reach nothing. A 20s drift over a typical ±5% lock is ~12 writes total.
+- **Cancellation is by divergence, not by a notify() at every call site.** Each tick
+  compares the deck's `playbackRate` against what the drift itself last wrote; anything
+  else — the DeckCard tempo slider (step 0.001), Sync, Lock, a MIDI fader, a jog nudge —
+  differs and aborts the drift immediately, mirroring the `syncLocked` "manual input wins"
+  convention. Unlike an explicit call it cannot be forgotten at a rate-writing site added
+  later. `notifyManualRateInput()` (`autoMix.ts:583`) is wired into the two MIDI paths
+  anyway (`midi/handler.ts`, the tempo fader and jog nudge) because those write audio
+  immediately and the *store* only on the next rAF — divergence would catch them a frame
+  later, and a frame later is one stale rate write on top of what the DJ just did.
+
+The drift is deliberately **not** force-settled when the next transition arrives mid-ease.
+Locking the incoming deck to a partially-drifted reference is musically *correct* — sync
+means matching what is playing now — and `applyLockedRates` keeps the incoming deck
+tracking the outgoing deck's own drift for the duration of the fade, so the two stay
+matched. Compounding is still bounded, because every transition ends with its own
+drift-back to native.
+
+**Tests**: rate eases back to 1.0 with `syncLocked` cleared and `session.bpm` landing on the
+incoming track's native bpm; `0` leaves the locked rate and the compounding reference exactly
+as before; a manual rate write mid-ease cancels it and leaves the deck where the DJ put it,
+with no dangling rAF loop; and a second transition locks against the settled 128bpm rather
+than the 120 the first one left behind.
+
+## Phase 6 — mix-point panel, zone visualization, transition preview (2026-08-30)
+
+🟡 **Built + unit-tested, not live-verified.** The ask: reclaim the deck card's
+Opacity/Volume/Rate slider space (keep the sliders as an option for a DJ with no
+controller), put marker management there instead, and make it possible to preview an auto
+transition without jumping to Digger mid-mix.
+
+**1. The sliders became opt-in.** `Session.compactControls` already existed as the
+hide/show switch — the default flipped to `true` (`session.ts`), the Settings checkbox
+inverted to read **"Mixer sliders"** (`ControlsSettings.svelte`), and the mechanism is
+otherwise untouched. ⚠️ `bootRestore.ts`'s restore is `restored.compactControls ?? true`:
+a DJ who has already chosen keeps their choice, and only a snapshot predating the field
+picks up the new default — the same "never let a default silently overrule a stored
+choice" rule the 2026-08-25 `crossfaderValue` incident above established the hard way.
+Hot cues are unaffected; they were never gated by this flag.
+
+**2. `MarkerPanel.svelte`** (new) takes that space, always visible, one uniform row per
+point — label · time · set-to-playhead (⦿) · clear (✕) — for Cue, **Intro**, **Outro** and
+the Loop region, plus the zone *length* next to intro/outro because the length is what
+`computeTransitionDurationMs` actually consumes. Set/clear writes the deck first and Digger
+second: the deck must reflect the edit immediately (the waveform shading and the next
+transition's duration both read the deck), and a local, non-Digger file simply skips the
+write.
+
+⚠️ **Intro/outro writes are delete-then-insert, and that is load-bearing.**
+`setMixMarker()` (`api.ts:318`) deletes *every* existing marker of that type before POSTing
+the new one. Digger's `_build_cuemark_payload()` resolves mix_in/mix_out as **"first marker
+of the type by `position_ms`"** — not most-recent, and not manual-first, the way it does for
+`downbeat` — so appending a manual marker later in the track than the auto-derived one
+silently loses to it, forever, with no error. That ambiguity is exactly why phase 4
+**declined** to ship a SET OUTRO button. Deleting first leaves one row, which makes "first
+by position" unambiguous whatever cuemark writes, and needs no Digger change: `DELETE
+/markers/{id}` and `GET /tracks/{id}` (which is where marker *ids* live — `/cuemark`
+flattens them away) already exist. New thin wrappers `getTrackMarkers`/`deleteMarker`/
+`setMixMarker`/`clearMixMarker` in `api.ts`, mirroring `pushMarker`'s shape.
+🔴 **Still open**: re-running `analyze_audio.py` on that track re-derives a `detected`
+marker alongside the manual one and the ambiguity returns. The real fix is in Digger
+(rank `source='manual'` first, or upsert), and is an open decision below rather than
+something worked around further from this side.
+
+**3. Zone shading on the waveform.** `drawMarkers()` in `WaveformCanvas.svelte:502` now
+draws the intro zone `[0, introPoint]` in blue and the outro zone `[outroPoint, end]` in
+amber, under everything else, as a low-alpha wash plus one boundary line — deliberately
+dimmer than the loop region's green fill and clear of the cue point's white, because zones
+are present on every analysed track and must read as background information rather than as
+an engaged mode. This is the piece that makes the rest legible: a DJ can *see* why a
+transition will be long or short.
+
+**4. `previewTransition()`** (`autoMix.ts:736`), the ▶ Preview button on each deck card:
+parks the fader on the outgoing side, seeks the outgoing deck to exactly the point the
+near-end trigger would have fired at (`reference − lead`) and the incoming deck to 0, then
+after one 200ms seek settle runs **the real `beginTransition()`** — same beatmatch, same
+ramp, same derived duration. Building a second ramp mechanism was rejected outright: the
+two would drift apart and "the preview sounded fine" would stop meaning anything.
+
+Three deliberate deviations, all so an audition is repeatable and consumes nothing: the
+outgoing deck keeps its `source` at the end (unloading it would also make the idle deck
+look empty to `checkAutoPreloadTrigger`, which would then eat the next queue entry for a
+transition that never happened); no `handledOutgoing`/`markSkipped` bookkeeping; and it
+works with Auto DJ **off**, because this is a workshopping tool, not automation. Seeking
+the incoming deck to its `introPoint` instead of 0 was considered and declined — the live
+path starts the incoming deck wherever it is parked, and a preview that differs from the
+live path is worth less than no preview (making *both* start at `mixIn` is a real idea, and
+an open decision below).
+
 ## Manual/auto interaction
 
 **Problem this section answers**: what should a manual action (play/pause, load, crossfader
@@ -441,6 +690,19 @@ of one deck, not just the automated ramp — see "Manual/auto interaction" above
    below. `nearEndReference()` in `autoMix.ts` swaps in `Deck.outroPoint` for
    `source.duration` as what "near-end" is measured from, in both the crossfade and
    preload triggers, when a track has one.
+5. 🟡 **BUILT + unit-tested 2026-08-30, not yet live-verified — Per-pair transition
+   duration, a Skip that skips, and tempo drift-back.** Three separate live asks, one
+   phase because all three change how a transition is decided. `Deck.introPoint` joins
+   `outroPoint` (again with zero Digger changes), `computeTransitionDurationMs()` derives
+   the fade length and the trigger lead from the pair's own zones with the flat settings as
+   floor/fallback, `skipCurrentTrack()` forces the real transition now, and
+   `startRateDriftBack()` returns a beatmatched deck to native tempo so the main-beat
+   reference stops compounding across a set. See the three "Phase 5" sections above.
+6. 🟡 **BUILT + unit-tested 2026-08-30, not yet live-verified — Mix-point panel, zone
+   shading, transition preview.** The deck card's mixer sliders became opt-in
+   (`compactControls` default flip) and `MarkerPanel.svelte` took the space; intro/outro
+   edits write back to Digger delete-then-insert; the waveform shades both zones; ▶ Preview
+   auditions the real transition on demand. See the "Phase 6" section above.
 
 ## Explicitly out of scope
 
@@ -467,3 +729,54 @@ section); this doc is about executing transitions live, not learning from past o
   change, no migration, no new endpoint, and (deliberately) no digger-repo edit at all.
 - Confirm the two-deck-only scope (gap 2) is acceptable, or whether N-deck auto-mixing is
   actually needed before starting. Phase 1 ships with the two-deck scope as recommended.
+
+### Opened 2026-08-30 by phases 5 and 6 — decisions, not work items
+
+Each of these is deliberately **not built**, per the convention phase 4's outro-marker
+scoping set: flag the cross-repo or taste-dependent call rather than build ahead of it
+blind.
+
+1. 🔴 **A real intro boundary needs new Digger analysis.** `mix_in` is `beat_times[0]`,
+   the first tracked beat — see the Phase 5 duration section. A genuine "end of the intro"
+   (first vocal, energy onset, first full-arrangement bar) would make the incoming side of
+   every transition duration meaningful for the whole library instead of only for manually
+   marked tracks. That is a Digger-side analysis change (`_derive_mix_points`, plus a
+   re-analysis pass over the library) and possibly a schema one if it wants its own marker
+   type rather than redefining `mix_in`. **Needs a call from the library's owner**: is
+   `mix_in` allowed to change meaning, or does this want a new `intro_end` marker type?
+2. 🟡 **Explicit per-track "suggested fade time", distinct from a zone boundary.** The
+   original ask mentioned a recommended fade-in/fade-out *time* as well as zones. Today the
+   duration is inferred from zone lengths, which is a proxy: a track can have a 30s outro
+   that only wants an 8s blend. A real hint is a new per-track field (Digger schema +
+   migration + a UI to set it) and is only worth it if the inferred duration turns out to
+   feel wrong live — **re-read the derived durations from a real set's `[auto-dj] trigger:
+   … (duration from …)` log lines before deciding.**
+3. 🟡 **Cross-track compatibility scoring (key/energy) as an input to the transition.**
+   Explicitly out of scope here, and adjacent to the transition-mining work Digger reserves
+   as a server-side job — noted only so it isn't re-derived as a new idea.
+4. 🔴 **Digger's mix_in/mix_out resolution should be most-recent- or manual-first.** Phase 6
+   works around "first marker by `position_ms` wins" by deleting before inserting, which is
+   correct from cuemark's side but does not survive a re-run of `analyze_audio.py` (a fresh
+   `detected` marker reappears alongside the manual one, and whichever sits earlier wins).
+   The fix is one line of ordering in `_build_cuemark_payload()` — matching what it already
+   does for `downbeat` — in the digger repo. Same call that phase 4 flagged and declined;
+   phase 6 raises the stakes because there is now a UI that makes manual markers routine.
+5. 🟡 **Should a transition start the incoming deck at its `mixIn` rather than at 0?**
+   Today both the live path and the preview start it wherever it's parked (position 0 for a
+   freshly loaded deck), so dead air at the head of a track is audible under the fade.
+   Starting at `mixIn` would skip it — but it means adding a seek to the live path, which
+   already has one documented fire-and-forget-seek race (see the 2026-08-24 phase-3 entry),
+   so it wants its own settle-window design rather than a one-liner.
+6. 🟡 **Zone editing is numeric/playhead-based, not draggable on the waveform.** The panel
+   sets a point from the playhead; dragging the shaded zone edge directly would be better
+   for workshopping, and `WaveformCanvas`'s pointer handlers already own a
+   press-anchored drag gesture that the scrub bus consumes — adding a second gesture there
+   is a real design question (what does grabbing an edge do to scrubbing?), not a
+   free addition. **Read `docs/design/waveform-scrub.md` before attempting it.**
+7. 🟡 **Preview leaves the crossfader wherever the fade ended.** It parks the fader on the
+   outgoing side before each run, so pressing Preview twice works, but after one preview
+   the fader sits at the far end until the DJ or the next transition moves it. Restoring
+   the pre-preview position afterwards was considered and left out — an automated fader
+   move *after* the DJ has heard the result is the kind of surprise the "hand back control
+   at current position" rule exists to avoid — but it should be checked against how it
+   actually feels live.

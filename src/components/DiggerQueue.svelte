@@ -11,7 +11,7 @@
   import { diggerQueue, selectedQueueIndex, loadQueueItemToDeck } from '../lib/digger/queueStore';
   import { currentDj, currentDjOrNull } from '../lib/digger/djSelector';
   import { autoDjEnabled } from '../lib/digger/autoDj';
-  import { skipUpcomingTrack } from '../lib/digger/autoMix';
+  import { skipCurrentTrack, skipUpcomingTrack } from '../lib/digger/autoMix';
   import { playedTrackIds, clearPlayed, clearAllPlayed } from '../lib/digger/playedTracks';
   import HistoryPanel from './HistoryPanel.svelte';
 
@@ -148,6 +148,14 @@
     }
   }
 
+  // Two deliberately distinct controls since 2026-08-30 — see autoMix.ts's
+  // skipCurrentTrack doc comment and docs/design/auto-dj-transitions.md "Phase 5 — Skip".
+  // ⏭ skips the track playing right now (starts the transition); ⤼ only changes which
+  // track is queued up next, leaving the current one alone.
+  function skipNow() {
+    skipCurrentTrack().catch((e) => { error = String(e); });
+  }
+
   function skipUpcoming() {
     skipUpcomingTrack().catch((e) => { error = String(e); });
   }
@@ -264,9 +272,14 @@
       {#if $autoDjEnabled}
         <button
           class="small-btn icon-btn"
-          onclick={skipUpcoming}
-          title="Skip — swap the upcoming/preloaded track for a different one, without turning Auto DJ off"
+          onclick={skipNow}
+          title="Skip — start the transition to the next track now, instead of waiting for this one's outro"
         >⏭</button>
+        <button
+          class="small-btn icon-btn"
+          onclick={skipUpcoming}
+          title="Change what's next — swap the upcoming/preloaded track for a different one, leaving the playing track alone"
+        >⤼</button>
       {/if}
     </div>
 

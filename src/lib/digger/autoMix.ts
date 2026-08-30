@@ -25,11 +25,13 @@
  * `Auto` button in DiggerQueue.svelte "the real thing" rather than the cold-reload stand-in.
  */
 import { writable, get } from "svelte/store";
+import type { Deck } from "../state/types";
 import { session, getDeck, updateDeck, setCrossfader } from "../state/session";
 import { autoDjEnabled, pickNextTrack } from "./autoDj";
 import { loadQueueItemToDeck } from "./queueStore";
 import { currentDj, currentDjOrNull } from "./djSelector";
 import { nudgePhaseToMaster } from "../audio/phaseNudge";
+import { seekDeck } from "../renderer/seekBus";
 import { markSkipped } from "./playedTracks";
 import { showToast } from "../ui/toast";
 import { debugLog } from "../debugLog";
@@ -54,12 +56,27 @@ function persistentWritable<T>(key: string, defaultValue: T) {
   };
 }
 
-/** How many seconds of remaining playback trigger the automated crossfade. Settings-configurable
- *  per the design doc ("likely Settings-configurable, not hardcoded") — see AudioSettings.svelte. */
+/** Minimum lead time before the near-end reference at which the automated crossfade starts.
+ *  Since phase 5 this is a *floor*, not the whole story: a track pair whose own mix markers
+ *  ask for a longer blend than this triggers earlier, so the fade always finishes by the
+ *  outgoing track's outro reference instead of being truncated by it. A pair with no marker
+ *  data still triggers exactly here, at the flat `crossfadeDurationMs` — see
+ *  `transitionPlan()` and docs/design/auto-dj-transitions.md "Phase 5". */
 export const autoMixThresholdSec = persistentWritable<number>("cuemark:autoMixThresholdSec", 15);
 
-/** Duration of the automated crossfade ramp, in milliseconds. */
+/** Fallback duration of the automated crossfade ramp, in milliseconds — used when the track
+ *  pair carries no usable mix-in/mix-out zone to derive one from (phase 5). Was the single
+ *  duration for every transition before that. */
 export const crossfadeDurationMs = persistentWritable<number>("cuemark:crossfadeDurationMs", 6000);
+
+/** Phase 5 (2026-08-30): after a *beatmatched* transition completes, how long the incoming
+ *  deck takes to ease its locked playbackRate back to 1.0 (its own native tempo). 0 = off,
+ *  i.e. exactly the pre-2026-08-30 behavior — the rate stays pinned wherever the sync step
+ *  put it, which is what let each transition's tempo reference compound off the previous
+ *  one's already-adjusted rate over a set. Only ever active when `autoMixSyncEnabled` is on,
+ *  since nothing else imposes a rate. See docs/design/auto-dj-transitions.md "Phase 5 —
+ *  tempo drift-back". */
+export const autoMixDriftBackSec = persistentWritable<number>("cuemark:autoMixDriftBackSec", 20);
 
 /** How many seconds of remaining playback trigger auto-preloading the next track onto the
  *  idle mapped deck (phase 2, gap 3) — deliberately larger than `autoMixThresholdSec` so the
@@ -145,13 +162,15 @@ export function notifyManualPlay(deckId: string): void {
 }
 
 /**
- * Tier 2 (your ask, 2026-08-26) — advances the mapped deck that isn't currently the
- * audible one past whatever it's holding (preloaded-but-idle, or genuinely empty),
- * without touching autoDjEnabled or the crossfader. Marks the displaced track skipped
- * (playedTracks.ts) so pickNextTrack doesn't loop back to a track that was chosen but
- * never actually played, then loads a fresh pick with `origin: 'auto'` so the new track
- * stays eligible for the ordinary near-end crossfade — this is "give me a different next
- * track", not a manual takeover of the deck.
+ * Tier 2 — "change what's coming up", the *secondary* Skip control since 2026-08-30 (it
+ * was the only one before that, which is what the "Skip did nothing" report was about —
+ * see `skipCurrentTrack` below and the design doc's "Phase 5 — Skip"). Advances the mapped
+ * deck that isn't currently the audible one past whatever it's holding
+ * (preloaded-but-idle, or genuinely empty), without touching autoDjEnabled, the
+ * crossfader, or the playing deck. Marks the displaced track skipped (playedTracks.ts) so
+ * pickNextTrack doesn't loop back to a track that was chosen but never actually played,
+ * then loads a fresh pick with `origin: 'auto'` so the new track stays eligible for the
+ * ordinary near-end crossfade.
  */
 export async function skipUpcomingTrack(): Promise<void> {
   const s = get(session);
@@ -166,6 +185,109 @@ export async function skipUpcomingTrack(): Promise<void> {
   debugLog(`[auto-dj] skip: advancing deck-${incoming.id} past its current pick`);
   const next = await pickNextTrack(owner, outgoing?.diggerTrackId ?? null);
   await loadQueueItemToDeck(next, incoming.id, "auto");
+}
+
+/** How long `skipCurrentTrack` waits for a just-loaded deck to report a real duration
+ *  before giving up. Same readiness signal every other Auto DJ path gates on
+ *  (`source.duration > 0`, gap 3 in the design doc) — not a fixed "the load is probably
+ *  done by now" delay. Generous because a cold Digger fetch + demux over the SMB mount is
+ *  seconds, not milliseconds (docs/design/preroll-latency.md). */
+const SKIP_READY_TIMEOUT_MS = 15000;
+const SKIP_READY_POLL_MS = 100;
+
+/** Date.now(), not performance.now(): this is a wall-clock deadline on a human-initiated
+ *  action, and it must not be affected by the fake performance clock the ramp tests
+ *  install. */
+async function awaitDeckReady(deckId: string): Promise<boolean> {
+  const deadline = Date.now() + SKIP_READY_TIMEOUT_MS;
+  for (;;) {
+    const d = getDeck(deckId);
+    if (!d) return false;
+    if (d.source?.type === "video" && d.source.duration > 0) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, SKIP_READY_POLL_MS));
+  }
+}
+
+/**
+ * Tier 2 — **"get me off this track now"**: the primary Skip control since 2026-08-30.
+ *
+ * Why this exists: `skipUpcomingTrack` above (the ⏭ button's only behavior until now)
+ * quietly requeues what's *next* and leaves the playing deck completely untouched. The
+ * DJ's report was "the next track loaded, but nothing happened — I expected it to start
+ * the transition automatically", which is what a Skip button reads as on every other DJ
+ * tool: skip the thing I'm hearing. Rather than reinterpret one control to mean two
+ * things, both behaviors are kept and separately labeled in DiggerQueue.svelte — see the
+ * design doc's "Phase 5 — Skip" for the reasoning and the alternatives weighed.
+ *
+ * Runs the *same* transition the near-end trigger would have run later — same beatmatch
+ * step, same ramp, same per-pair duration (phase 5) — just now instead of at the outro
+ * point, plus the same `handledOutgoing` bookkeeping so the outgoing deck's eventual EOS
+ * isn't treated as an unhandled one. Degrades to `skipUpcomingTrack()` when there's no
+ * single playing mapped deck to skip *from* (nothing playing yet, or a manual overlap
+ * where both are live and the DJ is mid-blend by hand): pressing Skip should always do
+ * the most useful available thing rather than silently no-op, which is the failure mode
+ * this whole entry is about.
+ */
+export async function skipCurrentTrack(): Promise<void> {
+  const s = get(session);
+  const { left, right } = s.crossfaderMapping;
+  const leftDeck = getDeck(left);
+  const rightDeck = getDeck(right);
+  if (!leftDeck || !rightDeck) return;
+
+  if (activeRamp) {
+    debugLog(`[auto-dj] skip-now: a crossfade is already in flight, ignoring`);
+    return;
+  }
+
+  const playing = [leftDeck, rightDeck].filter((d) => d.playing);
+  if (playing.length !== 1) {
+    debugLog(`[auto-dj] skip-now: ${playing.length} mapped decks playing — falling back to swapping the upcoming pick`);
+    return skipUpcomingTrack();
+  }
+
+  const outgoing = playing[0];
+  const incomingId = outgoing.id === left ? right : left;
+  const outgoingPath = outgoing.source?.type === "video" ? outgoing.source.filePath : undefined;
+
+  if (getDeck(incomingId)?.source === null) {
+    const owner = currentDjOrNull(get(currentDj));
+    debugLog(`[auto-dj] skip-now: deck-${incomingId} is empty, fetching a track before transitioning`);
+    const next = await pickNextTrack(owner, outgoing.diggerTrackId ?? null);
+    await loadQueueItemToDeck(next, incomingId, "auto");
+  }
+
+  if (!(await awaitDeckReady(incomingId))) {
+    debugLog(`[auto-dj] skip-now: deck-${incomingId} never became ready, aborting`);
+    showToast("Skip: the next track didn't load in time", "warning");
+    return;
+  }
+
+  // Re-read everything: the load above, and the wait, both yielded to other code.
+  const now = get(session);
+  const outgoingNow = getDeck(outgoing.id);
+  const incoming = getDeck(incomingId);
+  if (!outgoingNow?.playing || !incoming || incoming.playing) {
+    debugLog(`[auto-dj] skip-now: deck state changed while loading, aborting`);
+    return;
+  }
+  if (activeRamp) {
+    debugLog(`[auto-dj] skip-now: a crossfade started while loading, aborting`);
+    return;
+  }
+
+  // The outgoing track is deliberately being cut short: mark it handled (so its later EOS
+  // isn't treated as an unhandled transition) and skipped (so pickNextTrack doesn't offer
+  // it again later in the set — it may not have been audible long enough for
+  // playedTracks' own 15s "played" rule to have fired).
+  markHandledOutgoing(outgoing.id, outgoingPath);
+  if (outgoing.diggerTrackId !== null) markSkipped(outgoing.diggerTrackId);
+
+  const target: 0 | 1 = outgoing.id === now.crossfaderMapping.left ? 1 : 0;
+  const plan = transitionPlan(zonesOf(outgoingNow), zonesOf(incoming));
+  debugLog(`[auto-dj] skip-now: deck-${outgoing.id} -> deck-${incomingId} over ${plan.ms}ms (duration from ${plan.source}), sync=${get(autoMixSyncEnabled)}`);
+  beginTransition(outgoing.id, incomingId, incoming, target, plan.ms);
 }
 
 // Tier 3, alert + disengage — Auto DJ's model of the mix is structurally broken, not
@@ -186,7 +308,7 @@ session.subscribe((s) => {
 // Only one auto-mix transition in flight at a time — correct for the phase-1 two-deck scope
 // (crossfaderMapping never names more than two decks), and simpler than tracking one ramp per
 // deck pair for a case that can't currently arise.
-let activeRamp: { cancel: () => void } | null = null;
+let activeRamp: { cancel: (reason?: string) => void } | null = null;
 
 // Phase 4 (gap 1): where "near-end" is measured from. A set `outroPoint` (Digger's
 // auto-derived or manually-placed mix-out marker — see the Deck.outroPoint doc comment
@@ -207,6 +329,114 @@ function nearEndReference(outroPoint: number | null, duration: number): number {
   return duration;
 }
 
+// ── Phase 5 (2026-08-30): transition duration derived from the two tracks ────────────
+//
+// A blend can only be as long as the more constrained of the two tracks supports, so the
+// duration is the *minimum* of two zone lengths:
+//   - the outgoing track's OUTRO zone: `duration - outroPoint`, i.e. how much track sits
+//     after its mix-out marker. For Digger's auto-derived marker that is 16 bars (~30s at
+//     128bpm) — the tail the DJ is happy to have another track playing over.
+//   - the incoming track's INTRO zone: `introPoint`, i.e. how much of its head is
+//     blendable before its body starts.
+// Either side missing (no marker, or an untrustworthy one) simply doesn't constrain;
+// both missing falls back to the flat `crossfadeDurationMs` setting, which is the exact
+// behavior every transition had before this existed — the same fallback discipline
+// `nearEndReference` uses for `outroPoint` itself.
+//
+// ⚠️ In practice the intro side is almost always inert today, and that is not a bug in
+// this function: Digger's `_derive_mix_points()` sets `mix_in` to `beat_times[0]`, the
+// FIRST TRACKED BEAT of the track — typically well under a second, not "the end of the
+// intro section". So `introPoint` only carries real information when a DJ has placed a
+// manual mix_in marker. MIN_ZONE_SEC is what keeps those sub-second auto values from
+// collapsing every transition to the 2s floor. A genuine intro/outro *length* (or the
+// per-track "suggested fade time" the feature was asked for) needs new Digger-side
+// analysis — written up as an open decision in the design doc, deliberately not built here.
+const MIN_ZONE_SEC = 2;
+const MIN_TRANSITION_MS = 2000;
+const MAX_TRANSITION_MS = 20000;
+
+/** The two per-track fields a transition duration is derived from, plus the duration they
+ *  are relative to. Structural (not `Deck`) so callers can pass a bare object and so the
+ *  incoming side can be `null` where it isn't known yet (the preload trigger). */
+export interface TransitionZones {
+  duration: number;
+  outroPoint: number | null;
+  introPoint: number | null;
+}
+
+/** Per-transition switches threaded from the caller down to the ramp driver. */
+interface TransitionOptions {
+  /** Deck whose rate the sync step imposed, and which owes itself native tempo back once
+   *  the fade completes (phase 5's drift-back). */
+  driftBackDeckId?: string;
+  /** Audition rather than a real transition: keep the outgoing deck loaded, consume
+   *  nothing from the set (phase 6's `previewTransition`). */
+  preview?: boolean;
+}
+
+export interface TransitionDuration {
+  ms: number;
+  /** Which side(s) the duration came from — logged, and the thing to read when a
+   *  transition felt too short/long live. `fallback` means neither track had usable
+   *  marker data and the flat Settings duration applied. */
+  source: "zones" | "outro" | "intro" | "fallback";
+}
+
+function usableZone(sec: number): number | null {
+  return sec >= MIN_ZONE_SEC ? sec : null;
+}
+
+/**
+ * Pure — the whole point, so it can be unit-tested directly (autoMix.test.ts). `incoming`
+ * is `null` when the incoming track isn't loaded/measured yet, which the preload trigger
+ * needs: it can only see the outgoing side, and an *over*-estimated duration there just
+ * makes the preload fire a little earlier, never later.
+ */
+export function computeTransitionDurationMs(
+  outgoing: TransitionZones,
+  incoming: TransitionZones | null,
+  fallbackMs: number,
+): TransitionDuration {
+  const outro = outgoing.duration > 0
+    ? usableZone(outgoing.duration - nearEndReference(outgoing.outroPoint, outgoing.duration))
+    : null;
+  // Ceiling mirrors nearEndReference's floor: a "mix in" past the first third of a track
+  // is as untrustworthy as a "mix out" inside it, and would otherwise propose a blend
+  // longer than the incoming track's own body.
+  const intro = incoming !== null && incoming.introPoint !== null && incoming.duration > 0
+    && incoming.introPoint <= incoming.duration / 3
+    ? usableZone(incoming.introPoint)
+    : null;
+
+  if (outro === null && intro === null) return { ms: fallbackMs, source: "fallback" };
+  const zoneSec = outro === null ? intro! : intro === null ? outro : Math.min(outro, intro);
+  const ms = Math.max(MIN_TRANSITION_MS, Math.min(MAX_TRANSITION_MS, zoneSec * 1000));
+  return { ms, source: outro !== null && intro !== null ? "zones" : outro !== null ? "outro" : "intro" };
+}
+
+/**
+ * Duration + the lead time the crossfade must start at to finish by the outgoing track's
+ * near-end reference. The lead is `max(setting, duration)` rather than the setting alone:
+ * with a per-pair duration the two could otherwise disagree (a 20s blend triggered 15s from
+ * the outro point would be cut off by the track ending 5s early), and taking the max keeps
+ * the no-marker case — where the derived duration is the 6s default, below the 15s default
+ * threshold — triggering at exactly the configured threshold, identical to before phase 5.
+ */
+function transitionPlan(outgoing: TransitionZones, incoming: TransitionZones | null) {
+  const duration = computeTransitionDurationMs(outgoing, incoming, get(crossfadeDurationMs));
+  return { ...duration, leadSec: Math.max(get(autoMixThresholdSec), duration.ms / 1000) };
+}
+
+/** Extra lead the preload needs over the crossfade's own trigger point, so a long
+ *  marker-derived blend can never start before the incoming track has been fetched and
+ *  demuxed. Only matters when the derived duration exceeds the preload setting's own
+ *  margin; the 45s default already clears the 20s duration ceiling on its own. */
+const PRELOAD_LEAD_MARGIN_SEC = 15;
+
+function zonesOf(deck: Deck): TransitionZones {
+  return { duration: deck.source?.duration ?? 0, outroPoint: deck.outroPoint, introPoint: deck.introPoint };
+}
+
 // requestAnimationFrame doesn't exist under vitest's node test environment; degrade to a 16ms
 // setTimeout there so this module works the same (just not frame-synced) under `npm test`.
 const raf: (cb: (t: number) => void) => number =
@@ -216,12 +446,26 @@ const raf: (cb: (t: number) => void) => number =
 const cancelRaf: (id: number) => void =
   typeof cancelAnimationFrame !== "undefined" ? cancelAnimationFrame : clearTimeout;
 
-function startCrossfadeRamp(outgoingId: string, incomingId: string, target: 0 | 1): void {
+/**
+ * `durationMs` is per-transition since phase 5 (derived from the pair's own mix zones —
+ * see `transitionPlan`), not the flat setting it used to read internally.
+ * `driftBackDeckId`, when set, is the incoming deck whose playbackRate this transition's
+ * sync step imposed: once the fade completes it eases back to native tempo (see
+ * `startRateDriftBack`). Left unset by the native-tempo path, which imposed no rate.
+ * `preview` keeps the outgoing deck loaded at the end — see `previewTransition`.
+ */
+function startCrossfadeRamp(
+  outgoingId: string,
+  incomingId: string,
+  target: 0 | 1,
+  durationMs: number,
+  opts: TransitionOptions = {},
+): void {
+  const { driftBackDeckId, preview } = opts;
   activeRamp?.cancel();
 
   const touchAtStart = get(manualTouch);
   const startValue = get(session).crossfaderValue;
-  const durationMs = get(crossfadeDurationMs);
   const startTime = performance.now();
   let rafId = 0;
   let done = false;
@@ -263,7 +507,24 @@ function startCrossfadeRamp(outgoingId: string, incomingId: string, target: 0 | 
       // the Lock button's `active` class and the controller's sync LED (App.svelte), and
       // nothing else resets it once the deck goes empty, so it stayed lit on a track that
       // no longer exists (found 2026-08-26).
-      updateDeck(outgoingId, { playing: false, source: null, syncLocked: false });
+      // A drift-back still running on the deck that just faded out has nothing left to
+      // ease — it's about to be empty. Cancel before the updateDeck below, so the tick
+      // can't write a rate onto an unloaded deck.
+      cancelRateDriftBack(outgoingId, "outgoing deck freed");
+      // Preview is the one case that must NOT free the deck: the DJ is auditioning this
+      // transition and will very likely run it again, and unloading here would also make
+      // the idle deck look empty to checkAutoPreloadTrigger, which would then consume the
+      // next queue entry for a transition that never actually happened.
+      updateDeck(outgoingId, preview
+        ? { playing: false }
+        : { playing: false, source: null, syncLocked: false });
+      // The outgoing deck's updateDeck above is what promotes the incoming deck to
+      // masterDeckId (session.ts's reconcileMaster — exactly one deck playing now), which
+      // is also what pins Session.bpm to its *rate-adjusted* tempo. Start the drift-back
+      // immediately after, so the reference walks back to the incoming track's real bpm
+      // rather than staying wherever this transition's lock left it. See the design doc's
+      // "Phase 5 — tempo drift-back".
+      if (driftBackDeckId) startRateDriftBack(driftBackDeckId);
       cancel();
       return;
     }
@@ -272,6 +533,247 @@ function startCrossfadeRamp(outgoingId: string, incomingId: string, target: 0 | 
 
   activeRamp = { cancel };
   rafId = raf(step);
+}
+
+// ── Phase 5 (2026-08-30): tempo drift-back ───────────────────────────────────────────
+//
+// Problem this solves (live report: "tempo gets locked at some strange tempos over
+// time"). The sync step locks the incoming deck to `Session.bpm`. Once the transition
+// finishes and that deck is the only one playing, session.ts's `reconcileMaster` promotes
+// it to `masterDeckId` and sets `Session.bpm = deck.bpm * deck.playbackRate` — its
+// *already-adjusted* tempo. Nothing ever put the rate back, so the next transition locked
+// deck C to B's adjusted rate, the one after that to C's, and so on: every transition's
+// reference derived from the previous transition's output, with no anchor to any track's
+// real tempo. Over a set that compounds without bound in whichever direction the first
+// few pairs happened to push.
+//
+// The fix is an anchor, not a clamp: after the fade completes, ease the now-solo deck's
+// playbackRate back to 1.0 — its own native tempo, the tempo its detected `deck.bpm`
+// describes. `refreshMasterBpm` recomputes `Session.bpm` from `deck.bpm * playbackRate`
+// on every `updateDeck`, so the reference walks back to the track's true bpm alongside
+// it, and the next transition starts from an anchored value.
+//
+// Why 1.0 and not some other "configured rate": there is no per-deck configured-rate
+// concept in the data model (see types.ts) — `playbackRate` *is* the deviation from
+// native, and `deck.bpm` is measured at native. 1.0 is the only value that makes
+// `Session.bpm` mean "this track's real tempo".
+//
+// syncLocked is cleared at the START of the drift, not the end: while it's set,
+// `applyLockedRates` re-pins the deck to `Session.bpm / deck.bpm` on every session write,
+// which would undo each easing step as it lands. Clearing it first is also what the flag
+// means here — the deck is no longer following a master, it's returning to its own tempo.
+
+/** Rate step small enough to be inaudible, large enough to be worth a write: both
+ *  `syncRate` (audioSync.ts) and the legacy `<video>` path ignore rate changes below
+ *  0.005, so anything finer costs a Svelte store write and reaches nothing. */
+const DRIFT_RATE_STEP = 0.005;
+/** Anything larger than this between our own last write and what the deck now reports is
+ *  somebody else's rate write — the tempo slider (step 0.001), a jog nudge, Sync/Lock, a
+ *  MIDI tempo fader. That is the cancel condition: manual input wins immediately, the same
+ *  convention `syncLocked` and `manualTouch` already follow, and unlike an explicit
+ *  notify() call it cannot be forgotten at a rate-writing call site added later. */
+const DRIFT_DIVERGENCE_EPS = 1e-4;
+
+let activeDrift: { deckId: string; cancel: (reason: string) => void } | null = null;
+
+/** Explicit cancel for the paths whose *audio* rate write bypasses the store and whose
+ *  store write is rAF-deferred (midi/handler.ts's tempo fader and jog nudge) — the
+ *  divergence check below would catch them a frame later, but a frame later is one stale
+ *  rate write on top of what the DJ just did. Safe to call for any deck at any time. */
+export function notifyManualRateInput(deckId: string): void {
+  cancelRateDriftBack(deckId, "manual rate input");
+}
+
+function cancelRateDriftBack(deckId: string, reason: string): void {
+  if (activeDrift?.deckId === deckId) activeDrift.cancel(reason);
+}
+
+function startRateDriftBack(deckId: string): void {
+  activeDrift?.cancel("superseded");
+
+  const deck = getDeck(deckId);
+  if (!deck) return;
+  const fromRate = deck.playbackRate;
+  const durationMs = get(autoMixDriftBackSec) * 1000;
+  if (durationMs <= 0) {
+    // Off — exactly the pre-phase-5 behavior: the rate (and syncLocked) stay where the
+    // sync step left them. Logged so "the tempo never came back" is answerable from the
+    // log alone rather than by guessing at a setting.
+    debugLog(`[auto-dj] drift-back: disabled (0s), deck-${deckId} stays at rate ${fromRate.toFixed(4)}`);
+    return;
+  }
+  if (Math.abs(fromRate - 1) < DRIFT_RATE_STEP) {
+    updateDeck(deckId, { playbackRate: 1, syncLocked: false });
+    debugLog(`[auto-dj] drift-back: deck-${deckId} already at native tempo (rate ${fromRate.toFixed(4)}), unlocked`);
+    return;
+  }
+
+  const startTime = performance.now();
+  let lastWritten = fromRate;
+  let rafId = 0;
+  let done = false;
+
+  debugLog(`[auto-dj] drift-back start: deck-${deckId} rate ${fromRate.toFixed(4)} -> 1.000 over ${durationMs}ms`);
+
+  function finish(reason?: string) {
+    if (done) return;
+    done = true;
+    cancelRaf(rafId);
+    if (activeDrift?.deckId === deckId) activeDrift = null;
+    debugLog(reason
+      ? `[auto-dj] drift-back aborted: deck-${deckId} (${reason})`
+      : `[auto-dj] drift-back complete: deck-${deckId} back at native tempo`);
+  }
+
+  // syncLocked off first — see the block comment above; with it set, applyLockedRates
+  // re-pins the rate on every session write and every easing step below is undone.
+  updateDeck(deckId, { syncLocked: false });
+
+  function step() {
+    if (done) return;
+    const d = getDeck(deckId);
+    if (!d) { finish("deck vanished"); return; }
+    if (Math.abs(d.playbackRate - lastWritten) > DRIFT_DIVERGENCE_EPS) { finish("manual rate input"); return; }
+
+    const t = Math.min(1, (performance.now() - startTime) / durationMs);
+    if (t >= 1) {
+      updateDeck(deckId, { playbackRate: 1 });
+      finish();
+      return;
+    }
+    const target = fromRate + (1 - fromRate) * t;
+    if (Math.abs(target - lastWritten) >= DRIFT_RATE_STEP) {
+      lastWritten = target;
+      updateDeck(deckId, { playbackRate: target });
+    }
+    rafId = raf(step);
+  }
+
+  activeDrift = { deckId, cancel: finish };
+  rafId = raf(step);
+}
+
+/**
+ * The transition itself, shared by the near-end trigger and the Skip control (phase 5) so
+ * there is exactly one implementation of "beatmatch if asked, start the incoming deck, run
+ * the ramp" — Skip used to have none at all and did only bookkeeping, which is the whole
+ * of the 2026-08-30 "Skip did nothing" report.
+ */
+function beginTransition(
+  outgoingId: string,
+  incomingId: string,
+  incoming: Deck,
+  target: 0 | 1,
+  durationMs: number,
+  opts: Omit<TransitionOptions, "driftBackDeckId"> = {},
+): void {
+  const refBpm = get(session).bpm;
+  if (get(autoMixSyncEnabled) && incoming.bpm !== null && refBpm !== null) {
+    // Lock the incoming deck's rate to the main beat, then align its phase, before it
+    // starts playing — the same two-step the Lock button does (DeckCard.svelte). The 200ms
+    // settle mirrors that button's own comment: writing playbackRate rebuilds the legacy
+    // <video> pipeline, and seeking into that rebuild lands stale — see CLAUDE.md
+    // "Rate-then-seek ordering".
+    const rate = refBpm / incoming.bpm;
+    debugLog(`[auto-dj] sync: locking deck-${incomingId} to ${refBpm.toFixed(1)}bpm (rate ${rate.toFixed(4)})`);
+    const touchAtStart = get(manualTouch);
+    updateDeck(incomingId, { syncLocked: true, playbackRate: rate });
+    setTimeout(() => {
+      if (get(manualTouch) !== touchAtStart) { debugLog(`[auto-dj] sync: aborted, fader touched during rate settle`); return; }
+      if (!getDeck(outgoingId) || !getDeck(incomingId)) { debugLog(`[auto-dj] sync: aborted, a deck vanished during rate settle`); return; }
+      // Here the incoming deck is still paused, so nudgePhaseToMaster() takes its "seek to
+      // the in-phase position" branch (see phaseNudge.ts) — an immediate seekDeck() call
+      // whose audio_seek IPC is fire-and-forget (seekBus.ts). That seek has not landed in
+      // GStreamer by the time this function returns; setting playing:true right after it
+      // used to race that landing, so the deck audibly started from its pre-nudge position
+      // and the beat never appeared to change (reported live 2026-08-24). Give the seek the
+      // same kind of settle window the rate change above already gets, before starting
+      // playback and the crossfade.
+      nudgePhaseToMaster(incomingId);
+      debugLog(`[auto-dj] sync: phase-nudged deck-${incomingId}, settling seek before play`);
+      setTimeout(() => {
+        if (get(manualTouch) !== touchAtStart) { debugLog(`[auto-dj] sync: aborted, fader touched during seek settle`); return; }
+        if (!getDeck(outgoingId) || !getDeck(incomingId)) { debugLog(`[auto-dj] sync: aborted, a deck vanished during seek settle`); return; }
+        updateDeck(incomingId, { playing: true });
+        debugLog(`[auto-dj] sync: deck-${incomingId} playing, starting crossfade`);
+        // driftBackDeckId set: this path is the one that imposed a rate, so it's the one
+        // that owes the deck its native tempo back once the fade finishes.
+        startCrossfadeRamp(outgoingId, incomingId, target, durationMs, { ...opts, driftBackDeckId: incomingId });
+      }, 200);
+    }, 200);
+  } else {
+    if (get(autoMixSyncEnabled)) {
+      debugLog(`[auto-dj] sync skipped (no bpm reference): incoming.bpm=${incoming.bpm} session.bpm=${refBpm}`);
+    }
+    updateDeck(incomingId, { playing: true });
+    startCrossfadeRamp(outgoingId, incomingId, target, durationMs, opts);
+  }
+}
+
+/**
+ * Phase 6 (2026-08-30) — **audition the transition now**, from the deck card, without
+ * waiting for the real near-end trigger and without leaving cuemark for Digger.
+ *
+ * Deliberately the *real* path: same `beginTransition`, same beatmatch step, same ramp,
+ * same per-pair duration. What the DJ hears is the transition that will actually run, not
+ * a simulation of it — building a second ramp mechanism would guarantee the two drift
+ * apart, and "the preview sounded fine" would stop meaning anything.
+ *
+ * Three deliberate differences from a live transition, all so an audition is repeatable
+ * and consumes nothing:
+ *  - the outgoing deck keeps its `source` at the end (`preview: true`) — it is paused
+ *    where the fade left it, ready to be previewed again;
+ *  - no `handledOutgoing` / `markSkipped` bookkeeping, so the set state is untouched;
+ *  - both decks are seeked first: the outgoing to exactly the point the trigger would
+ *    have fired at (`reference − lead`), the incoming back to 0, which is where a
+ *    freshly-loaded deck sits when a real transition starts it. Seeking the incoming to
+ *    its `introPoint` instead was considered and declined — it would make the preview
+ *    *unfaithful* to the live path, which starts the incoming deck wherever it is parked.
+ *    Making both start at mixIn is a real idea, and an open decision in the design doc.
+ *
+ * Works with Auto DJ off: this is a workshopping tool, not part of the automation.
+ */
+export function previewTransition(outgoingId: string): void {
+  const s = get(session);
+  const { left, right } = s.crossfaderMapping;
+  if (outgoingId !== left && outgoingId !== right) {
+    showToast("Preview needs both decks mapped to the crossfader", "warning");
+    return;
+  }
+  const incomingId = outgoingId === left ? right : left;
+  const outgoing = getDeck(outgoingId);
+  const incoming = getDeck(incomingId);
+  if (!outgoing?.source || outgoing.source.type !== "video" || !(outgoing.source.duration > 0)
+    || !incoming?.source || incoming.source.type !== "video" || !(incoming.source.duration > 0)) {
+    debugLog(`[auto-dj] preview: needs a loaded, measured track on both deck-${outgoingId} and deck-${incomingId}`);
+    showToast("Preview needs a track loaded on both crossfader decks", "warning");
+    return;
+  }
+
+  activeRamp?.cancel("preview restarting");
+
+  const plan = transitionPlan(zonesOf(outgoing), zonesOf(incoming));
+  const startAt = Math.max(0, nearEndReference(outgoing.outroPoint, outgoing.source.duration) - plan.leadSec);
+  const target: 0 | 1 = outgoingId === left ? 1 : 0;
+
+  // Park the fader fully on the outgoing deck first, so the ramp has somewhere to travel
+  // from — the same "from == target, a zero-length interpolation" trap the 2026-08-25
+  // bootRestore incident produced, reached here by pressing preview twice in a row.
+  setCrossfader(target === 1 ? 0 : 1);
+  seekDeck(outgoingId, startAt, true);
+  seekDeck(incomingId, 0, true);
+  updateDeck(outgoingId, { playing: true });
+  debugLog(`[auto-dj] preview: deck-${outgoingId}@${startAt.toFixed(1)}s -> deck-${incomingId}, ${plan.ms}ms (duration from ${plan.source}), lead ${plan.leadSec.toFixed(1)}s`);
+
+  // Same settle rationale as the sync path above: seekDeck's audio_seek IPC is
+  // fire-and-forget, and starting the fade before it lands would audition the wrong part
+  // of the track.
+  setTimeout(() => {
+    const out = getDeck(outgoingId);
+    const inc = getDeck(incomingId);
+    if (!out || !inc) { debugLog(`[auto-dj] preview: aborted, a deck vanished during seek settle`); return; }
+    beginTransition(outgoingId, incomingId, inc, target, plan.ms, { preview: true });
+  }, 200);
 }
 
 /**
@@ -297,52 +799,16 @@ export function checkAutoMixTrigger(deckId: string, contentPos: number): void {
   // failing that — for the DJ or the EOS fallback to handle.
   if (!incoming || incoming.playing || incoming.source?.type !== "video" || !(incoming.source.duration > 0)) return;
 
+  const plan = transitionPlan(zonesOf(outgoing), zonesOf(incoming));
   const remaining = nearEndReference(outgoing.outroPoint, outgoing.source.duration) - contentPos;
-  if (remaining > get(autoMixThresholdSec) || remaining <= 0) return;
+  if (remaining > plan.leadSec || remaining <= 0) return;
   if (wasAutoMixTriggered(deckId, outgoing.source.filePath)) return;
 
   handledOutgoing.set(deckId, outgoing.source.filePath);
   const target: 0 | 1 = deckId === left ? 1 : 0;
-  debugLog(`[auto-dj] trigger: deck-${deckId} has ${remaining.toFixed(1)}s remaining (threshold ${get(autoMixThresholdSec)}s) -> crossfading to deck-${incomingId}, sync=${get(autoMixSyncEnabled)}`);
+  debugLog(`[auto-dj] trigger: deck-${deckId} has ${remaining.toFixed(1)}s remaining (lead ${plan.leadSec.toFixed(1)}s) -> crossfading to deck-${incomingId} over ${plan.ms}ms (duration from ${plan.source}), sync=${get(autoMixSyncEnabled)}`);
 
-  if (get(autoMixSyncEnabled) && incoming.bpm !== null && s.bpm !== null) {
-    // Lock the incoming deck's rate to the main beat, then align its phase, before it
-    // starts playing — the same two-step the Lock button does (DeckCard.svelte). The 200ms
-    // settle mirrors that button's own comment: writing playbackRate rebuilds the legacy
-    // <video> pipeline, and seeking into that rebuild lands stale — see CLAUDE.md
-    // "Rate-then-seek ordering".
-    const rate = s.bpm / incoming.bpm;
-    debugLog(`[auto-dj] sync: locking deck-${incomingId} to ${s.bpm.toFixed(1)}bpm (rate ${rate.toFixed(4)})`);
-    const touchAtStart = get(manualTouch);
-    updateDeck(incomingId, { syncLocked: true, playbackRate: rate });
-    setTimeout(() => {
-      if (get(manualTouch) !== touchAtStart) { debugLog(`[auto-dj] sync: aborted, fader touched during rate settle`); return; }
-      if (!getDeck(deckId) || !getDeck(incomingId)) { debugLog(`[auto-dj] sync: aborted, a deck vanished during rate settle`); return; }
-      // Here the incoming deck is still paused, so nudgePhaseToMaster() takes its "seek to
-      // the in-phase position" branch (see phaseNudge.ts) — an immediate seekDeck() call
-      // whose audio_seek IPC is fire-and-forget (seekBus.ts). That seek has not landed in
-      // GStreamer by the time this function returns; setting playing:true right after it
-      // used to race that landing, so the deck audibly started from its pre-nudge position
-      // and the beat never appeared to change (reported live 2026-08-24). Give the seek the
-      // same kind of settle window the rate change above already gets, before starting
-      // playback and the crossfade.
-      nudgePhaseToMaster(incomingId);
-      debugLog(`[auto-dj] sync: phase-nudged deck-${incomingId}, settling seek before play`);
-      setTimeout(() => {
-        if (get(manualTouch) !== touchAtStart) { debugLog(`[auto-dj] sync: aborted, fader touched during seek settle`); return; }
-        if (!getDeck(deckId) || !getDeck(incomingId)) { debugLog(`[auto-dj] sync: aborted, a deck vanished during seek settle`); return; }
-        updateDeck(incomingId, { playing: true });
-        debugLog(`[auto-dj] sync: deck-${incomingId} playing, starting crossfade`);
-        startCrossfadeRamp(deckId, incomingId, target);
-      }, 200);
-    }, 200);
-  } else {
-    if (get(autoMixSyncEnabled)) {
-      debugLog(`[auto-dj] sync skipped (no bpm reference): incoming.bpm=${incoming.bpm} session.bpm=${s.bpm}`);
-    }
-    updateDeck(incomingId, { playing: true });
-    startCrossfadeRamp(deckId, incomingId, target);
-  }
+  beginTransition(deckId, incomingId, incoming, target, plan.ms);
 }
 
 // deckId -> the outgoing-track filePath a preload was already triggered for. Prevents
@@ -375,13 +841,21 @@ export function checkAutoPreloadTrigger(deckId: string, contentPos: number): voi
   const incoming = s.decks.find((d) => d.id === incomingId);
   if (!incoming || incoming.source !== null) return; // already loaded (by anyone) — don't clobber
 
+  // The incoming track isn't known yet (that's what this trigger is for), so the plan is
+  // computed from the outgoing side alone — which can only over-estimate the eventual
+  // duration, i.e. preload earlier, never later. Taking the max with the setting keeps a
+  // no-marker track's preload exactly where it was before phase 5 (45s default vs. a 30s
+  // floor here), while a long marker-derived blend can never start before the load has had
+  // PRELOAD_LEAD_MARGIN_SEC to finish.
+  const plan = transitionPlan(zonesOf(outgoing), null);
+  const leadSec = Math.max(get(autoPreloadThresholdSec), plan.leadSec + PRELOAD_LEAD_MARGIN_SEC);
   const remaining = nearEndReference(outgoing.outroPoint, outgoing.source.duration) - contentPos;
-  if (remaining > get(autoPreloadThresholdSec) || remaining <= 0) return;
+  if (remaining > leadSec || remaining <= 0) return;
   if (preloadedFor.get(deckId) === outgoing.source.filePath) return;
 
   preloadedFor.set(deckId, outgoing.source.filePath);
   const owner = currentDjOrNull(get(currentDj));
-  debugLog(`[auto-dj] preload: deck-${deckId} has ${remaining.toFixed(1)}s remaining (threshold ${get(autoPreloadThresholdSec)}s) -> fetching next track for deck-${incomingId}`);
+  debugLog(`[auto-dj] preload: deck-${deckId} has ${remaining.toFixed(1)}s remaining (lead ${leadSec.toFixed(1)}s) -> fetching next track for deck-${incomingId}`);
   pickNextTrack(owner, outgoing.diggerTrackId ?? null)
     .then((next) => {
       // Re-check: the DJ may have loaded something onto this deck (or unloaded the outgoing

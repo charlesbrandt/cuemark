@@ -6,7 +6,7 @@
    */
   import { tempoRange, scratchMode, jogSecondsPerRev, scrubInertiaMs, SCRUB_INERTIA_MAX_MS } from "../lib/audio/audioSettings";
   import { fontScale } from "../lib/settings/displaySettings";
-  import { autoMixThresholdSec, crossfadeDurationMs, autoPreloadThresholdSec, autoMixSyncEnabled } from "../lib/digger/autoMix";
+  import { autoMixThresholdSec, crossfadeDurationMs, autoPreloadThresholdSec, autoMixSyncEnabled, autoMixDriftBackSec } from "../lib/digger/autoMix";
   import { session, setCompactControls } from "../lib/state/session";
 </script>
 
@@ -108,9 +108,10 @@
   -->
 
   <!--
-    Auto DJ phases 1-2 (docs/design/auto-dj-transitions.md) — only take effect once the Auto
-    button (DiggerQueue.svelte) is on. Fixed remaining-time thresholds, no per-track outro
-    marker yet (phase 4).
+    Auto DJ (docs/design/auto-dj-transitions.md) — only takes effect once the Auto button
+    (DiggerQueue.svelte) is on. Both numbers here are *floors/fallbacks* since phase 5: a
+    track pair carrying Digger mix-in/mix-out markers derives its own fade length and its
+    own (earlier) trigger point from them, and these values apply when it doesn't.
   -->
   <div class="settings-row">
     <span class="row-label">Auto Mix</span>
@@ -121,7 +122,7 @@
       step="1"
       bind:value={$autoMixThresholdSec}
     />
-    <span class="jog-scale-value">{$autoMixThresholdSec}s before end</span>
+    <span class="jog-scale-value">{$autoMixThresholdSec}s min lead</span>
     <input
       type="range"
       min="1"
@@ -137,8 +138,9 @@
       onclick={() => { autoMixThresholdSec.set(15); crossfadeDurationMs.set(6000); }}
     >Reset</button>
     <span class="hint-inline">
-      when Auto DJ is on, starts crossfading to the other crossfader-mapped deck this far
-      from the end — only if it's already loaded
+      when Auto DJ is on, starts crossfading to the other crossfader-mapped deck at least this
+      far from the end (earlier if the tracks' own mix markers ask for a longer blend) — only
+      if it's already loaded. The fade length applies to tracks with no marker data
     </span>
   </div>
 
@@ -153,6 +155,43 @@
       crossfade starts (needs bpm detected/set on both decks) — off cuts at native tempo
     </span>
   </div>
+
+  <!--
+    Only reachable with Beatmatch on — nothing else imposes a rate, so the control is
+    hidden rather than shown as a no-op. Phase 5: without it, each transition's tempo
+    reference is the previous transition's already-adjusted rate, which compounds over a
+    set ("locked at some strange tempos over time").
+  -->
+  {#if $autoMixSyncEnabled}
+    <div class="settings-row">
+      <span class="row-label"></span>
+      <input
+        type="range"
+        min="0"
+        max="60"
+        step="5"
+        bind:value={$autoMixDriftBackSec}
+      />
+      <span class="jog-scale-value">
+        {$autoMixDriftBackSec === 0 ? "off" : `${$autoMixDriftBackSec}s drift`}
+      </span>
+      <button
+        type="button"
+        class="font-scale-reset"
+        onclick={() => autoMixDriftBackSec.set(20)}
+      >Reset</button>
+      <span class="hint-inline">
+        {#if $autoMixDriftBackSec === 0}
+          the beatmatched deck keeps its locked tempo &mdash; each transition's reference
+          then builds on the last one's
+        {:else}
+          after the fade, eases the incoming deck back to its own native tempo over this
+          long, so the next transition matches against a real bpm &mdash; any manual tempo
+          input cancels it
+        {/if}
+      </span>
+    </div>
+  {/if}
 
   <div class="settings-row">
     <span class="row-label">Auto Preload</span>
@@ -193,16 +232,19 @@
   <div class="settings-row">
     <span class="row-label"></span>
     <label class="device-check">
+      <!-- Inverted 2026-08-30 with the default flip: the sliders are the opt-in now, so
+           the checkbox reads as "show them" rather than "compact away". Same field. -->
       <input
         type="checkbox"
-        checked={$session.compactControls}
-        onchange={(e) => setCompactControls(e.currentTarget.checked)}
+        checked={!$session.compactControls}
+        onchange={(e) => setCompactControls(!e.currentTarget.checked)}
       />
-      Compact controls
+      Mixer sliders
     </label>
     <span class="hint-inline">
-      hides per-deck opacity/volume/rate/EQ/filter sliders — for when a MIDI controller
-      drives those and the onscreen sliders just cost screen space
+      shows each deck's opacity/volume/rate + EQ + filter sliders under the marker panel —
+      off by default, since a MIDI controller drives those and the sliders cost the space
+      the mix-zone panel now uses
     </span>
   </div>
 
