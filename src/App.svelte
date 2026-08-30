@@ -433,7 +433,16 @@
       // media_cache.rs tries filePath locally first regardless — this fallback only
       // matters when that stat fails, e.g. no local NAS mount, Digger reachable instead.
       const fallbackUrl = deck.diggerFileId != null ? getDiggerFileUrl(deck.diggerFileId) : undefined;
+      // Load-latency instrumentation (docs/design/queue-prefetch-cache.md §1, item 3): capture
+      // this deck's loadSeq now, before the call, rather than re-reading the store inside the
+      // .then() below — by the time this promise resolves the store may already point at a
+      // newer load (the user loaded something else in the meantime), and re-reading would
+      // attribute the measurement to the wrong track.
+      const loadSeqAtCall = deck.source?.type === 'video' ? deck.source.loadSeq : undefined;
       audioLoad(deckId, filePath, fallbackUrl).then((duration) => {
+        if (loadSeqAtCall != null) {
+          debugLog(`[queue-load] deck=${deckId} updateDeck-to-audioLoad-resolved ms=${Date.now() - loadSeqAtCall}`);
+        }
         // A new DeckAudioPipeline is created with default gain/rate/volume=1.0 and
         // cue_enabled=false (pipeline.rs). Re-apply current session values so saved MIDI
         // state (or UI slider/cue-button state set before this track was loaded) takes

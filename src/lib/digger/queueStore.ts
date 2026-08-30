@@ -9,6 +9,7 @@ import { getCuemarkPayload, type DiggerQueueItem } from './api';
 import { markGridSaved } from '../audio/gridSource';
 import { setPendingTrackMeta } from '../state/history';
 import { notifyManualLoadDisplaced } from './playedTracks';
+import { debugLog } from '../debugLog';
 
 export const diggerQueue = writable<DiggerQueueItem[]>([]);
 export const selectedQueueIndex = writable(0);
@@ -59,7 +60,12 @@ export async function loadQueueItemToDeck(
     const ok = await ask(`${deckId.replace('deck-', 'D')} is playing "${label}". Load anyway?`, { title: 'Deck is playing', kind: 'warning' });
     if (!ok) return;
   }
+  // Load-latency instrumentation (docs/design/queue-prefetch-cache.md §1, item 3) — this
+  // Digger HTTP round trip runs before any Rust code is entered at all, so it's inside the
+  // user's perceived "load time" and worth timing on its own.
+  const payloadStart = performance.now();
   const payload = await getCuemarkPayload(item.track_id);
+  debugLog(`[queue-load] getCuemarkPayload track=${item.track_id} ms=${(performance.now() - payloadStart).toFixed(1)}`);
   if (!payload.filePath) throw new Error('No local file for this track');
   // Digger's API omits bpm/downbeat entirely when unset rather than sending JSON
   // `null`, which deserializes as `undefined` — normalize here so the rest of the

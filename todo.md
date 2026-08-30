@@ -1,5 +1,17 @@
 # todo
 
+### Load-time / button-to-audio latency during live mixing [open]
+
+Surfaced during the first real multi-listener session, carried over from digger's todo.md
+(that repo's the wrong home for this — digger only serves files, cuemark plays them). Two
+related complaints from that session: track load time into cuemark felt slow, and a
+perceptible gap between pressing a button and hearing the effect, which made beat-matching
+hard to line up. Open question worth checking before assuming this is purely cuemark's own
+playback/audio-engine path: whether the *source* of the load latency is actually
+digger's file-serving (`GET /files/{id}`, range-request streaming — could be a CIFS T7
+round-trip on a cold read) rather than something in cuemark's own deck-load code. Not
+investigated yet either side.
+
 tray icon dependency -- is this still needed? 
 
 Way to record a session

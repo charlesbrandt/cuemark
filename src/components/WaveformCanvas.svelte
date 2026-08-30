@@ -1,7 +1,8 @@
 <script lang="ts">
   import { analyzeFile, analyzeArrays, type AnalysisResult, COLOR_UPCOMING, COLOR_PLAYED } from '../lib/audio/waveform';
   import { seekDeckExitingLoop, getDeckTime, quantizeToGrid, scratchingDecks, seekVersions, beginScrub, updateScrub, endScrub, cancelScrub } from '../lib/renderer/seekBus';
-  import { getDiggerFileUrl, getWaveformCache } from '../lib/digger/api';
+  import { getDiggerFileUrl } from '../lib/digger/api';
+  import { getCachedWaveform } from '../lib/digger/waveformCache';
   import { recordAuxLoop } from '../lib/audio/pollStats';
   import { noteScrubInput } from '../lib/audio/scrubStats';
   import { suppressWaveformDraw } from '../lib/audio/perfArm';
@@ -91,7 +92,7 @@
     async function runAnalysis(): Promise<AnalysisResult> {
       if (diggerTrackId != null) {
         try {
-          const cache = await getWaveformCache(diggerTrackId);
+          const cache = await getCachedWaveform(diggerTrackId);
           if (cache && Math.abs(cache.durationS - DIGGER_ANALYSIS_CAP_S) > 1) {
             return analyzeArrays(cache.peaks, cache.envelope);
           }
