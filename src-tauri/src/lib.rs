@@ -96,6 +96,14 @@ fn media_server_port(state: tauri::State<MediaServerPort>) -> u16 {
     state.0
 }
 
+// Phase 1 of docs/design/queue-prefetch-cache.md — read-only usage snapshot for the
+// Settings "Storage" tab. Thin wrapper; see MediaCache::stats()'s doc comment for why
+// this rescans the cache dir on every call rather than tracking a running total.
+#[tauri::command]
+fn media_cache_stats(cache: tauri::State<std::sync::Arc<media_cache::MediaCache>>) -> media_cache::MediaCacheStats {
+    cache.stats()
+}
+
 // Lets frontend-side timing land in the same millisecond-timestamped log file as the
 // Rust backend, so a live-hardware stall can be localized to a layer (JS main thread
 // frozen vs. IPC round-trip slow vs. Rust busy) by reading one timeline instead of
@@ -201,6 +209,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_output_window,
             media_server_port,
+            media_cache_stats,
             frontend_log,
             ipc_ping,
             midi_state::midi_get_saved_state,

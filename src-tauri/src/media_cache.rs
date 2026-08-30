@@ -13,6 +13,7 @@
 // media_server.rs) from that local copy instead. The network is touched exactly once
 // per track (the same full-file read PCM decode already required), instead of
 // repeatedly and unpredictably on every seek.
+use serde::Serialize;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -25,6 +26,19 @@ use std::time::{Duration, Instant};
 enum CacheEntry {
     InProgress,
     Ready(String),
+}
+
+/// Phase 1 of docs/design/queue-prefetch-cache.md — read-only usage snapshot for the
+/// Settings "Storage" tab. `pending`/`in_flight` are phase-2 concepts (the background
+/// prefetch worker doesn't exist yet); they're in the struct now so the eventual real
+/// implementation is a non-breaking fill-in rather than a frontend contract change.
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaCacheStats {
+    pub bytes: u64,
+    pub files: u64,
+    pub free_bytes: u64,
+    pub pending: u64,
+    pub in_flight: Option<String>,
 }
 
 pub struct MediaCache {
@@ -98,10 +112,24 @@ impl MediaCache {
     /// primary load path" for why this fetches once into the same local cache slot rather
     /// than streaming the URL directly into GStreamer/the `<video>` element every time.
     pub fn ensure_cached(&self, original_path: &str, remote_fallback: Option<&str>) -> Result<String, String> {
+        let start = Instant::now();
         {
             let mut guard = self.resolved.lock().unwrap();
             match guard.get(original_path) {
-                Some(CacheEntry::Ready(p)) => return Ok(p.clone()),
+                Some(CacheEntry::Ready(p)) => {
+                    // lookup()/lookup_wait() both re-check is_file() before trusting a Ready
+                    // entry; this branch didn't, and eviction (a later phase) will make that
+                    // gap reachable — a Ready entry pointing at a since-deleted file must fall
+                    // through to a re-copy below, not hand back a dead path.
+                    if Path::new(p).is_file() {
+                        log::info!(
+                            "[media_cache] hit path={original_path} ms={:.1}",
+                            start.elapsed().as_secs_f64() * 1000.0
+                        );
+                        return Ok(p.clone());
+                    }
+                    guard.insert(original_path.to_string(), CacheEntry::InProgress);
+                }
                 Some(CacheEntry::InProgress) => {
                     // Another caller is already copying this exact path (shouldn't normally
                     // happen — audio_load is the only ensure_cached() caller — but wait
@@ -133,9 +161,26 @@ impl MediaCache {
                         // copy (app killed mid-load) must never leave a truncated file at
                         // the final path that a later lookup() would trust as complete.
                         let tmp_path = self.dir.join(format!("{:016x}-{}.{ext}.part", path_hash(original_path), meta.len()));
-                        fs::copy(src, &tmp_path).map_err(|e| format!("cache copy {original_path}: {e}"))?;
+                        if let Err(e) = fs::copy(src, &tmp_path) {
+                            // Previously left tmp_path on disk forever on a failed copy — the
+                            // remote-fetch branch below already cleans up on a truncated
+                            // transfer; mirror that here so a permission error or an ENOSPC
+                            // mid-copy doesn't leak an invisible .part file that counts
+                            // against disk usage permanently.
+                            let _ = fs::remove_file(&tmp_path);
+                            return Err(format!("cache copy {original_path}: {e}"));
+                        }
                         fs::rename(&tmp_path, &cached_path).map_err(|e| e.to_string())?;
-                        log::info!("[media_cache] cached {original_path} ({} bytes) -> {}", meta.len(), cached_path.display());
+                        log::info!(
+                            "[media_cache] copy path={original_path} bytes={} ms={:.1}",
+                            meta.len(),
+                            start.elapsed().as_secs_f64() * 1000.0
+                        );
+                    } else {
+                        log::info!(
+                            "[media_cache] hit path={original_path} ms={:.1} (on-disk)",
+                            start.elapsed().as_secs_f64() * 1000.0
+                        );
                     }
 
                     Ok(cached_path.to_string_lossy().into_owned())
@@ -213,8 +258,8 @@ impl MediaCache {
                     let cached_path = self.dir.join(format!("{:016x}-{}.{ext}", path_hash(original_path), written));
                     fs::rename(&tmp_path, &cached_path).map_err(|e| e.to_string())?;
                     log::info!(
-                        "[media_cache] fetched {original_path} from Digger ({written} bytes) -> {}",
-                        cached_path.display()
+                        "[media_cache] fetch path={original_path} bytes={written} ms={:.1} url={url}",
+                        start.elapsed().as_secs_f64() * 1000.0
                     );
 
                     Ok(cached_path.to_string_lossy().into_owned())
@@ -235,6 +280,39 @@ impl MediaCache {
         drop(guard);
         self.cond.notify_all();
         result
+    }
+
+    /// Rescans the cache dir on every call rather than tracking an incremental counter —
+    /// deliberately, per docs/design/queue-prefetch-cache.md §7: "this deliberately
+    /// eliminates the entire class of incremental counter drifted from reality bugs."
+    /// This is a Settings-panel-only read, not a hot path (a handful of files today,
+    /// microseconds even at thousands), so the cost of a full walk is fine.
+    pub fn stats(&self) -> MediaCacheStats {
+        let mut bytes: u64 = 0;
+        let mut files: u64 = 0;
+        if let Ok(entries) = fs::read_dir(&self.dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let Ok(meta) = entry.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                bytes += meta.len();
+                // .part/.download are in-flight copies, not cache hits — they occupy
+                // space and must count toward `bytes`, but not toward `files`.
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.ends_with(".part") && !name.ends_with(".download") {
+                    files += 1;
+                }
+            }
+        }
+        // available_space() needs an existing path to stat; the cache dir may not have
+        // been created yet (nothing cached this run) — fall back to its parent, which
+        // is the app data dir and always exists by the time Tauri is running.
+        let free_bytes = fs4::available_space(&self.dir)
+            .or_else(|_| fs4::available_space(self.dir.parent().unwrap_or(&self.dir)))
+            .unwrap_or(0);
+        MediaCacheStats { bytes, files, free_bytes, pending: 0, in_flight: None }
     }
 }
 

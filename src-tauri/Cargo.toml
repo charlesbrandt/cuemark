@@ -31,3 +31,6 @@ tiny_http = "0.12"
 # "json" feature for Request::send_json in audio/snapcontrol.rs (serde_json is already a
 # direct dependency; the feature only wires ureq's own serde impls to it).
 ureq = { version = "2", features = ["json"] }
+# Portable free-disk-space query (media_cache.rs's Storage-tab stats) — avoids hand-rolled
+# statvfs/GetDiskFreeSpaceEx per platform, per this project's cross-platform constraint.
+fs4 = "0.9"
