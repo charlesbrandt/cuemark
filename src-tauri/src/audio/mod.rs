@@ -8,6 +8,7 @@ pub mod snapcontrol;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tauri::{Emitter, Manager, State};
 
@@ -173,6 +174,10 @@ pub fn list_audio_devices(_state: State<'_, AudioState>) -> Vec<AudioDevice> {
 pub async fn audio_load(app: tauri::AppHandle, cache: State<'_, Arc<MediaCache>>, deck_id: String, file_path: String, fallback_url: Option<String>) -> Result<Option<f64>, String> {
     let cache = cache.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        // docs/design/queue-prefetch-cache.md §1 phase-1 instrumentation — splits the load
+        // into the same three phases the design's measurement gate depends on, so a real
+        // set's log can answer "is a warm media cache what's slow" without guessing.
+        let total_start = Instant::now();
         let state = app.state::<AudioState>();
 
         // Resolve to a local disk copy before touching GStreamer at all — see media_cache.rs.
@@ -185,15 +190,18 @@ pub async fn audio_load(app: tauri::AppHandle, cache: State<'_, Arc<MediaCache>>
         // any failure (permissions, disk full, source not stat-able yet) rather than
         // failing the load outright. `fallback_url`, when the local path doesn't stat at
         // all, lets ensure_cached() fetch from Digger instead — see its doc comment.
+        let cache_start = Instant::now();
         let load_path = cache.ensure_cached(&file_path, fallback_url.as_deref()).unwrap_or_else(|e| {
             log::warn!("[audio/{deck_id}] media cache miss, loading directly from source: {e}");
             file_path.clone()
         });
+        let cache_ms = cache_start.elapsed().as_secs_f64() * 1000.0;
 
         // Pull the pipeline out of the map before calling load() so the mutex is not held
         // during GStreamer preroll (which can block for up to 5 seconds). Without this,
         // every other audio command (audio_get_position, audio_play, …) waits on the mutex
         // for the full preroll duration, making the UI unresponsive on first track load.
+        let lock_start = Instant::now();
         let mut pipeline = {
             let mut mgr = state.lock().unwrap();
             // Temporary assertion (freeze-watchdog.md phases 2-3, "Adoption bugs" risk):
@@ -232,9 +240,12 @@ pub async fn audio_load(app: tauri::AppHandle, cache: State<'_, Arc<MediaCache>>
             })
             // mutex released here
         };
+        let lock_ms = lock_start.elapsed().as_secs_f64() * 1000.0;
 
         pipeline.set_app(app.clone());
+        let preroll_start = Instant::now();
         let result = pipeline.load(&load_path); // preroll runs without holding the mutex
+        let preroll_ms = preroll_start.elapsed().as_secs_f64() * 1000.0;
 
         // A brand-new `DeckAudioPipeline` (this deck's first load, or a reload after
         // audio_unload) starts with `recording: false` — `load()`'s own self-heal
@@ -255,7 +266,12 @@ pub async fn audio_load(app: tauri::AppHandle, cache: State<'_, Arc<MediaCache>>
         }
 
         // Re-insert the pipeline (even on error, to preserve the object for future loads).
-        state.lock().unwrap().pipelines.insert(deck_id, pipeline);
+        state.lock().unwrap().pipelines.insert(deck_id.clone(), pipeline);
+
+        log::info!(
+            "[audio_load] {deck_id} total={:.1} cache={cache_ms:.1} lock={lock_ms:.1} preroll={preroll_ms:.1}",
+            total_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         result
     })
