@@ -499,6 +499,36 @@
     W: number, H: number,
     timeToX: (t: number) => number
   ) {
+    // Mix zones (phase 6, docs/design/auto-dj-transitions.md) — the intro zone [0,
+    // introPoint] and the outro zone [outroPoint, end] Auto DJ derives a transition
+    // duration from. Drawn first, under everything else, and as a low-alpha wash plus one
+    // boundary line rather than the loop region's brighter fill: these are always present
+    // on an analysed track, so they must read as background information, not as an
+    // engaged mode. Amber for outro / blue for intro, deliberately clear of the loop
+    // region's green and the cue point's white.
+    const trackEnd = deck.source?.type === 'video' ? deck.source.duration : 0;
+    function drawZone(from: number, to: number, fill: string, edge: string, edgeAt: number) {
+      const x1 = timeToX(from);
+      const x2 = timeToX(to);
+      const left = Math.max(0, Math.min(x1, x2));
+      const right = Math.min(W, Math.max(x1, x2));
+      if (right <= left) return;
+      ctx.fillStyle = fill;
+      ctx.fillRect(left, 0, right - left, H);
+      const ex = timeToX(edgeAt);
+      if (ex >= -1 && ex <= W + 1) {
+        ctx.strokeStyle = edge;
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(ex, 0); ctx.lineTo(ex, H); ctx.stroke();
+      }
+    }
+    if (deck.introPoint !== null && deck.introPoint > 0) {
+      drawZone(0, deck.introPoint, 'rgba(90, 160, 255, 0.13)', 'rgba(120, 180, 255, 0.55)', deck.introPoint);
+    }
+    if (deck.outroPoint !== null && trackEnd > 0 && deck.outroPoint < trackEnd) {
+      drawZone(deck.outroPoint, trackEnd, 'rgba(255, 170, 60, 0.13)', 'rgba(255, 190, 90, 0.55)', deck.outroPoint);
+    }
+
     // Loop region highlight
     if (deck.loopIn !== null && deck.loopOut !== null && deck.loop) {
       const lx1 = timeToX(deck.loopIn);

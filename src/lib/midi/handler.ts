@@ -9,7 +9,7 @@ import { noteScrubInput } from "../audio/scrubStats";
 import { debugLog } from "../debugLog";
 import { pushMarker } from "../digger/api";
 import { moveQueueSelection, loadSelectedQueueItem, showDiggerQueue } from "../digger/queueStore";
-import { notifyManualCrossfaderTouch, notifyManualPlay } from "../digger/autoMix";
+import { notifyManualCrossfaderTouch, notifyManualPlay, notifyManualRateInput } from "../digger/autoMix";
 import { get } from "svelte/store";
 
 // Beat Loop pad ladder — index 0-7 (plain pad 1-4, then shift+pad 1-4). Longer lengths
@@ -424,6 +424,10 @@ export async function startMidiListener(): Promise<() => void> {
           const delta = (a.value - 1.0) / 0.5;
           const range = get(tempoRange) / 100;
           const scaled = 1.0 + delta * range;
+          // Auto DJ's tempo drift-back watches the store for a rate it didn't write, but
+          // this path's store write is rAF-deferred — tell it explicitly so it can't get
+          // one stale easing step in on top of the fader (autoMix.ts, phase 5).
+          notifyManualRateInput(deckId);
           syncRate(deckId, scaled);               // audio: immediate, no Svelte overhead
           queueDeckPatch(deckId, { playbackRate: scaled, syncLocked: false }); // UI: rAF-throttled
         }
@@ -666,6 +670,7 @@ export async function startMidiListener(): Promise<() => void> {
         // 150ms idle-reset window, so compounding ran the rate to the 4.0 clamp in under a
         // second (audible pitch runaway + soundtouch buffer stress). See journal.md.
         const nudged = Math.max(0.25, Math.min(4.0, jogBaseRate[deckId] + bend));
+        notifyManualRateInput(d.id);               // see deck_playback_rate above (phase 5)
         syncRate(d.id, nudged);                    // audio: immediate, no Svelte overhead
         queueDeckPatch(d.id, { playbackRate: nudged, syncLocked: false }); // UI: rAF-throttled — see deck_playback_rate
         // above and CLAUDE.md "session store is coarse-grained": a direct updateDeck() here

@@ -25,6 +25,7 @@ function baseDeck(id: string) {
     bpm: null,
     downbeat: null,
     outroPoint: null,
+    introPoint: null,
     diggerTrackId: null,
     diggerFileId: null,
     loopIn: null,

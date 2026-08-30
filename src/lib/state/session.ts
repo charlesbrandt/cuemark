@@ -16,6 +16,7 @@ function makeDeck(index: number): Deck {
     bpm: null,
     downbeat: null,
     outroPoint: null,
+    introPoint: null,
     diggerTrackId: null,
     diggerFileId: null,
     loopIn: null,
@@ -39,7 +40,11 @@ const initial: Session = {
   audioCurve: "equal-power",
   visualCurve: "linear",
   snapToBeat: false,
-  compactControls: false,
+  // Default flipped 2026-08-30 (docs/design/auto-dj-transitions.md "Phase 6"): the deck's
+  // opacity/volume/rate + EQ + filter sliders are hidden unless asked for, and the space
+  // carries the marker/zone panel instead. Still one toggle, still the same field — see
+  // bootRestore.ts for why an existing DJ's persisted `false` is not overridden.
+  compactControls: true,
   effects: [],
   visualization: null,
   visualizationOpacity: 0.5,

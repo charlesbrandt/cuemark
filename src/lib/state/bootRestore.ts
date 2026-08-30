@@ -137,7 +137,13 @@ export async function restoreSessionOnBoot(): Promise<BootRestoreResult> {
         audioCurve: restored.audioCurve,
         visualCurve: restored.visualCurve,
         snapToBeat: restored.snapToBeat,
-        compactControls: restored.compactControls ?? false,
+        // ⚠️ `?? true` matches the *fresh-install* default flipped on 2026-08-30 (phase 6 —
+        // the deck's mixer sliders are now opt-in, the marker panel took their space), but
+        // a DJ who has already chosen is not overridden: a persisted `false` restores
+        // sliders-visible exactly as before. Only a snapshot predating the field at all
+        // (undefined) picks up the new default. Same principle the crossfaderValue restore
+        // incident established — never let a default silently overrule a stored choice.
+        compactControls: restored.compactControls ?? true,
         visualization: restored.visualization,
         visualizationOpacity: restored.visualizationOpacity,
       }));

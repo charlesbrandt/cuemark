@@ -32,6 +32,11 @@ vi.mock('./playedTracks', () => ({
 const nudgePhaseToMaster = vi.fn();
 vi.mock('../audio/phaseNudge', () => ({ nudgePhaseToMaster: (...a: unknown[]) => nudgePhaseToMaster(...a) }));
 
+// previewTransition seeks both decks before running the real ramp; seekDeck reaches
+// GStreamer over IPC, which doesn't exist here.
+const seekDeck = vi.fn();
+vi.mock('../renderer/seekBus', () => ({ seekDeck: (...a: unknown[]) => seekDeck(...a) }));
+
 vi.mock('../debugLog', () => ({ debugLog: vi.fn() }));
 
 function baseDeck(id: string, overrides: Partial<Deck> = {}): Deck {
@@ -49,6 +54,7 @@ function baseDeck(id: string, overrides: Partial<Deck> = {}): Deck {
     bpm: null,
     downbeat: null,
     outroPoint: null,
+    introPoint: null,
     diggerTrackId: null,
     diggerFileId: null,
     loopIn: null,
@@ -133,6 +139,7 @@ beforeEach(() => {
   isSkipped.mockReset().mockReturnValue(false);
   markSkipped.mockReset();
   nudgePhaseToMaster.mockReset();
+  seekDeck.mockReset();
 });
 
 afterEach(() => {
@@ -812,7 +819,390 @@ describe('notifyManualPlay (Tier 2, silent)', () => {
   });
 });
 
-describe('skipUpcomingTrack (Tier 2, silent — the explicit Skip control)', () => {
+// ── Phase 5 (2026-08-30) ─────────────────────────────────────────────────────────────
+// docs/design/auto-dj-transitions.md "Phase 5". computeTransitionDurationMs is pure, so
+// it's tested directly rather than only through the trigger — the trigger tests below
+// then cover the one thing the pure function can't: that a derived duration also moves
+// the trigger point, so a long blend isn't truncated by the track ending under it.
+describe('computeTransitionDurationMs (Phase 5)', () => {
+  it('falls back to the flat setting when neither track carries usable markers', async () => {
+    const { autoMixMod } = await setup();
+    expect(autoMixMod.computeTransitionDurationMs(
+      { duration: 200, outroPoint: null, introPoint: null },
+      { duration: 200, outroPoint: null, introPoint: null },
+      6000,
+    )).toEqual({ ms: 6000, source: 'fallback' });
+  });
+
+  it('derives the duration from the outgoing track\'s outro zone alone', async () => {
+    const { autoMixMod } = await setup();
+    // 200s track, mix-out at 190 -> a 10s outro tail to fade under.
+    expect(autoMixMod.computeTransitionDurationMs(
+      { duration: 200, outroPoint: 190, introPoint: null },
+      { duration: 200, outroPoint: null, introPoint: null },
+      6000,
+    )).toEqual({ ms: 10000, source: 'outro' });
+  });
+
+  it('derives the duration from the incoming track\'s intro zone alone', async () => {
+    const { autoMixMod } = await setup();
+    expect(autoMixMod.computeTransitionDurationMs(
+      { duration: 200, outroPoint: null, introPoint: null },
+      { duration: 200, outroPoint: null, introPoint: 8 },
+      6000,
+    )).toEqual({ ms: 8000, source: 'intro' });
+  });
+
+  it('takes the shorter of the two zones when both tracks support a blend', async () => {
+    const { autoMixMod } = await setup();
+    expect(autoMixMod.computeTransitionDurationMs(
+      { duration: 200, outroPoint: 188, introPoint: null }, // 12s outro
+      { duration: 200, outroPoint: null, introPoint: 7 },   // 7s intro
+      6000,
+    )).toEqual({ ms: 7000, source: 'zones' });
+  });
+
+  it('ignores the sub-second mix_in Digger derives for most tracks', async () => {
+    // _derive_mix_points() sets mix_in = beat_times[0], the first tracked beat — usually
+    // well under a second, and meaningless as an intro *length*. Without MIN_ZONE_SEC
+    // every transition with any analysed incoming track would collapse to the 2s floor.
+    const { autoMixMod } = await setup();
+    expect(autoMixMod.computeTransitionDurationMs(
+      { duration: 200, outroPoint: 190, introPoint: null },
+      { duration: 200, outroPoint: null, introPoint: 0.43 },
+      6000,
+    )).toEqual({ ms: 10000, source: 'outro' });
+  });
+
+  it('ignores an introPoint past the first third of the incoming track', async () => {
+    const { autoMixMod } = await setup();
+    expect(autoMixMod.computeTransitionDurationMs(
+      { duration: 200, outroPoint: null, introPoint: null },
+      { duration: 200, outroPoint: null, introPoint: 120 },
+      6000,
+    )).toEqual({ ms: 6000, source: 'fallback' });
+  });
+
+  it('ignores an outroPoint inside the first third, same as the trigger does', async () => {
+    const { autoMixMod } = await setup();
+    expect(autoMixMod.computeTransitionDurationMs(
+      { duration: 200, outroPoint: 18, introPoint: null }, // the "Baddy On The Floor" shape
+      null,
+      6000,
+    )).toEqual({ ms: 6000, source: 'fallback' });
+  });
+
+  it('clamps a very long outro zone to the ceiling, and a very short one to the floor', async () => {
+    const { autoMixMod } = await setup();
+    expect(autoMixMod.computeTransitionDurationMs(
+      { duration: 300, outroPoint: 150, introPoint: null }, // 150s of "outro"
+      null,
+      6000,
+    ).ms).toBe(20000);
+    expect(autoMixMod.computeTransitionDurationMs(
+      { duration: 200, outroPoint: 197.5, introPoint: null }, // 2.5s outro
+      null,
+      6000,
+    ).ms).toBe(2500);
+    expect(autoMixMod.computeTransitionDurationMs(
+      { duration: 200, outroPoint: null, introPoint: null },
+      { duration: 200, outroPoint: null, introPoint: 2 }, // exactly at MIN_ZONE_SEC
+      6000,
+    ).ms).toBe(2000);
+  });
+});
+
+describe('checkAutoMixTrigger duration/lead derivation (Phase 5)', () => {
+  it('triggers earlier than the configured threshold when the tracks ask for a longer blend', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, driveFrame, runToCompletion } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixThresholdSec.set(15);
+    autoMixMod.crossfadeDurationMs.set(1000); // the flat fallback — must NOT be what runs
+    resetSession([
+      // 25s outro tail -> a 20s blend (the ceiling), so the lead is 20s, not the 15s setting.
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 200), outroPoint: 175 }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 200) }),
+    ]);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 157); // 18s to the marker: inside 20s, outside 15s
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+
+    driveFrame(10000); // half the derived 20s duration
+    expect(get(sessionMod.session).crossfaderValue).toBeCloseTo(0.5, 2);
+    runToCompletion(1000);
+    expect(get(sessionMod.session).crossfaderValue).toBe(1);
+  });
+
+  it('still waits for the configured threshold when the derived blend is shorter than it', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, driveFrame } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixThresholdSec.set(15);
+    autoMixMod.crossfadeDurationMs.set(6000);
+    resetSession([
+      // 5s outro tail -> a 5s blend, but the DJ's "start mixing 15s out" setting still wins
+      // as the trigger point; the fade just finishes 10s before the marker, as it always has.
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: 95 }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
+    ]);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 60); // 35s out — well outside both
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 85); // 10s out — inside the 15s threshold
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+
+    driveFrame(5000); // the derived 5s duration, not the 6s flat setting
+    expect(get(sessionMod.session).crossfaderValue).toBe(1);
+  });
+
+  it('runs for the flat fallback duration when neither track has marker data', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, driveFrame } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixThresholdSec.set(15);
+    autoMixMod.crossfadeDurationMs.set(4000);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100) }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
+    ]);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90);
+    driveFrame(2000);
+    expect(get(sessionMod.session).crossfaderValue).toBeCloseTo(0.5, 2);
+    driveFrame(2000);
+    expect(get(sessionMod.session).crossfaderValue).toBe(1);
+  });
+});
+
+describe('skipCurrentTrack (Phase 5 — the "skip now" control)', () => {
+  it('starts the incoming deck and runs the crossfade immediately, mid-track', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, runToCompletion } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 300), diggerTrackId: 7 }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 300), diggerTrackId: 8 }),
+    ]);
+
+    await autoMixMod.skipCurrentTrack();
+
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+    runToCompletion(100);
+    const s = get(sessionMod.session);
+    expect(s.crossfaderValue).toBe(1);
+    expect(s.decks.find((d) => d.id === 'deck-0')!.source).toBeNull(); // outgoing freed
+    // The outgoing track was deliberately cut short: its later EOS must not be treated as
+    // an unhandled transition, and it must not be re-offered by pickNextTrack.
+    expect(autoMixMod.wasAutoMixTriggered('deck-0', 'a.mp4')).toBe(true);
+    expect(markSkipped).toHaveBeenCalledWith(7);
+  });
+
+  it('fetches and loads a track first when the other mapped deck is empty', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    getQueue.mockResolvedValue([{ id: 1, track_id: 9, title: 'Next', artist: 'B' }]);
+    // Stand in for the real load: the deck only becomes transition-eligible once it
+    // reports a real duration (`source.duration > 0`), which is what skipCurrentTrack waits on.
+    loadQueueItemToDeck.mockImplementation(async (_item: unknown, deckId: string) => {
+      sessionMod.updateDeck(deckId, { source: videoSource('fetched.mp4', 240), diggerTrackId: 9 });
+    });
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 300), diggerTrackId: 7 }),
+      baseDeck('deck-1', { source: null }),
+    ]);
+
+    await autoMixMod.skipCurrentTrack();
+
+    expect(loadQueueItemToDeck).toHaveBeenCalledWith(
+      { id: 1, track_id: 9, title: 'Next', artist: 'B' }, 'deck-1', 'auto',
+    );
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+  });
+
+  it('degrades to swapping the upcoming pick when no mapped deck is playing', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    const fresh = { id: 2, track_id: 8, title: 'Fresh', artist: 'B' };
+    getQueue.mockResolvedValue([fresh]);
+    resetSession([
+      baseDeck('deck-0', { playing: false, source: null }),
+      baseDeck('deck-1', { source: videoSource('preloaded.mp4', 200), diggerTrackId: 20 }),
+    ]);
+
+    await autoMixMod.skipCurrentTrack();
+
+    // skipUpcomingTrack's behavior: swap what's queued, start nothing.
+    expect(loadQueueItemToDeck).toHaveBeenCalledWith(fresh, 'deck-0', 'auto');
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
+  });
+
+  it('does nothing while an automated crossfade is already running', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, driveFrame } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100) }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
+    ]);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90); // ramp in flight
+    driveFrame(300);
+    const midValue = get(sessionMod.session).crossfaderValue;
+
+    await autoMixMod.skipCurrentTrack();
+
+    expect(get(sessionMod.session).crossfaderValue).toBe(midValue); // ramp untouched, not restarted
+    expect(loadQueueItemToDeck).not.toHaveBeenCalled();
+  });
+});
+
+describe('previewTransition (Phase 6 — audition the transition)', () => {
+  it('seeks both decks to the transition point and runs the real ramp, keeping the outgoing deck loaded', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, runToCompletion } = await setup();
+    autoDjMod.autoDjEnabled.set(false); // preview is a workshopping tool, not automation
+    autoMixMod.autoMixThresholdSec.set(15);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    resetSession([
+      baseDeck('deck-0', { source: videoSource('a.mp4', 200), outroPoint: 180 }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 200) }),
+    ]);
+
+    autoMixMod.previewTransition('deck-0');
+
+    // 20s outro tail -> a 20s blend, so the trigger point is 20s before the marker: 160s.
+    expect(seekDeck).toHaveBeenCalledWith('deck-0', 160, true);
+    expect(seekDeck).toHaveBeenCalledWith('deck-1', 0, true);
+    expect(get(sessionMod.session).crossfaderValue).toBe(0); // parked on the outgoing side
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-0')!.playing).toBe(true);
+
+    await new Promise((r) => setTimeout(r, 250)); // seek settle
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+    runToCompletion(1000);
+
+    const s = get(sessionMod.session);
+    expect(s.crossfaderValue).toBe(1);
+    // The whole point of preview: nothing is consumed. The outgoing deck keeps its track
+    // (so the audition is repeatable, and the idle deck doesn't look empty to the preload
+    // trigger), and no transition bookkeeping was recorded.
+    expect(s.decks.find((d) => d.id === 'deck-0')!.source).not.toBeNull();
+    expect(s.decks.find((d) => d.id === 'deck-0')!.playing).toBe(false);
+    expect(autoMixMod.wasAutoMixTriggered('deck-0', 'a.mp4')).toBe(false);
+    expect(markSkipped).not.toHaveBeenCalled();
+  });
+
+  it('refuses when the other crossfader deck has nothing loaded', async () => {
+    const { sessionMod, autoMixMod, resetSession } = await setup();
+    resetSession([
+      baseDeck('deck-0', { source: videoSource('a.mp4', 200), outroPoint: 180 }),
+      baseDeck('deck-1', { source: null }),
+    ]);
+
+    autoMixMod.previewTransition('deck-0');
+
+    expect(seekDeck).not.toHaveBeenCalled();
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-0')!.playing).toBe(false);
+  });
+});
+
+describe('tempo drift-back after a beatmatched transition (Phase 5)', () => {
+  /** deck-0 (120bpm, master) fades into deck-1 (128bpm) with beatmatch on — deck-1 gets
+   *  locked to rate 120/128 = 0.9375, then the ramp runs to completion. */
+  async function runSyncedTransition(env: Awaited<ReturnType<typeof setup>>, driftSec: number) {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, runToCompletion } = env;
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixSyncEnabled.set(true);
+    autoMixMod.autoMixDriftBackSec.set(driftSec);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    resetSession(
+      [
+        baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), bpm: 120, downbeat: 0 }),
+        baseDeck('deck-1', { source: videoSource('b.mp4', 100), bpm: 128, downbeat: 0 }),
+      ],
+      { bpm: 120, masterDeckId: 'deck-0' },
+    );
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90);
+    await new Promise((r) => setTimeout(r, 250)); // rate settle
+    await new Promise((r) => setTimeout(r, 250)); // seek settle
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playbackRate).toBeCloseTo(0.9375);
+    runToCompletion(100); // ramp, then the drift-back's own frames
+  }
+
+  it('eases the now-solo deck back to its native tempo and clears syncLocked', async () => {
+    const env = await setup();
+    await runSyncedTransition(env, 2);
+
+    const deck1 = get(env.sessionMod.session).decks.find((d) => d.id === 'deck-1')!;
+    expect(deck1.playbackRate).toBe(1);
+    expect(deck1.syncLocked).toBe(false);
+    // …and the main-beat reference walks back with it, which is the whole point: without
+    // this, Session.bpm stays at deck-1's *adjusted* 120 and the next transition locks
+    // deck C to that instead of to 128.
+    expect(get(env.sessionMod.session).bpm).toBeCloseTo(128);
+  });
+
+  it('leaves the locked rate alone when the drift-back is off (pre-phase-5 behavior)', async () => {
+    const env = await setup();
+    await runSyncedTransition(env, 0);
+
+    const deck1 = get(env.sessionMod.session).decks.find((d) => d.id === 'deck-1')!;
+    expect(deck1.playbackRate).toBeCloseTo(0.9375);
+    expect(deck1.syncLocked).toBe(true);
+    expect(get(env.sessionMod.session).bpm).toBeCloseTo(120); // the compounding reference
+  });
+
+  it('is cancelled by a manual rate input, leaving the deck where the DJ put it', async () => {
+    const env = await setup();
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, driveFrame } = env;
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixSyncEnabled.set(true);
+    autoMixMod.autoMixDriftBackSec.set(20); // long enough to interrupt mid-ease
+    autoMixMod.crossfadeDurationMs.set(1000);
+    resetSession(
+      [
+        baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), bpm: 120, downbeat: 0 }),
+        baseDeck('deck-1', { source: videoSource('b.mp4', 100), bpm: 128, downbeat: 0 }),
+      ],
+      { bpm: 120, masterDeckId: 'deck-0' },
+    );
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90);
+    await new Promise((r) => setTimeout(r, 250));
+    await new Promise((r) => setTimeout(r, 250));
+    driveFrame(1100); // ramp completes, drift-back starts
+    driveFrame(4000); // ~20% of the way back
+    const easing = get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playbackRate;
+    expect(easing).toBeGreaterThan(0.9375);
+    expect(easing).toBeLessThan(1);
+
+    // The DJ grabs the tempo slider (DeckCard writes straight to the store).
+    sessionMod.updateDeck('deck-1', { playbackRate: 0.97, syncLocked: false });
+    driveFrame(4000);
+    driveFrame(4000);
+
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playbackRate).toBe(0.97);
+    expect(env.rafQueue.length).toBe(0); // the drift loop stopped, nothing dangling
+  });
+
+  it('gives the next transition a settled reference instead of a compounding one', async () => {
+    const env = await setup();
+    const { sessionMod, autoMixMod } = env;
+    await runSyncedTransition(env, 2);
+    expect(get(sessionMod.session).bpm).toBeCloseTo(128);
+
+    // Second transition: deck-1 (now solo/master at native 128) into a fresh 100bpm track
+    // on deck-0. The lock rate must derive from 128, not from the 120 the first transition
+    // left behind.
+    sessionMod.updateDeck('deck-0', { source: videoSource('c.mp4', 100), bpm: 100, downbeat: 0, playing: false });
+    autoMixMod.checkAutoMixTrigger('deck-1', 90);
+
+    const deck0 = get(sessionMod.session).decks.find((d) => d.id === 'deck-0')!;
+    expect(deck0.syncLocked).toBe(true);
+    expect(deck0.playbackRate).toBeCloseTo(128 / 100);
+  });
+});
+
+describe('skipUpcomingTrack (Tier 2, silent — the "change what\'s next" control)', () => {
   it('marks the currently-preloaded track skipped and loads a fresh pick with origin "auto"', async () => {
     const { autoDjMod, autoMixMod, resetSession } = await setup();
     autoDjMod.autoDjEnabled.set(true);
