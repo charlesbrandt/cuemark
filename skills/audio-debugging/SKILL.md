@@ -720,6 +720,63 @@ a video-typed deck source) also produces the same "timed out waiting for parsebi
 correctly — there's nothing for parsebin to find. That's a real, working demux path, not
 this bug — see the Twelfth mechanism in `docs/design/pcm-buffer-playback.md`.
 
+### Audio goes silent after a long-running session; a restart fixes it — mitigated 2026-09-05
+
+**Symptom**: cuemark has been open for hours/days, tracks have been loaded and reloaded
+many times, and a deck that reaches `Playing` normally (correct device, no bus `ERROR`,
+transport UI behaves) produces **no audio at all**. The user's own empirical fix is "just
+restart the app" — which always works, which is itself a clue: nothing about *this*
+track or *this* device is broken, something has *accumulated*.
+
+**Diagnostic — read `[deliver-tel/deck-N]`, not just whether the pipeline reached
+`Playing`.** Live-caught 2026-09-05: `vol0=0/s(min 0)` and `sink0=0/s(min 0)` on *every*
+5s sample for 9+ minutes straight, with an **unchanging** `margin` value across all of
+them. That last part is the tell — `margin` is only ever written inside the pad probe
+that fires on a real buffer (`instrument_delivery()`), so a value that never changes
+across many windows means literally one buffer ever arrived (the preroll buffer) and
+then genuinely zero since, not "a low rate" that a rounded `0/s` mean could also produce.
+
+**Root cause**: `DeckAudioPipeline::load()` (`src-tauri/src/audio/pipeline.rs`) tears the
+outgoing pipeline down with `pipeline.set_state(gst::State::Null)` and used to treat that
+as fire-and-forget — `self.inner` was dropped immediately after, without checking whether
+the transition actually completed. GStreamer state changes can be asynchronous; if some
+element in the outgoing pipeline is stuck, `Null` never lands and that pipeline's decode
+threads (`typefind:sink`, `qtdemux<N>:sink`, `queue<N>:src`) keep running for the rest of
+the process's life — invisible from `load()`'s side because the Rust-side handle to it is
+already gone. Confirmed live: a deck reloaded twice 10s apart left the *first* load's
+demux threads still alive and running 9 minutes later, while the replacement pipeline
+prerolled once and then delivered zero further buffers. Over a long session this leaks a
+little every reload (every track load *and* every device switch calls `load()`), each
+zombie pipeline competing for scheduling, until a new pipeline can preroll but can't keep
+streaming. A restart clears every leaked pipeline at once — which is exactly why it
+always "fixes" this.
+
+**Fix applied**: `load()` now waits up to 2s for the outgoing pipeline to actually reach
+`Null` and logs `[audio/<deck>] outgoing pipeline did not reach Null within 2s...` if it
+doesn't. This doesn't fix whatever wedges the old pipeline's teardown (a real GStreamer
+element still refusing to release under some as-yet-unidentified condition) — it turns a
+silent multi-day accumulation into an immediate, attributable log line the moment it
+happens. **If that warning ever fires, that's the next investigation** — start by reading
+which element(s) in the outgoing pipeline were mid-transition when `Null` was requested.
+
+⚠️ **Live diagnostic trap, fell into mid-investigation**: correlating leaked threads
+against the *current* pipeline requires GStreamer's own per-process element-number
+counter (embedded in thread names, e.g. `qtdemux112:sink` vs. the current load's own
+`pipeline125` in the log) — **not** `/proc/<pid>/task` thread-ID (`spid`) ordering. Thread
+IDs are recycled system-wide across *all* processes, not just this one, so on a busy
+desktop a thread created seconds ago can have a numerically lower `spid` than one created
+hours ago. Only the GStreamer element-number counter is a reliable proxy for creation
+order within the process.
+
+`pw-top`/CPU/FD counts all read completely healthy throughout this — the leak is in
+GStreamer decode threads, not PipeWire streams, sinks, or file descriptors, so none of
+this project's other standing instruments catch it. **Not this entry**: Bug B in
+`docs/design/output-noise-and-track-reload-silence.md` ("loading a second track onto a
+deck plays no audio", 2026-08-02) is the same *symptom* with a *different* confirmed-real
+mechanism (a `master_volume` omission in `load()`'s volume-application, unrelated to
+pipeline teardown) — see that doc's "Recurrence" note under Bug B before assuming either
+write-up fully explains the other.
+
 ### A network (Snapcast) output is silent while local outputs are fine
 
 **Symptom**: a `snapcast://…` target is ticked in Main, the deck plays normally on the booth

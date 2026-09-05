@@ -2882,6 +2882,26 @@ impl DeckAudioPipeline {
             inner.uridecodebin_el.set_locked_state(false);
             inner.bus.set_flushing(true);
             let _ = inner.pipeline.set_state(gst::State::Null);
+            // set_state() above only requests the transition — GStreamer can complete it
+            // asynchronously, and this call used to return immediately regardless. If some
+            // element in the outgoing pipeline is stuck (blocked pad, wedged demuxer), Null
+            // never lands: the old pipeline's decode threads (typefind/qtdemux/queue) keep
+            // running forever, invisible from here because `self.inner` is dropped right
+            // after this block. Live-caught 2026-09-05: a deck reloaded twice 10s apart left
+            // the first load's demux threads running 9+ minutes later while the replacement
+            // pipeline prerolled once and then delivered zero further buffers — see
+            // `[deliver-tel]`'s frozen `0/s` and unchanging `margin`. Wait up to 2s (same
+            // bound used for the state queries below) so a stuck teardown is at least logged
+            // instead of silently leaking for the rest of the process's life.
+            let (ret, cur, _pending) = inner.pipeline.state(gst::ClockTime::from_mseconds(2000));
+            if !matches!(ret, Ok(gst::StateChangeSuccess::Success)) || cur != gst::State::Null {
+                log::warn!(
+                    "[audio/{}] outgoing pipeline did not reach Null within 2s (state={cur:?}, \
+                     result={ret:?}) — its decode threads may be leaking; a subsequent load \
+                     stalling after one buffer is the known symptom",
+                    self.deck_id
+                );
+            }
         }
         self.inner = None;
 

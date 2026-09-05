@@ -8,7 +8,9 @@ like at the start of the 2026-08-02 session and was never updated.** The doc goe
   never an output-window bug at all; 2026-08-03: the underlying Mesa `crocus` GPU→CPU readback
   bug) and fixed structurally by the compositor-split architecture — see "Rendering pipeline"
   in `CLAUDE.md`.
-- **Bug B** (second track load on a deck plays no audio) — 🟢 RESOLVED, see its section below.
+- **Bug B** (second track load on a deck plays no audio) — 🟢 RESOLVED, see its section
+  below. ⚠️ The same symptom recurred 2026-09-05 via an unrelated mechanism (a
+  long-running-session pipeline-teardown leak) — see that section's "Recurrence" note.
 - **Bug C** (choppy audio) and **Bug D** (no master audio with cue enabled) — 🟢 RESOLVED
   2026-08-02, both via the `sink_buffer_times()` 50ms/10ms → 200ms/20ms `buffer-time`/
   `latency-time` change (see their sections below).
@@ -613,6 +615,21 @@ Nothing below has been tested yet — this is where the next session should star
    `PLAYING` cleanly, not that data was actually flowing through to the hardware after
    that point. That gap (state-transition success vs. actual buffer flow) is exactly
    where a silent, non-erroring device-contention issue would hide.
+
+### Recurrence 2026-09-05 — same symptom, a different confirmed mechanism
+
+Step 4 above got built (as `[deliver-tel]`, 2026-08-08) and is what caught a **second,
+distinct** cause of "a deck reaches `Playing` and produces no audio": not a per-load
+issue, but one that only shows up after a long-running session with many reloads
+accumulated. `DeckAudioPipeline::load()`'s teardown of the outgoing pipeline didn't wait
+for the `Null` state transition to actually complete, so a pipeline that got stuck
+mid-teardown leaked its decode threads for the rest of the process's life; enough of
+those piling up over hours/days left a fresh pipeline able to preroll once and then
+deliver nothing. Full writeup and the live evidence: `skills/audio-debugging/SKILL.md`,
+"Audio goes silent after a long-running session; a restart fixes it". Fix (waits up to 2s
+for `Null`, logs a warning if it doesn't land): `pipeline.rs`'s `load()`, 2026-09-05. This
+does **not** revise anything above — the `master_volume` omission was real and stayed
+fixed — it just means "second load, no audio" now has two known, unrelated causes.
 
 ---
 
