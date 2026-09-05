@@ -64,12 +64,18 @@ machine, not a fix.
   itself. No toast/alert component exists in the app yet (checked); the closest thing today is
   `DeckCard.svelte`'s inline `LEGACY` badge, which is easy to miss mid-set.
 
-## Feature requests — prioritized
+## Auto DJ
 
-Carried over from a 2026-08-08 review pass. Ranked by rough value/effort; each "scope" note is
-a starting point for whoever picks it up, not a committed design. Digger-side requests from the
-same review live in `~/repos/digger/todo.md` instead — different repo, different (chronological)
-todo format.
+read docs/design/auto-dj-transitions.md's latest section first, then live-test against the running dev instance (or relaunch per skills/run-app/SKILL.md if it's since been stopped) before deciding which open decision to tackle next.
+
+7 open design decisions, not built, documented in docs/design/auto-dj-transitions.md's "Opened 2026-08-30" section — worth a look before deciding what's next:
+1. Digger's auto-derived mix_in is just the first beat, not a real intro-end boundary — the intro-zone half of the duration calc is mostly inert until this gets real analysis.
+2. Explicit per-track fade-time hints (beyond zone boundaries).
+3. Key/energy compatibility scoring for transition quality.
+4. Digger's marker-resolution ordering ambiguity (cuemark worked around it client-side; a real fix belongs server-side in the digger repo).
+5. Whether transitions should start the incoming deck at mixIn rather than 0.
+6. Draggable zone editing directly on the waveform (interacts with the existing scrub gesture — needs a real answer, not a guess).
+7. Whether Preview should restore the pre-preview fader position.
 
 1. ~~**[MEDIUM] Auto DJ toggle.**~~ **DONE 2026-08-23.** `Rnd`/`Nxt` buttons in
    `DiggerQueue.svelte` replaced with a single persisted `Auto` toggle

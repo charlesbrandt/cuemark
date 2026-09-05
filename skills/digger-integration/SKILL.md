@@ -431,6 +431,31 @@ queue is a primary workflow surface, not an opt-in panel. The main window width 
 1280 to 1600 (`src-tauri/tauri.conf.json`) so decks aren't squeezed by the now-default-visible
 sidebar.
 
+## Favorite toggle + loaded-deck highlight (added 2026-09-05)
+
+`DiggerQueue.svelte`'s queue rows and search-result rows now carry a ★/☆ button
+(`toggleQueueLiked`/`toggleSearchLiked`, `setTrackLiked()` in `api.ts`) that writes
+Digger's existing `tracks.is_liked` field via the existing `PATCH /tracks/{id}` —
+**the same shared, global star Digger's own web UI already has** (`ui/src/lib/
+api.ts`'s `likeTrack`), not a new cuemark-only concept. Optimistic update,
+revert-on-failure, same pattern as `removeItem`. The only Digger-repo change needed
+was adding `t.is_liked` to `GET /queue`'s hand-rolled column list (`routers/
+queue.py`) — `/search` and `/tracks/{id}` already carried it for free via
+`_track_dict`, only the queue endpoint built its own dict by hand and had missed it.
+
+⚠️ **This is deliberately NOT per-DJ** — every DJ sharing a cuemark/Digger instance
+sees and can flip the same favorite. See `docs/design/per-dj-favorites.md` in the
+digger repo for the open architectural question (a `track_likes(track_id, dj_name)`
+table, mirroring `queue_items.owner`/`plays.listener`'s free-text DJ scoping) if
+this becomes a real live-set pain point.
+
+Separately, each queue row's per-deck load button (`→D0`/`→D1`) now highlights in
+the nav/coral accent (`--accent-nav`/`--accent-soft-nav`, the same tokens the
+toolbar region uses) when `deck.diggerTrackId === item.track_id` — a glance-able
+"this is already loaded here" signal, deliberately using the nav accent rather than
+the queue sidebar's own yellow (`--accent-queue`) so it reads the same regardless of
+region theming. Cuemark-only UI change, no Digger involvement.
+
 ## What cuemark owns
 
 - Current play queue — ordered list of upcoming loads; may be populated from Digger or manually

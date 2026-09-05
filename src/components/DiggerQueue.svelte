@@ -3,7 +3,7 @@
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { session } from '../lib/state/session';
   import {
-    search, getQueue, addToQueue, removeFromQueue,
+    search, getQueue, addToQueue, removeFromQueue, setTrackLiked,
     setDiggerBaseUrl, getDiggerBaseUrl, getDiggerBaseUrlHistory, getDiggerWebUrl,
     subscribeQueueChanges,
     type DiggerTrack, type DiggerQueueItem,
@@ -144,6 +144,32 @@
     try {
       await loadQueueItemToDeck(item, deckId);
     } catch (e) {
+      error = String(e);
+    }
+  }
+
+  // Favorite (★) toggle — writes Digger's shared, global `tracks.is_liked` (the same
+  // flag Digger's own web UI stars). Optimistic update, revert on failure, mirroring
+  // that UI's own toggleLike pattern. NOT per-DJ yet — see
+  // docs/design/per-dj-favorites.md in the digger repo.
+  async function toggleQueueLiked(item: DiggerQueueItem) {
+    const next = !item.is_liked;
+    diggerQueue.update((q) => q.map((i) => (i.id === item.id ? { ...i, is_liked: next } : i)));
+    try {
+      await setTrackLiked(item.track_id, next);
+    } catch (e) {
+      diggerQueue.update((q) => q.map((i) => (i.id === item.id ? { ...i, is_liked: !next } : i)));
+      error = String(e);
+    }
+  }
+
+  async function toggleSearchLiked(track: DiggerTrack) {
+    const next = !track.is_liked;
+    searchResults = searchResults.map((t) => (t.id === track.id ? { ...t, is_liked: next } : t));
+    try {
+      await setTrackLiked(track.id, next);
+    } catch (e) {
+      searchResults = searchResults.map((t) => (t.id === track.id ? { ...t, is_liked: !next } : t));
       error = String(e);
     }
   }
@@ -300,6 +326,12 @@
                 title={$playedTrackIds.has(track.id) ? 'Played this session — click to clear' : 'Not played this session'}
               >✓</button>
               <span class="track-label">{trackLabel(track)}</span>
+              <button
+                class="like-btn"
+                class:liked={track.is_liked}
+                onclick={(e) => { e.stopPropagation(); toggleSearchLiked(track); }}
+                title={track.is_liked ? 'Favorited — click to remove' : 'Mark as favorite'}
+              >{track.is_liked ? '★' : '☆'}</button>
               <button class="add-btn" onclick={() => addSearchResult(track)}>+</button>
             </div>
           {/each}
@@ -328,12 +360,19 @@
               >✓</button>
               <span class="track-label">{trackLabel(item)}</span>
               {#if item.bpm != null}<span class="bpm-badge">{Math.round(item.bpm)}</span>{/if}
+              <button
+                class="like-btn"
+                class:liked={item.is_liked}
+                onclick={(e) => { e.stopPropagation(); toggleQueueLiked(item); }}
+                title={item.is_liked ? 'Favorited — click to remove' : 'Mark as favorite'}
+              >{item.is_liked ? '★' : '☆'}</button>
               <div class="queue-actions">
                 {#each decks as deck (deck.id)}
                   <button
                     class="deck-btn"
+                    class:loaded={deck.diggerTrackId === item.track_id}
                     onclick={() => loadToDeck(item, deck.id)}
-                    title="Load to {deck.id}"
+                    title="Load to {deck.id}{deck.diggerTrackId === item.track_id ? ' (already loaded here)' : ''}"
                   >→{deck.id.replace('deck-', 'D')}</button>
                 {/each}
                 <button class="remove-btn" onclick={() => removeItem(item.id)} title="Remove from queue">✕</button>
@@ -504,6 +543,20 @@
     color: #ff6b6b;
   }
 
+  .like-btn {
+    flex-shrink: 0;
+    width: 16px;
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: calc(13px * var(--font-scale));
+    line-height: 1;
+    color: color-mix(in srgb, var(--text) 30%, transparent);
+    cursor: pointer;
+  }
+  .like-btn:hover { color: var(--accent); }
+  .like-btn.liked { color: var(--accent); }
+
   .results-list,
   .queue-list {
     flex: 1;
@@ -570,6 +623,15 @@
     white-space: nowrap;
   }
   .deck-btn:hover { filter: brightness(1.15); }
+
+  /* A deck currently holding this track — always the nav/coral accent regardless of
+     region (queue rows normally live under the yellow --accent-queue theme), so a
+     loaded deck reads the same way everywhere. */
+  .deck-btn.loaded {
+    background: var(--accent-soft-nav);
+    border-color: var(--accent-nav);
+    color: var(--accent-nav);
+  }
 
   .add-btn {
     background: var(--accent-soft);

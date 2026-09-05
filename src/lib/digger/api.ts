@@ -7,6 +7,10 @@ export interface DiggerTrack {
   duration_ms: number | null;
   source: string;
   era: string;
+  // Local-only star, shared across every DJ on this Digger instance — see
+  // docs/design/per-dj-favorites.md in the digger repo for why this is NOT
+  // per-DJ yet, and the digger-integration skill's "Liked (star)" pointer.
+  is_liked: boolean;
 }
 
 export interface DiggerQueueItem {
@@ -21,6 +25,8 @@ export interface DiggerQueueItem {
   duration_ms: number | null;
   source: string;
   era: string;
+  // Same shared-across-DJs caveat as DiggerTrack.is_liked above.
+  is_liked: boolean;
 }
 
 export interface CuemarkPayload {
@@ -350,6 +356,20 @@ export async function setTrackGain(trackId: number, gain: number): Promise<void>
     body: JSON.stringify({ gain }),
   });
   if (!r.ok) throw new Error(`set gain ${r.status}`);
+}
+
+// Toggles Digger's `tracks.is_liked` star — deliberately the SAME shared,
+// global flag Digger's own web UI ★ writes to (`ui/src/lib/api.ts`'s
+// `likeTrack`), not a cuemark-only concept. See docs/design/per-dj-favorites.md
+// in the digger repo: this is a known, accepted limitation (visible/editable by
+// every DJ on the instance), not an oversight.
+export async function setTrackLiked(trackId: number, liked: boolean): Promise<void> {
+  const r = await fetch(`${_baseUrl}/tracks/${trackId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ is_liked: liked }),
+  });
+  if (!r.ok) throw new Error(`set liked ${r.status}`);
 }
 
 // Session/play-history reporting — Digger's own `plays` table doubles as cuemark's
