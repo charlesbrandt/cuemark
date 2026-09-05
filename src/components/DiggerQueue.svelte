@@ -112,7 +112,7 @@
     if (searchQuery.length < 2) return;
     try {
       loading = true;
-      searchResults = await search(searchQuery, true, 20);
+      searchResults = await search(searchQuery, true, 20, currentDjOrNull($currentDj));
     } catch {
       searchResults = [];
     } finally {
@@ -148,15 +148,15 @@
     }
   }
 
-  // Favorite (★) toggle — writes Digger's shared, global `tracks.is_liked` (the same
-  // flag Digger's own web UI stars). Optimistic update, revert on failure, mirroring
-  // that UI's own toggleLike pattern. NOT per-DJ yet — see
-  // docs/design/per-dj-favorites.md in the digger repo.
+  // Favorite (★) toggle — writes Digger's per-DJ `track_likes` table (added
+  // 2026-09-05, docs/design/per-dj-favorites.md in the digger repo), scoped to
+  // whoever's currently selected in the DJ selector. Optimistic update, revert on
+  // failure, mirroring Digger's own web UI toggleLike pattern.
   async function toggleQueueLiked(item: DiggerQueueItem) {
     const next = !item.is_liked;
     diggerQueue.update((q) => q.map((i) => (i.id === item.id ? { ...i, is_liked: next } : i)));
     try {
-      await setTrackLiked(item.track_id, next);
+      await setTrackLiked(item.track_id, next, currentDjOrNull($currentDj));
     } catch (e) {
       diggerQueue.update((q) => q.map((i) => (i.id === item.id ? { ...i, is_liked: !next } : i)));
       error = String(e);
@@ -167,7 +167,7 @@
     const next = !track.is_liked;
     searchResults = searchResults.map((t) => (t.id === track.id ? { ...t, is_liked: next } : t));
     try {
-      await setTrackLiked(track.id, next);
+      await setTrackLiked(track.id, next, currentDjOrNull($currentDj));
     } catch (e) {
       searchResults = searchResults.map((t) => (t.id === track.id ? { ...t, is_liked: !next } : t));
       error = String(e);

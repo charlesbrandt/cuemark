@@ -7,9 +7,10 @@ export interface DiggerTrack {
   duration_ms: number | null;
   source: string;
   era: string;
-  // Local-only star, shared across every DJ on this Digger instance — see
-  // docs/design/per-dj-favorites.md in the digger repo for why this is NOT
-  // per-DJ yet, and the digger-integration skill's "Liked (star)" pointer.
+  // Per-DJ favorite (Digger's track_likes table, added 2026-09-05) — scoped to
+  // whichever `dj` was passed to search()/getQueue(), same identity as the DJ
+  // selector's currentDjOrNull(). See docs/design/per-dj-favorites.md in the
+  // digger repo and the digger-integration skill's "Liked (star)" pointer.
   is_liked: boolean;
 }
 
@@ -25,7 +26,7 @@ export interface DiggerQueueItem {
   duration_ms: number | null;
   source: string;
   era: string;
-  // Same shared-across-DJs caveat as DiggerTrack.is_liked above.
+  // Scoped to the same `owner` this queue was fetched for — see DiggerTrack.is_liked above.
   is_liked: boolean;
 }
 
@@ -137,8 +138,9 @@ export function getDiggerFileUrl(fileId: number): string | undefined {
   return `${_baseUrl}/files/${fileId}`;
 }
 
-export async function search(q: string, hasFile = true, limit = 50): Promise<DiggerTrack[]> {
+export async function search(q: string, hasFile = true, limit = 50, dj: string | null = null): Promise<DiggerTrack[]> {
   const params = new URLSearchParams({ q, has_file: String(hasFile), limit: String(limit) });
+  if (dj) params.set('dj_name', dj);
   const r = await fetch(`${_baseUrl}/search?${params}`);
   if (!r.ok) throw new Error(`search ${r.status}`);
   return r.json();
@@ -358,16 +360,17 @@ export async function setTrackGain(trackId: number, gain: number): Promise<void>
   if (!r.ok) throw new Error(`set gain ${r.status}`);
 }
 
-// Toggles Digger's `tracks.is_liked` star — deliberately the SAME shared,
-// global flag Digger's own web UI ★ writes to (`ui/src/lib/api.ts`'s
-// `likeTrack`), not a cuemark-only concept. See docs/design/per-dj-favorites.md
-// in the digger repo: this is a known, accepted limitation (visible/editable by
-// every DJ on the instance), not an oversight.
-export async function setTrackLiked(trackId: number, liked: boolean): Promise<void> {
-  const r = await fetch(`${_baseUrl}/tracks/${trackId}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ is_liked: liked }),
+// Toggles a per-DJ favorite in Digger's `track_likes` table (added 2026-09-05,
+// docs/design/per-dj-favorites.md in the digger repo) — no longer the shared
+// global `tracks.is_liked` flag. `djName` should be djSelector.ts's
+// `currentDjOrNull($currentDj)`, the same identity used for queue scoping.
+export async function setTrackLiked(trackId: number, liked: boolean, djName: string | null = null): Promise<void> {
+  const url = new URL(`${_baseUrl}/tracks/${trackId}/like`);
+  if (!liked && djName) url.searchParams.set('dj_name', djName);
+  const r = await fetch(url, {
+    method: liked ? 'POST' : 'DELETE',
+    headers: liked ? { 'Content-Type': 'application/json' } : undefined,
+    body: liked ? JSON.stringify({ dj_name: djName }) : undefined,
   });
   if (!r.ok) throw new Error(`set liked ${r.status}`);
 }

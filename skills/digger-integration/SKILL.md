@@ -431,23 +431,27 @@ queue is a primary workflow surface, not an opt-in panel. The main window width 
 1280 to 1600 (`src-tauri/tauri.conf.json`) so decks aren't squeezed by the now-default-visible
 sidebar.
 
-## Favorite toggle + loaded-deck highlight (added 2026-09-05)
+## Favorite toggle + loaded-deck highlight (added 2026-09-05, per-DJ same day)
 
-`DiggerQueue.svelte`'s queue rows and search-result rows now carry a ★/☆ button
+`DiggerQueue.svelte`'s queue rows and search-result rows carry a ★/☆ button
 (`toggleQueueLiked`/`toggleSearchLiked`, `setTrackLiked()` in `api.ts`) that writes
-Digger's existing `tracks.is_liked` field via the existing `PATCH /tracks/{id}` —
-**the same shared, global star Digger's own web UI already has** (`ui/src/lib/
-api.ts`'s `likeTrack`), not a new cuemark-only concept. Optimistic update,
-revert-on-failure, same pattern as `removeItem`. The only Digger-repo change needed
-was adding `t.is_liked` to `GET /queue`'s hand-rolled column list (`routers/
-queue.py`) — `/search` and `/tracks/{id}` already carried it for free via
-`_track_dict`, only the queue endpoint built its own dict by hand and had missed it.
+Digger's `track_likes` table — one favorites set **per DJ**, scoped by the DJ
+selector's `currentDjOrNull($currentDj)` (same identity already used for queue
+scoping — see "Multi-DJ queue scoping" above). Optimistic update, revert-on-failure,
+same pattern as `removeItem`.
 
-⚠️ **This is deliberately NOT per-DJ** — every DJ sharing a cuemark/Digger instance
-sees and can flip the same favorite. See `docs/design/per-dj-favorites.md` in the
-digger repo for the open architectural question (a `track_likes(track_id, dj_name)`
-table, mirroring `queue_items.owner`/`plays.listener`'s free-text DJ scoping) if
-this becomes a real live-set pain point.
+This shipped as a shared global `tracks.is_liked` flag first, then was reworked to
+per-DJ the same day once digger's side (`docs/design/per-dj-favorites.md`) settled
+the open architectural question — a `track_likes(track_id, dj_name)` table,
+mirroring `queue_items.owner`/`plays.listener`'s free-text DJ scoping. Changes on
+this side:
+- `setTrackLiked(trackId, liked, djName)` now POSTs/DELETEs `/tracks/{id}/like`
+  (body/query `dj_name`) instead of PATCHing `tracks.is_liked` directly.
+- `search()` takes an optional `dj` param (→ `?dj_name=`) so search-result stars
+  reflect the DJ actually driving the session, not whoever favorited last.
+- `getQueue(owner)` needed **no change** — `GET /queue`'s `owner` param already
+  doubles as the like-scoping identity on Digger's side, so its `is_liked` field
+  came along correctly scoped for free.
 
 Separately, each queue row's per-deck load button (`→D0`/`→D1`) now highlights in
 the nav/coral accent (`--accent-nav`/`--accent-soft-nav`, the same tokens the
