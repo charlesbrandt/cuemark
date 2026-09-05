@@ -515,9 +515,13 @@ function startCrossfadeRamp(
       // transition and will very likely run it again, and unloading here would also make
       // the idle deck look empty to checkAutoPreloadTrigger, which would then consume the
       // next queue entry for a transition that never actually happened.
+      // diggerTrackId/diggerFileId must be cleared alongside source — otherwise the
+      // just-played track keeps reading as "loaded on this deck" in DiggerQueue.svelte's
+      // deck-btn highlight (deck.diggerTrackId === item.track_id) even though the deck is
+      // now empty (found 2026-09-05).
       updateDeck(outgoingId, preview
         ? { playing: false }
-        : { playing: false, source: null, syncLocked: false });
+        : { playing: false, source: null, syncLocked: false, diggerTrackId: null, diggerFileId: null });
       // The outgoing deck's updateDeck above is what promotes the incoming deck to
       // masterDeckId (session.ts's reconcileMaster — exactly one deck playing now), which
       // is also what pins Session.bpm to its *rate-adjusted* tempo. Start the drift-back

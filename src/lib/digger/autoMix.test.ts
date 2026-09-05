@@ -403,6 +403,27 @@ describe('crossfade ramp', () => {
     expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-0')!.syncLocked).toBe(false);
   });
 
+  it('clears diggerTrackId/diggerFileId on the outgoing deck once it unloads, so DiggerQueue\'s deck highlight doesn\'t stay lit', async () => {
+    // Regression: source: null used to leave diggerTrackId/diggerFileId stuck on an empty
+    // deck, so DiggerQueue.svelte's deck-btn `loaded` class (deck.diggerTrackId ===
+    // item.track_id) kept highlighting a queue row for a track that had already finished
+    // and been unloaded — found 2026-09-05.
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, runToCompletion } = await setup();
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), diggerTrackId: 7, diggerFileId: 70 }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
+    ]);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90);
+    runToCompletion(100);
+
+    const deck0 = get(sessionMod.session).decks.find((d) => d.id === 'deck-0')!;
+    expect(deck0.diggerTrackId).toBeNull();
+    expect(deck0.diggerFileId).toBeNull();
+  });
+
   it('frees the outgoing deck for a fresh preload after it fades out, even if it was manually loaded', async () => {
     // Regression for the live-session report (2026-08-24): a DJ manually loaded a track
     // several queue slots ahead onto deck-0; Auto DJ correctly auto-picked+crossfaded deck-1
