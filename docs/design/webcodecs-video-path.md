@@ -1,5 +1,15 @@
 # WebCodecs video path: replacing the `<video>` element for deck playback (design)
 
+**Status update (2026-09-05): PARTIALLY RESOLVED — phases 1–7 all ran; the only open item is
+AV1.** The paragraph below is frozen at phase 5 (2026-07-26); two more phases happened after
+it and aren't reflected there. Phase 6 (2026-08-02, black-screen bug hunt) is resolved — see
+`docs/design/webcodecs-video-not-rendering.md`. Phase 7 (2026-08-05, "Phase 7 results" below)
+shipped VP9 on the WebCodecs path; **AV1 was tried and explicitly refused — `isConfigSupported`
+lies and returns `true`, but every real decode fails with zero frames.** AV1 stays on the
+legacy `<video>` path, where it also renders zero frames (see
+`docs/design/legacy-video-fallback-cost.md`'s open item) — this is the one place in the
+codebase where neither path plays this codec.
+
 Status: **phase 5 (flip the default) done, 2026-07-26** — `videoPathSettings.ts`'s
 `envDefault` now resolves to `webcodecs` unless `VITE_VIDEO_PATH=legacy` is set at
 build time; legacy remains available as a per-deck override and as the automatic

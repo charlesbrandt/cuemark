@@ -1,6 +1,7 @@
 # Queue prefetch and local media cache management
 
-**Status (2026-08-30):** Phase 1 + 1b built and live-verified (`[media_cache]`/`[audio_load]`/
+**Status (2026-08-30): RESOLVED — closed with a negative result; phase 2/3 will not be built** (see
+below for why). Phase 1 + 1b built and live-verified (`[media_cache]`/`[audio_load]`/
 `[queue-load]` lines all firing correctly, both bug fixes and the waveform-cache lane in place).
 **The phase-1 gate has been read, and it says stop.** Real-set log data (7 cold loads +
 1 clean cold/warm reload A/B of the same file, 2026-08-30) shows `preroll` at 70–94% of

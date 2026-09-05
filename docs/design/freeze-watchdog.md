@@ -1,5 +1,12 @@
 # Freeze watchdog and session recovery (design)
 
+**Status update (2026-09-05): PARTIALLY RESOLVED — phases 1–3 closed, phase 4 gate still
+open.** Phases 1–3 (below) are done: headless + real-desktop gates all passed 2026-07-25.
+Phase 4 (mechanism-B self-heal, "Phases" §4 below) is implemented but its live-repro gate
+never reproduced enough attempts to trust — it's documented as intermittent (~2/3 historical
+stall rate) and stayed there. Phase 1's own week-long false-positive-rate gate was also never
+run (only spot-verified). Neither blocks using phases 1–3; treat phase 4 as still open.
+
 Status: **Phase 1 (observe-only) implemented and live-verified 2026-07-25. Phase 2
 (session-of-record) implemented 2026-07-25; full gate PASSED 2026-07-25 — headless (5/5
 runs, `scripts/rehydration-test.sh`, 14/14 checks each run — deck source/bpm/downbeat

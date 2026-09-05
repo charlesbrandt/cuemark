@@ -529,35 +529,12 @@ playback, the drift-resync path, or anything freeze-related:
 - `docs/design/native-output-pipeline.md` — shelved escalation path; do not start
   without an explicit decision.
 
-## Open findings from the 2026-08-05 live set
+## Design doc status
 
-Statuses below were refreshed 2026-08-12. Each doc carries its own Status line — read that
-rather than trusting a summary here.
-
-- `docs/design/legacy-video-fallback-cost.md` — 🟡 **one open item: AV1 renders zero frames on
-  the legacy `<video>` path.** A1/A2/A4 (codec-linked cost, the draw-frequency fix, moving VP9
-  to WebCodecs) all stand. The "VP9 decay" that briefly reopened this doc was a measurement
-  artifact and does not exist — see "Rendering pipeline" above. Do not re-run the DMA-BUF arm;
-  it made things worse and nothing here points at DMA-BUF.
-- `docs/design/audio-dropout-mid-playback.md` — 🔴 **still open, never reproduced on demand.**
-  10.8s of silence mid-track with the pipeline in `Playing` and the frame rate healthy, ~21s
-  after headphone cue was enabled. Its leading hypothesis H1 (main and cue `pulsesink`s
-  contending on one USB node) had its precondition **structurally removed** by the shared-output
-  default flip on 2026-08-11 — but the doc deliberately declines to call itself fixed on that
-  basis: it is a different fault, there is no reproducer, and ⚠️ **nothing in this pipeline can
-  see *clipping*** (the gap warning needs >1s of silence, `underrun` needs starvation), so **"the
-  log is clean" and "the artifact is gone" are very nearly independent statements**. Closing it
-  needs the 6:1 false-positive rate in `instrument_sink_flow()` fixed first, then a soak on the
-  shared path long enough to cover the original event's ~20-minute scale.
-- `docs/design/scratch-audio-downstream-delivery.md` — 🟢 **CLOSED 2026-08-08**, in two stages,
-  both user-confirmed live: `GstAudioBaseSink` resyncing its ringbuffer write pointer ~253ms
-  *backwards* after `discont-wait` expired (fixed by widening the sink's alignment tolerance for
-  the duration of a gesture), then the servo's designed `arrived ⇒ silence` firing in the gaps
-  between sparse pointer events (fixed by coasting — see "Direct manipulation" above). Keep the
-  doc's three standing cautions: a **sustained negative delivery margin during a scratch is the
-  fix working**, not a fault; `output_queue underrun` fires once per chunk by construction here
-  and adjudicates nothing; and both `arrived%` on a decelerating hand and `snaps` on a coarse
-  drag are silence **by design** — ask for slow, smooth, zoomed gestures when requesting a repro.
+`docs/design/README.md` is the status index for every doc in that directory — what's open,
+what's closed, what's a permanent reference — refreshed independently of each doc's own
+(sometimes stale) `Status:` line. **Moved there 2026-09-05** from a list that used to live in
+this section; check it before assuming a design doc's headline framing is current.
 
 ## Development phases
 

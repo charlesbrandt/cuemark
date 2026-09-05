@@ -7,7 +7,7 @@
 > in §1–§2 is real and `Jog scale` is a genuine taste lever, but it was never what the user was
 > hearing — and the same capture had digitally-silent headphone channels nobody had looked at.
 
-**Status (2026-08-11)**: 🟢 **ROOT-CAUSED — the fault condition is two `pulsesink`s on one
+**Status (2026-08-11)**: 🟢 **RESOLVED / ROOT-CAUSED — the fault condition is two `pulsesink`s on one
 PipeWire node.** §10.9 ran the complementary arm §10.8 asked for and closed the last confound:
 with **main** moved off the Starlight and **cue left exactly where it was** — same device, same
 `RL,RR` pair, same `analog-surround-40` profile, same 4-channel `mix-matrix` code path — the

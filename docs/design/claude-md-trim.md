@@ -1,6 +1,6 @@
 # Trim CLAUDE.md's accumulated investigation narrative
 
-**Status: ✅ EXECUTED 2026-08-12 — 772 → 639 lines, `## Architecture` 422 → 300.** All three
+**Status: ✅ RESOLVED (EXECUTED) 2026-08-12 — 772 → 639 lines, `## Architecture` 422 → 300.** All three
 blocks below were compacted as scoped, plus two adjacent ones of the same class (the
 DMA-BUF-retirement measurement narrative, and the VA-API-demotion block, which became
 redundant when `docs/environment.md` landed). Every cut fact was re-verified as greppable in

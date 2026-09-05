@@ -1,5 +1,12 @@
 # Jog-wheel scratch audio while paused (design, not implemented)
 
+**Status: 🟡 SUPERSEDED (vinyl mode) 2026-08-08 — not fixed, replaced.** The velocity-derived
+rate this doc designs was found to be the wrong approach for vinyl mode (see "Superseded for
+vinyl mode" below): burst-delivered USB MIDI ticks can't be divided into a reliable rate, so
+vinyl mode instead accumulates ticks into an absolute target position (`scratch_to()`,
+`docs/design/waveform-scrub.md`). **Shuttle mode still uses the velocity/EMA approach
+described here** — it remains the live design for that mode, so this doc is not fully retired.
+
 ## Goal
 
 Turning the jog wheel on a paused deck currently moves the position (see

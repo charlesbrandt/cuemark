@@ -1,6 +1,6 @@
 # Play pressed during a scratch gesture: lost transport + a runaway video clock (design)
 
-**Status: 🟢 CLOSED 2026-08-13. Root-caused from log forensics with no reproducer, fixed, and
+**Status: 🟢 RESOLVED / CLOSED 2026-08-13.** Root-caused from log forensics with no reproducer, fixed, and
 live-confirmed the same day — the deck now plays from where the gesture left off.**
 
 Two independent defects that only surface together, both reachable by an ordinary live

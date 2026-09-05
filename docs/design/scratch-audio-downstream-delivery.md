@@ -1,6 +1,6 @@
 # Scratch audio reaches GStreamer and never reaches the speakers — 2026-08-08
 
-**🟢 CLOSED 2026-08-08 (night) — root-caused, fixed, and verified live.**
+**🟢 RESOLVED / CLOSED 2026-08-08 (night) — root-caused, fixed, and verified live.**
 `GstAudioBaseSink` gave up masking the feeder's accumulated lateness after `discont-wait`
 (1s) and resynced its ringbuffer write pointer ~253ms *backwards*, behind the read
 pointer, so every subsequent buffer landed in already-played segments (F10). Widening

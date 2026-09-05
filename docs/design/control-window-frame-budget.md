@@ -1,6 +1,6 @@
 # Control-window frame budget: why the position poll is slow
 
-Status: **fixed and verified live (§7, 2026-08-04). A playing deck holds a flat ~61fps where
+Status: **RESOLVED (2026-08-04) — fixed and verified live (§7). A playing deck holds a flat ~61fps where
 it used to run 21fps and slide to 13.** The cause was `DeckCard` publishing its transport
 readout on every rAF tick; both writes are now rate-limited to the resolution they actually
 render at. Two earlier fixes landed and hold (the `postFrame` listener gate, the waveform bar

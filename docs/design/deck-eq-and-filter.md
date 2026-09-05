@@ -1,6 +1,6 @@
 # Deck EQ and sweep filter
 
-**Status**: 🟢 Built and **live-verified 2026-08-17** — user-confirmed audibly, on the real
+**Status**: 🟢 **RESOLVED (2026-08-17)** — built and live-verified, user-confirmed audibly, on the real
 Starlight, in both knob modes. The MIDI path resolves end to end across full travel with
 an exact centre:
 

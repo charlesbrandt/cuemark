@@ -1,6 +1,24 @@
 # Output window renders noise; second track load on a deck plays no audio; choppy audio
 
-Status: **OPEN.** Three live-hardware bugs, none root-caused. Bug C (choppy audio) was
+Status: **⚠️ STALE BANNER, corrected 2026-09-05 — the paragraph below is what this doc looked
+like at the start of the 2026-08-02 session and was never updated.** The doc goes on to cover
+**five** bugs, not three, and four of them are resolved:
+
+- **Bug A** (output window noise) — 🟢 RESOLVED. Root-caused twice over (2026-08-02: it was
+  never an output-window bug at all; 2026-08-03: the underlying Mesa `crocus` GPU→CPU readback
+  bug) and fixed structurally by the compositor-split architecture — see "Rendering pipeline"
+  in `CLAUDE.md`.
+- **Bug B** (second track load on a deck plays no audio) — 🟢 RESOLVED, see its section below.
+- **Bug C** (choppy audio) and **Bug D** (no master audio with cue enabled) — 🟢 RESOLVED
+  2026-08-02, both via the `sink_buffer_times()` 50ms/10ms → 200ms/20ms `buffer-time`/
+  `latency-time` change (see their sections below).
+- **Bug E** (UI freeze near end of track) — 🔴 still open at the time, since absorbed into
+  `docs/design/freeze-watchdog.md` and `docs/design/webcodecs-video-path.md` as the structural
+  freeze-recovery work. Not tracked here anymore.
+
+The original (now-stale) framing follows, kept for the diagnostic reasoning it captured:
+
+Three live-hardware bugs, none root-caused *as of 2026-08-02*. Bug C (choppy audio) was
 added in the 2026-08-02 follow-up session; that session's work was diagnostic rather than
 corrective — see "2026-08-02 follow-up" below — because all three symptoms share one
 root problem: **the logs cannot currently tell a working audio path from a broken one.**

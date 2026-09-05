@@ -1,6 +1,6 @@
 # Video not rendering on the webcodecs path (deck shows no picture, audio fine)
 
-Status: **FIXED and confirmed 2026-08-02** — user re-tested live after all three fixes
+Status: **RESOLVED / FIXED and confirmed 2026-08-02** — user re-tested live after all three fixes
 below and confirmed both audio and video play correctly for the original repro file (see
 "Bug 3", the one that actually explained the symptom). Captured 2026-08-02 during the
 live test of the
