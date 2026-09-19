@@ -236,8 +236,8 @@ export async function skipCurrentTrack(): Promise<void> {
   const rightDeck = getDeck(right);
   if (!leftDeck || !rightDeck) return;
 
-  if (activeRamp) {
-    debugLog(`[auto-dj] skip-now: a crossfade is already in flight, ignoring`);
+  if (activeRamp || previewInFlight) {
+    debugLog(`[auto-dj] skip-now: a crossfade or preview is already in flight, ignoring`);
     return;
   }
 
@@ -309,6 +309,27 @@ session.subscribe((s) => {
 // (crossfaderMapping never names more than two decks), and simpler than tracking one ramp per
 // deck pair for a case that can't currently arise.
 let activeRamp: { cancel: (reason?: string) => void } | null = null;
+
+// A preview seeks the outgoing deck to exactly the point the live trigger fires at and starts
+// it playing, then waits for the seek to settle before the ramp exists — a window in which
+// `activeRamp` is still null, so the real trigger claimed the deck and ran a second,
+// non-preview transition on top (live-hit 2026-09-19: two concurrent ramps, the outgoing deck
+// freed and the next queue track loaded onto it). This flag holds the automation off from the
+// moment the preview starts until its ramp ends. The timer is the fallback for every path that
+// never reaches a ramp (sync path bailing, a deck vanishing), so the guard can never stick.
+let previewInFlight = false;
+let previewGuardTimer: ReturnType<typeof setTimeout> | null = null;
+
+function beginPreviewGuard(maxMs: number): void {
+  previewInFlight = true;
+  if (previewGuardTimer) clearTimeout(previewGuardTimer);
+  previewGuardTimer = setTimeout(endPreviewGuard, maxMs);
+}
+
+function endPreviewGuard(): void {
+  previewInFlight = false;
+  if (previewGuardTimer) { clearTimeout(previewGuardTimer); previewGuardTimer = null; }
+}
 
 // Phase 4 (gap 1): where "near-end" is measured from. A set `outroPoint` (Digger's
 // auto-derived or manually-placed mix-out marker — see the Deck.outroPoint doc comment
@@ -477,6 +498,7 @@ function startCrossfadeRamp(
     done = true;
     cancelRaf(rafId);
     activeRamp = null;
+    if (preview) endPreviewGuard();
     if (reason) {
       debugLog(`[auto-dj] ramp aborted: deck-${outgoingId} -> deck-${incomingId} (${reason})`);
     } else {
@@ -757,6 +779,8 @@ export function previewTransition(outgoingId: string): void {
   activeRamp?.cancel("preview restarting");
 
   const plan = transitionPlan(zonesOf(outgoing), zonesOf(incoming));
+  // Seek settle (200ms) + sync settle + the fade itself, with generous slack.
+  beginPreviewGuard(plan.ms + 8000);
   const startAt = Math.max(0, nearEndReference(outgoing.outroPoint, outgoing.source.duration) - plan.leadSec);
   const target: 0 | 1 = outgoingId === left ? 1 : 0;
 
@@ -775,7 +799,7 @@ export function previewTransition(outgoingId: string): void {
   setTimeout(() => {
     const out = getDeck(outgoingId);
     const inc = getDeck(incomingId);
-    if (!out || !inc) { debugLog(`[auto-dj] preview: aborted, a deck vanished during seek settle`); return; }
+    if (!out || !inc) { endPreviewGuard(); debugLog(`[auto-dj] preview: aborted, a deck vanished during seek settle`); return; }
     beginTransition(outgoingId, incomingId, inc, target, plan.ms, { preview: true });
   }, 200);
 }
@@ -786,7 +810,7 @@ export function previewTransition(outgoingId: string): void {
  * closing in on its end with the other half already loaded and idle.
  */
 export function checkAutoMixTrigger(deckId: string, contentPos: number): void {
-  if (!get(autoDjEnabled) || activeRamp) return;
+  if (!get(autoDjEnabled) || activeRamp || previewInFlight) return;
 
   const s = get(session);
   const { left, right } = s.crossfaderMapping;
@@ -832,7 +856,7 @@ const preloadedFor = new Map<string, string>();
  * ended. See the design doc's phase 2 and `pickNextTrack`'s own comment.
  */
 export function checkAutoPreloadTrigger(deckId: string, contentPos: number): void {
-  if (!get(autoDjEnabled)) return;
+  if (!get(autoDjEnabled) || previewInFlight) return;
 
   const s = get(session);
   const { left, right } = s.crossfaderMapping;

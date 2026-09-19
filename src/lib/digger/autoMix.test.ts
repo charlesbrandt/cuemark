@@ -1111,6 +1111,36 @@ describe('previewTransition (Phase 6 — audition the transition)', () => {
     expect(markSkipped).not.toHaveBeenCalled();
   });
 
+  it('holds the live trigger off during the seek-settle window, so Auto DJ cannot run a second transition (live-hit 2026-09-19)', async () => {
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, runToCompletion } = await setup();
+    autoDjMod.autoDjEnabled.set(true); // the case that raced: preview with Auto DJ ON
+    autoMixMod.autoMixThresholdSec.set(15);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    resetSession([
+      baseDeck('deck-0', { source: videoSource('a.mp4', 200), outroPoint: 180 }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 200) }),
+    ]);
+
+    autoMixMod.previewTransition('deck-0');
+    // The position poll lands on the trigger point before the preview's ramp exists.
+    autoMixMod.checkAutoMixTrigger('deck-0', 160.8);
+    expect(autoMixMod.wasAutoMixTriggered('deck-0', 'a.mp4')).toBe(false);
+
+    await new Promise((r) => setTimeout(r, 250));
+    runToCompletion(1000);
+
+    const deck0 = get(sessionMod.session).decks.find((d) => d.id === 'deck-0')!;
+    expect(deck0.source).not.toBeNull(); // still loaded: only the preview ran
+    expect(autoMixMod.wasAutoMixTriggered('deck-0', 'a.mp4')).toBe(false);
+
+    // And the guard is released once the preview ends: the live trigger works again (the
+    // preview left both decks paused, so put the outgoing one back in play first).
+    sessionMod.updateDeck('deck-0', { playing: true });
+    sessionMod.updateDeck('deck-1', { playing: false });
+    autoMixMod.checkAutoMixTrigger('deck-0', 160.8);
+    expect(autoMixMod.wasAutoMixTriggered('deck-0', 'a.mp4')).toBe(true);
+  });
+
   it('refuses when the other crossfader deck has nothing loaded', async () => {
     const { sessionMod, autoMixMod, resetSession } = await setup();
     resetSession([
