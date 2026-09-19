@@ -63,6 +63,10 @@ pub const RECORD_DEVICE_KEY: &str = "__record__";
 /// Identifies one deck output attached to a node: `("deck-0", "main0")` / `("deck-0", "cue")`.
 pub type BranchKey = (String, String);
 
+/// The clock `docs/design/shared-output-pipeline.md`'s clock section describes. Anything
+/// else is warned about once per graph — see `create_node()`.
+const EXPECTED_SHARED_CLOCK: &str = "GstSystemClock";
+
 /// Elements of one attached branch, kept so it can be detached again cleanly.
 struct Branch {
     appsrc: AppSrc,
@@ -113,6 +117,18 @@ pub struct OutputGraph {
     /// `RECORD_DEVICE_KEY`. Must be set (via `set_record_target()`) before that first attach;
     /// see that method's doc comment for why this can't just be a parameter on `attach()`.
     record_target: Option<(std::path::PathBuf, RecordFormat)>,
+    /// Epoch milliseconds of the last buffer *any* node handed to a real device (0 = none
+    /// yet) — see `device_activity_handle()`.
+    last_device_buffer_ms: Arc<AtomicU64>,
+}
+
+/// What `[census]` reports about this graph. `appsrcs` is counted by walking each node's
+/// pipeline rather than derived from `branches`, deliberately: the two are equal by
+/// construction, so a divergence is a branch whose elements were never removed.
+pub struct GraphCensus {
+    pub nodes: usize,
+    pub branches: usize,
+    pub appsrcs: usize,
 }
 
 impl OutputGraph {
@@ -123,6 +139,43 @@ impl OutputGraph {
             shared_clock: None,
             extra_latency: HashMap::new(),
             record_target: None,
+            last_device_buffer_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Epoch milliseconds of the last buffer any node delivered to a real device — the
+    /// graph's own "how long has this output been idle" clock, shared lock-free with every
+    /// deck so a `[audio/deck-N] play:` line can report it without taking this mutex on a
+    /// bus thread.
+    ///
+    /// Added 2026-09-19 for the incident in `docs/design/shared-output-pipeline.md`
+    /// ("Clock reference drifting while idle"): the offset a resumed deck came back with
+    /// tracked how long *the graph* had been silent, not how old the deck's pipeline was,
+    /// so the idle span is the variable to record beside every play.
+    pub fn device_activity_handle(&self) -> Arc<AtomicU64> {
+        self.last_device_buffer_ms.clone()
+    }
+
+    /// Node/branch/appsrc counts for the 5-minute `[census]` line — see `GraphCensus`.
+    pub fn census(&self) -> GraphCensus {
+        let appsrcs = self
+            .nodes
+            .values()
+            .map(|n| {
+                let mut count = 0usize;
+                let mut it = n.pipeline.iterate_elements();
+                while let Ok(Some(el)) = it.next() {
+                    if el.factory().map(|f| f.name() == "appsrc").unwrap_or(false) {
+                        count += 1;
+                    }
+                }
+                count
+            })
+            .sum();
+        GraphCensus {
+            nodes: self.nodes.len(),
+            branches: self.nodes.values().map(|n| n.branches.len()).sum(),
+            appsrcs,
         }
     }
 
@@ -474,6 +527,20 @@ impl OutputGraph {
         }
         let sink = tail.last().expect("tail is non-empty").clone();
 
+        // Stamp the graph's last-delivery clock on every buffer that reaches a real
+        // device. Not the record node: a file sink says nothing about whether the
+        // *outputs* are idle, which is the only thing this measures. One relaxed store
+        // per buffer, no allocation — see `device_activity_handle()`.
+        if node_name != RECORD_DEVICE_KEY {
+            if let Some(pad) = sink.static_pad("sink") {
+                let activity = self.last_device_buffer_ms.clone();
+                pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                    activity.store(crate::epoch_ms() as u64, Ordering::Relaxed);
+                    gst::PadProbeReturn::Ok
+                });
+            }
+        }
+
         let latency_ns = Arc::new(AtomicU64::new(0));
         // The record node is the one exception — see `finish_recording()`'s doc comment on
         // why it must be the sole consumer of its own bus, for its entire life.
@@ -566,8 +633,9 @@ impl OutputGraph {
             let from_sink = sink.provide_clock();
             let chosen = from_sink.clone().or_else(|| pipeline.clock());
             if let Some(clock) = chosen {
+                let kind = clock.type_().name().to_string();
                 log::info!(
-                    "[audio/out/{}] shared clock for every deck pipeline: {} ({})",
+                    "[audio/out/{}] shared clock for every deck pipeline: {} [{kind}] ({})",
                     short(&node_name),
                     clock.name(),
                     if from_sink.is_some() {
@@ -576,6 +644,23 @@ impl OutputGraph {
                         "pipeline fallback — pulsesink slaves its device to this; see OutputGraph::create_node"
                     }
                 );
+                // ⚠️ **The docs describe one clock; say so loudly when it is another.**
+                // `GstSystemClock` is what the design (and the reasoning about
+                // `pulsesink` slaving its device to it) assumes. A 2026-09-19 run came up
+                // on `GstPulseSinkClock` instead, and that run is the one where a deck's
+                // `[deliver-tel]` margin read minus the process's whole uptime. The
+                // mechanism is unproven, so this does not claim a cause — it makes the
+                // discrepancy impossible to miss in a log, once per graph.
+                if kind != EXPECTED_SHARED_CLOCK {
+                    log::warn!(
+                        "[audio/out/{}] shared clock is {kind}, not {EXPECTED_SHARED_CLOCK} — \
+                         docs/design/shared-output-pipeline.md's clock section assumes the \
+                         latter. Not known to be a fault in itself; it is recorded because \
+                         the one observed run of the idle-clock-drift incident \
+                         (2026-09-19) had this clock. Read [deliver-tel]'s margin next.",
+                        short(&node_name)
+                    );
+                }
                 self.shared_clock = Some(clock);
             } else {
                 log::warn!(
@@ -850,6 +935,13 @@ fn short(node_name: &str) -> String {
         return format!("snap-{host}:{port}");
     }
     node_name.rsplit('.').next().unwrap_or(node_name).to_string()
+}
+
+/// The name the graph itself would print for the node a device id lands on — so a deck's
+/// own warnings can say *which* device went quiet in the same words the `[audio/out/…]`
+/// lines use, instead of an index nobody can map back to hardware.
+pub fn device_short_name(device: &str) -> String {
+    short(node_key(device))
 }
 
 /// An output pipeline has no owner watching it, so its errors would otherwise be silent —

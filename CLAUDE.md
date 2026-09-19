@@ -312,9 +312,12 @@ node is *sufficient*, so the fix reaches that configuration structurally.
 - **`is-live=true` on every output `appsrc`.** With it false the mixer emits **zero** buffers
   for as long as any branch is idle — one paused deck silences the whole node. Measured:
   `scripts/probes/shared_output_mixer_probe.py --not-live`.
-- **Deck pipelines `use_clock()` the graph's clock** — in practice `GstSystemClock`, with
-  `pulsesink` slaving its device to it rather than the device clock the design first assumed.
-  The log line says which.
+- **Deck pipelines `use_clock()` the graph's clock** — whichever clock the log line names,
+  which is not always the same one: `GstSystemClock` (with `pulsesink` slaving its device to
+  it) on the 2026-08-11 runs, and **`GstPulseSinkClock` measured on 2026-09-19**. Read the
+  `shared clock for every deck pipeline: … [GstType]` line rather than assuming; anything
+  other than `GstSystemClock` now warns once per graph. No cause is claimed for the
+  difference — see "Clock reference drifting while idle" in the design doc.
 - **`position()` subtracts the graph's latency — measured 171.3ms.** An `appsink` reports the
   last buffer handed off, not what the device is playing. Uncorrected, video leads audio by a
   sixth of a second on every deck, constantly, and it reads exactly like "the video decoder is

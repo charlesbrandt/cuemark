@@ -21,7 +21,7 @@ type EosCallback = Arc<dyn Fn() + Send + Sync>;
 use gstreamer::{self as gst, glib, prelude::*};
 use gstreamer_app::{AppSink, AppSrc};
 
-use super::mixer::{wire_handoff, BranchKey, HandoffCounters, OutputGraph, RECORD_DEVICE_KEY};
+use super::mixer::{self, wire_handoff, BranchKey, HandoffCounters, OutputGraph, RECORD_DEVICE_KEY};
 use tauri::Emitter;
 use super::analysis;
 use super::pcm_buffer::{self, PcmBuffer};
@@ -214,6 +214,14 @@ fn instrument_queue_flow(
 /// broke the 2026-08-05 investigation open — that the stall began within 200 ms of an
 /// `output_queue underrun` — had to be back-computed by hand from the duration, and was
 /// nearly missed.
+///
+/// It also reports **how fast audio was delivered in the span before the gap**
+/// (2026-09-19). A gap alone cannot distinguish the two faults that produce it: a sink
+/// that is *starved* (upstream stopped) delivers under 1× real time right up to the
+/// silence, while a sink that has *stopped pacing* dumps a burst well above 1× and then
+/// goes quiet — which is what the 2026-09-19 incident's sinks did (measured 3.6×). The
+/// ratio is the only field that separates them, and without it the same warning text was
+/// read as "starved" for a whole session.
 fn instrument_sink_flow(
     sink: &gst::Element,
     deck_id: &str,
@@ -228,7 +236,7 @@ fn instrument_sink_flow(
     let probe_state = state.clone();
     let deck_id = deck_id.to_string();
     let label = label.to_string();
-    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+    pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
         let is_playing = gates.iter().all(|g| g.load(Ordering::Relaxed));
         let now = Instant::now();
         let mut st = probe_state.lock().unwrap();
@@ -245,18 +253,70 @@ fn instrument_sink_flow(
             if let Some(prev) = st.last {
                 let gap = now.duration_since(prev);
                 if gap > Duration::from_secs(1) {
+                    // The window measured is the delivering span *before* the gap
+                    // (window start → last buffer), not the span including it: a burst
+                    // followed by silence averages back to ~1× and says nothing.
+                    let pace = st
+                        .window_start
+                        .map(|start| (st.window_content_secs, prev.duration_since(start).as_secs_f64()))
+                        .and_then(|(content, wall)| {
+                            delivery_ratio(content, wall).map(|r| (r, content, wall))
+                        })
+                        .map(|(ratio, content, wall)| {
+                            format!(
+                                " Before it, this sink took {content:.1}s of audio in {wall:.1}s \
+                                 = {ratio:.1}× real time ({}).",
+                                if ratio > 1.2 {
+                                    "faster than real time — the sink was not pacing, it was \
+                                     being drained"
+                                } else if ratio < 0.8 {
+                                    "slower than real time — the sink was starved from upstream"
+                                } else {
+                                    "real time — delivery was healthy right up to the gap"
+                                }
+                            )
+                        })
+                        .unwrap_or_default();
                     log::warn!(
                         "[audio/{deck_id}] {label}: buffer flow resumed after a {:.1}s gap \
                          (began {}) — the device received no audio for that span, and the \
-                         pipeline was Playing throughout. See instrument_sink_flow()'s doc \
-                         comment.",
+                         pipeline was Playing throughout.{pace} See instrument_sink_flow()'s \
+                         doc comment.",
                         gap.as_secs_f64(),
                         wall_clock_utc(SystemTime::now().checked_sub(gap)),
                     );
+                    st.reset_window();
+                }
+            }
+            // Same frame arithmetic `[level/deck-N]`'s `frames=` uses — see `pad_frames`.
+            // The buffer that *opens* a window contributes no content to it: what the
+            // ratio measures is the audio that arrived between the window's first buffer
+            // and its last, against the wall time between those same two moments.
+            // Counting the opening buffer's content would bias every short window high,
+            // in the same direction as the fault.
+            if let Some(buf) = info.buffer() {
+                // And it is bounded. Left to run for the whole playback span, a burst in
+                // the seconds before a gap is averaged away by the healthy minutes ahead
+                // of it and every warning reports ~1.0× — which is the one reading this
+                // field must never give when the sink has stopped pacing.
+                if st.window_start.is_some_and(|s| now.duration_since(s) > SINK_PACE_WINDOW) {
+                    st.reset_window();
+                }
+                match st.window_start {
+                    None => st.window_start = Some(now),
+                    Some(_) => {
+                        let (channels, rate) = pad_audio_format(pad);
+                        st.window_content_secs +=
+                            pad_frames(buf.size(), channels) as f64 / rate as f64;
+                    }
                 }
             }
         }
-        st.last = if is_playing { Some(now) } else { None };
+        if is_playing {
+            st.last = Some(now);
+        } else {
+            st.invalidate();
+        }
         gst::PadProbeReturn::Ok
     });
     Some(state)
@@ -269,6 +329,65 @@ fn instrument_sink_flow(
 struct SinkFlow {
     first_logged: bool,
     last: Option<Instant>,
+    /// Start of the span the delivery ratio is measured over, and the content time
+    /// delivered in it. Reset alongside `last` for exactly the same reason: a ratio that
+    /// spans a pause measures the pause, not the sink.
+    window_start: Option<Instant>,
+    window_content_secs: f64,
+}
+
+impl SinkFlow {
+    /// Forget everything a gap or a pace could be measured *from*. Called by the probe
+    /// itself when a buffer arrives with the gates closed, and by the bus thread /
+    /// `set_cue_enabled()` on the way down — see `instrument_sink_flow()`'s doc comment
+    /// for why both sides are needed.
+    fn invalidate(&mut self) {
+        self.last = None;
+        self.reset_window();
+    }
+
+    fn reset_window(&mut self) {
+        self.window_start = None;
+        self.window_content_secs = 0.0;
+    }
+}
+
+/// How much of the recent past the sink-flow delivery ratio covers. Long enough to be a
+/// rate at any buffer size, short enough that a burst immediately before a gap is not
+/// diluted by the healthy playback ahead of it.
+const SINK_PACE_WINDOW: Duration = Duration::from_secs(10);
+
+/// Content seconds delivered per wall-clock second. `None` when the window is too short
+/// to divide by — a single buffer is not a rate.
+///
+/// `> 1` means the sink accepted audio faster than it could be played, i.e. it stopped
+/// pacing against the clock; `< 1` means it was starved. See `instrument_sink_flow()`.
+fn delivery_ratio(content_secs: f64, wall_secs: f64) -> Option<f64> {
+    if !(wall_secs.is_finite() && content_secs.is_finite()) || wall_secs < 0.2 {
+        return None;
+    }
+    Some(content_secs / wall_secs)
+}
+
+/// Channels and sample rate on a pad, from its current caps. Falls back to the graph's
+/// own pinned format (48kHz stereo, `deck_output_caps()`) when caps cannot be read, which
+/// is only ever true before negotiation.
+fn pad_audio_format(pad: &gst::Pad) -> (usize, u32) {
+    let Some(s) = pad.current_caps().and_then(|c| c.structure(0).map(|s| s.to_owned())) else {
+        return (2, 48_000);
+    };
+    (
+        s.get::<i32>("channels").unwrap_or(2).max(1) as usize,
+        s.get::<i32>("rate").unwrap_or(48_000).max(1) as u32,
+    )
+}
+
+/// Frames in an F32LE buffer: 4 bytes per sample, `channels` samples per frame. The one
+/// place this arithmetic lives — `instrument_level()`'s `frames=` and
+/// `instrument_sink_flow()`'s delivery ratio both go through it, so the two instruments
+/// cannot come to disagree about how much audio passed a pad.
+fn pad_frames(bytes: usize, channels: usize) -> u64 {
+    (bytes / 4 / channels.max(1)) as u64
 }
 
 /// Shared with the bus thread so a transition out of `Playing` can invalidate the last
@@ -312,6 +431,11 @@ struct DeliveryProbe {
     /// Most recent buffer's running time minus the element's current running time, in
     /// microseconds. `i64::MIN` = never set (no PTS, or no clock yet).
     margin_us: AtomicI64,
+    /// Epoch milliseconds of the most recent buffer (0 = never). Unlike `count`, this
+    /// answers "how long has this branch been dry" without a second sample to difference
+    /// against — which is what a one-shot line (`[audio/deck-N] play:`) needs, and what a
+    /// deck resumed after 48 minutes of idle had no way to report on 2026-09-19.
+    last_buffer_ms: AtomicU64,
 }
 
 /// All delivery probes for one pipeline, shared with the scratch feeder so a gesture's
@@ -319,29 +443,157 @@ struct DeliveryProbe {
 /// correlating them by hand across two log lines is what made this fault hard to read.
 type DeliveryProbes = Arc<Vec<Arc<DeliveryProbe>>>;
 
-fn instrument_delivery(element: &gst::Element, pad_name: &str, label: &str) -> Option<Arc<DeliveryProbe>> {
+/// `play_report`, when present, is completed by the first buffer this pad sees after each
+/// `Paused → Playing` — see `PlayReport`. Only the primary main sink passes one; every
+/// other pad passes `None` and pays one relaxed load per buffer for it.
+fn instrument_delivery(
+    element: &gst::Element,
+    pad_name: &str,
+    label: &str,
+    play_report: Option<Arc<PlayReport>>,
+) -> Option<Arc<DeliveryProbe>> {
     let pad = element.static_pad(pad_name)?;
     let probe = Arc::new(DeliveryProbe {
         label: label.to_string(),
         count: AtomicU64::new(0),
         margin_us: AtomicI64::new(i64::MIN),
+        last_buffer_ms: AtomicU64::new(0),
     });
     let probe_ref = probe.clone();
     // Weak, so the probe closure can never keep the element alive across a rebuild.
     let elem_weak = element.downgrade();
     pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
         probe_ref.count.fetch_add(1, Ordering::Relaxed);
+        probe_ref.last_buffer_ms.store(crate::epoch_ms() as u64, Ordering::Relaxed);
+        let mut margin_us = None;
         if let Some(gst::PadProbeData::Buffer(buf)) = &info.data {
             if let (Some(pts), Some(elem)) = (buf.pts(), elem_weak.upgrade()) {
                 if let Some(now) = elem.current_running_time() {
                     let margin_ns = pts.nseconds() as i64 - now.nseconds() as i64;
                     probe_ref.margin_us.store(margin_ns / 1000, Ordering::Relaxed);
+                    margin_us = Some(margin_ns / 1000);
                 }
             }
+        }
+        if let Some(report) = &play_report {
+            report.first_buffer(margin_us);
         }
         gst::PadProbeReturn::Ok
     });
     Some(probe)
+}
+
+/// The per-play record: one `[audio/deck-N] play:` line on every `Paused → Playing`, plus
+/// a one-shot follow-up naming the margin the first delivered buffer actually came back
+/// with.
+///
+/// **Why a play needs its own line at all** (2026-09-19). Both halves of that incident
+/// were invisible in the standing instruments. A deck resumed after ~48 minutes idle
+/// delivered *zero* buffers for 34 s while reporting `Playing`, and a freshly loaded
+/// pipeline on the same idle graph came back with a margin of ≈ −2,860 s — about the idle
+/// span, not the pipeline's own age. Neither number exists in `[deliver-tel]`, which only
+/// reports a *playing* deck every 5 s and re-baselines across the pause; the conditions
+/// that distinguish a healthy play from that one (how long the pipeline has existed, how
+/// long this branch and the whole graph have been dry, which clock is in use) are only
+/// knowable at the moment play is pressed.
+///
+/// Two lines, not one, and deliberately: the arming line goes out at the transition so it
+/// is still logged when *no buffer ever arrives* — which is the interesting case and the
+/// one a first-buffer-only line would silently omit. The follow-up carries the margin and
+/// the delay, and its absence is itself the reading.
+struct PlayReport {
+    deck_id: String,
+    /// When `load()` built this pipeline, for the "pipeline age" field.
+    built_at: Instant,
+    /// Short name of the output node this deck's primary main branch feeds.
+    node: String,
+    /// Epoch ms of the last buffer *any* node delivered to a device — see
+    /// `OutputGraph::device_activity_handle()`. The suspected independent variable.
+    graph_activity_ms: Arc<AtomicU64>,
+    /// The primary main branch's delivery probe, for its last-buffer time. Weak: this
+    /// report is held by that probe's own closure.
+    sink_probe: Mutex<Option<std::sync::Weak<DeliveryProbe>>>,
+    /// Armed by the bus thread at the transition, consumed by the next buffer. Checked
+    /// with a relaxed load on the streaming thread so the common (unarmed) case never
+    /// takes the mutex below.
+    armed: AtomicBool,
+    pending: Mutex<Option<Instant>>,
+}
+
+impl PlayReport {
+    fn new(deck_id: &str, node: String, graph_activity_ms: Arc<AtomicU64>) -> Arc<Self> {
+        Arc::new(Self {
+            deck_id: deck_id.to_string(),
+            built_at: Instant::now(),
+            node,
+            graph_activity_ms,
+            sink_probe: Mutex::new(None),
+            armed: AtomicBool::new(false),
+            pending: Mutex::new(None),
+        })
+    }
+
+    /// Called from the bus thread on `Paused → Playing`.
+    fn arm(&self, pipeline: &gst::Pipeline) {
+        let now_ms = crate::epoch_ms() as u64;
+        let deck_idle = self
+            .sink_probe
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .map(|p| p.last_buffer_ms.load(Ordering::Relaxed))
+            .filter(|&ms| ms > 0)
+            .map(|ms| (now_ms.saturating_sub(ms)) as f64 / 1000.0);
+        let graph_idle = match self.graph_activity_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some((now_ms.saturating_sub(ms)) as f64 / 1000.0),
+        };
+        let clock = pipeline
+            .clock()
+            .map(|c| format!("{} [{}]", c.name(), c.type_().name()))
+            .unwrap_or_else(|| "none".to_string());
+        log::info!(
+            "[audio/{}] play: pipeline age {}, idle-since-last-buffer {}, graph idle {}, \
+             shared clock {clock}, node {}, margin at first buffer pending",
+            self.deck_id,
+            format_hms(self.built_at.elapsed().as_secs_f64()),
+            opt_secs(deck_idle),
+            opt_secs(graph_idle),
+            self.node,
+        );
+        *self.pending.lock().unwrap() = Some(Instant::now());
+        self.armed.store(true, Ordering::Relaxed);
+    }
+
+    /// Called from the sink's streaming thread for every buffer; does nothing unless a
+    /// play is waiting to be completed.
+    fn first_buffer(&self, margin_us: Option<i64>) {
+        // Load before swap: the common case is "not armed", and a plain load is cheaper
+        // than a read-modify-write on a pad that sees ~50 buffers a second per deck.
+        if !self.armed.load(Ordering::Relaxed) || !self.armed.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let Some(armed_at) = self.pending.lock().unwrap().take() else { return };
+        log::info!(
+            "[audio/{}] play: first buffer {:.0}ms after Playing, margin {}",
+            self.deck_id,
+            armed_at.elapsed().as_secs_f64() * 1000.0,
+            margin_us
+                .map(|us| format!("{:+.0}ms", us as f64 / 1000.0))
+                .unwrap_or_else(|| "no ts".to_string()),
+        );
+    }
+}
+
+/// `4h 2m 11s`, for an age nobody wants to divide by 3600 in their head at 2am.
+fn format_hms(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    format!("{}h {}m {}s", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+fn opt_secs(v: Option<f64>) -> String {
+    v.map(|s| format!("{s:.1}s")).unwrap_or_else(|| "never".to_string())
 }
 
 /// Report every `DeliveryProbe` on this pipeline once per 5s **while the deck is playing**,
@@ -373,10 +625,17 @@ fn instrument_delivery(element: &gst::Element, pad_name: &str, label: &str) -> O
 /// Terminates when the pipeline is torn down: it holds a `Weak` to the probe vec, which
 /// only `PipelineInner` (and any live scratch feeder) keeps alive, so a rebuild drops it
 /// and the next tick exits rather than leaking a thread per `set_devices()`.
+///
+/// It also runs the **margin watchdog** (2026-09-19) — see `MarginWatchdog`. Until then
+/// nothing in the app ever *acted* on `margin`: on the incident run it sat at
+/// −689,001,487 ms (about the process's 8-day uptime) at INFO level among thousands of
+/// other lines, and the set was over before anyone read it.
 fn spawn_delivery_reporter(
     deck_id: &str,
+    node: &str,
     probes: &DeliveryProbes,
     playing: &Arc<AtomicBool>,
+    scratching: &Arc<AtomicBool>,
     handoffs: Vec<(String, Arc<HandoffCounters>)>,
 ) {
     if probes.is_empty() {
@@ -384,8 +643,16 @@ fn spawn_delivery_reporter(
     }
     let weak = Arc::downgrade(probes);
     let playing = playing.clone();
+    let scratching = scratching.clone();
     let deck_id = deck_id.to_string();
+    let node = node.to_string();
     std::thread::spawn(move || {
+        let mut watchdog = MarginWatchdog::default();
+        // A gesture anywhere inside the window disqualifies the whole window, not just
+        // the 1s sample it landed in: the margin it drives negative is still negative at
+        // the window's boundary, so sampling scratch state only at report time would let
+        // a gesture that ended two seconds ago be read as a clock fault.
+        let mut scratch_in_window = false;
         // Per-label: last cumulative count, and the accumulating window stats.
         let mut last_counts: Vec<u64> = Vec::new();
         let mut win_total: Vec<u64> = Vec::new();
@@ -413,7 +680,12 @@ fn spawn_delivery_reporter(
             }
 
             let is_playing = playing.load(Ordering::Relaxed);
+            if scratching.load(Ordering::Relaxed) {
+                scratch_in_window = true;
+            }
             if !is_playing {
+                watchdog.observe(None, false, scratch_in_window);
+                scratch_in_window = false;
                 // Re-baseline without reporting: the counts kept moving during preroll and
                 // will move again on resume, and a delta spanning the pause is not a rate.
                 for (i, p) in probes.iter().enumerate() {
@@ -509,6 +781,33 @@ fn spawn_delivery_reporter(
             }
             log::info!("[deliver-tel/{deck_id}] {report}{handoff}");
 
+            // Deck-level verdict: the worst |margin| any branch ended the window on. A
+            // single number, because the fault this watches for is not per-branch — the
+            // clock reference belongs to the pipeline, and on the incident run both
+            // decks' every probe carried the same enormous offset.
+            let worst = win_margin_last
+                .iter()
+                .filter(|&&m| m != i64::MIN)
+                .max_by_key(|&&m| m.abs())
+                .map(|&m| m as f64 / 1000.0);
+            if watchdog.observe(worst, true, scratch_in_window) {
+                let off = worst.unwrap_or(0.0) / 1000.0;
+                log::warn!(
+                    "[audio/{deck_id}] CLOCK REFERENCE OFF BY {off:+.1}s on node {node} — \
+                     buffers are being handed to the sink that far from its own running \
+                     time, for {MARGIN_WATCHDOG_WINDOWS} consecutive 5s windows while \
+                     playing (and not during a scratch gesture). The sink has stopped \
+                     pacing against the clock: expect audio delivered in bursts followed \
+                     by second-long gaps (see this deck's 'buffer flow resumed after a \
+                     gap' warnings and their delivered-vs-real-time ratio), and eventually \
+                     no audible output at all while every transport instrument still reads \
+                     healthy. The known cure is an app restart; see \
+                     docs/design/shared-output-pipeline.md, 'Clock reference drifting \
+                     while idle'."
+                );
+            }
+            scratch_in_window = false;
+
             for i in 0..probes.len() {
                 win_total[i] = 0;
                 win_min[i] = f64::MAX;
@@ -517,6 +816,168 @@ fn spawn_delivery_reporter(
             samples = 0;
         }
     });
+}
+
+/// Consecutive `[deliver-tel]` windows (5s each) a deck must spend past
+/// `MARGIN_WARN_THRESHOLD_MS` before the watchdog speaks. Two windows is ~10s of
+/// sustained offset: long enough that nothing transient survives it, short enough to name
+/// the fault while the set is still running.
+const MARGIN_WATCHDOG_WINDOWS: u32 = 2;
+
+/// |margin| past which a window counts as a breach. A healthy deck sits in the low
+/// hundreds of milliseconds at most; the incident run read −689,001,487 ms, so the
+/// threshold is nowhere near either population and its exact value is not delicate.
+const MARGIN_WARN_THRESHOLD_MS: f64 = 1000.0;
+
+/// |margin| a window must come back inside before the watchdog will warn again. The gap
+/// between this and the threshold is plain hysteresis: without it a margin hovering at
+/// the boundary re-arms and re-fires every ten seconds for the rest of the set.
+const MARGIN_REARM_MS: f64 = 500.0;
+
+/// Decides when the margin watchdog should speak. Pure and GStreamer-free so the
+/// decision — which is the whole of the feature, the logging being one line — can be
+/// tested against a window sequence instead of against a live pipeline.
+///
+/// One WARN per deck per episode: `fired` stays set until a window comes back inside
+/// `MARGIN_REARM_MS`, which is what stops a fault that persists for hours from writing
+/// the same paragraph into the log 400 times.
+#[derive(Default)]
+struct MarginWatchdog {
+    breaches: u32,
+    /// True once this episode has been reported. Cleared only by a return to normal.
+    fired: bool,
+}
+
+impl MarginWatchdog {
+    /// One window's verdict. `true` means "warn now".
+    ///
+    /// ⚠️ **A scratch gesture drives margin legitimately negative and must never trip
+    /// this.** The feeder pushes `do-timestamp`ed buffers at wall-clock pace with no head
+    /// start, so during a gesture buffers routinely arrive at or behind the element's
+    /// running time — that is H5's whole measurement premise (see `DeliveryProbe`), not a
+    /// fault. A window containing any scratch is discarded rather than re-armed: the
+    /// gesture says nothing about whether the clock recovered.
+    ///
+    /// A paused deck is discarded for the same reason. Neither case re-arms.
+    fn observe(&mut self, margin_ms: Option<f64>, playing: bool, scratching: bool) -> bool {
+        if !playing || scratching {
+            self.breaches = 0;
+            return false;
+        }
+        // No timestamped buffer in the window: nothing was measured, so nothing is
+        // claimed. (A deck delivering *nothing* is the `min 0/s` reading in the same
+        // line, a different fault with a different instrument.)
+        let Some(margin_ms) = margin_ms else {
+            self.breaches = 0;
+            return false;
+        };
+        let magnitude = margin_ms.abs();
+        if magnitude > MARGIN_WARN_THRESHOLD_MS {
+            self.breaches += 1;
+            if self.breaches >= MARGIN_WATCHDOG_WINDOWS && !self.fired {
+                self.fired = true;
+                return true;
+            }
+            return false;
+        }
+        self.breaches = 0;
+        if magnitude <= MARGIN_REARM_MS {
+            self.fired = false;
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod audio_health_tests {
+    use super::*;
+
+    /// Feed a window sequence and collect the windows that warned.
+    fn run(windows: &[(Option<f64>, bool, bool)]) -> Vec<usize> {
+        let mut wd = MarginWatchdog::default();
+        windows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &(m, playing, scratching))| {
+                wd.observe(m, playing, scratching).then_some(i)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn warns_once_after_n_consecutive_bad_windows() {
+        // One bad window is not enough; the second one fires; the rest stay silent
+        // however long the fault lasts.
+        let bad = (Some(-689_001_487.0), true, false);
+        assert_eq!(run(&[bad; 6]), vec![MARGIN_WATCHDOG_WINDOWS as usize - 1]);
+    }
+
+    #[test]
+    fn a_healthy_window_between_breaches_resets_the_count() {
+        let bad = (Some(-4_000.0), true, false);
+        let ok = (Some(-12.0), true, false);
+        assert!(run(&[bad, ok, bad, ok, bad]).is_empty());
+    }
+
+    #[test]
+    fn re_arms_only_after_the_margin_comes_back_inside_the_band() {
+        let bad = (Some(2_500.0), true, false);
+        // 700ms is past the re-arm band but under the warn threshold — the hysteresis
+        // gap. It must NOT re-arm, or a margin hovering at the boundary warns forever.
+        let hovering = (Some(700.0), true, false);
+        let recovered = (Some(100.0), true, false);
+        assert_eq!(run(&[bad, bad, hovering, bad, bad]), vec![1]);
+        assert_eq!(run(&[bad, bad, recovered, bad, bad]), vec![1, 4]);
+    }
+
+    #[test]
+    fn a_scratch_gesture_never_trips_it() {
+        // A gesture drives margin negative by construction (see MarginWatchdog::observe).
+        // Even an extreme value, for many windows, must stay silent — and must not leave
+        // a breach behind that the first post-gesture window then completes.
+        let scratching = (Some(-50_000.0), true, true);
+        assert!(run(&[scratching; 8]).is_empty());
+        let bad = (Some(-50_000.0), true, false);
+        assert_eq!(run(&[scratching, scratching, bad, bad]), vec![3]);
+    }
+
+    #[test]
+    fn a_paused_deck_never_trips_it() {
+        let paused = (Some(-9_000.0), false, false);
+        assert!(run(&[paused; 5]).is_empty());
+        // Nor does an un-measurable window (no timestamped buffer in it).
+        assert!(run(&[(None, true, false); 5]).is_empty());
+    }
+
+    #[test]
+    fn delivery_ratio_separates_starved_from_unpaced() {
+        // The incident's signature: 3.6× real time, then a gap.
+        assert_eq!(delivery_ratio(3.6, 1.0), Some(3.6));
+        // Healthy: content seconds ≈ wall seconds.
+        assert!((delivery_ratio(5.0, 5.0).unwrap() - 1.0).abs() < 1e-9);
+        // Starved.
+        assert!(delivery_ratio(0.4, 2.0).unwrap() < 1.0);
+        // A window too short to be a rate, and arithmetic that cannot be trusted.
+        assert_eq!(delivery_ratio(0.01, 0.05), None);
+        assert_eq!(delivery_ratio(1.0, f64::NAN), None);
+    }
+
+    #[test]
+    fn pad_frames_matches_the_level_probes_arithmetic() {
+        // 1024 stereo F32LE frames = 8192 bytes, which is what `[level/…] frames=` counts.
+        assert_eq!(pad_frames(8192, 2), 1024);
+        assert_eq!(pad_frames(8192, 4), 512);
+        // Never divides by zero, whatever caps claimed.
+        assert_eq!(pad_frames(8192, 0), 2048);
+    }
+
+    #[test]
+    fn format_hms_reads_as_an_age() {
+        assert_eq!(format_hms(0.0), "0h 0m 0s");
+        assert_eq!(format_hms(3661.4), "1h 1m 1s");
+        // Eight days, the age of the pipeline in the 2026-09-19 incident.
+        assert_eq!(format_hms(8.0 * 86_400.0), "192h 0m 0s");
+    }
 }
 
 /// Time-of-day in UTC, matching the log formatter in `lib.rs` so a timestamp printed
@@ -1130,11 +1591,7 @@ fn instrument_level(element: &gst::Element, pad_name: &str, label: &str, deck_id
     )));
     pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
         let Some(buf) = info.buffer() else { return gst::PadProbeReturn::Ok };
-        let channels = pad
-            .current_caps()
-            .and_then(|c| c.structure(0).and_then(|s| s.get::<i32>("channels").ok()))
-            .unwrap_or(2)
-            .max(1) as usize;
+        let (channels, _rate) = pad_audio_format(pad);
         let Ok(map) = buf.map_readable() else { return gst::PadProbeReturn::Ok };
         let data = map.as_slice();
         let mut st = state.lock().unwrap();
@@ -1152,7 +1609,7 @@ fn instrument_level(element: &gst::Element, pad_name: &str, label: &str, deck_id
                 st.1[ch] += 1;
             }
         }
-        st.2 += (n / channels) as u64;
+        st.2 += pad_frames(data.len(), channels);
         if st.3.elapsed() >= Duration::from_secs(1) {
             let frames = st.2.max(1) as f64;
             let per_ch: Vec<String> = st
@@ -2086,6 +2543,12 @@ struct PipelineInner {
     uridecodebin_el: gst::Element,
     /// Present only while a scratch gesture is in progress.
     scratch_feeder: Option<ScratchFeeder>,
+    /// Mirrors `scratch_feeder.is_some()` for threads that cannot reach this struct —
+    /// today only the delivery reporter's margin watchdog, which must stay silent during
+    /// a gesture (see `MarginWatchdog::observe`). Kept in step by
+    /// `begin_or_update_scratch()` and `take_and_join_feeder()`, the only two places the
+    /// feeder is created and destroyed.
+    scratching: Arc<AtomicBool>,
     /// The shared queue between `input_selector` and `tee` — see the constants
     /// above `make_el` for why `scratch()` widens its cap for the gesture's
     /// duration.
@@ -2414,6 +2877,7 @@ impl DeckAudioPipeline {
         &self,
         shared_output: bool,
         at_playing: &Arc<AtomicBool>,
+        play_report: &Arc<PlayReport>,
         sink_flow_states: &mut Vec<SinkFlowState>,
         delivery_probes: &mut Vec<Arc<DeliveryProbe>>,
         pending_handoffs: &mut Vec<(gst::Element, String, String)>,
@@ -2480,18 +2944,34 @@ impl DeckAudioPipeline {
             if i > 0 {
                 snk.set_property("async", false);
             }
+            // The device is named, not just the index: "main sink 1" alone cannot be
+            // mapped back to hardware after the fact, and a multi-device set's warnings
+            // are unreadable without it. Same short name the `[audio/out/…]` lines use.
             sink_flow_states.extend(instrument_sink_flow(
                 &snk,
                 &self.deck_id,
-                &format!("main sink {i}"),
+                &format!("main sink {i} ({})", mixer::device_short_name(dev)),
                 vec![at_playing.clone()],
             ));
             // Bracket the last stage: what leaves `volume` against what the sink accepts.
             // Both, not just the sink — a count that matches at `volume` and not at the
             // sink narrows the fault to one link, and a count that advances at both while
             // the room is silent moves the whole question past delivery. See DeliveryProbe.
-            delivery_probes.extend(instrument_delivery(&vol, "src", &format!("vol{i}")));
-            delivery_probes.extend(instrument_delivery(&snk, "sink", &format!("sink{i}")));
+            delivery_probes.extend(instrument_delivery(&vol, "src", &format!("vol{i}"), None));
+            // Only the primary main branch completes the per-play line — it is the one
+            // branch every deck has, and the one whose node's latency `position()` uses.
+            let sink_probe = instrument_delivery(
+                &snk,
+                "sink",
+                &format!("sink{i}"),
+                (i == 0).then(|| play_report.clone()),
+            );
+            if i == 0 {
+                if let Some(p) = &sink_probe {
+                    *play_report.sink_probe.lock().unwrap() = Some(Arc::downgrade(p));
+                }
+            }
+            delivery_probes.extend(sink_probe);
             volume_els.push(vol);
             main_sinks.push(snk);
             main_channel_remaps.push(main_remap);
@@ -2588,7 +3068,7 @@ impl DeckAudioPipeline {
             let st = instrument_sink_flow(
                 &cue_sink,
                 &self.deck_id,
-                "cue sink",
+                &format!("cue sink ({})", mixer::device_short_name(&self.cue_device)),
                 vec![at_playing.clone(), cue_open.clone()],
             );
             // Also registered with the bus thread, so a transition out of Playing
@@ -2598,8 +3078,8 @@ impl DeckAudioPipeline {
             // bracketed: `cue_volume`'s src against the sink's own pad. A count that
             // advances at `cuevol` and not at `cuesink` isolates the fault to that link;
             // both advancing while the headphones are silent moves it past delivery.
-            delivery_probes.extend(instrument_delivery(&cue_volume, "src", "cuevol"));
-            delivery_probes.extend(instrument_delivery(&cue_sink, "sink", "cuesink"));
+            delivery_probes.extend(instrument_delivery(&cue_volume, "src", "cuevol", None));
+            delivery_probes.extend(instrument_delivery(&cue_sink, "sink", "cuesink", None));
             st
         } else {
             None
@@ -2617,6 +3097,7 @@ impl DeckAudioPipeline {
         eos_cb: Option<EosCallback>,
         app: Option<tauri::AppHandle>,
         at_playing: &Arc<AtomicBool>,
+        play_report: &Arc<PlayReport>,
         sink_flow_states: &[SinkFlowState],
     ) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
         let at_eos = Arc::new(AtomicBool::new(false));
@@ -2627,11 +3108,13 @@ impl DeckAudioPipeline {
         let fft_logged = Arc::new(AtomicBool::new(false));
         let fft_logged_thread = fft_logged.clone();
         let at_playing_thread = at_playing.clone();
+        let play_report_thread = play_report.clone();
         let sink_flow_thread = sink_flow_states.to_vec();
         let bus_thread = bus.clone();
         let deck_id_log = deck_id.to_string();
         let app_handle = app;
         let pipeline_eos = pipeline.clone();
+        let pipeline_state = pipeline.clone();
 
         std::thread::spawn(move || {
             for msg in bus_thread.iter_timed(None) {
@@ -2681,6 +3164,14 @@ impl DeckAudioPipeline {
                             // after EOS — see instrument_queue_flow().
                             let now_playing = s.current() == gst::State::Playing;
                             at_playing_thread.store(now_playing, Ordering::Relaxed);
+                            // One line per play, with the conditions the 2026-09-19
+                            // incident turned out to depend on — see `PlayReport`.
+                            // Paused→Playing only: Ready→Playing never happens here (a
+                            // load always prerolls first), and re-arming on anything
+                            // else would report a play that did not occur.
+                            if now_playing && s.old() == gst::State::Paused {
+                                play_report_thread.arm(&pipeline_state);
+                            }
                             if !now_playing {
                                 // Invalidate every sink's last-buffer time so the span
                                 // across this pause/preroll/EOS can never be reported as a
@@ -2690,7 +3181,7 @@ impl DeckAudioPipeline {
                                 // instrument_sink_flow(). Safe from this thread: the probe
                                 // holds no other lock under this one.
                                 for st in &sink_flow_thread {
-                                    st.lock().unwrap().last = None;
+                                    st.lock().unwrap().invalidate();
                                 }
                             }
                         }
@@ -2843,10 +3334,15 @@ impl DeckAudioPipeline {
                     // at its own rate, and the handoff slowly over- or underflows forever.
                     // See OutputGraph::shared_clock.
                     pipeline.use_clock(Some(&clock));
+                    // The GLib type name, not just the instance name: which *kind* of
+                    // clock this is decides whether the reasoning in
+                    // shared-output-pipeline.md's clock section applies, and the
+                    // instance name alone does not say (`OutputGraph::create_node` warns
+                    // once per graph when it is not the expected one).
                     log::info!(
-                        "[audio/{}] using shared output clock {} (output latency {:.0}ms \
-                         subtracted from reported position)",
-                        self.deck_id, clock.name(),
+                        "[audio/{}] using shared output clock {} [{}] (output latency \
+                         {:.0}ms subtracted from reported position)",
+                        self.deck_id, clock.name(), clock.type_().name(),
                         output_latency_ns.load(Ordering::Relaxed) as f64 / 1e6
                     );
                 }
@@ -3006,7 +3502,26 @@ impl DeckAudioPipeline {
         // current_state() query. Declared here rather than next to its queue hookup below
         // because the sink probes are attached as the sinks are built, just underneath.
         let at_playing = Arc::new(AtomicBool::new(false));
+        // True for the duration of a scratch gesture. Read by the margin watchdog on the
+        // delivery reporter's thread, which must not mistake a gesture's legitimately
+        // negative margin for a clock fault — see `MarginWatchdog::observe`.
+        let scratching = Arc::new(AtomicBool::new(false));
         let mut sink_flow_states: Vec<SinkFlowState> = Vec::new();
+
+        // Everything the per-play line needs, assembled before the branches are built
+        // because the primary sink's delivery probe is what completes it. The graph's
+        // activity clock is read once here rather than per play: taking the graph mutex
+        // on a bus thread is exactly the kind of new lock acquisition this file's
+        // deadlock history says not to introduce.
+        let node_label = mixer::device_short_name(
+            self.devices.first().map(String::as_str).unwrap_or(""),
+        );
+        let graph_activity = self
+            .output_graph
+            .as_ref()
+            .map(|g| g.lock().unwrap().device_activity_handle())
+            .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+        let play_report = PlayReport::new(&self.deck_id, node_label.clone(), graph_activity);
 
         // Filled by build_main_branches()/build_cue_branch() below, then consumed by the
         // add/link section and handed to the per-second delivery reporter at the end.
@@ -3033,6 +3548,7 @@ impl DeckAudioPipeline {
             self.build_main_branches(
                 shared_output,
                 &at_playing,
+                &play_report,
                 &mut sink_flow_states,
                 &mut delivery_probes,
                 &mut pending_handoffs,
@@ -3309,6 +3825,7 @@ impl DeckAudioPipeline {
             self.eos_callback.clone(),
             self.app.clone(),
             &at_playing,
+            &play_report,
             &sink_flow_states,
         );
 
@@ -3342,8 +3859,10 @@ impl DeckAudioPipeline {
         let delivery_probes_shared: DeliveryProbes = Arc::new(delivery_probes);
         spawn_delivery_reporter(
             &self.deck_id,
+            &node_label,
             &delivery_probes_shared,
             &at_playing,
+            &scratching,
             handoffs,
         );
 
@@ -3366,6 +3885,7 @@ impl DeckAudioPipeline {
             valve_normal_el: valve_normal,
             uridecodebin_el: src.clone(),
             scratch_feeder: None,
+            scratching,
             output_queue_el: output_queue,
             main_sink_els: main_sinks,
             delivery_probes: delivery_probes_shared,
@@ -3663,7 +4183,7 @@ impl DeckAudioPipeline {
         if let Some(inner) = &self.inner {
             inner.cue_open.store(enabled, Ordering::Relaxed);
             if let Some(st) = &inner.cue_sink_flow {
-                st.lock().unwrap().last = None;
+                st.lock().unwrap().invalidate();
             }
             inner.cue_valve_el.set_property("drop", !enabled);
             log::info!("[audio/{}] cue {}", self.deck_id, if enabled { "ON" } else { "OFF" });
@@ -3850,6 +4370,9 @@ impl DeckAudioPipeline {
             .set_state(gst::State::Playing)
             .map_err(|e| format!("scratch play failed: {e}"))?;
 
+        // Set before the feeder exists, not after: the watchdog's window is 5s wide and
+        // must already be suppressed for the first chunk this gesture pushes.
+        inner.scratching.store(true, Ordering::Relaxed);
         inner.scratch_feeder = Some(spawn_scratch_feeder(
             self.deck_id.clone(),
             inner.appsrc.clone(),
@@ -4003,6 +4526,7 @@ impl DeckAudioPipeline {
     /// which only has a live `&mut PipelineInner` for the pipeline being replaced, not
     /// a full `&mut self` — can call it too.
     fn take_and_join_feeder(inner: &mut PipelineInner) -> Option<f64> {
+        inner.scratching.store(false, Ordering::Relaxed);
         let feeder = inner.scratch_feeder.take()?;
         feeder.stop_requested.store(true, Ordering::Relaxed);
         if let Some(h) = feeder.handle {
