@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod census;
 pub mod grid_store;
 pub mod media_cache;
 pub mod media_server;
@@ -275,6 +276,13 @@ pub fn run() {
             let watchdog_persist = watchdog::new_persist();
             app.manage(watchdog_persist.clone());
             watchdog::spawn_watchdog(watchdog_persist, app.handle().clone());
+
+            // Standing 5-minute process census. The graph handle is taken once, here, so
+            // the census thread never has to reach through `AudioState`'s mutex — see
+            // census.rs for what it records and why it is a *standing* line rather than
+            // something switched on once a fault is suspected.
+            let output_graph = app.state::<audio::AudioState>().lock().unwrap().output_graph();
+            census::spawn(output_graph);
 
             // See media_cache.rs — resolved here (not at builder-config time, before
             // media_server::start()) because it needs app.path(), which requires an

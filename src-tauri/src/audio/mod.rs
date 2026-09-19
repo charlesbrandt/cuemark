@@ -59,6 +59,12 @@ impl AudioManager {
         }
     }
 
+    /// The shared output graph, for something outside the audio path that needs to read
+    /// it without holding this manager's mutex — today the 5-minute `[census]` line.
+    pub fn output_graph(&self) -> Arc<Mutex<OutputGraph>> {
+        self.output_graph.clone()
+    }
+
     /// Take every live Snapcast claim out of the manager, for release on app exit —
     /// quitting with a target enabled must hand the speakers back the same way
     /// unticking it does. Take-then-release (rather than release-under-lock) keeps the
@@ -105,6 +111,12 @@ pub struct DeckAudioStatus {
 }
 
 pub type AudioState = Mutex<AudioManager>;
+
+/// Host `/proc/pressure/io` `full avg60` above which a track load says so. PSI reports a
+/// percentage of wall time; 30% of the last minute with *every* task blocked on I/O is
+/// far outside anything an idle desktop produces, so this cannot fire in normal use —
+/// see the guard in `audio_load`.
+const IO_PRESSURE_WARN: f64 = 30.0;
 
 /// Runs `f` against one deck's pipeline without holding `state`'s mutex for the
 /// duration of `f` itself — only for the HashMap remove/insert around it. Same pattern
@@ -180,6 +192,23 @@ pub async fn audio_load(app: tauri::AppHandle, cache: State<'_, Arc<MediaCache>>
         let total_start = Instant::now();
         let state = app.state::<AudioState>();
 
+        // Host I/O pressure, read before anything touches the disk or the share. A load
+        // is the app's heaviest I/O moment (cache copy, full-file PCM decode, preroll),
+        // and a machine already stalled on I/O starves GStreamer's streaming threads —
+        // which presents as a slow or silent load, with nothing in this app's own logs
+        // to say the cause was outside it. `full avg60` is time *every* task was
+        // stalled; see census::parse_pressure_full_avg60.
+        if let Some(io) = crate::census::io_pressure_now() {
+            if io > IO_PRESSURE_WARN {
+                log::warn!(
+                    "[audio/{deck_id}] host I/O pressure full avg60={io:.1}% (>{IO_PRESSURE_WARN:.0}%) \
+                     at load — the machine as a whole has been stalled on I/O for much of the \
+                     last minute. Expect a slow load and possible audio underruns; the cause is \
+                     outside cuemark (check the `[census]` line and what else is on this disk)."
+                );
+            }
+        }
+
         // Resolve to a local disk copy before touching GStreamer at all — see media_cache.rs.
         // The library here is served over SMB/CIFS; scratch leaves the normal playback
         // branch idle for a whole gesture, and resuming it against the network share after
@@ -244,7 +273,15 @@ pub async fn audio_load(app: tauri::AppHandle, cache: State<'_, Arc<MediaCache>>
 
         pipeline.set_app(app.clone());
         let preroll_start = Instant::now();
+        // Threads before/after the rebuild. `load()` tears the outgoing pipeline down and
+        // builds a new one, so in a healthy load these two numbers end up close; a load
+        // whose predecessor never reached Null leaves its decode threads behind and the
+        // count ratchets up, load after load, until a fresh pipeline can preroll and then
+        // delivers nothing (the audio-debugging skill's long-session-silence entry). One
+        // `read_dir`, on a path that already costs hundreds of milliseconds.
+        let threads_before = crate::census::thread_count();
         let result = pipeline.load(&load_path); // preroll runs without holding the mutex
+        let threads_after = crate::census::thread_count();
         let preroll_ms = preroll_start.elapsed().as_secs_f64() * 1000.0;
 
         // A brand-new `DeckAudioPipeline` (this deck's first load, or a reload after
@@ -269,8 +306,11 @@ pub async fn audio_load(app: tauri::AppHandle, cache: State<'_, Arc<MediaCache>>
         state.lock().unwrap().pipelines.insert(deck_id.clone(), pipeline);
 
         log::info!(
-            "[audio_load] {deck_id} total={:.1} cache={cache_ms:.1} lock={lock_ms:.1} preroll={preroll_ms:.1}",
-            total_start.elapsed().as_secs_f64() * 1000.0
+            "[audio_load] {deck_id} total={:.1} cache={cache_ms:.1} lock={lock_ms:.1} \
+             preroll={preroll_ms:.1} threads={}→{}",
+            total_start.elapsed().as_secs_f64() * 1000.0,
+            threads_before.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+            threads_after.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
         );
 
         result

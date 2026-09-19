@@ -122,6 +122,14 @@ drift is ever observed (the tell: a click every few minutes, `lag` creeping up i
 `[deliver-tel]`), the lever is to re-select `sink.provide_clock()` after PLAYING and push it
 to every deck — but do not assume that is already happening.
 
+⚠️ **The clock in practice is whatever that line says, and it has not always been the same
+one.** `GstSystemClock` above is the 2026-08-11 measurement; a run on **2026-09-19 came up
+on `GstPulseSinkClock`** instead (i.e. the sink *did* provide a clock that time). No cause
+is claimed for the difference, and neither clock is known to be a fault in itself — it is
+recorded because that same run is the one in "Clock reference drifting while idle" below.
+The line now carries the GLib type name (`… [GstSystemClock]`), and anything other than
+`GstSystemClock` warns once per graph so the discrepancy cannot pass unread.
+
 With more than one node there is more than one candidate clock; the first output pipeline's
 wins and the other node's `pulsesink` slaves to it, which is already the status quo (a deck
 with two main devices today has two `pulsesink`s in one pipeline, one of which is slaving).
@@ -478,3 +486,39 @@ gst-launch-1.0 pipewiresrc target-object=<object.serial> \
 (`object.serial` from `pw-dump <node-id>`, not the node id.) Then verify the capture node's
 ports before believing any per-channel number — see the `audio-debugging` skill's "an
 instrument that cannot vary with the fault carries no information about it".
+
+## Clock reference drifting while idle — OPEN (observed 2026-09-19)
+
+**Status: observed once, mechanism unproven, no fix attempted.** What follows is what was
+measured, plus the instruments added so the next occurrence is legible. Nothing here
+claims a cause, and nothing self-heals — a restart of the app cures it.
+
+**Symptom**: a long-running instance (8 days up) produced no audio. Both decks reached
+`Playing`, no bus `ERROR`, transport and position healthy. `[deliver-tel]`'s `margin`
+— buffer PTS running time minus element running time — read **−689,001,487 ms** on one
+deck (about the process's whole uptime) and −241,7xx,xxx ms on the other. The sinks had
+stopped pacing: audio was delivered in bursts at **3.6× real time** followed by ~1.2s
+gaps, which is what `main sink 0: buffer flow resumed after a 1.3s gap` was reporting.
+
+**What it is not**: pipeline age. A later test on the same instance resumed a deck after
+~48 minutes idle — it delivered **zero** buffers for 34s while `Playing` — and then a
+*freshly loaded* pipeline on the same idle output graph came back with margin ≈ **−2,860 s**,
+which is the idle span, not the new pipeline's age. Whatever accumulates appears to
+accumulate on the output-graph / shared-clock side while nothing plays. That run also
+came up on `GstPulseSinkClock` rather than the `GstSystemClock` the section above
+describes; whether that matters is unknown.
+
+**Instruments added (2026-09-19), all in the standing log:**
+
+| Line | Says |
+|---|---|
+| `[audio/deck-N] CLOCK REFERENCE OFF BY …` | WARN, once per deck per episode: \|margin\| over 1s for two consecutive 5s windows while playing. Suppressed during a scratch gesture, which drives margin negative by design; re-arms when margin returns inside ±500ms. |
+| `[audio/deck-N] play: pipeline age …, idle-since-last-buffer …, graph idle …, shared clock …, node …` | One line per `Paused→Playing`, with the conditions above (the deck's dry time, the *graph's* dry time — the suspected independent variable — and the clock actually in use). A follow-up line carries the first delivered buffer's margin and how long after play it arrived; **its absence is the 34s-of-nothing case**. |
+| `… buffer flow resumed after a Ns gap … took Xs of audio in Ys = Z× real time` | Separates a *starved* sink (<1×) from one that has *stopped pacing* (>1×). The incident measured 3.6×. |
+| `[census]` (every 5 min) | Threads by comm prefix, fds, RSS/swap, graph node/branch/appsrc counts, host `/proc/pressure/io` `full avg60`, swap free. The accumulating faults in this project take days; nothing recorded the process's own slope before. |
+| `[audio_load] … threads=N→M` | Per-load thread delta, for the leaked-decode-thread failure in the `audio-debugging` skill. |
+
+**Next occurrence, read in this order**: the `play:` line's `graph idle` against the
+margin the first buffer comes back with (does the offset track idle time?), then which
+clock the graph chose, then the `[census]` slope across the hours before it. Do not add
+self-healing or graph rebuilding until that data exists.
