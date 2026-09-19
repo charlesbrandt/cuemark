@@ -780,3 +780,39 @@ blind.
    move *after* the DJ has heard the result is the kind of surprise the "hand back control
    at current position" rule exists to avoid — but it should be checked against how it
    actually feels live.
+
+
+## Phase 7 — fade over the outro zone, preview restores itself (2026-09-19)
+
+🟡 **Built + unit-tested, not live-verified.** Prompted by a review of the marker path
+(see the numbered open decisions above for what it settled).
+
+1. **The blend now starts AT `outroPoint`** when a usable outro marker exists
+   (`transitionPlan().startsAtOutro`, lead 0; the live trigger fires when the playhead
+   reaches the marker and there is room for the blend). Before this the ramp was timed to
+   *finish* at the marker and the outgoing deck was then unloaded, so the region
+   `[outroPoint, end]` — the tail the marker's length is *derived from* — was never heard.
+   Tracks with no usable marker (and intro-only) keep the old end-anchored lead and the
+   `autoMixThresholdSec` setting; with a marker the setting no longer moves the start.
+2. **Preview restores itself** (`finishPreview`): 3s after the fade completes it pauses the
+   incoming deck at 0, puts back its rate/`syncLocked`, and returns the crossfader to where
+   the DJ left it (open decision #7, now decided *yes*). Skipped on any abort — a fader
+   touch hands control back and nothing is moved for the DJ. Pressing Preview again during
+   the tail keeps the original snapshot.
+3. The marker panel prints the engine's own zone figures (`outroZoneSec`/`introZoneSec`),
+   showing "ignored" for a marker the engine discards, instead of raw numbers.
+4. A ramp whose start already equals its target logs a WARN (the 2026-08-25 zero-length
+   trap, which the live trigger can still reach).
+5. Loading a local file onto a deck now also clears `introPoint`/`outroPoint`, and the
+   drag-drop path clears `diggerTrackId`/`diggerFileId` (it cleared neither, so ⦿ wrote
+   markers to the previous track's Digger row).
+
+⚠️ **Open decision #4 is stale**: re-running `analyze_audio.py` does NOT clobber a manual
+marker — `_upsert_mix_marker` returns early when any non-`detected` marker of that type
+exists and cuemark writes `source='manual'`. What still happens is that a *cleared* marker
+is re-derived on the next analysis run.
+
+Not done (from the review, needs a decision or Digger work): two-ended zones (`intro_end` /
+`outro_end` marker types — no migration needed, `markers.type` is free text), seeking the
+incoming deck to its intro point (#5), marker-write rollback (`setMixMarker` is
+delete-then-insert with no transaction).

@@ -322,6 +322,13 @@
         updateDeck(deckId, {
           source: { type: 'video', filePath: paths[0], duration: 0, loadSeq: Date.now() },
           playing: false,
+          // A local file has no Digger identity: without these the mix-point ⦿ buttons keep
+          // writing markers to the PREVIOUS track's Digger row, and its intro/outro keep
+          // driving this file's transitions.
+          diggerTrackId: null,
+          diggerFileId: null,
+          introPoint: null,
+          outroPoint: null,
         });
         notifyManualLoadDisplaced(previousDiggerTrackId);
       }

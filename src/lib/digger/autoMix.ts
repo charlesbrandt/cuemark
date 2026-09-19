@@ -328,7 +328,32 @@ function beginPreviewGuard(maxMs: number): void {
 
 function endPreviewGuard(): void {
   previewInFlight = false;
+  previewRestore = null;
   if (previewGuardTimer) { clearTimeout(previewGuardTimer); previewGuardTimer = null; }
+}
+
+// What a preview must put back so the next press (or the DJ's own mix) starts from the
+// state the DJ left. Before this a preview parked the crossfader at the far end and left the
+// incoming deck playing at a beatmatch-imposed rate, so every audition needed a manual
+// recovery (D4, 2026-09-19). Restored only when the preview ran to completion: an abort
+// (fader touched, deck vanished) means the DJ has taken over and nothing is moved for them.
+interface PreviewRestore { incomingId: string; fader: number; rate: number; syncLocked: boolean }
+let previewRestore: PreviewRestore | null = null;
+let previewTailTimer: ReturnType<typeof setTimeout> | null = null;
+/** How long the incoming deck keeps playing at full after the fade completes, so the
+ *  audition includes hearing the new track settle rather than cutting the moment it wins. */
+const PREVIEW_TAIL_MS = 3000;
+
+function finishPreview(): void {
+  previewTailTimer = null;
+  const r = previewRestore;
+  if (r && getDeck(r.incomingId)) {
+    updateDeck(r.incomingId, { playing: false, playbackRate: r.rate, syncLocked: r.syncLocked });
+    seekDeck(r.incomingId, 0, true);
+    setCrossfader(r.fader);
+    debugLog(`[auto-dj] preview: restored fader to ${r.fader.toFixed(3)}, deck-${r.incomingId} paused at 0 (rate ${r.rate.toFixed(4)})`);
+  }
+  endPreviewGuard();
 }
 
 // Phase 4 (gap 1): where "near-end" is measured from. A set `outroPoint` (Digger's
@@ -413,21 +438,31 @@ function usableZone(sec: number): number | null {
  * needs: it can only see the outgoing side, and an *over*-estimated duration there just
  * makes the preload fire a little earlier, never later.
  */
+/** Usable length of the outgoing track's outro zone, or `null` when there is no trustworthy
+ *  marker or the zone is too short to blend over. Exported so the marker panel reads the
+ *  exact figure the engine will use, instead of printing raw `duration - outroPoint` for
+ *  values the engine discards (a sub-2s zone, a marker in the first third). */
+export function outroZoneSec(duration: number, outroPoint: number | null): number | null {
+  return duration > 0 ? usableZone(duration - nearEndReference(outroPoint, duration)) : null;
+}
+
+/** Usable length of the incoming track's intro zone, or `null` — same contract as
+ *  `outroZoneSec`. Ceiling mirrors nearEndReference's floor: a "mix in" past the first third
+ *  of a track is as untrustworthy as a "mix out" inside it, and would otherwise propose a
+ *  blend longer than the incoming track's own body. */
+export function introZoneSec(duration: number, introPoint: number | null): number | null {
+  return introPoint !== null && duration > 0 && introPoint <= duration / 3
+    ? usableZone(introPoint)
+    : null;
+}
+
 export function computeTransitionDurationMs(
   outgoing: TransitionZones,
   incoming: TransitionZones | null,
   fallbackMs: number,
 ): TransitionDuration {
-  const outro = outgoing.duration > 0
-    ? usableZone(outgoing.duration - nearEndReference(outgoing.outroPoint, outgoing.duration))
-    : null;
-  // Ceiling mirrors nearEndReference's floor: a "mix in" past the first third of a track
-  // is as untrustworthy as a "mix out" inside it, and would otherwise propose a blend
-  // longer than the incoming track's own body.
-  const intro = incoming !== null && incoming.introPoint !== null && incoming.duration > 0
-    && incoming.introPoint <= incoming.duration / 3
-    ? usableZone(incoming.introPoint)
-    : null;
+  const outro = outroZoneSec(outgoing.duration, outgoing.outroPoint);
+  const intro = incoming !== null ? introZoneSec(incoming.duration, incoming.introPoint) : null;
 
   if (outro === null && intro === null) return { ms: fallbackMs, source: "fallback" };
   const zoneSec = outro === null ? intro! : intro === null ? outro : Math.min(outro, intro);
@@ -445,7 +480,19 @@ export function computeTransitionDurationMs(
  */
 function transitionPlan(outgoing: TransitionZones, incoming: TransitionZones | null) {
   const duration = computeTransitionDurationMs(outgoing, incoming, get(crossfadeDurationMs));
-  return { ...duration, leadSec: Math.max(get(autoMixThresholdSec), duration.ms / 1000) };
+  // A usable outro marker means the blend runs OVER the outro zone, starting AT the marker
+  // (2026-09-19). Until then the ramp was timed to *finish* at `outroPoint` and the outgoing
+  // deck was unloaded there, so the region `[outroPoint, end]` — the very tail the marker
+  // exists to say another track may play over, and the one its length is derived from —
+  // was never heard. Digger's own doc reads it the same way: mix_out is "where the next
+  // track starts coming in". Lead is then 0: the trigger fires when the playhead reaches the
+  // marker. Every other case (no marker, or intro-only) keeps the old lead untouched.
+  const startsAtOutro = duration.source === "zones" || duration.source === "outro";
+  return {
+    ...duration,
+    startsAtOutro,
+    leadSec: startsAtOutro ? 0 : Math.max(get(autoMixThresholdSec), duration.ms / 1000),
+  };
 }
 
 /** Extra lead the preload needs over the crossfade's own trigger point, so a long
@@ -492,13 +539,20 @@ function startCrossfadeRamp(
   let done = false;
 
   debugLog(`[auto-dj] ramp start: deck-${outgoingId} -> deck-${incomingId}, target=${target}, from=${startValue.toFixed(3)}, duration=${durationMs}ms`);
+  if (Math.abs(target - startValue) < 0.01) {
+    // The 2026-08-25 trap: a ramp whose start already equals its target is a silent
+    // zero-length "fade" — the outgoing deck is freed with nothing having been crossfaded.
+    debugLog(`[auto-dj] WARN ramp is zero-length: the crossfader is already at target=${target} (from=${startValue.toFixed(3)}) — nothing will actually fade`);
+  }
 
   function cancel(reason?: string) {
     if (done) return;
     done = true;
     cancelRaf(rafId);
     activeRamp = null;
-    if (preview) endPreviewGuard();
+    // A preview that ran to completion ends its guard in finishPreview() after the tail;
+    // only an abort (a reason) ends it here, and forgets the restore snapshot with it.
+    if (preview && reason) endPreviewGuard();
     if (reason) {
       debugLog(`[auto-dj] ramp aborted: deck-${outgoingId} -> deck-${incomingId} (${reason})`);
     } else {
@@ -550,7 +604,12 @@ function startCrossfadeRamp(
       // immediately after, so the reference walks back to the incoming track's real bpm
       // rather than staying wherever this transition's lock left it. See the design doc's
       // "Phase 5 — tempo drift-back".
-      if (driftBackDeckId) startRateDriftBack(driftBackDeckId);
+      // A preview restores the incoming deck's rate itself (finishPreview), so no drift-back.
+      if (preview) {
+        previewTailTimer = setTimeout(finishPreview, PREVIEW_TAIL_MS);
+      } else if (driftBackDeckId) {
+        startRateDriftBack(driftBackDeckId);
+      }
       cancel();
       return;
     }
@@ -750,8 +809,11 @@ function beginTransition(
  *  - the outgoing deck keeps its `source` at the end (`preview: true`) — it is paused
  *    where the fade left it, ready to be previewed again;
  *  - no `handledOutgoing` / `markSkipped` bookkeeping, so the set state is untouched;
+ *  - once the fade and a short tail have played, everything is put back (crossfader,
+ *    incoming deck paused at 0 and at its old rate), so pressing it again needs no manual
+ *    recovery (`finishPreview`);
  *  - both decks are seeked first: the outgoing to exactly the point the trigger would
- *    have fired at (`reference − lead`), the incoming back to 0, which is where a
+ *    have fired at (the outro marker, or `reference − lead` without one), the incoming back to 0, which is where a
  *    freshly-loaded deck sits when a real transition starts it. Seeking the incoming to
  *    its `introPoint` instead was considered and declined — it would make the preview
  *    *unfaithful* to the live path, which starts the incoming deck wherever it is parked.
@@ -776,11 +838,20 @@ export function previewTransition(outgoingId: string): void {
     return;
   }
 
+  // cancel() with a reason ends the guard and forgets the snapshot; a restart must keep it.
+  const keptRestore = previewRestore;
   activeRamp?.cancel("preview restarting");
+  previewRestore = keptRestore;
+  // Pressed again during the previous preview's tail: cancel the pending reset, but keep
+  // the ORIGINAL snapshot — the fader is at the far end now, not where the DJ left it.
+  if (previewTailTimer) { clearTimeout(previewTailTimer); previewTailTimer = null; }
+  if (!previewRestore) {
+    previewRestore = { incomingId, fader: s.crossfaderValue, rate: incoming.playbackRate, syncLocked: incoming.syncLocked };
+  }
 
   const plan = transitionPlan(zonesOf(outgoing), zonesOf(incoming));
-  // Seek settle (200ms) + sync settle + the fade itself, with generous slack.
-  beginPreviewGuard(plan.ms + 8000);
+  // Seek settle (200ms) + sync settle + the fade itself + the tail, with generous slack.
+  beginPreviewGuard(plan.ms + PREVIEW_TAIL_MS + 8000);
   const startAt = Math.max(0, nearEndReference(outgoing.outroPoint, outgoing.source.duration) - plan.leadSec);
   const target: 0 | 1 = outgoingId === left ? 1 : 0;
 
@@ -829,7 +900,15 @@ export function checkAutoMixTrigger(deckId: string, contentPos: number): void {
 
   const plan = transitionPlan(zonesOf(outgoing), zonesOf(incoming));
   const remaining = nearEndReference(outgoing.outroPoint, outgoing.source.duration) - contentPos;
-  if (remaining > plan.leadSec || remaining <= 0) return;
+  if (plan.startsAtOutro) {
+    // Fire once the playhead is AT the marker. Not when too little track is left for the
+    // blend (a deck seeked deep into its tail): that case is left to the EOS fallback,
+    // exactly as `remaining <= 0` always was for the end-anchored path.
+    if (remaining > 0) return;
+    if (outgoing.source.duration - contentPos < plan.ms / 1000 - 0.5) return;
+  } else if (remaining > plan.leadSec || remaining <= 0) {
+    return;
+  }
   if (wasAutoMixTriggered(deckId, outgoing.source.filePath)) return;
 
   handledOutgoing.set(deckId, outgoing.source.filePath);

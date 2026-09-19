@@ -271,16 +271,17 @@ describe('checkAutoMixTrigger / checkAutoPreloadTrigger with outroPoint (Phase 4
     autoDjMod.autoDjEnabled.set(true);
     autoMixMod.autoMixThresholdSec.set(15);
     resetSession([
-      // outroPoint at 60s, well before the 100s duration — the fixed threshold alone
-      // (100 - 90 = 10s remaining) would fire here too, so use a position that's only
-      // inside the threshold relative to the marker (60 - 50 = 10s) to actually
-      // distinguish the two references.
+      // outroPoint at 60s, well before the 100s duration. The blend runs OVER the outro
+      // zone (2026-09-19), so it starts when the playhead reaches the marker — not 10s
+      // before it, and not off the 100s track end.
       baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: 60 }),
       baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
     ]);
 
-    autoMixMod.checkAutoMixTrigger('deck-0', 50); // 50s remaining to literal end, 10s to the marker
+    autoMixMod.checkAutoMixTrigger('deck-0', 50); // 10s BEFORE the marker: the blend starts AT it
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
 
+    autoMixMod.checkAutoMixTrigger('deck-0', 60); // the playhead reaches the marker
     expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
   });
 
@@ -934,18 +935,20 @@ describe('computeTransitionDurationMs (Phase 5)', () => {
 });
 
 describe('checkAutoMixTrigger duration/lead derivation (Phase 5)', () => {
-  it('triggers earlier than the configured threshold when the tracks ask for a longer blend', async () => {
+  it('starts at the outro marker and fades over the outro zone, whatever the lead setting', async () => {
     const { sessionMod, autoDjMod, autoMixMod, resetSession, driveFrame, runToCompletion } = await setup();
     autoDjMod.autoDjEnabled.set(true);
     autoMixMod.autoMixThresholdSec.set(15);
     autoMixMod.crossfadeDurationMs.set(1000); // the flat fallback — must NOT be what runs
     resetSession([
-      // 25s outro tail -> a 20s blend (the ceiling), so the lead is 20s, not the 15s setting.
+      // 25s outro tail -> a 20s blend (the ceiling), running from the marker onwards.
       baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 200), outroPoint: 175 }),
       baseDeck('deck-1', { source: videoSource('b.mp4', 200) }),
     ]);
 
-    autoMixMod.checkAutoMixTrigger('deck-0', 157); // 18s to the marker: inside 20s, outside 15s
+    autoMixMod.checkAutoMixTrigger('deck-0', 157); // 18s before the marker: too early
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
+    autoMixMod.checkAutoMixTrigger('deck-0', 175); // the marker
     expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
 
     driveFrame(10000); // half the derived 20s duration
@@ -954,14 +957,14 @@ describe('checkAutoMixTrigger duration/lead derivation (Phase 5)', () => {
     expect(get(sessionMod.session).crossfaderValue).toBe(1);
   });
 
-  it('still waits for the configured threshold when the derived blend is shorter than it', async () => {
+  it('a short outro zone still starts at the marker, not at the configured threshold', async () => {
     const { sessionMod, autoDjMod, autoMixMod, resetSession, driveFrame } = await setup();
     autoDjMod.autoDjEnabled.set(true);
     autoMixMod.autoMixThresholdSec.set(15);
     autoMixMod.crossfadeDurationMs.set(6000);
     resetSession([
-      // 5s outro tail -> a 5s blend, but the DJ's "start mixing 15s out" setting still wins
-      // as the trigger point; the fade just finishes 10s before the marker, as it always has.
+      // 5s outro tail -> a 5s blend from the marker. The "start mixing 15s out" setting only
+      // governs tracks WITHOUT a usable marker; with one, the marker is the start.
       baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: 95 }),
       baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
     ]);
@@ -969,7 +972,9 @@ describe('checkAutoMixTrigger duration/lead derivation (Phase 5)', () => {
     autoMixMod.checkAutoMixTrigger('deck-0', 60); // 35s out — well outside both
     expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
 
-    autoMixMod.checkAutoMixTrigger('deck-0', 85); // 10s out — inside the 15s threshold
+    autoMixMod.checkAutoMixTrigger('deck-0', 85); // 10s out — inside the 15s threshold, but not at the marker
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
+    autoMixMod.checkAutoMixTrigger('deck-0', 95); // the marker
     expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
 
     driveFrame(5000); // the derived 5s duration, not the 6s flat setting
@@ -1090,8 +1095,8 @@ describe('previewTransition (Phase 6 — audition the transition)', () => {
 
     autoMixMod.previewTransition('deck-0');
 
-    // 20s outro tail -> a 20s blend, so the trigger point is 20s before the marker: 160s.
-    expect(seekDeck).toHaveBeenCalledWith('deck-0', 160, true);
+    // 20s outro tail -> a 20s blend that runs from the marker: the trigger point is 180s.
+    expect(seekDeck).toHaveBeenCalledWith('deck-0', 180, true);
     expect(seekDeck).toHaveBeenCalledWith('deck-1', 0, true);
     expect(get(sessionMod.session).crossfaderValue).toBe(0); // parked on the outgoing side
     expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-0')!.playing).toBe(true);
@@ -1109,6 +1114,15 @@ describe('previewTransition (Phase 6 — audition the transition)', () => {
     expect(s.decks.find((d) => d.id === 'deck-0')!.playing).toBe(false);
     expect(autoMixMod.wasAutoMixTriggered('deck-0', 'a.mp4')).toBe(false);
     expect(markSkipped).not.toHaveBeenCalled();
+
+    // After the tail the preview puts everything back, so pressing it again needs no manual
+    // recovery: fader where the DJ left it, incoming deck paused at 0 and at its old rate.
+    await new Promise((r) => setTimeout(r, 3200));
+    const after = get(sessionMod.session);
+    expect(after.crossfaderValue).toBe(0);
+    expect(after.decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
+    expect(after.decks.find((d) => d.id === 'deck-1')!.playbackRate).toBe(1);
+    expect(seekDeck).toHaveBeenLastCalledWith('deck-1', 0, true);
   });
 
   it('holds the live trigger off during the seek-settle window, so Auto DJ cannot run a second transition (live-hit 2026-09-19)', async () => {
@@ -1123,11 +1137,12 @@ describe('previewTransition (Phase 6 — audition the transition)', () => {
 
     autoMixMod.previewTransition('deck-0');
     // The position poll lands on the trigger point before the preview's ramp exists.
-    autoMixMod.checkAutoMixTrigger('deck-0', 160.8);
+    autoMixMod.checkAutoMixTrigger('deck-0', 180.2);
     expect(autoMixMod.wasAutoMixTriggered('deck-0', 'a.mp4')).toBe(false);
 
     await new Promise((r) => setTimeout(r, 250));
     runToCompletion(1000);
+    await new Promise((r) => setTimeout(r, 3200)); // the preview tail, after which the guard lifts
 
     const deck0 = get(sessionMod.session).decks.find((d) => d.id === 'deck-0')!;
     expect(deck0.source).not.toBeNull(); // still loaded: only the preview ran
@@ -1137,7 +1152,7 @@ describe('previewTransition (Phase 6 — audition the transition)', () => {
     // preview left both decks paused, so put the outgoing one back in play first).
     sessionMod.updateDeck('deck-0', { playing: true });
     sessionMod.updateDeck('deck-1', { playing: false });
-    autoMixMod.checkAutoMixTrigger('deck-0', 160.8);
+    autoMixMod.checkAutoMixTrigger('deck-0', 180.2);
     expect(autoMixMod.wasAutoMixTriggered('deck-0', 'a.mp4')).toBe(true);
   });
 
@@ -1327,5 +1342,18 @@ describe('structural disengage (Tier 3, alert)', () => {
     sessionMod.removeDeck('deck-2');
 
     expect(get(autoDjMod.autoDjEnabled)).toBe(true);
+  });
+});
+
+describe('outroZoneSec / introZoneSec (what the marker panel prints)', () => {
+  it('report the engine\'s usable zone, and null for values the engine discards', async () => {
+    const { autoMixMod } = await setup();
+    expect(autoMixMod.outroZoneSec(200, 180)).toBe(20);
+    expect(autoMixMod.outroZoneSec(200, 199)).toBeNull(); // sub-2s zone
+    expect(autoMixMod.outroZoneSec(200, 50)).toBeNull(); // marker inside the first third
+    expect(autoMixMod.outroZoneSec(200, null)).toBeNull();
+    expect(autoMixMod.introZoneSec(200, 12)).toBe(12);
+    expect(autoMixMod.introZoneSec(200, 0.4)).toBeNull(); // Digger's first-beat mix_in
+    expect(autoMixMod.introZoneSec(200, 120)).toBeNull(); // past the first third
   });
 });

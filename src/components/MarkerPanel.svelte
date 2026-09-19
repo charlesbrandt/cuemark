@@ -21,7 +21,7 @@
   import { updateDeck } from "../lib/state/session";
   import { getDeckTime, quantizeToGrid } from "../lib/renderer/seekBus";
   import { setMixMarker, clearMixMarker, pushMarker } from "../lib/digger/api";
-  import { previewTransition } from "../lib/digger/autoMix";
+  import { previewTransition, introZoneSec, outroZoneSec } from "../lib/digger/autoMix";
   import { showToast } from "../lib/ui/toast";
   import { debugLog } from "../lib/debugLog";
 
@@ -93,8 +93,12 @@
   // Zone lengths, shown next to the times because the *length* is what Auto DJ actually
   // uses (computeTransitionDurationMs in autoMix.ts takes the shorter of the two), and a
   // bare timestamp doesn't tell a DJ whether a blend will be long or short.
-  const introZone = $derived(deck.introPoint);
-  const outroZone = $derived(deck.outroPoint !== null && duration > 0 ? duration - deck.outroPoint : null);
+  // The engine's own figures (autoMix.ts), not raw `duration - outroPoint` / `introPoint`:
+  // a sub-2s zone, an outro inside the first third or an intro past it is DISCARDED by the
+  // engine, and printing the raw number for one made the panel claim a zone the transition
+  // would never use. `null` with a marker set is shown as "ignored".
+  const introZone = $derived(introZoneSec(duration, deck.introPoint));
+  const outroZone = $derived(outroZoneSec(duration, deck.outroPoint));
 </script>
 
 <div class="marker-panel">
@@ -119,7 +123,7 @@
   <div class="mp-row">
     <span class="mp-label" title="Where this track becomes blendable — the incoming half of an auto transition">Intro</span>
     <span class="mp-time">{fmt(deck.introPoint)}</span>
-    <span class="mp-zone">{introZone !== null ? `${introZone.toFixed(1)}s zone` : ""}</span>
+    <span class="mp-zone">{introZone !== null ? `${introZone.toFixed(1)}s zone` : deck.introPoint !== null ? "ignored" : ""}</span>
     <button class="mp-btn" onclick={() => setMix("mix_in")} disabled={!deck.source || busy["mix_in"]} title="Set the intro/mix-in point at the playhead (saved to Digger)">⦿</button>
     <button class="mp-btn" onclick={() => clearMix("mix_in")} disabled={deck.introPoint === null || busy["mix_in"]} title="Clear the intro point (removes it in Digger too)">✕</button>
   </div>
@@ -127,7 +131,7 @@
   <div class="mp-row">
     <span class="mp-label" title="Where this track's outro starts — the outgoing half of an auto transition, and what the near-end trigger measures from">Outro</span>
     <span class="mp-time">{fmt(deck.outroPoint)}</span>
-    <span class="mp-zone">{outroZone !== null ? `${outroZone.toFixed(1)}s zone` : ""}</span>
+    <span class="mp-zone">{outroZone !== null ? `${outroZone.toFixed(1)}s zone` : deck.outroPoint !== null ? "ignored" : ""}</span>
     <button class="mp-btn" onclick={() => setMix("mix_out")} disabled={!deck.source || busy["mix_out"]} title="Set the outro/mix-out point at the playhead (saved to Digger)">⦿</button>
     <button class="mp-btn" onclick={() => clearMix("mix_out")} disabled={deck.outroPoint === null || busy["mix_out"]} title="Clear the outro point (removes it in Digger too)">✕</button>
   </div>
