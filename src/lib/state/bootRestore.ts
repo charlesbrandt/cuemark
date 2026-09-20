@@ -82,6 +82,18 @@ export async function restoreSessionOnBoot(): Promise<BootRestoreResult> {
       // future caller invokes this rehydration path without a full page reload. Without
       // it, this is exactly the stale-trust bug class fixed in 060de16.
       for (const deck of restored.decks) clearSavedGrid(deck.id);
+      // A snapshot written before 2026-09-20 carries `introPoint`/`outroPoint` and none of
+      // the four mix-zone fields, so they rehydrate as `undefined` — and `undefined !== null`
+      // passes every `!== null` guard in the engine, which is the exact silent-failure class
+      // that froze a deck on 2026-07-06 (digger-integration skill, "Digger omits unset
+      // bpm/downbeat"). Normalize at the boundary rather than trusting the cast above; the
+      // old fields are deliberately NOT translated, since their meaning is what changed.
+      for (const deck of restored.decks) {
+        deck.mixInStart ??= null;
+        deck.mixInEnd ??= null;
+        deck.mixOutStart ??= null;
+        deck.mixOutEnd ??= null;
+      }
       for (const status of recovery.audio) {
         if (status.filePath) {
           // Audio wins on disagreement (design doc "Session-of-record"): the pipeline's

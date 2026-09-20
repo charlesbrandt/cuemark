@@ -95,8 +95,10 @@ export async function loadQueueItemToDeck(
     diggerFileId: payload.fileId ?? null,
     // Same omitted-when-unset gotcha as bpm/downbeat above (api.ts's CuemarkPayload
     // doc comment) — normalize here rather than trust the JSON to carry `null`.
-    outroPoint: payload.mixOut ?? null,
-    introPoint: payload.mixIn ?? null,
+    mixOutStart: payload.mixOut ?? null,
+    mixOutEnd: payload.mixOutEnd ?? null,
+    mixInStart: payload.mixIn ?? null,
+    mixInEnd: payload.mixInEnd ?? null,
     // Reset to the deck default (1.0) unless Digger supplies one — mirrors the
     // bpm/downbeat pull-on-load pattern above.
     gain: payload.gain ?? 1.0,

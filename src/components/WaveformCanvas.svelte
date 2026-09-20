@@ -499,34 +499,51 @@
     W: number, H: number,
     timeToX: (t: number) => number
   ) {
-    // Mix zones (phase 6, docs/design/auto-dj-transitions.md) — the intro zone [0,
-    // introPoint] and the outro zone [outroPoint, end] Auto DJ derives a transition
-    // duration from. Drawn first, under everything else, and as a low-alpha wash plus one
-    // boundary line rather than the loop region's brighter fill: these are always present
-    // on an analysed track, so they must read as background information, not as an
-    // engaged mode. Amber for outro / blue for intro, deliberately clear of the loop
-    // region's green and the cue point's white.
+    // Mix zones (four-point vocabulary, 2026-09-20, docs/design/mix-zones.md) — the
+    // fade-in zone [mixInStart, mixInEnd] and the fade-out zone [mixOutStart, mixOutEnd ??
+    // trackEnd] Auto DJ derives a transition duration from. Drawn first, under everything
+    // else, and as a low-alpha wash plus boundary lines rather than the loop region's
+    // brighter fill: these are always present on an analysed track, so they must read as
+    // background information, not as an engaged mode. Amber for outro / blue for intro,
+    // deliberately clear of the loop region's green and the cue point's white.
+    //
+    // Deliberately NOT `effectiveZones()` (autoMix.ts): this draws what the DJ has
+    // *placed*, not what the engine will *trust and use* — a zone the engine would reject
+    // (too short, outro inside the first third, etc.) still needs to be visible here so
+    // the DJ can see why and fix it, which is the opposite of what the panel should show.
     const trackEnd = deck.source?.type === 'video' ? deck.source.duration : 0;
-    function drawZone(from: number, to: number, fill: string, edge: string, edgeAt: number) {
-      const x1 = timeToX(from);
-      const x2 = timeToX(to);
-      const left = Math.max(0, Math.min(x1, x2));
-      const right = Math.min(W, Math.max(x1, x2));
-      if (right <= left) return;
-      ctx.fillStyle = fill;
-      ctx.fillRect(left, 0, right - left, H);
-      const ex = timeToX(edgeAt);
-      if (ex >= -1 && ex <= W + 1) {
+    // `to` is null when a zone has a start but no placed end yet — draw only the start's
+    // boundary line, no shaded span, so a half-placed zone reads as "half placed" rather
+    // than as a zone that doesn't exist (a guessed end would lie about that).
+    function drawZone(start: number, end: number | null, fill: string, edge: string) {
+      function edgeLine(t: number) {
+        const ex = timeToX(t);
+        if (ex < -1 || ex > W + 1) return;
         ctx.strokeStyle = edge;
         ctx.lineWidth = 1;
         ctx.beginPath(); ctx.moveTo(ex, 0); ctx.lineTo(ex, H); ctx.stroke();
       }
+      if (end !== null) {
+        const x1 = timeToX(start);
+        const x2 = timeToX(end);
+        const left = Math.max(0, Math.min(x1, x2));
+        const right = Math.min(W, Math.max(x1, x2));
+        if (right > left) {
+          ctx.fillStyle = fill;
+          ctx.fillRect(left, 0, right - left, H);
+        }
+        edgeLine(end);
+      }
+      edgeLine(start);
     }
-    if (deck.introPoint !== null && deck.introPoint > 0) {
-      drawZone(0, deck.introPoint, 'rgba(90, 160, 255, 0.13)', 'rgba(120, 180, 255, 0.55)', deck.introPoint);
+    // Neither zone is pinned to a track boundary any more — intro no longer implicitly
+    // starts at 0, and only the outro's missing-end case still falls back to trackEnd
+    // (Deck.mixOutEnd's own null-fallback rule; mixInEnd has deliberately no such fallback).
+    if (deck.mixInStart !== null) {
+      drawZone(deck.mixInStart, deck.mixInEnd, 'rgba(90, 160, 255, 0.13)', 'rgba(120, 180, 255, 0.55)');
     }
-    if (deck.outroPoint !== null && trackEnd > 0 && deck.outroPoint < trackEnd) {
-      drawZone(deck.outroPoint, trackEnd, 'rgba(255, 170, 60, 0.13)', 'rgba(255, 190, 90, 0.55)', deck.outroPoint);
+    if (deck.mixOutStart !== null) {
+      drawZone(deck.mixOutStart, deck.mixOutEnd ?? (trackEnd > 0 ? trackEnd : null), 'rgba(255, 170, 60, 0.13)', 'rgba(255, 190, 90, 0.55)');
     }
 
     // Loop region highlight

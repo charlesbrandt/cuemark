@@ -327,8 +327,10 @@
           // driving this file's transitions.
           diggerTrackId: null,
           diggerFileId: null,
-          introPoint: null,
-          outroPoint: null,
+          mixInStart: null,
+          mixInEnd: null,
+          mixOutStart: null,
+          mixOutEnd: null,
         });
         notifyManualLoadDisplaced(previousDiggerTrackId);
       }

@@ -53,8 +53,10 @@ function baseDeck(id: string, overrides: Partial<Deck> = {}): Deck {
     hotCues: [],
     bpm: null,
     downbeat: null,
-    outroPoint: null,
-    introPoint: null,
+    mixOutStart: null,
+    mixOutEnd: null,
+    mixInStart: null,
+    mixInEnd: null,
     diggerTrackId: null,
     diggerFileId: null,
     loopIn: null,
@@ -274,7 +276,7 @@ describe('checkAutoMixTrigger / checkAutoPreloadTrigger with outroPoint (Phase 4
       // outroPoint at 60s, well before the 100s duration. The blend runs OVER the outro
       // zone (2026-09-19), so it starts when the playhead reaches the marker — not 10s
       // before it, and not off the 100s track end.
-      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: 60 }),
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), mixOutStart: 60 }),
       baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
     ]);
 
@@ -290,7 +292,7 @@ describe('checkAutoMixTrigger / checkAutoPreloadTrigger with outroPoint (Phase 4
     autoDjMod.autoDjEnabled.set(true);
     autoMixMod.autoMixThresholdSec.set(15);
     resetSession([
-      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: 90 }),
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), mixOutStart: 90 }),
       baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
     ]);
 
@@ -305,7 +307,7 @@ describe('checkAutoMixTrigger / checkAutoPreloadTrigger with outroPoint (Phase 4
     autoMixMod.autoMixThresholdSec.set(15);
     resetSession([
       // A stale/bad marker beyond duration must not push the trigger point past EOS.
-      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: 500 }),
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), mixOutStart: 500 }),
       baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
     ]);
 
@@ -323,7 +325,7 @@ describe('checkAutoMixTrigger / checkAutoPreloadTrigger with outroPoint (Phase 4
     autoDjMod.autoDjEnabled.set(true);
     autoMixMod.autoMixThresholdSec.set(15);
     resetSession([
-      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: 10 }),
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), mixOutStart: 10 }),
       baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
     ]);
 
@@ -341,7 +343,7 @@ describe('checkAutoMixTrigger / checkAutoPreloadTrigger with outroPoint (Phase 4
     getQueue.mockResolvedValue([]);
     queueNext.mockResolvedValue({ id: 1, track_id: 7, title: 'T', artist: 'A' });
     resetSession([
-      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: 60 }),
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), mixOutStart: 60 }),
       baseDeck('deck-1', { source: null }),
     ]);
 
@@ -355,7 +357,7 @@ describe('checkAutoMixTrigger / checkAutoPreloadTrigger with outroPoint (Phase 4
     autoDjMod.autoDjEnabled.set(true);
     autoMixMod.autoMixThresholdSec.set(15);
     resetSession([
-      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: null }),
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), mixOutStart: null }),
       baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
     ]);
 
@@ -846,69 +848,120 @@ describe('notifyManualPlay (Tier 2, silent)', () => {
 // it's tested directly rather than only through the trigger — the trigger tests below
 // then cover the one thing the pure function can't: that a derived duration also moves
 // the trigger point, so a long blend isn't truncated by the track ending under it.
-describe('computeTransitionDurationMs (Phase 5)', () => {
+describe('computeTransitionDurationMs (Phase 5, four-point since Phase 8)', () => {
+  // Every literal below is a full TransitionZones: two [start, end] pairs. The outro
+  // side's `mixOutEnd: null` is not laziness — null there means "the track's own end",
+  // which is the value that was implicit before the field existed, so these cases are
+  // byte-identical to their Phase 5 versions. The intro side has no such fallback, which
+  // is why its cases had to change shape rather than just be renamed.
+  const noZones = { duration: 200, mixOutStart: null, mixOutEnd: null, mixInStart: null, mixInEnd: null };
+
   it('falls back to the flat setting when neither track carries usable markers', async () => {
     const { autoMixMod } = await setup();
-    expect(autoMixMod.computeTransitionDurationMs(
-      { duration: 200, outroPoint: null, introPoint: null },
-      { duration: 200, outroPoint: null, introPoint: null },
-      6000,
-    )).toEqual({ ms: 6000, source: 'fallback' });
+    expect(autoMixMod.computeTransitionDurationMs(noZones, noZones, 6000))
+      .toEqual({ ms: 6000, source: 'fallback' });
   });
 
   it('derives the duration from the outgoing track\'s outro zone alone', async () => {
     const { autoMixMod } = await setup();
-    // 200s track, mix-out at 190 -> a 10s outro tail to fade under.
+    // 200s track, mix-out at 190, no explicit end -> a 10s outro tail to fade under.
     expect(autoMixMod.computeTransitionDurationMs(
-      { duration: 200, outroPoint: 190, introPoint: null },
-      { duration: 200, outroPoint: null, introPoint: null },
+      { ...noZones, mixOutStart: 190 },
+      noZones,
       6000,
     )).toEqual({ ms: 10000, source: 'outro' });
+  });
+
+  it('honours an explicit mixOutEnd shorter than the track', async () => {
+    // The thing the one-point model could not say at all: fade over [170, 182] and let
+    // the last 18s of the track play out alone. Before Phase 8 this zone was always
+    // "mix-out marker to EOS" by construction.
+    const { autoMixMod } = await setup();
+    expect(autoMixMod.computeTransitionDurationMs(
+      { ...noZones, mixOutStart: 170, mixOutEnd: 182 },
+      noZones,
+      6000,
+    )).toEqual({ ms: 12000, source: 'outro' });
   });
 
   it('derives the duration from the incoming track\'s intro zone alone', async () => {
     const { autoMixMod } = await setup();
     expect(autoMixMod.computeTransitionDurationMs(
-      { duration: 200, outroPoint: null, introPoint: null },
-      { duration: 200, outroPoint: null, introPoint: 8 },
+      noZones,
+      { ...noZones, mixInStart: 0, mixInEnd: 8 },
       6000,
     )).toEqual({ ms: 8000, source: 'intro' });
+  });
+
+  it('measures the intro zone from its start, not from zero', async () => {
+    // The Phase 7b double-duty bug, as a test. A mix-in hand-placed at 18s used to mean
+    // both "start the incoming track at 18s" AND "18s of blendable head" — so the engine
+    // skipped 18s and then offered a blend as long as the part it had just skipped. The
+    // zone here is [18, 24]: six seconds, which is what min() should see.
+    const { autoMixMod } = await setup();
+    expect(autoMixMod.computeTransitionDurationMs(
+      noZones,
+      { ...noZones, mixInStart: 18, mixInEnd: 24 },
+      6000,
+    )).toEqual({ ms: 6000, source: 'intro' });
+  });
+
+  it('contributes nothing from the intro side when only the start is marked', async () => {
+    // An un-backfilled track: Digger gave it a mix_in_start but no mix_in_end. Deliberate
+    // — see Deck.mixInEnd. The alternative (assume the end is the track's) is the old bug.
+    const { autoMixMod } = await setup();
+    expect(autoMixMod.computeTransitionDurationMs(
+      { ...noZones, mixOutStart: 190 },
+      { ...noZones, mixInStart: 18 },
+      6000,
+    )).toEqual({ ms: 10000, source: 'outro' });
   });
 
   it('takes the shorter of the two zones when both tracks support a blend', async () => {
     const { autoMixMod } = await setup();
     expect(autoMixMod.computeTransitionDurationMs(
-      { duration: 200, outroPoint: 188, introPoint: null }, // 12s outro
-      { duration: 200, outroPoint: null, introPoint: 7 },   // 7s intro
+      { ...noZones, mixOutStart: 188 },                    // 12s outro
+      { ...noZones, mixInStart: 0, mixInEnd: 7 },          // 7s intro
       6000,
     )).toEqual({ ms: 7000, source: 'zones' });
   });
 
   it('ignores the sub-second mix_in Digger derives for most tracks', async () => {
-    // _derive_mix_points() sets mix_in = beat_times[0], the first tracked beat — usually
-    // well under a second, and meaningless as an intro *length*. Without MIN_ZONE_SEC
-    // every transition with any analysed incoming track would collapse to the 2s floor.
+    // _derive_mix_points() sets mix_in_start = beat_times[0], the first tracked beat —
+    // usually well under a second. As a zone START that is harmless and even correct; it
+    // just carries no LENGTH on its own, which is what this asserts. (Whether it is worth
+    // *seeking* to is a separate question — see INTRO_SEEK_MIN_SEC.)
     const { autoMixMod } = await setup();
     expect(autoMixMod.computeTransitionDurationMs(
-      { duration: 200, outroPoint: 190, introPoint: null },
-      { duration: 200, outroPoint: null, introPoint: 0.43 },
+      { ...noZones, mixOutStart: 190 },
+      { ...noZones, mixInStart: 0.43 },
       6000,
     )).toEqual({ ms: 10000, source: 'outro' });
   });
 
-  it('ignores an introPoint past the first third of the incoming track', async () => {
+  it('ignores a mix-in start past the first third of the incoming track', async () => {
     const { autoMixMod } = await setup();
     expect(autoMixMod.computeTransitionDurationMs(
-      { duration: 200, outroPoint: null, introPoint: null },
-      { duration: 200, outroPoint: null, introPoint: 120 },
+      noZones,
+      { ...noZones, mixInStart: 120, mixInEnd: 140 },
       6000,
     )).toEqual({ ms: 6000, source: 'fallback' });
   });
 
-  it('ignores an outroPoint inside the first third, same as the trigger does', async () => {
+  it('ignores an intro zone shorter than MIN_ZONE_SEC even with both ends placed', async () => {
+    // The zone rule still applies to the zone — splitting the rules did not remove it.
     const { autoMixMod } = await setup();
     expect(autoMixMod.computeTransitionDurationMs(
-      { duration: 200, outroPoint: 18, introPoint: null }, // the "Baddy On The Floor" shape
+      noZones,
+      { ...noZones, mixInStart: 10, mixInEnd: 11.5 },
+      6000,
+    )).toEqual({ ms: 6000, source: 'fallback' });
+  });
+
+  it('ignores a mix-out start inside the first third, same as the trigger does', async () => {
+    const { autoMixMod } = await setup();
+    expect(autoMixMod.computeTransitionDurationMs(
+      { ...noZones, mixOutStart: 18 }, // the "Baddy On The Floor" shape
       null,
       6000,
     )).toEqual({ ms: 6000, source: 'fallback' });
@@ -917,18 +970,18 @@ describe('computeTransitionDurationMs (Phase 5)', () => {
   it('clamps a very long outro zone to the ceiling, and a very short one to the floor', async () => {
     const { autoMixMod } = await setup();
     expect(autoMixMod.computeTransitionDurationMs(
-      { duration: 300, outroPoint: 150, introPoint: null }, // 150s of "outro"
+      { ...noZones, duration: 300, mixOutStart: 150 }, // 150s of "outro"
       null,
       6000,
     ).ms).toBe(20000);
     expect(autoMixMod.computeTransitionDurationMs(
-      { duration: 200, outroPoint: 197.5, introPoint: null }, // 2.5s outro
+      { ...noZones, mixOutStart: 197.5 }, // 2.5s outro
       null,
       6000,
     ).ms).toBe(2500);
     expect(autoMixMod.computeTransitionDurationMs(
-      { duration: 200, outroPoint: null, introPoint: null },
-      { duration: 200, outroPoint: null, introPoint: 2 }, // exactly at MIN_ZONE_SEC
+      noZones,
+      { ...noZones, mixInStart: 0, mixInEnd: 2 }, // exactly at MIN_ZONE_SEC
       6000,
     ).ms).toBe(2000);
   });
@@ -942,7 +995,7 @@ describe('checkAutoMixTrigger duration/lead derivation (Phase 5)', () => {
     autoMixMod.crossfadeDurationMs.set(1000); // the flat fallback — must NOT be what runs
     resetSession([
       // 25s outro tail -> a 20s blend (the ceiling), running from the marker onwards.
-      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 200), outroPoint: 175 }),
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 200), mixOutStart: 175 }),
       baseDeck('deck-1', { source: videoSource('b.mp4', 200) }),
     ]);
 
@@ -965,7 +1018,7 @@ describe('checkAutoMixTrigger duration/lead derivation (Phase 5)', () => {
     resetSession([
       // 5s outro tail -> a 5s blend from the marker. The "start mixing 15s out" setting only
       // governs tracks WITHOUT a usable marker; with one, the marker is the start.
-      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), outroPoint: 95 }),
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), mixOutStart: 95 }),
       baseDeck('deck-1', { source: videoSource('b.mp4', 100) }),
     ]);
 
@@ -1089,7 +1142,7 @@ describe('previewTransition (Phase 6 — audition the transition)', () => {
     autoMixMod.autoMixThresholdSec.set(15);
     autoMixMod.crossfadeDurationMs.set(1000);
     resetSession([
-      baseDeck('deck-0', { source: videoSource('a.mp4', 200), outroPoint: 180 }),
+      baseDeck('deck-0', { source: videoSource('a.mp4', 200), mixOutStart: 180 }),
       baseDeck('deck-1', { source: videoSource('b.mp4', 200) }),
     ]);
 
@@ -1131,7 +1184,7 @@ describe('previewTransition (Phase 6 — audition the transition)', () => {
     autoMixMod.autoMixThresholdSec.set(15);
     autoMixMod.crossfadeDurationMs.set(1000);
     resetSession([
-      baseDeck('deck-0', { source: videoSource('a.mp4', 200), outroPoint: 180 }),
+      baseDeck('deck-0', { source: videoSource('a.mp4', 200), mixOutStart: 180 }),
       baseDeck('deck-1', { source: videoSource('b.mp4', 200) }),
     ]);
 
@@ -1159,7 +1212,7 @@ describe('previewTransition (Phase 6 — audition the transition)', () => {
   it('refuses when the other crossfader deck has nothing loaded', async () => {
     const { sessionMod, autoMixMod, resetSession } = await setup();
     resetSession([
-      baseDeck('deck-0', { source: videoSource('a.mp4', 200), outroPoint: 180 }),
+      baseDeck('deck-0', { source: videoSource('a.mp4', 200), mixOutStart: 180 }),
       baseDeck('deck-1', { source: null }),
     ]);
 
@@ -1181,14 +1234,14 @@ describe('previewTransition (Phase 6 — audition the transition)', () => {
 describe('incoming deck starts at its mix-in marker (Phase 7b)', () => {
   /** deck-0 plays out with no outro marker (so the old end-anchored lead applies); deck-1
    *  waits with whatever intro marker the test gives it. */
-  async function armPair(env: Awaited<ReturnType<typeof setup>>, introPoint: number | null, incomingOverrides: Partial<Deck> = {}) {
+  async function armPair(env: Awaited<ReturnType<typeof setup>>, mixInStart: number | null, incomingOverrides: Partial<Deck> = {}) {
     const { autoDjMod, autoMixMod, resetSession } = env;
     autoDjMod.autoDjEnabled.set(true);
     autoMixMod.autoMixThresholdSec.set(15);
     autoMixMod.crossfadeDurationMs.set(1000);
     resetSession([
       baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100) }),
-      baseDeck('deck-1', { source: videoSource('b.mp4', 100), introPoint, ...incomingOverrides }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 100), mixInStart, ...incomingOverrides }),
     ]);
   }
 
@@ -1266,7 +1319,7 @@ describe('incoming deck starts at its mix-in marker (Phase 7b)', () => {
     resetSession(
       [
         baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), bpm: 120, downbeat: 0 }),
-        baseDeck('deck-1', { source: videoSource('b.mp4', 100), bpm: 128, downbeat: 0, introPoint: 10 }),
+        baseDeck('deck-1', { source: videoSource('b.mp4', 100), bpm: 128, downbeat: 0, mixInStart: 10 }),
       ],
       { bpm: 120, masterDeckId: 'deck-0' },
     );
@@ -1313,8 +1366,8 @@ describe('incoming deck starts at its mix-in marker (Phase 7b)', () => {
     autoMixMod.autoMixThresholdSec.set(15);
     autoMixMod.crossfadeDurationMs.set(1000);
     resetSession([
-      baseDeck('deck-0', { source: videoSource('a.mp4', 200), outroPoint: 180 }),
-      baseDeck('deck-1', { source: videoSource('b.mp4', 200), introPoint: 20 }),
+      baseDeck('deck-0', { source: videoSource('a.mp4', 200), mixOutStart: 180 }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 200), mixInStart: 20 }),
     ]);
 
     autoMixMod.previewTransition('deck-0');
@@ -1506,15 +1559,72 @@ describe('structural disengage (Tier 3, alert)', () => {
   });
 });
 
-describe('outroZoneSec / introZoneSec (what the marker panel prints)', () => {
-  it('report the engine\'s usable zone, and null for values the engine discards', async () => {
+// ── Phase 8 (2026-09-20): one resolver, two rules ────────────────────────────────────
+// `effectiveZones` replaced the exported `outroZoneSec`/`introZoneSec` pair so that the
+// marker panel and the engine cannot disagree about which markers count (design review
+// A4). The tests that matter most here are the two that the old one-rule-for-everything
+// model got wrong: a point that is a fine START but a useless ZONE, and a zone measured
+// from its own start rather than from the track's.
+describe('effectiveZones (the one place every trust rule lives)', () => {
+  const z = (o: Partial<{ duration: number; mixOutStart: number | null; mixOutEnd: number | null; mixInStart: number | null; mixInEnd: number | null }> = {}) =>
+    ({ duration: 200, mixOutStart: null, mixOutEnd: null, mixInStart: null, mixInEnd: null, ...o });
+
+  it('reports the usable length of each zone', async () => {
     const { autoMixMod } = await setup();
-    expect(autoMixMod.outroZoneSec(200, 180)).toBe(20);
-    expect(autoMixMod.outroZoneSec(200, 199)).toBeNull(); // sub-2s zone
-    expect(autoMixMod.outroZoneSec(200, 50)).toBeNull(); // marker inside the first third
-    expect(autoMixMod.outroZoneSec(200, null)).toBeNull();
-    expect(autoMixMod.introZoneSec(200, 12)).toBe(12);
-    expect(autoMixMod.introZoneSec(200, 0.4)).toBeNull(); // Digger's first-beat mix_in
-    expect(autoMixMod.introZoneSec(200, 120)).toBeNull(); // past the first third
+    const e = autoMixMod.effectiveZones(z({ mixOutStart: 180, mixInStart: 4, mixInEnd: 16 }));
+    expect(e.outLenSec).toBe(20); // mixOutEnd null -> the track's own end
+    expect(e.inLenSec).toBe(12);  // measured from 4, not from 0
+    expect(e.outStart).toBe(180);
+    expect(e.inStart).toBe(4);
+    expect(e.nearEnd).toBe(180);
+  });
+
+  it('accepts a sub-MIN_ZONE_SEC mix-in as a START while rejecting it as a ZONE', async () => {
+    // The rule split, stated as an assertion. A track with a hard first downbeat has a
+    // perfectly good mix-in at 0.5s and no usable 0.5s blend zone; the single
+    // `introZoneSec` gate rejected it as both, so Phase 7b could never start a deck there.
+    const { autoMixMod } = await setup();
+    const e = autoMixMod.effectiveZones(z({ mixInStart: 0.5 }));
+    expect(e.inStart).toBe(0.5);
+    expect(e.inLenSec).toBeNull();
+  });
+
+  it('rejects a mix-in start past the first third, as a start AND as a zone', async () => {
+    const { autoMixMod } = await setup();
+    const e = autoMixMod.effectiveZones(z({ mixInStart: 120, mixInEnd: 140 }));
+    expect(e.inStart).toBeNull();
+    expect(e.inLenSec).toBeNull();
+    expect(e.inRejected).toMatch(/first third/);
+  });
+
+  it('rejects a mix-out inside the first third but still never reports past EOS', async () => {
+    const { autoMixMod } = await setup();
+    expect(autoMixMod.effectiveZones(z({ mixOutStart: 50 })).outStart).toBeNull();
+    expect(autoMixMod.effectiveZones(z({ mixOutStart: 50 })).nearEnd).toBe(200);
+    // A stale marker past the end is clamped rather than pushing the trigger past EOS.
+    expect(autoMixMod.effectiveZones(z({ mixOutStart: 260 })).nearEnd).toBe(200);
+  });
+
+  it('reports a sub-2s zone as rejected rather than as a tiny zone', async () => {
+    const { autoMixMod } = await setup();
+    const e = autoMixMod.effectiveZones(z({ mixOutStart: 199 }));
+    expect(e.outLenSec).toBeNull();
+    expect(e.outStart).toBe(199); // still a valid point — the trigger still measures here
+    expect(e.outRejected).toMatch(/under 2s/);
+  });
+
+  it('distinguishes a half-placed zone from a rejected one', async () => {
+    // What the marker panel needs to say something useful: "you have not set the end yet"
+    // is a different message from "your zone is too short to blend over".
+    const { autoMixMod } = await setup();
+    expect(autoMixMod.effectiveZones(z({ mixInStart: 10 })).inRejected).toBe('no end marker');
+    expect(autoMixMod.effectiveZones(z({ mixInStart: 10, mixInEnd: 11 })).inRejected).toMatch(/under 2s/);
+    expect(autoMixMod.effectiveZones(z()).inRejected).toBeNull(); // nothing placed, nothing to explain
+  });
+
+  it('returns a neutral result for a deck with no measured duration', async () => {
+    const { autoMixMod } = await setup();
+    const e = autoMixMod.effectiveZones(z({ duration: 0, mixOutStart: 180, mixInStart: 4, mixInEnd: 16 }));
+    expect(e).toEqual({ inStart: null, inLenSec: null, outStart: null, outLenSec: null, nearEnd: 0, inRejected: null, outRejected: null });
   });
 });

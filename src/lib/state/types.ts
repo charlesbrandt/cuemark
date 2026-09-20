@@ -55,24 +55,43 @@ export interface Deck {
   hotCues: number[];      // up to 4 time markers
   bpm: number | null;      // detected or tapped BPM for this deck
   downbeat: number | null; // absolute playback position (seconds) of beat 1; null = unset
-  // Per-track outro/mix-out point (content seconds), pulled from Digger's `mixOut` —
-  // auto-derived during BPM analysis as 16 bars before the last detected beat (or ~30s
-  // before the end as a fallback), manually overridable there via the generic markers
-  // API. Auto DJ's near-end trigger (autoMix.ts) measures against this instead of
-  // source.duration when set; null (no analysis run yet, or Digger not the source)
-  // falls back to the fixed Settings threshold measured from the literal end, same as
-  // before this field existed. See docs/design/auto-dj-transitions.md "Phase 4".
-  outroPoint: number | null;
-  // Per-track intro/mix-in point (content seconds), pulled from Digger's `mixIn` — the
-  // mirror of outroPoint above, and derived by the same analysis pass (the first tracked
-  // beat; see _derive_mix_points in digger's importers/analyze_audio.py). Auto DJ reads
-  // it as the length of the incoming track's blendable intro zone when computing a
-  // transition duration (autoMix.ts's computeTransitionDurationMs). ⚠️ Digger's
-  // auto-derived value is "the first beat of the track", usually well under a second —
-  // NOT "the end of the intro section" — so in practice it only carries information when
-  // a DJ has placed a manual mix_in marker; a value shorter than MIN_ZONE_SEC is ignored.
-  // See docs/design/auto-dj-transitions.md "Phase 5".
-  introPoint: number | null;
+  // ── Mix zones: four points, two zones (2026-09-20) ────────────────────────────────
+  //
+  // Each zone is an explicit [start, end] pair in content seconds, pulled from Digger's
+  // `mixIn`/`mixInEnd`/`mixOut`/`mixOutEnd` (stored there as the marker types
+  // `mix_in_start`/`mix_in_end`/`mix_out_start`/`mix_out_end`). null everywhere means
+  // "no analysis run yet, or Digger was not the source".
+  //
+  // ⚠️ The names carry the end deliberately. These were `introPoint`/`outroPoint` until
+  // 2026-09-20, and a single scalar bounding a region got read as a *length* by the
+  // duration math and as a *start position* by the seek — both defensible, so the
+  // disagreement was silent until a DJ hand-placed a marker. `mixInStart` cannot be read
+  // as a length. See docs/design/mix-zones.md §1.
+  //
+  // Which rule applies to which field matters, and they are NOT the same rule
+  // (autoMix.ts's `effectiveZones`): a *point* only has to sit in a plausible part of the
+  // track, while a *zone* additionally has to be long enough to blend over
+  // (MIN_ZONE_SEC). A mix-in at 0.5s is a fine start position on a track with a hard first
+  // downbeat and a useless 0.5s zone; one rule for both rejected it as both.
+
+  /** Fade-out zone START — where the outgoing track's blend begins, and what Auto DJ's
+   *  near-end trigger measures against instead of `source.duration`. Digger derives it as
+   *  16 bars before the last detected beat (~30s before the end as a fallback). */
+  mixOutStart: number | null;
+  /** Fade-out zone END. null ⇒ `source.duration`, which is the value that was implicit
+   *  before this field existed, so an un-backfilled track behaves exactly as before. */
+  mixOutEnd: number | null;
+  /** Fade-in zone START — where the incoming deck is seeked to before it starts playing
+   *  (docs/design/auto-dj-transitions.md "Phase 7b"). ⚠️ Digger's auto-derived value is
+   *  `beat_times[0]`, the first tracked beat — typically well under a second, i.e. "the
+   *  beginning of the song", not "the end of the intro". Deriving something better is
+   *  docs/design/mix-zones.md §2. */
+  mixInStart: number | null;
+  /** Fade-in zone END — the length side of the intro zone, as `mixInEnd − mixInStart`.
+   *  Deliberately has NO duration fallback: unlike the outro side there is no sensible
+   *  implicit end, and inventing one is exactly the old `introPoint`-as-length bug. null
+   *  ⇒ the intro side simply does not constrain the transition duration. */
+  mixInEnd: number | null;
   diggerTrackId: number | null; // Digger track id if loaded from the Digger queue; null = local file
   diggerFileId: number | null; // Digger `files.id` behind the loaded track — used as a
                                 // remote-fetch fallback (media_cache.rs) when the local

@@ -45,16 +45,26 @@ export interface CuemarkPayload {
   beatGridAlgo: string | null;
   beatGridConfidence: number | null;
   gain: number | null;
-  // Automix transition window — both ends auto-derived by Digger's analyze_audio.py
-  // (`_derive_mix_points`) or manually set there via the markers API, and both returned
-  // by GET /tracks/{id}/cuemark. `mixOut` is 16 bars before the last detected beat
-  // (~30s-before-end fallback) and feeds Deck.outroPoint; `mixIn` is the first tracked
-  // beat and feeds Deck.introPoint. ⚠️ The auto-derived `mixIn` is the first beat of the
-  // track, not the end of its intro section — see Deck.introPoint's own comment and
-  // docs/design/auto-dj-transitions.md "Phase 4"/"Phase 5" before treating it as an
-  // intro *length*.
+  // Automix transition zones — two [start, end] pairs, all four auto-derived by Digger's
+  // analyze_audio.py (`_derive_mix_points`) or manually set there via the markers API, and
+  // all four returned by GET /tracks/{id}/cuemark. They feed Deck.mixInStart/mixInEnd/
+  // mixOutStart/mixOutEnd respectively.
+  //
+  // ⚠️ The wire names are deliberately NOT the storage names. Digger stores these as the
+  // marker types `mix_in_start`/`mix_in_end`/`mix_out_start`/`mix_out_end` (renamed from
+  // `mix_in`/`mix_out` on 2026-09-20), but the payload keeps `mixIn`/`mixOut` for the two
+  // starts so an un-updated cuemark build keeps working against an updated Digger. The
+  // payload is a separate contract from the storage vocabulary — that is what made the
+  // rename affordable. See docs/design/mix-zones.md §1.
+  //
+  // ⚠️ `mixIn` is auto-derived as `beat_times[0]`, the first tracked beat — i.e. "the
+  // beginning of the song", not "the end of the intro". It is a usable START POSITION and
+  // it is NOT an intro length; the length is `mixInEnd − mixIn`. Deriving a mix-in worth
+  // having is docs/design/mix-zones.md §2.
   mixIn: number | null;
+  mixInEnd: number | null;
   mixOut: number | null;
+  mixOutEnd: number | null;
 }
 
 /** A cached decode from Digger's waveform_cache table (see beat-grid-precision.md) —
@@ -261,7 +271,7 @@ export function subscribeQueueChanges(onChange: () => void): () => void {
   };
 }
 
-export type MarkerType = 'cue' | 'hot_cue' | 'downbeat' | 'mix_in' | 'mix_out';
+export type MarkerType = 'cue' | 'hot_cue' | 'downbeat' | MixMarkerType;
 
 export interface DiggerMarker {
   id: number;
@@ -305,12 +315,24 @@ export async function deleteMarker(markerId: number): Promise<void> {
   if (!r.ok) throw new Error(`delete marker ${r.status}`);
 }
 
+/** The four mix-zone marker types, as Digger stores them since 2026-09-20. Each zone says
+ *  which end it is, so no value can be read as a length by one consumer and a position by
+ *  another — the exact defect this vocabulary replaced. See docs/design/mix-zones.md §1. */
+export type MixMarkerType = 'mix_in_start' | 'mix_in_end' | 'mix_out_start' | 'mix_out_end';
+
+const MIX_MARKER_LABEL: Record<MixMarkerType, string> = {
+  mix_in_start: 'Mix in',
+  mix_in_end: 'Mix in end',
+  mix_out_start: 'Mix out',
+  mix_out_end: 'Mix out end',
+};
+
 /**
- * Replace a track's mix_in / mix_out marker — **delete-then-insert, not append**.
+ * Replace one of a track's four mix-zone markers — **delete-then-insert, not append**.
  *
  * ⚠️ This is load-bearing, and it is the reason a manual "set the outro here" control was
  * declined in phase 4 (see docs/design/auto-dj-transitions.md). Digger's
- * `_build_cuemark_payload()` resolves mix_in/mix_out by taking the **first marker of that
+ * `_build_cuemark_payload()` resolves each mix marker by taking the **first marker of that
  * type ordered by `position_ms`** — not the most recent, and not `source='manual'` first,
  * the way it does for `downbeat`. So simply POSTing a manual marker later in the track
  * than the auto-derived 'detected' one silently loses to it, forever, with no error.
@@ -319,23 +341,24 @@ export async function deleteMarker(markerId: number): Promise<void> {
  *
  * Note this is *within* Digger's existing API — no schema change, no endpoint change, and
  * no dependence on Digger's resolution rule being fixed later (if it ever is, this still
- * behaves identically). Re-running `analyze_audio.py` on the track will re-derive a
- * 'detected' marker alongside the manual one, and the same ambiguity returns — flagged as
- * an open decision in the design doc rather than worked around from this side.
+ * behaves identically). Re-running `analyze_audio.py` will NOT clobber what this writes:
+ * `_upsert_mix_marker` backs off entirely for a type that has any non-'detected' row, and
+ * every cuemark POST lands as `source='manual'`. The one residual is that a *cleared*
+ * marker is re-derived on the next analysis run — moved is durable, cleared is not.
  */
 export async function setMixMarker(
   trackId: number,
-  type: 'mix_in' | 'mix_out',
+  type: MixMarkerType,
   positionSec: number,
 ): Promise<void> {
   await clearMixMarker(trackId, type);
-  await pushMarker(trackId, Math.round(positionSec * 1000), type, type === 'mix_in' ? 'Mix in' : 'Mix out');
+  await pushMarker(trackId, Math.round(positionSec * 1000), type, MIX_MARKER_LABEL[type]);
 }
 
 /** Removes every marker of this type from the track (usually one 'detected' row, plus a
  *  'manual' one if cuemark has already overridden it). Leaves the track with no mix point
- *  of that type at all, which cuemark reads as "no marker" and falls back to duration. */
-export async function clearMixMarker(trackId: number, type: 'mix_in' | 'mix_out'): Promise<void> {
+ *  of that type at all, which cuemark reads as "no marker" for that end of the zone. */
+export async function clearMixMarker(trackId: number, type: MixMarkerType): Promise<void> {
   const markers = await getTrackMarkers(trackId);
   for (const m of markers) {
     if (m.type === type) await deleteMarker(m.id);

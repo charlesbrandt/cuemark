@@ -356,8 +356,8 @@ function finishPreview(): void {
   endPreviewGuard();
 }
 
-// Phase 4 (gap 1): where "near-end" is measured from. A set `outroPoint` (Digger's
-// auto-derived or manually-placed mix-out marker — see the Deck.outroPoint doc comment
+// Phase 4 (gap 1): where "near-end" is measured from. A set `mixOutStart` (Digger's
+// auto-derived or manually-placed mix-out marker — see the Deck.mixOutStart doc comment
 // in types.ts) takes over from the literal track end; the existing threshold settings
 // (autoMixThresholdSec / autoPreloadThresholdSec) still measure their lead time from
 // whichever point applies, so a DJ with no marker data sees identical behavior to before
@@ -370,44 +370,144 @@ function finishPreview(): void {
 // been mixed in. The doc's own clamp above only ever protected the high end (never past
 // EOS); a marker inside the first third of the track is equally untrustworthy and is
 // now ignored in favor of raw duration, same as no marker at all.
-function nearEndReference(outroPoint: number | null, duration: number): number {
-  if (outroPoint !== null && outroPoint >= duration / 3) return Math.min(outroPoint, duration);
-  return duration;
-}
-
-// ── Phase 5 (2026-08-30): transition duration derived from the two tracks ────────────
+//
+// ── Phase 8 (2026-09-20): four points, two zones, two rules ──────────────────────────
 //
 // A blend can only be as long as the more constrained of the two tracks supports, so the
-// duration is the *minimum* of two zone lengths:
-//   - the outgoing track's OUTRO zone: `duration - outroPoint`, i.e. how much track sits
-//     after its mix-out marker. For Digger's auto-derived marker that is 16 bars (~30s at
-//     128bpm) — the tail the DJ is happy to have another track playing over.
-//   - the incoming track's INTRO zone: `introPoint`, i.e. how much of its head is
-//     blendable before its body starts.
-// Either side missing (no marker, or an untrustworthy one) simply doesn't constrain;
-// both missing falls back to the flat `crossfadeDurationMs` setting, which is the exact
-// behavior every transition had before this existed — the same fallback discipline
-// `nearEndReference` uses for `outroPoint` itself.
+// duration is the *minimum* of two zone lengths — and since 2026-09-20 both are real
+// measured lengths rather than distances to an implicit track boundary:
+//   - the outgoing track's OUTRO zone: `mixOutEnd − mixOutStart` (end defaulting to the
+//     track duration, which is the value that was implicit before the field existed);
+//   - the incoming track's INTRO zone: `mixInEnd − mixInStart`.
+// Either side missing simply doesn't constrain; both missing falls back to the flat
+// `crossfadeDurationMs` setting, which is the behavior every transition had before any of
+// this existed.
 //
-// ⚠️ In practice the intro side is almost always inert today, and that is not a bug in
-// this function: Digger's `_derive_mix_points()` sets `mix_in` to `beat_times[0]`, the
-// FIRST TRACKED BEAT of the track — typically well under a second, not "the end of the
-// intro section". So `introPoint` only carries real information when a DJ has placed a
-// manual mix_in marker. MIN_ZONE_SEC is what keeps those sub-second auto values from
-// collapsing every transition to the 2s floor. A genuine intro/outro *length* (or the
-// per-track "suggested fade time" the feature was asked for) needs new Digger-side
-// analysis — written up as an open decision in the design doc, deliberately not built here.
+// ⚠️ What this replaces, and why it was wrong: the intro length used to be `introPoint`
+// itself — i.e. the zone was assumed to be `[0, introPoint]`. That made one scalar mean
+// both "start the incoming deck here" (phase 7b) and "this much head is blendable", two
+// readings that disagree the moment a DJ hand-places a mix-in: the engine would start the
+// track at 18s *and* offer an 18s blend derived from the 18s it had just skipped. See
+// docs/design/mix-zones.md §1 and `[[feedback_name_which_end_not_the_region]]`.
+//
+// ⚠️ A track analysed before Digger's four-point derivation shipped has no `mixInEnd`, so
+// its intro side contributes nothing until the backfill runs. That is deliberate and is
+// strictly better than the old reading, which contributed a *wrong* number.
+//
+// ⚠️ The point rule and the zone rule are SEPARATE, which is the other thing the
+// one-scalar model could not express. A mix-in at 0.5s is a perfectly good start position
+// on a track with a hard first downbeat and a useless 0.5s blend zone; applying
+// MIN_ZONE_SEC to both rejected it as both.
 const MIN_ZONE_SEC = 2;
 const MIN_TRANSITION_MS = 2000;
 const MAX_TRANSITION_MS = 20000;
 
-/** The two per-track fields a transition duration is derived from, plus the duration they
- *  are relative to. Structural (not `Deck`) so callers can pass a bare object and so the
+/** Below this, "start the incoming deck here" and "start it at 0" are the same instruction
+ *  — the target is inside the track's own pre-roll and the deck is parked at 0 anyway.
+ *
+ *  ⚠️ This is about *delivery*, not trust, and the distinction matters because it looks
+ *  like the rule Phase 8 just removed. `effectiveZones().inStart` still ACCEPTS a
+ *  sub-second mix-in as a valid start position — that was the point of splitting the point
+ *  rule from the zone rule. This only declines to *act* on one, because acting costs a
+ *  GStreamer pipeline + codec-decoder flush plus a whole SEEK_SETTLE_MS stage at the exact
+ *  moment a transition begins, in exchange for a fraction of a second of near-silence
+ *  under a fade. Digger derives `mix_in_start` as `beat_times[0]` — sub-second on most of
+ *  the library — so without this floor every transition on an analysed track would start
+ *  paying that, which is a live change nobody asked for and nobody has heard yet.
+ *
+ *  1s is chosen to sit above librosa's first-beat values (0.2–0.7s typically), which is
+ *  the same "well under a second" figure the rest of this file uses to describe them. It
+ *  is a taste knob, not a measurement: raise it if a hand-placed early mix-in is being
+ *  honoured when it shouldn't be, lower it if one is being ignored. */
+const INTRO_SEEK_MIN_SEC = 1.0;
+
+/** The four per-track mix points a transition is derived from, plus the duration they are
+ *  relative to. Structural (not `Deck`) so callers can pass a bare object and so the
  *  incoming side can be `null` where it isn't known yet (the preload trigger). */
 export interface TransitionZones {
   duration: number;
-  outroPoint: number | null;
-  introPoint: number | null;
+  mixOutStart: number | null;
+  mixOutEnd: number | null;
+  mixInStart: number | null;
+  mixInEnd: number | null;
+}
+
+/** What the engine will actually *do* with a track's four raw points, after every trust
+ *  rule has been applied. One exported resolver so `transitionPlan` and `MarkerPanel`
+ *  cannot disagree about which markers count — before this the panel printed raw
+ *  arithmetic for values the engine silently discarded. */
+export interface EffectiveZones {
+  /** Trusted position to start the incoming deck at, or null. POINT rule: somewhere in
+   *  the first third of the track. No length floor — see MIN_ZONE_SEC's comment. */
+  inStart: number | null;
+  /** Trusted blendable intro length in seconds, or null. ZONE rule: needs a trusted start
+   *  AND an explicit `mixInEnd` AND at least MIN_ZONE_SEC between them. */
+  inLenSec: number | null;
+  /** Trusted position the fade starts at on the outgoing deck, or null. POINT rule: not
+   *  inside the first third of the track (the "Baddy On The Floor" floor above). */
+  outStart: number | null;
+  /** Trusted blendable outro length in seconds, or null. ZONE rule, same shape as
+   *  `inLenSec` except that a missing `mixOutEnd` falls back to the track duration. */
+  outLenSec: number | null;
+  /** What the near-end trigger measures against: `outStart` when trusted, else the literal
+   *  track duration. Note this uses the POINT rule, not the zone rule — a marker too close
+   *  to the end to blend over still correctly says where the track is heading. */
+  nearEnd: number;
+  /** Why a zone was discarded, for the marker panel to show instead of a bare number.
+   *  null when the zone is usable or when there is no marker to reject. */
+  inRejected: string | null;
+  outRejected: string | null;
+}
+
+function usableZone(sec: number): number | null {
+  return sec >= MIN_ZONE_SEC ? sec : null;
+}
+
+/** Resolve a track's four raw mix points into what the engine will use. Pure, exported,
+ *  and the single place every trust rule lives (design review item A4). */
+export function effectiveZones(z: TransitionZones): EffectiveZones {
+  const d = z.duration;
+  if (!(d > 0)) {
+    return { inStart: null, inLenSec: null, outStart: null, outLenSec: null, nearEnd: 0, inRejected: null, outRejected: null };
+  }
+
+  // Intro POINT rule.
+  const inStart = z.mixInStart !== null && z.mixInStart >= 0 && z.mixInStart <= d / 3 ? z.mixInStart : null;
+  // Intro ZONE rule. No duration fallback for the end: see Deck.mixInEnd in types.ts.
+  const inLenSec = inStart !== null && z.mixInEnd !== null ? usableZone(z.mixInEnd - inStart) : null;
+
+  // Outro POINT rule — `Math.min` keeps a stale marker from pushing the trigger past EOS.
+  const outStart = z.mixOutStart !== null && z.mixOutStart >= d / 3 ? Math.min(z.mixOutStart, d) : null;
+  // Outro ZONE rule. A missing end is the track's own end, the pre-four-point behavior.
+  const outEnd = Math.min(z.mixOutEnd ?? d, d);
+  const outLenSec = outStart !== null ? usableZone(outEnd - outStart) : null;
+
+  return {
+    inStart,
+    inLenSec,
+    outStart,
+    outLenSec,
+    nearEnd: outStart ?? d,
+    inRejected: zoneRejection(z.mixInStart, inStart, z.mixInEnd, inLenSec, "mix-in past the first third"),
+    outRejected: zoneRejection(z.mixOutStart, outStart, z.mixOutEnd ?? d, outLenSec, "mix-out inside the first third"),
+  };
+}
+
+/** The panel's "why is this ignored" string. Ordered so the *first* failing rule is the
+ *  one reported — telling a DJ their zone is too short when the start was rejected outright
+ *  would send them tuning the wrong end. */
+function zoneRejection(
+  rawStart: number | null,
+  trustedStart: number | null,
+  end: number | null,
+  lenSec: number | null,
+  startReason: string,
+): string | null {
+  if (rawStart === null) return null;
+  if (trustedStart === null) return startReason;
+  if (end === null) return "no end marker";
+  if (lenSec === null) return `zone under ${MIN_ZONE_SEC}s`;
+  return null;
 }
 
 /** Per-transition switches threaded from the caller down to the ramp driver. */
@@ -428,41 +528,19 @@ export interface TransitionDuration {
   source: "zones" | "outro" | "intro" | "fallback";
 }
 
-function usableZone(sec: number): number | null {
-  return sec >= MIN_ZONE_SEC ? sec : null;
-}
-
 /**
  * Pure — the whole point, so it can be unit-tested directly (autoMix.test.ts). `incoming`
  * is `null` when the incoming track isn't loaded/measured yet, which the preload trigger
  * needs: it can only see the outgoing side, and an *over*-estimated duration there just
  * makes the preload fire a little earlier, never later.
  */
-/** Usable length of the outgoing track's outro zone, or `null` when there is no trustworthy
- *  marker or the zone is too short to blend over. Exported so the marker panel reads the
- *  exact figure the engine will use, instead of printing raw `duration - outroPoint` for
- *  values the engine discards (a sub-2s zone, a marker in the first third). */
-export function outroZoneSec(duration: number, outroPoint: number | null): number | null {
-  return duration > 0 ? usableZone(duration - nearEndReference(outroPoint, duration)) : null;
-}
-
-/** Usable length of the incoming track's intro zone, or `null` — same contract as
- *  `outroZoneSec`. Ceiling mirrors nearEndReference's floor: a "mix in" past the first third
- *  of a track is as untrustworthy as a "mix out" inside it, and would otherwise propose a
- *  blend longer than the incoming track's own body. */
-export function introZoneSec(duration: number, introPoint: number | null): number | null {
-  return introPoint !== null && duration > 0 && introPoint <= duration / 3
-    ? usableZone(introPoint)
-    : null;
-}
-
 export function computeTransitionDurationMs(
   outgoing: TransitionZones,
   incoming: TransitionZones | null,
   fallbackMs: number,
 ): TransitionDuration {
-  const outro = outroZoneSec(outgoing.duration, outgoing.outroPoint);
-  const intro = incoming !== null ? introZoneSec(incoming.duration, incoming.introPoint) : null;
+  const outro = effectiveZones(outgoing).outLenSec;
+  const intro = incoming !== null ? effectiveZones(incoming).inLenSec : null;
 
   if (outro === null && intro === null) return { ms: fallbackMs, source: "fallback" };
   const zoneSec = outro === null ? intro! : intro === null ? outro : Math.min(outro, intro);
@@ -480,14 +558,17 @@ export function computeTransitionDurationMs(
  */
 function transitionPlan(outgoing: TransitionZones, incoming: TransitionZones | null) {
   const duration = computeTransitionDurationMs(outgoing, incoming, get(crossfadeDurationMs));
-  // A usable outro marker means the blend runs OVER the outro zone, starting AT the marker
-  // (2026-09-19). Until then the ramp was timed to *finish* at `outroPoint` and the outgoing
-  // deck was unloaded there, so the region `[outroPoint, end]` — the very tail the marker
-  // exists to say another track may play over, and the one its length is derived from —
-  // was never heard. Digger's own doc reads it the same way: mix_out is "where the next
-  // track starts coming in". Lead is then 0: the trigger fires when the playhead reaches the
-  // marker. Every other case (no marker, or intro-only) keeps the old lead untouched.
-  const startsAtOutro = duration.source === "zones" || duration.source === "outro";
+  // A usable outro ZONE means the blend runs OVER it, starting AT `mixOutStart`
+  // (2026-09-19). Until then the ramp was timed to *finish* at the marker and the outgoing
+  // deck was unloaded there, so the region `[mixOutStart, mixOutEnd]` — the very tail the
+  // marker exists to say another track may play over, and the one its length is derived
+  // from — was never heard. Digger's own doc reads it the same way: mix_out is "where the
+  // next track starts coming in". Lead is then 0: the trigger fires when the playhead
+  // reaches the marker. Every other case (no marker, or intro-only) keeps the old lead.
+  // Read off the resolved zone rather than inferred from `duration.source`: the two agree
+  // today, but the source enum is about which side won the *length*, which is a different
+  // question from whether this track has somewhere to start the fade.
+  const startsAtOutro = effectiveZones(outgoing).outLenSec !== null;
   return {
     ...duration,
     startsAtOutro,
@@ -502,35 +583,37 @@ function transitionPlan(outgoing: TransitionZones, incoming: TransitionZones | n
 const PRELOAD_LEAD_MARGIN_SEC = 15;
 
 function zonesOf(deck: Deck): TransitionZones {
-  return { duration: deck.source?.duration ?? 0, outroPoint: deck.outroPoint, introPoint: deck.introPoint };
+  return {
+    duration: deck.source?.duration ?? 0,
+    mixOutStart: deck.mixOutStart,
+    mixOutEnd: deck.mixOutEnd,
+    mixInStart: deck.mixInStart,
+    mixInEnd: deck.mixInEnd,
+  };
 }
 
 // ── Phase 7b (2026-09-19): where the incoming deck starts ────────────────────────────
 //
-// Until now nothing positioned the incoming deck at all: the live path started it wherever
-// it happened to be parked (position 0 for a freshly preloaded deck) and Preview explicitly
-// seeked it to 0, so the dead air at the head of a track played underneath the whole blend.
-// `introPoint` bounded the blend's LENGTH and nothing else; `cuePoint` was — and still is —
-// unused by transitions. Digger's own spec reads mix_in as a start point ("start the next
-// track at its mix_in", `docs/design/playlist-management.md`), so this is what the marker
-// was for. Design-doc open decision #5.
+// Until phase 7b nothing positioned the incoming deck at all: the live path started it
+// wherever it happened to be parked (position 0 for a freshly preloaded deck) and Preview
+// explicitly seeked it to 0, so the dead air at the head of a track played underneath the
+// whole blend. `cuePoint` was — and still is — unused by transitions. Digger's own spec
+// reads mix_in as a start point ("start the next track at its mix_in",
+// `docs/design/playlist-management.md`), so this is what the marker was for.
 //
-// Gated on `introZoneSec` rather than on `introPoint !== null` so that exactly one rule
-// decides whether a mix-in marker is trustworthy, and the same rule the duration already
-// uses: at least MIN_ZONE_SEC of head, and not past the first third of the track. Digger's
-// auto-derived `mix_in` is `beat_times[0]` — the first tracked beat, typically well under a
-// second — so on an auto-analysed track this returns null and the deck keeps starting where
-// it was parked, byte-identical to before. It becomes real the moment a DJ places a marker
-// by hand.
+// ⚠️ Phase 8 (2026-09-20) changed which rule gates this, and it is the *point* rule now,
+// not the zone rule. Phase 7b gated the seek on `introZoneSec` so that exactly one rule
+// decided whether a mix-in was trustworthy — but that made a *zone* rule govern a *point*,
+// and the two genuinely differ: a mix-in at 0.5s on a track with a hard first downbeat is a
+// good place to start and a useless 0.5s zone, and it was rejected as both. Now
+// `effectiveZones().inStart` decides where to start and `.inLenSec` decides how long to
+// blend, independently. The double duty that phase 7b had to warn about is gone with it:
+// the length comes from `mixInEnd − mixInStart`, never from the start point.
 //
-// ⚠️ `introPoint` is now doing double duty and the two readings disagree: as a LENGTH it
-// says "[0, introPoint] is blendable head", and as a START it says "begin here", which
-// skips that head. They coincide only while Digger's value is sub-second noise. The fix is
-// the two-ended zone model (`intro_end`, review §3) where the length becomes
-// `introEnd − introPoint`; until then a hand-placed marker means "start here" and the blend
-// length falls back to the outro side. Recorded in the design doc rather than guessed at.
-function introStartSec(deck: Deck): number | null {
-  return introZoneSec(deck.source?.duration ?? 0, deck.introPoint) !== null ? deck.introPoint : null;
+// The floor below is not a third trust rule — see INTRO_SEEK_MIN_SEC.
+function introSeekSec(deck: Deck): number | null {
+  const p = effectiveZones(zonesOf(deck)).inStart;
+  return p !== null && p > INTRO_SEEK_MIN_SEC ? p : null;
 }
 
 /** How long a fire-and-forget `seekDeck` (its `audio_seek` IPC never reports back — see
@@ -791,7 +874,7 @@ function beginTransition(
   // this seek at its own correct moment — see the two comments at those sites; both are
   // constrained by CLAUDE.md's "Rate-then-seek ordering", which is why this is only the
   // *value* here and not the seek itself.
-  const introStart = introStartSec(incoming);
+  const introStart = introSeekSec(incoming);
 
   const refBpm = get(session).bpm;
   if (get(autoMixSyncEnabled) && incoming.bpm !== null && refBpm !== null) {
@@ -925,7 +1008,7 @@ export function previewTransition(outgoingId: string): void {
   const plan = transitionPlan(zonesOf(outgoing), zonesOf(incoming));
   // Seek settle (200ms) + sync settle + the fade itself + the tail, with generous slack.
   beginPreviewGuard(plan.ms + PREVIEW_TAIL_MS + 8000);
-  const startAt = Math.max(0, nearEndReference(outgoing.outroPoint, outgoing.source.duration) - plan.leadSec);
+  const startAt = Math.max(0, effectiveZones(zonesOf(outgoing)).nearEnd - plan.leadSec);
   const target: 0 | 1 = outgoingId === left ? 1 : 0;
 
   // Park the fader fully on the outgoing deck first, so the ramp has somewhere to travel
@@ -935,7 +1018,7 @@ export function previewTransition(outgoingId: string): void {
   seekDeck(outgoingId, startAt, true);
   seekDeck(incomingId, 0, true);
   updateDeck(outgoingId, { playing: true });
-  const introStart = introStartSec(incoming);
+  const introStart = introSeekSec(incoming);
   debugLog(`[auto-dj] preview: deck-${outgoingId}@${startAt.toFixed(1)}s -> deck-${incomingId}@${introStart !== null ? `${introStart.toFixed(1)}s (mix-in)` : "0.0s (no mix-in)"}, ${plan.ms}ms (duration from ${plan.source}), lead ${plan.leadSec.toFixed(1)}s`);
 
   // Same settle rationale as the sync path above: seekDeck's audio_seek IPC is
@@ -973,7 +1056,7 @@ export function checkAutoMixTrigger(deckId: string, contentPos: number): void {
   if (!incoming || incoming.playing || incoming.source?.type !== "video" || !(incoming.source.duration > 0)) return;
 
   const plan = transitionPlan(zonesOf(outgoing), zonesOf(incoming));
-  const remaining = nearEndReference(outgoing.outroPoint, outgoing.source.duration) - contentPos;
+  const remaining = effectiveZones(zonesOf(outgoing)).nearEnd - contentPos;
   if (plan.startsAtOutro) {
     // Fire once the playhead is AT the marker. Not when too little track is left for the
     // blend (a deck seeked deep into its tail): that case is left to the EOS fallback,
@@ -1030,7 +1113,7 @@ export function checkAutoPreloadTrigger(deckId: string, contentPos: number): voi
   // PRELOAD_LEAD_MARGIN_SEC to finish.
   const plan = transitionPlan(zonesOf(outgoing), null);
   const leadSec = Math.max(get(autoPreloadThresholdSec), plan.leadSec + PRELOAD_LEAD_MARGIN_SEC);
-  const remaining = nearEndReference(outgoing.outroPoint, outgoing.source.duration) - contentPos;
+  const remaining = effectiveZones(zonesOf(outgoing)).nearEnd - contentPos;
   if (remaining > leadSec || remaining <= 0) return;
   if (preloadedFor.get(deckId) === outgoing.source.filePath) return;
 

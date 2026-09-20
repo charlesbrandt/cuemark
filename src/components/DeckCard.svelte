@@ -349,7 +349,7 @@
       // otherwise leave marker pushes (SET BEAT, cue, hot cues) silently writing to the
       // old track, and the old fileId as a stale remote-fetch fallback for this new path.
       const previousDiggerTrackId = deck.diggerTrackId;
-      updateDeck(deck.id, { source: { type: "video", filePath: file, duration: 0 }, playing: false, diggerTrackId: null, diggerFileId: null, introPoint: null, outroPoint: null });
+      updateDeck(deck.id, { source: { type: "video", filePath: file, duration: 0 }, playing: false, diggerTrackId: null, diggerFileId: null, mixInStart: null, mixInEnd: null, mixOutStart: null, mixOutEnd: null });
       notifyManualLoadDisplaced(previousDiggerTrackId);
     }
   }
