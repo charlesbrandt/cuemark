@@ -768,10 +768,10 @@ blind.
    the incoming deck to its mix-in marker before starting it, on the live path and in
    Preview alike, gated on the same `introZoneSec` trustworthiness rule the derived
    duration uses. The fire-and-forget-seek race this decision was held back on is handled
-   by reusing the existing 200 ms settle window rather than adding a stage: on the
-   beatmatched path the seek is issued ahead of the rate write and rides out the rate
-   settle; on the plain path it gets a settle of its own, which is the only place a
-   transition got 200 ms slower.
+   by reusing the existing 200 ms settle windows rather than adding a stage: on the
+   beatmatched path the seek sits inside the rate settle, just ahead of the phase nudge
+   that refines it; on the plain path it gets a settle of its own, which is the only place
+   a transition got 200 ms slower.
 6. 🟡 **Zone editing is numeric/playhead-based, not draggable on the waveform.** The panel
    sets a point from the playhead; dragging the shaded zone edge directly would be better
    for workshopping, and `WaveformCanvas`'s pointer handlers already own a
@@ -847,12 +847,19 @@ and Preview go through — seeks the incoming deck to `introPoint` before starti
   derived duration already uses: at least `MIN_ZONE_SEC` (2 s) of head, and not past the
   first third of the track. No marker, or an untrusted one, and the deck starts where it was
   parked — byte-identical to before.
-- **The seek is issued first, ahead of the rate write**, so on the beatmatched path it rides
-  out the existing rate settle instead of needing a stage of its own. That ordering is also
-  required rather than merely tidy: `nudgePhaseToMaster` computes its correction *relative
-  to the deck's current position*, so it has to see the mix-in point, not the parked one.
-  (It does so immediately — `seekDeck` updates the frontend's own position sources
-  synchronously; the settle window is for GStreamer.)
+- **On the beatmatched path the seek goes *inside* the rate settle**, immediately before
+  `nudgePhaseToMaster`. It was first written ahead of the rate write — which is what the
+  review §3 suggested — and that is wrong on the legacy `<video>` path: the rate write
+  rebuilds the WebKit pipeline, and the rebuild re-reads GStreamer's still-pre-seek position
+  over `v.currentTime`, silently undoing a seek issued just before it
+  (`av-sync-architecture.md`, "Rate-then-seek ordering"). Caught in review, not live — it
+  would have shown up only on an AV1 deck or one pinned to the legacy path, as "the mix-in
+  marker does nothing on some tracks".
+- **It still costs no extra stage**, which is why the placement is not merely "one window
+  later": `nudgePhaseToMaster` corrects *relative to the deck's current position*, and
+  `seekDeck` updates the frontend's own position sources synchronously (`el.currentTime`
+  for a legacy deck, `pendingSeekTarget` for a codec one). So the nudge in that same tick
+  reads the mix-in point and refines it. Two writes, one effective landing, one settle.
 - **The plain (non-beatmatched) path is the only one that got slower**: it had no settle
   window to borrow, and starting playback through a fire-and-forget `audio_seek` is exactly
   the 2026-08-24 race, so it now waits one `SEEK_SETTLE_MS` before playing — and only when a

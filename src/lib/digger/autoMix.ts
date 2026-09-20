@@ -787,17 +787,11 @@ function beginTransition(
   durationMs: number,
   opts: Omit<TransitionOptions, "driftBackDeckId"> = {},
 ): void {
-  // Position the incoming deck at its mix-in marker before anything else touches it
-  // (phase 7b, open decision #5). Deliberately FIRST, ahead of the rate write below: the
-  // rate write is what rebuilds the legacy <video> pipeline, so a seek issued after it
-  // needs its own settle window, while a seek issued before it gets the rate settle as
-  // its own — which is the existing 200ms window this reuses rather than adding a stage.
-  // Both branches below then read a deck that is already where it should start.
+  // Where the incoming deck starts (phase 7b, open decision #5). Each branch below issues
+  // this seek at its own correct moment — see the two comments at those sites; both are
+  // constrained by CLAUDE.md's "Rate-then-seek ordering", which is why this is only the
+  // *value* here and not the seek itself.
   const introStart = introStartSec(incoming);
-  if (introStart !== null) {
-    seekDeck(incomingId, introStart, true);
-    debugLog(`[auto-dj] intro: deck-${incomingId} starting at its mix-in marker ${introStart.toFixed(2)}s`);
-  }
 
   const refBpm = get(session).bpm;
   if (get(autoMixSyncEnabled) && incoming.bpm !== null && refBpm !== null) {
@@ -806,12 +800,6 @@ function beginTransition(
     // settle mirrors that button's own comment: writing playbackRate rebuilds the legacy
     // <video> pipeline, and seeking into that rebuild lands stale — see CLAUDE.md
     // "Rate-then-seek ordering".
-    // The intro seek above also has to be ordered ahead of `nudgePhaseToMaster`, which
-    // computes its correction *relative to the deck's current position* (getPhase →
-    // getDeckTime) and seeks there — so it must see the mix-in position, not the parked
-    // one. It does, immediately: `seekDeck` updates the frontend's own position sources
-    // synchronously (el.currentTime for a legacy deck, pendingSeekTarget for a codec one),
-    // ahead of the IPC. The settle window below is for GStreamer, not for this ordering.
     const rate = refBpm / incoming.bpm;
     debugLog(`[auto-dj] sync: locking deck-${incomingId} to ${refBpm.toFixed(1)}bpm (rate ${rate.toFixed(4)})`);
     const touchAtStart = get(manualTouch);
@@ -827,6 +815,21 @@ function beginTransition(
       // and the beat never appeared to change (reported live 2026-08-24). Give the seek the
       // same kind of settle window the rate change above already gets, before starting
       // playback and the crossfade.
+      // The mix-in seek belongs HERE, not before the rate write: on the legacy <video>
+      // path the rate write rebuilds the WebKit pipeline, and that rebuild re-reads
+      // GStreamer's still-pre-seek position and overwrites `v.currentTime` with it —
+      // silently undoing a seek issued just before it (av-sync-architecture.md,
+      // "Rate-then-seek ordering"). Inside the rate settle it costs no extra stage,
+      // because `nudgePhaseToMaster` below then refines *this* position rather than
+      // needing a window of its own: it corrects relative to the deck's current position
+      // (getPhase → getDeckTime), and `seekDeck` updates the frontend's own position
+      // sources synchronously (el.currentTime for a legacy deck, pendingSeekTarget for a
+      // codec one), so it reads the mix-in point in this same tick. Two writes, one
+      // effective landing, one settle.
+      if (introStart !== null) {
+        seekDeck(incomingId, introStart, true);
+        debugLog(`[auto-dj] intro: deck-${incomingId} starting at its mix-in marker ${introStart.toFixed(2)}s`);
+      }
       nudgePhaseToMaster(incomingId);
       debugLog(`[auto-dj] sync: phase-nudged deck-${incomingId}, settling seek before play`);
       setTimeout(() => {
@@ -847,11 +850,14 @@ function beginTransition(
       updateDeck(incomingId, { playing: true });
       startCrossfadeRamp(outgoingId, incomingId, target, durationMs, opts);
     };
-    // No intro marker: start immediately, exactly as this path always has. With one, the
-    // seek above is fire-and-forget and this branch has no settle window of its own to
-    // borrow — playing straight through it is the 2026-08-24 race (the deck audibly starts
-    // from its pre-seek position), so give the seek the same window the sync branch gets.
+    // No intro marker: start immediately, exactly as this path always has.
     if (introStart === null) { play(); return; }
+    // With one: nothing writes the rate on this branch, so there is no pipeline rebuild to
+    // order against and the seek goes first — but there is also no settle window to borrow,
+    // and playing straight through a fire-and-forget `audio_seek` is the 2026-08-24 race
+    // (the deck audibly starts from its pre-seek position). So it gets a window of its own.
+    seekDeck(incomingId, introStart, true);
+    debugLog(`[auto-dj] intro: deck-${incomingId} starting at its mix-in marker ${introStart.toFixed(2)}s`);
     const touchAtStart = get(manualTouch);
     setTimeout(() => {
       if (get(manualTouch) !== touchAtStart) { debugLog(`[auto-dj] intro: aborted, fader touched during seek settle`); return; }

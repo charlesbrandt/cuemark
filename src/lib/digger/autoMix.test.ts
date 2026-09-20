@@ -1256,7 +1256,7 @@ describe('incoming deck starts at its mix-in marker (Phase 7b)', () => {
     expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
   });
 
-  it('seeks to the mix-in marker before the rate write on the beatmatched path', async () => {
+  it('seeks to the mix-in marker inside the rate settle, not before the rate write, on the beatmatched path', async () => {
     const env = await setup();
     const { sessionMod, autoDjMod, autoMixMod, resetSession, runToCompletion } = env;
     autoDjMod.autoDjEnabled.set(true);
@@ -1273,16 +1273,21 @@ describe('incoming deck starts at its mix-in marker (Phase 7b)', () => {
 
     autoMixMod.checkAutoMixTrigger('deck-0', 90);
 
-    // Both land in the trigger's own tick, the seek first: it then rides out the rate
-    // settle instead of needing a stage of its own, and nudgePhaseToMaster — which corrects
-    // *relative to the deck's current position* — reads the mix-in point rather than the
-    // parked one.
-    expect(seekDeck).toHaveBeenCalledWith('deck-1', 10, true);
+    // The rate write lands in the trigger's own tick; the seek must NOT. On the legacy
+    // <video> path the rate write rebuilds the WebKit pipeline, and that rebuild re-reads
+    // GStreamer's still-pre-seek position over `v.currentTime` — a seek issued just before
+    // it is silently undone (av-sync-architecture.md, "Rate-then-seek ordering").
     expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playbackRate).toBeCloseTo(120 / 128);
+    expect(seekDeck).not.toHaveBeenCalled();
     expect(nudgePhaseToMaster).not.toHaveBeenCalled();
 
-    await new Promise((r) => setTimeout(r, 250)); // rate settle (and the intro seek's)
+    await new Promise((r) => setTimeout(r, 250)); // rate settle
+    // It costs no extra stage: the seek happens here, and nudgePhaseToMaster — which
+    // corrects *relative to the deck's current position*, synchronously visible through
+    // seekBus — then refines this position instead of needing a window of its own.
+    expect(seekDeck).toHaveBeenCalledWith('deck-1', 10, true);
     expect(nudgePhaseToMaster).toHaveBeenCalledWith('deck-1');
+    expect(seekDeck.mock.invocationCallOrder[0]).toBeLessThan(nudgePhaseToMaster.mock.invocationCallOrder[0]);
     await new Promise((r) => setTimeout(r, 250)); // nudge-seek settle
     expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
     runToCompletion(1000);
