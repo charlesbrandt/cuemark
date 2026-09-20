@@ -170,6 +170,16 @@ because `appsink` is not a `GstAudioBaseSink`.
 | **Verify** | `scripts/probes/snapcast_tcp_sink_probe.py --stall` (must pass) **and** `--stall --no-leaky` (must fail). ⚠️ Needs ~35s — kernel socket buffers absorb ~21s of audio first, so a shorter run passes regardless and proves nothing. |
 | **If the room glitches** | Raise `SNAPCAST_QUEUE_NS`. Never remove the leak. |
 
+### 8. Auto DJ transition shape — a blend feels too short, too abrupt, or starts at the wrong place
+
+| | |
+|---|---|
+| **Where** | `autoMix.ts`: `MIN_ZONE_SEC` (2), `MIN_TRANSITION_MS` / `MAX_TRANSITION_MS` (2 s / 20 s), `PREVIEW_TAIL_MS` (3 s), plus the Settings blend length / threshold / preload. |
+| **First read** | The log line `[auto-dj] trigger: … (duration from outro\|zones\|intro\|fallback)` and, for Preview, `[auto-dj] preview: …`. `fallback` means **no usable marker on either track** and the flat Settings duration applied — the usual reason a blend "ignores the markers". |
+| **🛑 Known trap** | With a usable outro marker the blend **starts at `outroPoint`** (since 2026-09-19) and the "start mixing N s out" threshold no longer moves it; it still governs tracks with no marker. Turning that setting and seeing nothing change on a marked track is by design. |
+| **Marker panel says "ignored"** | The engine discards the value: zone < 2 s, outro inside the first third, or intro past it. Digger's auto `mix_in` (first tracked beat, <1 s) is always ignored — only a hand-placed intro counts. |
+| **Preview** | Resets itself `PREVIEW_TAIL_MS` after the fade (fader, incoming deck position/rate). Touching the fader aborts the reset on purpose. |
+
 ---
 
 ## Before you turn anything

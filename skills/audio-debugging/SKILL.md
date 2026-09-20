@@ -777,6 +777,54 @@ mechanism (a `master_volume` omission in `load()`'s volume-application, unrelate
 pipeline teardown) — see that doc's "Recurrence" note under Bug B before assuming either
 write-up fully explains the other.
 
+### Silent or bursty audio on a long-running instance — read `margin` first, and it is NOT pipeline age (2026-09-19, OPEN)
+
+**Symptom**: hours-to-days uptime; decks reach `Playing`, no bus `ERROR`, but nothing is
+audible (or it arrives in ~1s bursts). A different fault from the leaked-decode-thread entry
+above — check that one first with a thread census, because the two look identical from the UI.
+
+**Read these, in this order** (all in the standing log):
+1. `[deliver-tel/deck-N] … margin` — **a value in the thousands of seconds negative is the
+   whole diagnosis**: the sink believes every buffer is days late, stops pacing, and dumps
+   audio as fast as `appsrc` `max-bytes` allows. Measured: −689,001 s on an 8-day process.
+2. `buffer flow resumed after a Ns gap … Z× real time` — **>1× means "not pacing", <1× means
+   "starved"**. They need opposite fixes; `[level] frames=` at 3.6× real time is what ruled
+   out starvation. A starved pipeline cannot over-produce.
+3. The `[audio/deck-N] play:` line — `graph idle` against the first-buffer margin. The offset
+   tracked the **output graph's idle time** (−2,860 s after ~48 min idle), not the deck's
+   age: a *freshly loaded* pipeline on the idle graph read it too, and a deck resumed after
+   idle delivered **zero** buffers for 34s while `Playing`. So **reloading the deck does not
+   cure it**; an app restart does. Mechanism unproven — see "Clock reference drifting while
+   idle" in `docs/design/shared-output-pipeline.md`.
+4. `[census]` — thread/fd/swap slope across the preceding hours.
+
+**Refute the cheap suspects first, all read-only** (this is the order that worked): thread
+count and creation cohorts from `/proc/<pid>/task/*/stat` field 22 against `btime` (no
+threads created in 8 days ⇒ not a leak); fd count and `pw-dump` streams; `[audio_load] lock=`
+(mutex starvation); `journalctl --user -u pipewire -u wireplumber` and `pw-top` `ERR`. The
+host was *also* sick (swap 99.6%, `/proc/pressure/io full avg300` 57, 19-day uptime, Frigate +
+ffmpeg co-resident) and produced a transient browser-audio glitch — real, contributory to slow
+loads, and **not** the cause of the gaps. Read `/proc/pressure/io` and `free -m` before
+attributing a slow `audio_load` to cuemark.
+
+**Before any of that, two free checks that would each have explained "no audio" alone**:
+- *Which device was the process actually on?* This run only ever used the USB CODEC
+  `analog-stereo`, never the Starlight. Warnings now name the node.
+- *Is the running binary older than the fix you are chasing?* The `[build]` line's `built=`
+  stamp against `git log`: this instance predated the 09-05 teardown fix by three days.
+
+**Preserve the specimen.** A live instance in this state is evidence; a restart, PipeWire
+restart or reboot destroys it. Do the non-destructive test first — play a stale deck ~20s
+while tailing `grep -E "deliver-tel|buffer flow resumed|level/deck"`, then load a fresh track
+and repeat — and only then restart. Investigations of it should be forbidden from
+`gdb`/`strace`/signals (they stop threads) — see the delegation notes in the project memory.
+
+**Also live-hit here, different fault**: pressing ▶ Preview with Auto DJ **on** ran a second,
+real transition on top (two `ramp start` lines, one "completing" in 168 ms, outgoing deck
+freed, next queue track loaded onto it). Fixed 2026-09-19 (`previewInFlight` in
+`autoMix.ts`) — but the *report* it produced ("pressed Preview, heard nothing") was
+indistinguishable from the clock fault above until the log was read line by line.
+
 ### A network (Snapcast) output is silent while local outputs are fine
 
 **Symptom**: a `snapcast://…` target is ticked in Main, the deck plays normally on the booth

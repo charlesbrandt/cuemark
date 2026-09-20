@@ -46,7 +46,7 @@ to finish right now.
 
 | Doc | Fixed | Still open |
 |---|---|---|
-| [`auto-dj-transitions.md`](auto-dj-transitions.md) | Phases 1–4 live-verified | Phases 5–6 built + unit-tested, not live-verified; 3 open design questions in the tail |
+| [`auto-dj-transitions.md`](auto-dj-transitions.md) | Phases 1–4 live-verified | Phases 5–7 built + unit-tested, not live-verified (7 = fade over the outro zone, self-resetting Preview); open: start incoming at its intro point, two-ended zones. Marker-path review: [`auto-dj-zone-review-2026-09-19.md`](auto-dj-zone-review-2026-09-19.md) |
 | [`beatmatching.md`](beatmatching.md) | Root cause #1 fixed | Everything past that is proposed work, not implemented |
 | [`codec-frame-cache.md`](codec-frame-cache.md) | Live-verified 2026-08-13 | A short list of explicitly non-blocking open items (§7b) |
 | [`ddj-flx4-feature-gaps.md`](ddj-flx4-feature-gaps.md) | Tier 1+2 implemented + bench-verified | Tier 3 — real features, own design pass still needed. Living catalogue, not a closeable doc. |
@@ -90,7 +90,7 @@ regardless of how settled the underlying feature is.
 | [`native-output-pipeline.md`](native-output-pipeline.md) | Shelved escalation path — deliberately documented, not chosen, not deleted |
 | [`pcm-buffer-playback.md`](pcm-buffer-playback.md) | Scratch feeder design/gotchas — the feature is done, this doc is the ongoing "read before touching" reference |
 | [`pipewiresink-play-hang.md`](pipewiresink-play-hang.md) | Root cause found 2026-08-02 (upstream GStreamer bug) — mitigation (never multi-instance `pipewiresink`) is permanent guidance |
-| [`shared-output-pipeline.md`](shared-output-pipeline.md) | Default since 2026-08-11, all gates passed — but still the doc to read before touching the output graph |
+| [`shared-output-pipeline.md`](shared-output-pipeline.md) | Default since 2026-08-11, all gates passed — but still the doc to read before touching the output graph. **Open (2026-09-19): idle output graph accumulates a clock offset; see "Clock reference drifting while idle"** |
 | [`silent-failure-inventory.md`](silent-failure-inventory.md) | Catalogue of ~25 known silent-success failure modes. Nothing here is scheduled work — it's a checklist |
 | [`controller-mapping.md`](controller-mapping.md) | Profile system + FLX4 profile bench-verified, but this stays the living doc for adding/re-calibrating any controller |
 

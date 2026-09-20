@@ -522,3 +522,19 @@ describes; whether that matters is unknown.
 margin the first buffer comes back with (does the offset track idle time?), then which
 clock the graph chose, then the `[census]` slope across the hours before it. Do not add
 self-healing or graph rebuilding until that data exists.
+
+**Follow-up measurements, same day** (the live specimen, before it was restarted):
+- Pipeline **age is refuted** as the variable: a deck loaded seconds earlier already read
+  margin ≈ −2,860 s; the offset matched the *graph's* idle span (~2,870 s since the last
+  delivered buffer) to within ~10 s, and matched the earlier 8-day and 2.8-day readings
+  the same way (each = time since that deck last played).
+- **Reloading a deck did not cure it.** The 17:36 reload looked like it did (fresh margin
+  +34 ms, gaps stopped) only because the graph was *active* at the time — deck-1 was playing.
+- The first delivered buffer after a long idle can be **absent**: `Playing`, `vol0=0/s`, a
+  static margin for 34s, until a new load. Hence the `play:` line's follow-up is logged
+  separately — its absence is the observation.
+- Host was independently degraded (swap 99.6%, I/O pressure `full avg300` 57, 19-day
+  uptime) — explains slow loads and a transient browser-audio glitch, **not** the gaps.
+- A candidate self-heal, if data supports it: rebuild the *output graph* when no deck is
+  playing. Ranked above a per-deck rebuild by this evidence, and still unbuilt.
+

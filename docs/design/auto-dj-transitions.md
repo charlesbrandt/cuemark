@@ -784,6 +784,16 @@ blind.
 
 ## Phase 7 — fade over the outro zone, preview restores itself (2026-09-19)
 
+**0. Preview raced the live trigger (fixed, `d874990`).** Preview seeks the outgoing deck to
+the trigger point and starts it playing, then waits 200 ms for the seek to settle before its
+ramp exists; in that window `activeRamp` was still null, so with Auto DJ **on** the real
+trigger fired too — two concurrent ramps, one "completing" in 168 ms, the outgoing deck freed
+and the next queue track loaded onto it. `previewInFlight` (with a timeout fallback so it can
+never stick) now holds the trigger, the auto-preload and Skip off from the moment a preview
+starts until its tail ends. Regression test: "holds the live trigger off during the
+seek-settle window". The full review of the marker path that prompted the items below is
+kept in [`auto-dj-zone-review-2026-09-19.md`](auto-dj-zone-review-2026-09-19.md).
+
 🟡 **Built + unit-tested, not live-verified.** Prompted by a review of the marker path
 (see the numbered open decisions above for what it settled).
 
@@ -816,3 +826,13 @@ Not done (from the review, needs a decision or Digger work): two-ended zones (`i
 `outro_end` marker types — no migration needed, `markers.type` is free text), seeking the
 incoming deck to its intro point (#5), marker-write rollback (`setMixMarker` is
 delete-then-insert with no transaction).
+
+**What a transition does with the two tracks' markers today (verified 2026-09-19)** — the
+incoming deck is never *positioned* by a marker: Preview seeks it to 0 and the live path
+starts it wherever it is parked. `cuePoint` is unused by transitions. `introPoint` only
+bounds the blend *length* (min of the outro zone and, if ≤ duration/3, the intro zone).
+Making the incoming deck start at its `introPoint` is the next piece of work (decision #5
+above, now wanted): it needs the same seek on the live path and in Preview, reusing the
+existing 200 ms settle window, and a real intro boundary — Digger's auto `mix_in` is the
+first tracked beat (usually <1 s), so it only carries information once a human has placed it.
+
