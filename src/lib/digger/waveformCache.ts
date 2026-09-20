@@ -11,13 +11,19 @@ const DB_NAME = 'cuemark-waveform-cache';
 const STORE_NAME = 'waveforms';
 const DB_VERSION = 1;
 
-// librosa.load(..., duration=600) caps Digger's analysis at 10 minutes (see
-// importers/analyze_audio.py) — must match WaveformCanvas.svelte's own constant.
-// A cached entry landing at this duration is a truncated analysis, not a real
-// waveform, and must never be served as if it were valid forever: a later
-// re-analysis without the cap should win, so this rejection has to travel with
-// the cache, not just the live fetch.
-const DIGGER_ANALYSIS_CAP_S = 600;
+// Digger's analysis is bounded (`MAX_ANALYZE_SECONDS` in importers/analyze_audio.py),
+// so a long file can come back with a waveform that stops partway through. Until
+// 2026-09-20 that bound was 10 minutes and both this file and WaveformCanvas detected
+// truncation by comparing the cached duration against a hardcoded 600 — which meant the
+// check silently became wrong the moment the cap moved, and read a genuinely 10:00 track
+// as truncated. Compare against the duration we already know for the file instead: it
+// needs no constant, it keeps working across every future change to the cap, and it still
+// catches the ~1,646 rows cached at exactly 600.0 before the cap was raised.
+//
+// A truncated entry must never be served as if it were valid forever — a later
+// re-analysis should win — so the rejection travels with the cache, not just the live
+// fetch. With no expected duration to compare against we cannot tell, and serve it.
+const TRUNCATION_SLACK_S = 2;
 
 // Digger's `/tracks/{id}/waveform` doesn't expose `updated_at` yet (design doc §4,
 // open decision #8) — once it adds an `X-Updated-At` header, swap this TTL for an
@@ -82,12 +88,23 @@ async function writeEntry(entry: StoredEntry): Promise<void> {
  * back to a local decode). Never throws on a storage failure — falls through
  * to the network call, same as api.ts's own function does.
  */
-export async function getCachedWaveform(trackId: number): Promise<WaveformCache | null> {
+/** True when a cached analysis covers materially less of the track than the file actually
+ *  runs for. Unknown or non-positive `expectedDurationS` means we have nothing to compare
+ *  against, so we do not claim truncation. */
+function isTruncated(cachedDurationS: number, expectedDurationS?: number): boolean {
+  if (!expectedDurationS || expectedDurationS <= 0) return false;
+  return cachedDurationS < expectedDurationS - TRUNCATION_SLACK_S;
+}
+
+export async function getCachedWaveform(
+  trackId: number,
+  expectedDurationS?: number,
+): Promise<WaveformCache | null> {
   const stored = await readEntry(trackId);
   if (stored) {
     const expired = Date.now() - stored.cachedAt > TTL_MS;
-    const capped = Math.abs(stored.durationS - DIGGER_ANALYSIS_CAP_S) <= 1;
-    if (!expired && !capped) {
+    const truncated = isTruncated(stored.durationS, expectedDurationS);
+    if (!expired && !truncated) {
       return {
         peaks: new Float32Array(stored.peaks),
         envelope: new Float32Array(stored.envelope),
@@ -97,6 +114,7 @@ export async function getCachedWaveform(trackId: number): Promise<WaveformCache 
   }
 
   const fresh = await getWaveformCache(trackId);
+  if (fresh && isTruncated(fresh.durationS, expectedDurationS)) return null;
   if (fresh) {
     void writeEntry({
       trackId,

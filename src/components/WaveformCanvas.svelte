@@ -83,17 +83,19 @@
     const fallbackUrl = deck.diggerFileId != null ? getDiggerFileUrl(deck.diggerFileId) : undefined;
     const diggerTrackId = deck.diggerTrackId;
 
-    // librosa.load(..., duration=600) caps Digger's analysis at 10 minutes (see
-    // importers/analyze_audio.py) — a cache landing suspiciously at that exact
-    // boundary means a longer file got truncated, so fall back to a full local
-    // decode rather than showing a waveform/grid that stops 10 minutes in.
-    const DIGGER_ANALYSIS_CAP_S = 600;
+    // Digger's analysis is bounded (`MAX_ANALYZE_SECONDS`, raised from 600s to 4h on
+    // 2026-09-20), so a long file can come back analysed only partway. Detection lives in
+    // waveformCache.ts and compares the cached duration against the one we already know
+    // for this file — not against a hardcoded copy of the cap, which went stale the moment
+    // the cap moved. A truncated cache falls back to a full local decode rather than
+    // showing a waveform/grid that silently stops partway in.
+    const expectedDurationS = deck.source?.type === 'video' ? deck.source.duration : undefined;
 
     async function runAnalysis(): Promise<AnalysisResult> {
       if (diggerTrackId != null) {
         try {
-          const cache = await getCachedWaveform(diggerTrackId);
-          if (cache && Math.abs(cache.durationS - DIGGER_ANALYSIS_CAP_S) > 1) {
+          const cache = await getCachedWaveform(diggerTrackId, expectedDurationS);
+          if (cache) {
             return analyzeArrays(cache.peaks, cache.envelope);
           }
         } catch (err) {

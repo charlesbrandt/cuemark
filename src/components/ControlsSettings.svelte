@@ -6,7 +6,7 @@
    */
   import { tempoRange, scratchMode, jogSecondsPerRev, scrubInertiaMs, SCRUB_INERTIA_MAX_MS } from "../lib/audio/audioSettings";
   import { fontScale } from "../lib/settings/displaySettings";
-  import { autoMixThresholdSec, crossfadeDurationMs, autoPreloadThresholdSec, autoMixSyncEnabled, autoMixDriftBackSec } from "../lib/digger/autoMix";
+  import { autoMixThresholdSec, crossfadeDurationMs, autoPreloadThresholdSec, autoMixSyncEnabled, autoMixDriftBackSec, previewTailSec } from "../lib/digger/autoMix";
   import { session, setCompactControls } from "../lib/state/session";
 </script>
 
@@ -132,15 +132,26 @@
       oninput={(e) => crossfadeDurationMs.set(+e.currentTarget.value * 1000)}
     />
     <span class="jog-scale-value">{($crossfadeDurationMs / 1000).toFixed(1)}s fade</span>
+    <input
+      type="range"
+      min="3"
+      max="30"
+      step="1"
+      bind:value={$previewTailSec}
+    />
+    <span class="jog-scale-value">{$previewTailSec}s preview tail</span>
     <button
       type="button"
       class="font-scale-reset"
-      onclick={() => { autoMixThresholdSec.set(15); crossfadeDurationMs.set(6000); }}
+      onclick={() => { autoMixThresholdSec.set(15); crossfadeDurationMs.set(6000); previewTailSec.set(8); }}
     >Reset</button>
     <span class="hint-inline">
       when Auto DJ is on, starts crossfading to the other crossfader-mapped deck at least this
       far from the end (earlier if the tracks' own mix markers ask for a longer blend) — only
-      if it's already loaded. The fade length applies to tracks with no marker data
+      if it's already loaded. The fade length applies to tracks with no marker data. The
+      preview tail is how long the incoming track keeps playing after a Preview's fade
+      finishes, before the fader and deck are put back — Auto DJ won't start a real
+      transition while a preview is still running, so keep it short during a set
     </span>
   </div>
 

@@ -341,8 +341,20 @@ interface PreviewRestore { incomingId: string; fader: number; rate: number; sync
 let previewRestore: PreviewRestore | null = null;
 let previewTailTimer: ReturnType<typeof setTimeout> | null = null;
 /** How long the incoming deck keeps playing at full after the fade completes, so the
- *  audition includes hearing the new track settle rather than cutting the moment it wins. */
-const PREVIEW_TAIL_MS = 3000;
+ *  audition includes hearing the new track settle rather than cutting the moment it wins.
+ *  Settings → Controls → Auto Mix. Raised from a flat 3s to 8s and made adjustable
+ *  2026-09-20 on live feedback ("maybe the preview could keep going on the new track").
+ *
+ *  ⚠️ This is not a free knob: `previewInFlight` holds every real Auto DJ transition off
+ *  for the whole preview, tail included (the two-concurrent-ramps bug of 2026-09-19), so a
+ *  long tail set mid-set can suppress a transition that was due. That is why the slider
+ *  stops at 30s, and why `beginPreviewGuard`'s ceiling reads the same store rather than
+ *  carrying its own copy of the old constant — the guard must always outlast the tail. */
+export const previewTailSec = persistentWritable<number>("cuemark:previewTailSec", 8);
+
+function previewTailMs(): number {
+  return get(previewTailSec) * 1000;
+}
 
 function finishPreview(): void {
   previewTailTimer = null;
@@ -724,7 +736,7 @@ function startCrossfadeRamp(
       // "Phase 5 — tempo drift-back".
       // A preview restores the incoming deck's rate itself (finishPreview), so no drift-back.
       if (preview) {
-        previewTailTimer = setTimeout(finishPreview, PREVIEW_TAIL_MS);
+        previewTailTimer = setTimeout(finishPreview, previewTailMs());
       } else if (driftBackDeckId) {
         startRateDriftBack(driftBackDeckId);
       }
@@ -1007,7 +1019,7 @@ export function previewTransition(outgoingId: string): void {
 
   const plan = transitionPlan(zonesOf(outgoing), zonesOf(incoming));
   // Seek settle (200ms) + sync settle + the fade itself + the tail, with generous slack.
-  beginPreviewGuard(plan.ms + PREVIEW_TAIL_MS + 8000);
+  beginPreviewGuard(plan.ms + previewTailMs() + 8000);
   const startAt = Math.max(0, effectiveZones(zonesOf(outgoing)).nearEnd - plan.leadSec);
   const target: 0 | 1 = outgoingId === left ? 1 : 0;
 

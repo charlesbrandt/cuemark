@@ -1141,6 +1141,7 @@ describe('previewTransition (Phase 6 — audition the transition)', () => {
     autoDjMod.autoDjEnabled.set(false); // preview is a workshopping tool, not automation
     autoMixMod.autoMixThresholdSec.set(15);
     autoMixMod.crossfadeDurationMs.set(1000);
+    autoMixMod.previewTailSec.set(0.2);
     resetSession([
       baseDeck('deck-0', { source: videoSource('a.mp4', 200), mixOutStart: 180 }),
       baseDeck('deck-1', { source: videoSource('b.mp4', 200) }),
@@ -1170,7 +1171,9 @@ describe('previewTransition (Phase 6 — audition the transition)', () => {
 
     // After the tail the preview puts everything back, so pressing it again needs no manual
     // recovery: fader where the DJ left it, incoming deck paused at 0 and at its old rate.
-    await new Promise((r) => setTimeout(r, 3200));
+    // The wait is derived from the tail setting this test pinned, not from a literal: the
+    // tail became a user setting on 2026-09-20 and a hardcoded 3200 broke silently.
+    await new Promise((r) => setTimeout(r, get(autoMixMod.previewTailSec) * 1000 + 200));
     const after = get(sessionMod.session);
     expect(after.crossfaderValue).toBe(0);
     expect(after.decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
@@ -1183,6 +1186,7 @@ describe('previewTransition (Phase 6 — audition the transition)', () => {
     autoDjMod.autoDjEnabled.set(true); // the case that raced: preview with Auto DJ ON
     autoMixMod.autoMixThresholdSec.set(15);
     autoMixMod.crossfadeDurationMs.set(1000);
+    autoMixMod.previewTailSec.set(0.2);
     resetSession([
       baseDeck('deck-0', { source: videoSource('a.mp4', 200), mixOutStart: 180 }),
       baseDeck('deck-1', { source: videoSource('b.mp4', 200) }),
@@ -1195,7 +1199,8 @@ describe('previewTransition (Phase 6 — audition the transition)', () => {
 
     await new Promise((r) => setTimeout(r, 250));
     runToCompletion(1000);
-    await new Promise((r) => setTimeout(r, 3200)); // the preview tail, after which the guard lifts
+    // The preview tail, after which the guard lifts — derived from the setting, not a literal.
+    await new Promise((r) => setTimeout(r, get(autoMixMod.previewTailSec) * 1000 + 200));
 
     const deck0 = get(sessionMod.session).decks.find((d) => d.id === 'deck-0')!;
     expect(deck0.source).not.toBeNull(); // still loaded: only the preview ran
@@ -1207,6 +1212,40 @@ describe('previewTransition (Phase 6 — audition the transition)', () => {
     sessionMod.updateDeck('deck-1', { playing: false });
     autoMixMod.checkAutoMixTrigger('deck-0', 180.2);
     expect(autoMixMod.wasAutoMixTriggered('deck-0', 'a.mp4')).toBe(true);
+  });
+
+  it('honours the preview-tail setting, and the in-flight guard outlasts it (2026-09-20)', async () => {
+    // The tail was a flat 3s constant until a live session asked for the preview to keep
+    // playing the new track. Promoting it to a setting promotes the margin it silently
+    // protected: `beginPreviewGuard`'s ceiling is `plan.ms + tail + slack`, so if the guard
+    // ever stops tracking the tail, a long tail gets cut off mid-audition by its own guard.
+    // Both halves are asserted here because neither fails visibly on its own.
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, runToCompletion } = await setup();
+    autoDjMod.autoDjEnabled.set(false);
+    autoMixMod.autoMixThresholdSec.set(15);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    autoMixMod.previewTailSec.set(1.2);
+    resetSession([
+      baseDeck('deck-0', { source: videoSource('a.mp4', 200), mixOutStart: 180 }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 200) }),
+    ]);
+
+    autoMixMod.previewTransition('deck-0');
+    await new Promise((r) => setTimeout(r, 250));
+    runToCompletion(1000);
+
+    // Well inside the tail: the new track is still playing and nothing has been put back.
+    await new Promise((r) => setTimeout(r, 400));
+    const during = get(sessionMod.session);
+    expect(during.decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+    expect(during.crossfaderValue).toBe(1);
+
+    // Past it: the restore runs, which also proves the guard did not expire early and
+    // tear the audition down before the tail the DJ asked for had elapsed.
+    await new Promise((r) => setTimeout(r, 1100));
+    const after = get(sessionMod.session);
+    expect(after.decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
+    expect(after.crossfaderValue).toBe(0);
   });
 
   it('refuses when the other crossfader deck has nothing loaded', async () => {
