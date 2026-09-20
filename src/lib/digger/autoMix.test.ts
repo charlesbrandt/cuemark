@@ -1170,6 +1170,162 @@ describe('previewTransition (Phase 6 — audition the transition)', () => {
   });
 });
 
+/**
+ * Phase 7b (2026-09-19) — the incoming deck starts at its mix-in marker, on the live path
+ * and in Preview alike (design-doc open decision #5). Before this nothing positioned the
+ * incoming deck at all: it started wherever it was parked, so a track's dead-air head
+ * played under the whole blend. The gate is `introZoneSec`, the same trustworthiness rule
+ * the derived duration already uses — which is what keeps Digger's auto-derived `mix_in`
+ * (`beat_times[0]`, typically well under a second) from moving anything.
+ */
+describe('incoming deck starts at its mix-in marker (Phase 7b)', () => {
+  /** deck-0 plays out with no outro marker (so the old end-anchored lead applies); deck-1
+   *  waits with whatever intro marker the test gives it. */
+  async function armPair(env: Awaited<ReturnType<typeof setup>>, introPoint: number | null, incomingOverrides: Partial<Deck> = {}) {
+    const { autoDjMod, autoMixMod, resetSession } = env;
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixThresholdSec.set(15);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    resetSession([
+      baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100) }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 100), introPoint, ...incomingOverrides }),
+    ]);
+  }
+
+  it('seeks the incoming deck to its mix-in marker and settles that seek before starting it', async () => {
+    const env = await setup();
+    const { sessionMod, autoMixMod, runToCompletion, rafQueue } = env;
+    await armPair(env, 10);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90);
+
+    // The seek is issued synchronously, before anything starts the deck.
+    expect(seekDeck).toHaveBeenCalledWith('deck-1', 10, true);
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
+    expect(rafQueue.length).toBe(0); // and no ramp yet — the fade starts with the deck
+
+    // seekDeck's audio_seek IPC is fire-and-forget; playing through it would start the
+    // deck from its pre-seek position (the 2026-08-24 race), so it gets the same 200ms
+    // settle window the sync path's rate/nudge seeks already use.
+    await new Promise((r) => setTimeout(r, 250));
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+    runToCompletion(1000);
+    expect(get(sessionMod.session).crossfaderValue).toBe(1);
+  });
+
+  it('starts the incoming deck where it is parked, immediately, when it has no marker', async () => {
+    const env = await setup();
+    const { sessionMod, autoMixMod, runToCompletion } = env;
+    await armPair(env, null);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90);
+
+    // Byte-identical to before phase 7b: no seek, no extra settle, the deck plays in the
+    // same tick the trigger fires in.
+    expect(seekDeck).not.toHaveBeenCalled();
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+    runToCompletion(100);
+    expect(get(sessionMod.session).crossfaderValue).toBe(1);
+  });
+
+  it("ignores Digger's auto-derived sub-second mix_in rather than seeking to it", async () => {
+    const env = await setup();
+    const { sessionMod, autoMixMod } = env;
+    // _derive_mix_points() writes mix_in = beat_times[0] — the first tracked beat. Seeking
+    // 0.43s into the track would be a pointless IPC round trip and a needless 200ms delay
+    // on every transition in the library.
+    await armPair(env, 0.43);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90);
+
+    expect(seekDeck).not.toHaveBeenCalled();
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+  });
+
+  it('ignores a mix-in marker past the first third of the incoming track', async () => {
+    const env = await setup();
+    const { sessionMod, autoMixMod } = env;
+    // Same ceiling introZoneSec applies to the duration: a "mix in" halfway through a track
+    // is as untrustworthy as a "mix out" in its first third, and starting there would skip
+    // half the track the DJ queued.
+    await armPair(env, 50);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90);
+
+    expect(seekDeck).not.toHaveBeenCalled();
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+  });
+
+  it('seeks to the mix-in marker before the rate write on the beatmatched path', async () => {
+    const env = await setup();
+    const { sessionMod, autoDjMod, autoMixMod, resetSession, runToCompletion } = env;
+    autoDjMod.autoDjEnabled.set(true);
+    autoMixMod.autoMixSyncEnabled.set(true);
+    autoMixMod.autoMixThresholdSec.set(15);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    resetSession(
+      [
+        baseDeck('deck-0', { playing: true, source: videoSource('a.mp4', 100), bpm: 120, downbeat: 0 }),
+        baseDeck('deck-1', { source: videoSource('b.mp4', 100), bpm: 128, downbeat: 0, introPoint: 10 }),
+      ],
+      { bpm: 120, masterDeckId: 'deck-0' },
+    );
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90);
+
+    // Both land in the trigger's own tick, the seek first: it then rides out the rate
+    // settle instead of needing a stage of its own, and nudgePhaseToMaster — which corrects
+    // *relative to the deck's current position* — reads the mix-in point rather than the
+    // parked one.
+    expect(seekDeck).toHaveBeenCalledWith('deck-1', 10, true);
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playbackRate).toBeCloseTo(120 / 128);
+    expect(nudgePhaseToMaster).not.toHaveBeenCalled();
+
+    await new Promise((r) => setTimeout(r, 250)); // rate settle (and the intro seek's)
+    expect(nudgePhaseToMaster).toHaveBeenCalledWith('deck-1');
+    await new Promise((r) => setTimeout(r, 250)); // nudge-seek settle
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+    runToCompletion(1000);
+    expect(get(sessionMod.session).crossfaderValue).toBe(1);
+  });
+
+  it('abandons the transition if the DJ touches the fader during the mix-in seek settle', async () => {
+    const env = await setup();
+    const { sessionMod, autoMixMod, rafQueue } = env;
+    await armPair(env, 10);
+
+    autoMixMod.checkAutoMixTrigger('deck-0', 90);
+    autoMixMod.notifyManualCrossfaderTouch(); // DJ grabs the fader inside the new window
+
+    await new Promise((r) => setTimeout(r, 250));
+    expect(get(sessionMod.session).decks.find((d) => d.id === 'deck-1')!.playing).toBe(false);
+    expect(rafQueue.length).toBe(0); // no ramp was ever scheduled
+  });
+
+  it('Preview positions the incoming deck exactly as the live path does', async () => {
+    const { autoDjMod, autoMixMod, resetSession } = await setup();
+    autoDjMod.autoDjEnabled.set(false); // preview is a workshopping tool, not automation
+    autoMixMod.autoMixThresholdSec.set(15);
+    autoMixMod.crossfadeDurationMs.set(1000);
+    resetSession([
+      baseDeck('deck-0', { source: videoSource('a.mp4', 200), outroPoint: 180 }),
+      baseDeck('deck-1', { source: videoSource('b.mp4', 200), introPoint: 20 }),
+    ]);
+
+    autoMixMod.previewTransition('deck-0');
+
+    // Preview still resets the incoming deck to 0 first, so a second press auditions the
+    // same thing as the first...
+    expect(seekDeck).toHaveBeenCalledWith('deck-1', 0, true);
+    expect(seekDeck).not.toHaveBeenCalledWith('deck-1', 20, true);
+
+    // ...and then the shared beginTransition puts it at its mix-in marker, which is the
+    // asymmetry phase 6 deliberately shipped and phase 7b removes.
+    await new Promise((r) => setTimeout(r, 250));
+    expect(seekDeck).toHaveBeenCalledWith('deck-1', 20, true);
+  });
+});
+
 describe('tempo drift-back after a beatmatched transition (Phase 5)', () => {
   /** deck-0 (120bpm, master) fades into deck-1 (128bpm) with beatmatch on — deck-1 gets
    *  locked to rate 120/128 = 0.9375, then the ramp runs to completion. */

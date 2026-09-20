@@ -505,6 +505,41 @@ function zonesOf(deck: Deck): TransitionZones {
   return { duration: deck.source?.duration ?? 0, outroPoint: deck.outroPoint, introPoint: deck.introPoint };
 }
 
+// ── Phase 7b (2026-09-19): where the incoming deck starts ────────────────────────────
+//
+// Until now nothing positioned the incoming deck at all: the live path started it wherever
+// it happened to be parked (position 0 for a freshly preloaded deck) and Preview explicitly
+// seeked it to 0, so the dead air at the head of a track played underneath the whole blend.
+// `introPoint` bounded the blend's LENGTH and nothing else; `cuePoint` was — and still is —
+// unused by transitions. Digger's own spec reads mix_in as a start point ("start the next
+// track at its mix_in", `docs/design/playlist-management.md`), so this is what the marker
+// was for. Design-doc open decision #5.
+//
+// Gated on `introZoneSec` rather than on `introPoint !== null` so that exactly one rule
+// decides whether a mix-in marker is trustworthy, and the same rule the duration already
+// uses: at least MIN_ZONE_SEC of head, and not past the first third of the track. Digger's
+// auto-derived `mix_in` is `beat_times[0]` — the first tracked beat, typically well under a
+// second — so on an auto-analysed track this returns null and the deck keeps starting where
+// it was parked, byte-identical to before. It becomes real the moment a DJ places a marker
+// by hand.
+//
+// ⚠️ `introPoint` is now doing double duty and the two readings disagree: as a LENGTH it
+// says "[0, introPoint] is blendable head", and as a START it says "begin here", which
+// skips that head. They coincide only while Digger's value is sub-second noise. The fix is
+// the two-ended zone model (`intro_end`, review §3) where the length becomes
+// `introEnd − introPoint`; until then a hand-placed marker means "start here" and the blend
+// length falls back to the outro side. Recorded in the design doc rather than guessed at.
+function introStartSec(deck: Deck): number | null {
+  return introZoneSec(deck.source?.duration ?? 0, deck.introPoint) !== null ? deck.introPoint : null;
+}
+
+/** How long a fire-and-forget `seekDeck` (its `audio_seek` IPC never reports back — see
+ *  seekBus.ts) is given to land in GStreamer before anything reads the deck's position or
+ *  starts it playing. Was three copies of a bare `200`; named so the new intro-point seek
+ *  is visibly the same window the rate settle and the phase-nudge settle already use, and
+ *  so all four move together. See CLAUDE.md "Rate-then-seek ordering". */
+const SEEK_SETTLE_MS = 200;
+
 // requestAnimationFrame doesn't exist under vitest's node test environment; degrade to a 16ms
 // setTimeout there so this module works the same (just not frame-synced) under `npm test`.
 const raf: (cb: (t: number) => void) => number =
@@ -752,6 +787,18 @@ function beginTransition(
   durationMs: number,
   opts: Omit<TransitionOptions, "driftBackDeckId"> = {},
 ): void {
+  // Position the incoming deck at its mix-in marker before anything else touches it
+  // (phase 7b, open decision #5). Deliberately FIRST, ahead of the rate write below: the
+  // rate write is what rebuilds the legacy <video> pipeline, so a seek issued after it
+  // needs its own settle window, while a seek issued before it gets the rate settle as
+  // its own — which is the existing 200ms window this reuses rather than adding a stage.
+  // Both branches below then read a deck that is already where it should start.
+  const introStart = introStartSec(incoming);
+  if (introStart !== null) {
+    seekDeck(incomingId, introStart, true);
+    debugLog(`[auto-dj] intro: deck-${incomingId} starting at its mix-in marker ${introStart.toFixed(2)}s`);
+  }
+
   const refBpm = get(session).bpm;
   if (get(autoMixSyncEnabled) && incoming.bpm !== null && refBpm !== null) {
     // Lock the incoming deck's rate to the main beat, then align its phase, before it
@@ -759,6 +806,12 @@ function beginTransition(
     // settle mirrors that button's own comment: writing playbackRate rebuilds the legacy
     // <video> pipeline, and seeking into that rebuild lands stale — see CLAUDE.md
     // "Rate-then-seek ordering".
+    // The intro seek above also has to be ordered ahead of `nudgePhaseToMaster`, which
+    // computes its correction *relative to the deck's current position* (getPhase →
+    // getDeckTime) and seeks there — so it must see the mix-in position, not the parked
+    // one. It does, immediately: `seekDeck` updates the frontend's own position sources
+    // synchronously (el.currentTime for a legacy deck, pendingSeekTarget for a codec one),
+    // ahead of the IPC. The settle window below is for GStreamer, not for this ordering.
     const rate = refBpm / incoming.bpm;
     debugLog(`[auto-dj] sync: locking deck-${incomingId} to ${refBpm.toFixed(1)}bpm (rate ${rate.toFixed(4)})`);
     const touchAtStart = get(manualTouch);
@@ -784,14 +837,27 @@ function beginTransition(
         // driftBackDeckId set: this path is the one that imposed a rate, so it's the one
         // that owes the deck its native tempo back once the fade finishes.
         startCrossfadeRamp(outgoingId, incomingId, target, durationMs, { ...opts, driftBackDeckId: incomingId });
-      }, 200);
-    }, 200);
+      }, SEEK_SETTLE_MS);
+    }, SEEK_SETTLE_MS);
   } else {
     if (get(autoMixSyncEnabled)) {
       debugLog(`[auto-dj] sync skipped (no bpm reference): incoming.bpm=${incoming.bpm} session.bpm=${refBpm}`);
     }
-    updateDeck(incomingId, { playing: true });
-    startCrossfadeRamp(outgoingId, incomingId, target, durationMs, opts);
+    const play = () => {
+      updateDeck(incomingId, { playing: true });
+      startCrossfadeRamp(outgoingId, incomingId, target, durationMs, opts);
+    };
+    // No intro marker: start immediately, exactly as this path always has. With one, the
+    // seek above is fire-and-forget and this branch has no settle window of its own to
+    // borrow — playing straight through it is the 2026-08-24 race (the deck audibly starts
+    // from its pre-seek position), so give the seek the same window the sync branch gets.
+    if (introStart === null) { play(); return; }
+    const touchAtStart = get(manualTouch);
+    setTimeout(() => {
+      if (get(manualTouch) !== touchAtStart) { debugLog(`[auto-dj] intro: aborted, fader touched during seek settle`); return; }
+      if (!getDeck(outgoingId) || !getDeck(incomingId)) { debugLog(`[auto-dj] intro: aborted, a deck vanished during seek settle`); return; }
+      play();
+    }, SEEK_SETTLE_MS);
   }
 }
 
@@ -813,11 +879,12 @@ function beginTransition(
  *    incoming deck paused at 0 and at its old rate), so pressing it again needs no manual
  *    recovery (`finishPreview`);
  *  - both decks are seeked first: the outgoing to exactly the point the trigger would
- *    have fired at (the outro marker, or `reference − lead` without one), the incoming back to 0, which is where a
- *    freshly-loaded deck sits when a real transition starts it. Seeking the incoming to
- *    its `introPoint` instead was considered and declined — it would make the preview
- *    *unfaithful* to the live path, which starts the incoming deck wherever it is parked.
- *    Making both start at mixIn is a real idea, and an open decision in the design doc.
+ *    have fired at (the outro marker, or `reference − lead` without one), the incoming
+ *    back to 0 — where a freshly-loaded deck sits when a real transition starts it, so a
+ *    second press auditions the same thing as the first. The incoming deck's *musical*
+ *    start point is not decided here: since phase 7b `beginTransition` seeks it to its
+ *    mix-in marker on the live path and this one alike (open decision #5, now decided
+ *    yes), so the reset to 0 decides only where a *marker-less* track starts.
  *
  * Works with Auto DJ off: this is a workshopping tool, not part of the automation.
  */
@@ -862,7 +929,8 @@ export function previewTransition(outgoingId: string): void {
   seekDeck(outgoingId, startAt, true);
   seekDeck(incomingId, 0, true);
   updateDeck(outgoingId, { playing: true });
-  debugLog(`[auto-dj] preview: deck-${outgoingId}@${startAt.toFixed(1)}s -> deck-${incomingId}, ${plan.ms}ms (duration from ${plan.source}), lead ${plan.leadSec.toFixed(1)}s`);
+  const introStart = introStartSec(incoming);
+  debugLog(`[auto-dj] preview: deck-${outgoingId}@${startAt.toFixed(1)}s -> deck-${incomingId}@${introStart !== null ? `${introStart.toFixed(1)}s (mix-in)` : "0.0s (no mix-in)"}, ${plan.ms}ms (duration from ${plan.source}), lead ${plan.leadSec.toFixed(1)}s`);
 
   // Same settle rationale as the sync path above: seekDeck's audio_seek IPC is
   // fire-and-forget, and starting the fade before it lands would audition the wrong part
@@ -872,7 +940,7 @@ export function previewTransition(outgoingId: string): void {
     const inc = getDeck(incomingId);
     if (!out || !inc) { endPreviewGuard(); debugLog(`[auto-dj] preview: aborted, a deck vanished during seek settle`); return; }
     beginTransition(outgoingId, incomingId, inc, target, plan.ms, { preview: true });
-  }, 200);
+  }, SEEK_SETTLE_MS);
 }
 
 /**

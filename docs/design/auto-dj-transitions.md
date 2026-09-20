@@ -506,10 +506,12 @@ outgoing deck keeps its `source` at the end (unloading it would also make the id
 look empty to `checkAutoPreloadTrigger`, which would then eat the next queue entry for a
 transition that never happened); no `handledOutgoing`/`markSkipped` bookkeeping; and it
 works with Auto DJ **off**, because this is a workshopping tool, not automation. Seeking
-the incoming deck to its `introPoint` instead of 0 was considered and declined — the live
-path starts the incoming deck wherever it is parked, and a preview that differs from the
-live path is worth less than no preview (making *both* start at `mixIn` is a real idea, and
-an open decision below).
+the incoming deck to its `introPoint` instead of 0 was considered and declined *here* — the
+live path started the incoming deck wherever it was parked, and a preview that differs from
+the live path is worth less than no preview. ⚠️ **Superseded by phase 7b below**: both paths
+now seek to `mixIn`, from inside the shared `beginTransition`, so the symmetry this
+paragraph was protecting is preserved and the asymmetry it settled for is gone. Preview's
+own reset-to-0 stays, and now only decides where a *marker-less* track starts.
 
 ## Manual/auto interaction
 
@@ -761,12 +763,15 @@ blind.
    The fix is one line of ordering in `_build_cuemark_payload()` — matching what it already
    does for `downbeat` — in the digger repo. Same call that phase 4 flagged and declined;
    phase 6 raises the stakes because there is now a UI that makes manual markers routine.
-5. 🟡 **Should a transition start the incoming deck at its `mixIn` rather than at 0?**
-   Today both the live path and the preview start it wherever it's parked (position 0 for a
-   freshly loaded deck), so dead air at the head of a track is audible under the fade.
-   Starting at `mixIn` would skip it — but it means adding a seek to the live path, which
-   already has one documented fire-and-forget-seek race (see the 2026-08-24 phase-3 entry),
-   so it wants its own settle-window design rather than a one-liner.
+5. ✅ **Should a transition start the incoming deck at its `mixIn` rather than at 0?**
+   **Decided yes, built 2026-09-19 — see "Phase 7b" below.** `beginTransition` now seeks
+   the incoming deck to its mix-in marker before starting it, on the live path and in
+   Preview alike, gated on the same `introZoneSec` trustworthiness rule the derived
+   duration uses. The fire-and-forget-seek race this decision was held back on is handled
+   by reusing the existing 200 ms settle window rather than adding a stage: on the
+   beatmatched path the seek is issued ahead of the rate write and rides out the rate
+   settle; on the plain path it gets a settle of its own, which is the only place a
+   transition got 200 ms slower.
 6. 🟡 **Zone editing is numeric/playhead-based, not draggable on the waveform.** The panel
    sets a point from the playhead; dragging the shaded zone edge directly would be better
    for workshopping, and `WaveformCanvas`'s pointer handlers already own a
@@ -823,16 +828,67 @@ exists and cuemark writes `source='manual'`. What still happens is that a *clear
 is re-derived on the next analysis run.
 
 Not done (from the review, needs a decision or Digger work): two-ended zones (`intro_end` /
-`outro_end` marker types — no migration needed, `markers.type` is free text), seeking the
-incoming deck to its intro point (#5), marker-write rollback (`setMixMarker` is
-delete-then-insert with no transaction).
+`outro_end` marker types — no migration needed, `markers.type` is free text),
+marker-write rollback (`setMixMarker` is delete-then-insert with no transaction).
 
-**What a transition does with the two tracks' markers today (verified 2026-09-19)** — the
-incoming deck is never *positioned* by a marker: Preview seeks it to 0 and the live path
-starts it wherever it is parked. `cuePoint` is unused by transitions. `introPoint` only
-bounds the blend *length* (min of the outro zone and, if ≤ duration/3, the intro zone).
-Making the incoming deck start at its `introPoint` is the next piece of work (decision #5
-above, now wanted): it needs the same seek on the live path and in Preview, reusing the
-existing 200 ms settle window, and a real intro boundary — Digger's auto `mix_in` is the
-first tracked beat (usually <1 s), so it only carries information once a human has placed it.
+## Phase 7b — the incoming deck starts at its mix-in marker (2026-09-19)
+
+🟡 **Built + unit-tested, not live-verified.** Open decision #5, decided yes. Closes the
+gap phase 7 left: with an outro marker the blend now runs over the right region of the
+*outgoing* track, but nothing positioned the *incoming* one — Preview seeked it to 0 and the
+live path started it wherever it was parked, so a track's dead-air head played underneath the
+whole blend. `cuePoint` is still unused by transitions.
+
+**What changed.** `beginTransition()` — the one implementation both the live trigger, Skip
+and Preview go through — seeks the incoming deck to `introPoint` before starting it:
+
+- **Gated on `introZoneSec(duration, introPoint) !== null`**, not on `introPoint !== null`,
+  so exactly one rule decides whether a mix-in marker is trustworthy and it is the rule the
+  derived duration already uses: at least `MIN_ZONE_SEC` (2 s) of head, and not past the
+  first third of the track. No marker, or an untrusted one, and the deck starts where it was
+  parked — byte-identical to before.
+- **The seek is issued first, ahead of the rate write**, so on the beatmatched path it rides
+  out the existing rate settle instead of needing a stage of its own. That ordering is also
+  required rather than merely tidy: `nudgePhaseToMaster` computes its correction *relative
+  to the deck's current position*, so it has to see the mix-in point, not the parked one.
+  (It does so immediately — `seekDeck` updates the frontend's own position sources
+  synchronously; the settle window is for GStreamer.)
+- **The plain (non-beatmatched) path is the only one that got slower**: it had no settle
+  window to borrow, and starting playback through a fire-and-forget `audio_seek` is exactly
+  the 2026-08-24 race, so it now waits one `SEEK_SETTLE_MS` before playing — and only when a
+  seek was actually issued. A fader touch or a vanished deck inside that window aborts, the
+  same way the sync path's two windows already do.
+- **Preview is now symmetric with live** by construction, since the seek lives in the shared
+  path. Its own reset-to-0 stays (a second press must audition the same thing as the first)
+  and now only decides where a *marker-less* track starts.
+- The three bare `200`s became `SEEK_SETTLE_MS`. Same value, no behaviour change.
+
+7 tests in `autoMix.test.ts` ("incoming deck starts at its mix-in marker"): the seek + its
+settle, the no-marker path staying immediate, Digger's sub-second `mix_in` ignored, a
+marker past `duration/3` ignored, the ordering on the beatmatched path, the fader-touch
+abort, and Preview landing on the same position as live.
+
+⚠️ **`introPoint` is now doing double duty, and the two readings disagree.** As a *length*
+it says "`[0, introPoint]` is blendable head" (that is what `computeTransitionDurationMs`
+uses it for); as a *start* it says "begin here", which skips that head. They coincide only
+while the value is Digger's sub-second noise — the case where neither reading does anything.
+The moment a DJ hand-places a mix-in at, say, 18 s, the engine both starts the incoming track
+at 18 s *and* offers an 18 s blend length derived from the 18 s it just skipped. Starting
+there is what was asked for and what Digger's own spec says (`playlist-management.md`: "start
+the next track at its mix_in"); the length is the half that is now wrong. **The fix is the
+two-ended zone model** (`intro_end`, review §3): the length becomes `introEnd − introPoint`
+and the two readings separate. Until then, treat a hand-placed mix-in as "start here" and let
+the outro side carry the length — and expect a hand-placed intro marker to make blends
+longer than intended.
+
+**Open, and worth a decision**: the trust gate is a *zone* rule being applied to a *point*.
+A hand-placed mix-in at 0.5 s — a perfectly good start point on a track with a hard first
+downbeat — is rejected, because 0.5 s is not a usable zone. Splitting the two rules only
+makes sense alongside the two-ended model, so it is deliberately not done here.
+
+**Also worth building, from the review's watch item**: a hand-placed mix-in is now
+load-bearing for where a track *starts*, and the only place it is visible is the intro
+zone's shading on the waveform plus the panel's zone figure. A "starts here" marker line at
+`introPoint`, read the way the cue point's line reads, would make that legible — small, and
+`drawMarkers()` already draws a boundary line per zone.
 

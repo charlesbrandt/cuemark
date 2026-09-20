@@ -365,7 +365,7 @@ cross-repo.
 | C2 | **cuemark**: `Deck.introEnd`/`outroEnd`, `TransitionZones`, `zonesOf`, `queueStore` mapping, `computeTransitionDurationMs` using two real lengths. Unit tests. | M |
 | C3 | `MarkerPanel`: two rows per zone (start/end) or one row with two ⦿ buttons. Keep the uniform label·time·⦿·✕ grammar the panel's own header comment insists on. | M |
 | C4 | `WaveformCanvas`: `drawZone` with both edges drawn, both zones unpinned. | S |
-| C5 | Seek the incoming deck to `introPoint` on both the live path and preview, reusing the existing 200 ms settle window (open decision #5). **⚠️ needs decision D3.** | M |
+| C5 | ~~Seek the incoming deck to `introPoint` on both the live path and preview, reusing the existing 200 ms settle window (open decision #5).~~ ✅ **BUILT 2026-09-19 ahead of the rest of phase C** (D3 answered yes) — see "Phase 7b" in `auto-dj-transitions.md`. Gated on `introZoneSec`, so it is inert until a marker is hand-placed; that is also what makes `introPoint`'s length-vs-start double duty (C2's job to split) start to bite. | M |
 
 ### Phase D — optional, only if Phase A–C still feels wrong live
 
@@ -385,8 +385,10 @@ cross-repo.
 - **D2 — fade placement.** Should the blend run *over* `[outroPoint, outroEnd]` (my
   recommendation, and what Digger's own spec says) rather than finishing at `outroPoint`?
   Every existing transition moves later by its own length.
-- **D3 — incoming start.** Should the live path seek the incoming deck to its `mixIn`?
-  (Open decision #5. With real zones this stops being optional in practice.)
+- **D3 — incoming start.** ✅ **Answered yes; built 2026-09-19** (C5, "Phase 7b" in
+  `auto-dj-transitions.md`). Residual question it exposed: the trust gate is `introZoneSec`,
+  a *zone* rule applied to a *point*, so a hand-placed mix-in under `MIN_ZONE_SEC` is
+  rejected as a start position. Splitting the two rules only makes sense alongside C1/C2.
 - **D4 — preview fader restore.** Open decision #7, a taste call the doc explicitly defers to
   live feel.
 

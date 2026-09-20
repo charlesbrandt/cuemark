@@ -46,7 +46,7 @@ to finish right now.
 
 | Doc | Fixed | Still open |
 |---|---|---|
-| [`auto-dj-transitions.md`](auto-dj-transitions.md) | Phases 1–4 live-verified | Phases 5–7 built + unit-tested, not live-verified (7 = fade over the outro zone, self-resetting Preview); open: start incoming at its intro point, two-ended zones. Marker-path review: [`auto-dj-zone-review-2026-09-19.md`](auto-dj-zone-review-2026-09-19.md) |
+| [`auto-dj-transitions.md`](auto-dj-transitions.md) | Phases 1–4 live-verified | Phases 5–7b built + unit-tested, not live-verified (7 = fade over the outro zone, self-resetting Preview; 7b = incoming deck starts at its mix-in marker); open: two-ended zones (`intro_end`/`outro_end`), which is also what un-splits `introPoint`'s length-vs-start double duty. Marker-path review: [`auto-dj-zone-review-2026-09-19.md`](auto-dj-zone-review-2026-09-19.md) |
 | [`beatmatching.md`](beatmatching.md) | Root cause #1 fixed | Everything past that is proposed work, not implemented |
 | [`codec-frame-cache.md`](codec-frame-cache.md) | Live-verified 2026-08-13 | A short list of explicitly non-blocking open items (§7b) |
 | [`ddj-flx4-feature-gaps.md`](ddj-flx4-feature-gaps.md) | Tier 1+2 implemented + bench-verified | Tier 3 — real features, own design pass still needed. Living catalogue, not a closeable doc. |
