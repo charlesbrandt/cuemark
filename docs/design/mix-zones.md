@@ -1,9 +1,9 @@
 # Mix zones: four-point vocabulary, and deriving the points algorithmically
 
-**Status (2026-09-20): §1 BUILT and DEPLOYED — cuemark + Digger, tests green, migration and
-backfill run against production. NOT live-verified. The backfill reached only 2,096 tracks
-because `duration_ms` is missing library-wide; see "Before §1 is done". §2 unstarted, but its
-gating measurement is answered (see below).** Two linked pieces of work, in the order they should be done. Written as
+**Status (2026-09-20): §1 BUILT, DEPLOYED, and BACKFILLED library-wide — cuemark + Digger,
+tests green. First live Preview test sounded right; the rest is not live-verified. The
+`duration_ms` gap that limited the first backfill to 2,096 tracks is closed (see "Duration
+gap — resolved"). §2 unstarted, but its gating measurement is answered (see below).** Two linked pieces of work, in the order they should be done. Written as
 a cold-start brief for a new session — read this first, then only the two docs it names.
 
 Build notes for §1 live in [`auto-dj-transitions.md`](auto-dj-transitions.md) "Phase 8",
@@ -152,16 +152,32 @@ All four build-order steps landed. Three deviations from the plan above, each de
   `source='manual'`, only the type string renamed. Step 54 re-run afterwards reported
   "Renaming 0", so it is idempotent on the real database, not just in the code.
 
-- 🔴 **The backfill reached 2,096 tracks, not ~50,000, and the blocker is `duration_ms`.**
-  `_TARGET_SET` requires `duration_ms > 0` (it needs the track length for the `duration/3`
-  ceiling and for `mix_out_end`), and only **6,604 of 66,105** tracks have one at all — of
-  the 50,381 tracks carrying a `mix_in_start`, just **2,096** do. So ~48k analysed tracks now
-  have two of the four markers and will contribute **no intro length** to any transition
-  until their durations are populated. This is not a defect in §1; it is a pre-existing
-  library-metadata gap that §1 is the first feature to depend on. Populating `duration_ms`
-  (ffprobe pass, or from the files table) is the prerequisite for a second backfill run —
-  and it is also worth checking before §2, whose own coverage numbers were measured on
-  `waveform_cache` rows rather than on `duration_ms`.
+- ✅ **Duration gap — resolved 2026-09-20.** The first backfill reached 2,096 tracks, not
+  ~50,000, because `_TARGET_SET` requires `duration_ms > 0` and only 6,604 of 66,105 tracks
+  had one. Investigating it found a second, worse problem: `tracks.duration_ms` is written at
+  *import* time from ID3/CSV metadata, so it describes a release, not the file — where it and
+  the cached `waveform_cache.duration_s` both existed they disagreed by >2s on **36.5%**, and
+  on a 25-track ffprobe sample the cache was right **25/25**, the metadata **0/25**. Not stale
+  cache from an earlier iteration: August- and September-cached rows disagreed at 35% and 40%.
+  Fixed by `importers/backfill_durations.py` (cache first, ffprobe for truncated/uncached rows,
+  never writes an unmeasured value): `duration_ms > 0` went **6,604 → 52,650**, every analysed
+  track now has one, and 727 wrong values were corrected. Then
+  `backfill_mix_points.py --all` (new flag — the default target set selects only tracks
+  *missing* a marker, so corrected tracks were never revisited) re-derived **49,723** tracks:
+  intro-zone ends **2,096 → 47,904**. Full-set check before writing: 0 inverted zones, 0 real
+  overlaps (205 flagged were sub-millisecond rounding), 206 intro ends correctly withheld.
+  All 8 manual mix markers byte-identical before/after. Snapshot:
+  `~/backups/digger/digger-20260920-184322.db.gz`.
+- ✅ **The 600s analysis cap is gone.** `librosa.load(duration=600)` truncated **1,646** tracks
+  (DJ sets, radio shows — median 17.8 min, longest 111) to a cached duration of exactly 600.0s.
+  Now `MAX_ANALYZE_SECONDS = 4h` (raised, not removed: `librosa.load` materialises the whole
+  file, so the ceiling bounds one pathological file to ~1.3GB in the always-on api container).
+  cuemark's two copies of the 600 constant were replaced by comparing the cached duration to
+  the file's known duration. ⚠️ **Existing rows stay truncated until re-analysed**, so for those
+  1,646 the waveform cache and beat grid still describe only the first 10 minutes; their mix
+  markers are now placed from the real duration under a constant-tempo assumption that is
+  weak for DJ sets. A `analyze_audio --force` pass over them is ~1,100 hours of decode — a
+  deliberate decision, not done.
 
 - Dry-run sanity over the 2,096, for the record: no degenerate zones (`start == end`), no
   inverted outro zones, and **zero** `_mix_in_end_ms()` `None` returns — the sub-one-bar
