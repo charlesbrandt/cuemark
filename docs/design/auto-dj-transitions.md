@@ -815,7 +815,9 @@ kept in [`auto-dj-zone-review-2026-09-19.md`](auto-dj-zone-review-2026-09-19.md)
    touch hands control back and nothing is moved for the DJ. Pressing Preview again during
    the tail keeps the original snapshot.
 3. The marker panel prints the engine's own zone figures (`outroZoneSec`/`introZoneSec`),
-   showing "ignored" for a marker the engine discards, instead of raw numbers.
+   showing "ignored" for a marker the engine discards, instead of raw numbers. *(Phase 8
+   folded both functions into `effectiveZones()` and replaced the bare "ignored" with the
+   resolver's own reason string — `no end marker`, `zone under 2s`, and so on.)*
 4. A ramp whose start already equals its target logs a WARN (the 2026-08-25 zero-length
    trap, which the live trigger can still reach).
 5. Loading a local file onto a deck now also clears `introPoint`/`outroPoint`, and the
@@ -875,6 +877,12 @@ settle, the no-marker path staying immediate, Digger's sub-second `mix_in` ignor
 marker past `duration/3` ignored, the ordering on the beatmatched path, the fader-touch
 abort, and Preview landing on the same position as live.
 
+✅ **SUPERSEDED by Phase 8 (2026-09-20) — the two-ended zone model below was built.** The
+warning is kept because it is the clearest statement of *why*, and because the rule it asks
+for ("treat a hand-placed mix-in as start here and let the outro side carry the length") is
+no longer what the engine does. Read Phase 8 for current behaviour; the paragraph below
+describes the state between 2026-09-19 and 2026-09-20 only.
+
 ⚠️ **`introPoint` is now doing double duty, and the two readings disagree.** As a *length*
 it says "`[0, introPoint]` is blendable head" (that is what `computeTransitionDurationMs`
 uses it for); as a *start* it says "begin here", which skips that head. They coincide only
@@ -888,7 +896,10 @@ and the two readings separate. Until then, treat a hand-placed mix-in as "start 
 the outro side carry the length — and expect a hand-placed intro marker to make blends
 longer than intended.
 
-**Open, and worth a decision**: the trust gate is a *zone* rule being applied to a *point*.
+**Open, and worth a decision** — ✅ **decided and built in Phase 8**: the two rules are now
+separate (`effectiveZones().inStart` vs `.inLenSec`), and a hand-placed mix-in under
+`MIN_ZONE_SEC` is accepted as a start position. The original framing: the trust gate is a
+*zone* rule being applied to a *point*.
 A hand-placed mix-in at 0.5 s — a perfectly good start point on a track with a hard first
 downbeat — is rejected, because 0.5 s is not a usable zone. Splitting the two rules only
 makes sense alongside the two-ended model, so it is deliberately not done here.
@@ -904,3 +915,104 @@ zone's shading on the waveform plus the panel's zone figure. A "starts here" mar
 [`mix-zones.md`](mix-zones.md).** That is the handoff doc for the next session on this —
 start there rather than here.
 
+
+## Phase 8 — four points, two zones, two rules (2026-09-20)
+
+🟡 **Built + unit-tested, not live-verified.** Cross-repo (cuemark + Digger). This is §1 of
+[`mix-zones.md`](mix-zones.md); §2 (deriving a mix-in worth having) is still unstarted.
+
+**What it closes.** Phase 7b's own warning: `introPoint` was doing double duty, read as a zone
+*length* by `computeTransitionDurationMs` and as a *start position* by the incoming-deck seek,
+and the two disagreed the moment a DJ hand-placed a marker — the engine would start the track
+at 18 s *and* offer an 18 s blend derived from the 18 s it had just skipped. Each zone now has
+both of its ends stored explicitly, so a length is a length and a position is a position.
+
+### Vocabulary
+
+| Zone | start | end |
+|---|---|---|
+| mix-in (fade-in) | `mix_in_start` | `mix_in_end` |
+| mix-out (fade-out) | `mix_out_start` | `mix_out_end` |
+
+**The wire payload did not change its existing keys.** `/tracks/{id}/cuemark` still emits
+`mixIn`/`mixOut` (now from the `_start` types, falling back to the legacy type names on an
+un-migrated database) and adds `mixInEnd`/`mixOutEnd`. The payload being a separate contract
+from the storage vocabulary is what made a rename over ~100k marker rows affordable at all.
+
+cuemark's `Deck` fields were renamed too — `introPoint`/`outroPoint` → `mixInStart`/`mixInEnd`/
+`mixOutStart`/`mixOutEnd` — rather than extended. `introPoint` is the exact name that got read
+two ways; keeping it as the start would have left the ambiguity in the one place the bug
+actually lived. `[[feedback_name_which_end_not_the_region]]`.
+
+### The rule split — the part most likely to be undone by accident
+
+Phase 7b gated the incoming-deck seek on `introZoneSec`, deliberately, so that exactly one rule
+decided whether a mix-in was trustworthy. That was the wrong unification: it made a **zone**
+rule govern a **point**, and the two genuinely differ. A mix-in at 0.5 s on a track with a hard
+first downbeat is a fine place to start and a useless 0.5 s blend zone; one rule rejected it as
+both. There are now two, and one exported resolver holds them:
+
+```ts
+effectiveZones(z) -> { inStart, inLenSec, outStart, outLenSec, nearEnd, inRejected, outRejected }
+```
+
+- **Point rule** — `inStart`: within the first third. `outStart`: not within the first third
+  (the "Baddy On The Floor" floor), clamped to duration.
+- **Zone rule** — both ends placed, and at least `MIN_ZONE_SEC` between them.
+
+`MarkerPanel` and the engine both read this one function (review item A4), so the panel can no
+longer print a figure the engine silently discards — and it now shows *why* a zone was
+rejected (`no end marker`, `zone under 2s`, `mix-in past the first third`) instead of "ignored".
+
+⚠️ **`mixInEnd` has no duration fallback, unlike `mixOutEnd`.** A missing mix-out end means the
+track's own end, which is exactly what was implicit before the field existed. A missing mix-in
+end means *no intro length at all* — inventing one is precisely the old bug. So a track
+analysed before this shipped contributes nothing from its intro side until the backfill runs.
+That is deliberate and strictly better than contributing a wrong number.
+
+### `INTRO_SEEK_MIN_SEC` is not a third trust rule
+
+`effectiveZones().inStart` accepts Digger's sub-second auto-derived mix-in as a valid start
+position — that was the point of the split. A separate 1 s floor decides whether the seek is
+worth *issuing*: acting on a 0.4 s target costs a GStreamer pipeline and codec-decoder flush
+plus a whole `SEEK_SETTLE_MS` stage at the exact moment a transition begins, in exchange for a
+fraction of a second of near-silence under a fade. Without it, every transition on an analysed
+track would start paying that — a live change nobody asked for and nobody has heard.
+
+It is a taste knob, not a measurement. Raise it if a hand-placed early mix-in is honoured when
+it shouldn't be; lower it if one is ignored.
+
+### Two defects the property sweep caught, that examples did not
+
+Both derivations (`_derive_mix_points` and the backfill's `_derive_from_stored`) are the same
+rules written twice in two files, about to run over ~50k production tracks nobody will inspect
+row by row. They are now covered by an invariant **sweep** over ~1000 bpm/anchor/duration
+combinations each (`tests/test_smoke.py`), not by hand-written examples. The sweep found two
+real defects that every example test passed:
+
+1. **Overlapping zones.** The no-overlap ceiling (`mix_in_end ≤ mix_out_start`) was applied on
+   the main path and silently dropped on the pathological fallback path, so any track whose
+   first detected beat lands past `duration/3` — a long ambient head — got an intro zone
+   reaching into its own outro zone. 18 of 1056 combinations. Fixed by separating the
+   **inviolable** ceiling (no overlap) from the **droppable** one (`duration/3`, a taste rule);
+   only the latter may be discarded when it collapses the zone.
+2. **Zero-length stored zones.** The degeneracy guard ran on the pre-rounding floats, so a zone
+   a fraction of a millisecond long survived as `start == end` in integer ms. Now gated after
+   rounding, and on a **one-bar** floor rather than merely non-zero — a few hundred
+   milliseconds is not something anyone can blend over, and writing it would force every
+   consumer to carry its own floor.
+
+⚠️ Both invariant helpers compare **integer milliseconds**, never the intermediate floats.
+`markers.position_ms` is an INTEGER column, so ms is the only ground truth; comparing a rounded
+value against an unrounded one manufactures failures that cannot occur in the database, and can
+hide a real one behind a float that lands the right side of an epsilon. Two of the sweep's
+early "failures" were exactly that artifact.
+
+### Still outstanding
+
+- 🔴 **The migration and the backfill have NOT been run against production.** Until they are,
+  the library still carries `mix_in`/`mix_out` rows (the payload's legacy fallback keeps
+  everything working) and no `_end` markers at all, so the intro side contributes no length.
+- Nothing in phases 5–8 has been live-verified. See `[[feedback_live_set_no_rebuild]]`.
+- §2 of `mix-zones.md` — deriving a mix-in better than "the beginning of the song" — is
+  unstarted, and is what makes any of this matter on an un-marked library.

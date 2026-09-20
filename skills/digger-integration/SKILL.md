@@ -217,8 +217,9 @@ let `MarkerPatchIn` accept `position_ms` so cuemark can `PATCH` in place. Not bu
   `create_marker`).
 - cuemark: `queueStore.ts` (`loadQueueItemToDeck`), `api.ts`
   (`setMixMarker`/`clearMixMarker`/`pushMarker`/`getTrackMarkers`/`deleteMarker`),
-  `MarkerPanel.svelte`, `autoMix.ts` (`introZoneSec`/`outroZoneSec`/`introStartSec`),
-  `WaveformCanvas.svelte` (`drawMarkers`), `types.ts` (`Deck.introPoint`/`outroPoint`).
+  `MarkerPanel.svelte`, `autoMix.ts` (`effectiveZones`, `introSeekSec`),
+  `WaveformCanvas.svelte` (`drawMarkers`),
+  `types.ts` (`Deck.mixInStart`/`mixInEnd`/`mixOutStart`/`mixOutEnd`).
 
 ## Beat-grid precision + waveform cache (added 2026-08-23)
 
@@ -329,34 +330,50 @@ this path logged anything to `cuemark.log` before — every state change was a p
 write. Both fixed 2026-08-24, still not live-reverified.
 
 **Phase 4 (per-track outro marker), built + unit-tested 2026-08-24 — no digger-repo change
-needed.** Digger's `analyze_audio.py` already derives a `mix_out` marker automatically during
-BPM analysis and already returns it from `/tracks/{id}/cuemark` as `mixOut` (see
+needed.** Digger's `analyze_audio.py` already derives a `mix_out_start` marker automatically
+during BPM analysis and already returns it from `/tracks/{id}/cuemark` as `mixOut` (see
 `_derive_mix_points` in the digger repo) — cuemark just never consumed it. Now pulled into
-`Deck.outroPoint` (`queueStore.ts`'s `loadQueueItemToDeck`, same omitted-vs-null
-normalization as bpm/downbeat above) and used by both triggers via `nearEndReference()` in
-`autoMix.ts` in place of `source.duration` whenever a track has one — the existing
+`Deck.mixOutStart` (`queueStore.ts`'s `loadQueueItemToDeck`, same omitted-vs-null
+normalization as bpm/downbeat above) and used by both triggers via `effectiveZones().nearEnd`
+in `autoMix.ts` in place of `source.duration` whenever a track has one — the existing
 threshold settings still measure their lead time from whichever reference applies. Falls
 back to duration exactly as before when unset (no analysis run yet, or a non-Digger load).
-**Phase 5 (2026-08-30) pulled `mixIn` through the same way**, into `Deck.introPoint`, and
-derives each transition's *duration* from the two tracks' zone lengths (`duration −
-outroPoint` on the outgoing side, `introPoint` on the incoming side) —
-`computeTransitionDurationMs()` in `autoMix.ts`. Again **no digger-repo change**. ⚠️ Know
-this before reading a short transition as a bug: `_derive_mix_points()` sets `mix_in =
-beat_times[0]`, the **first tracked beat**, usually well under a second — it is not "the end
-of the intro", so on an auto-analysed track the intro side contributes nothing and the
-duration comes from the outro zone alone. A `MIN_ZONE_SEC = 2` floor is what keeps those
-sub-second values from collapsing every blend to the 2s minimum.
+**Phase 5 (2026-08-30) pulled `mixIn` through the same way**, into `Deck.mixInStart`, and
+derived each transition's *duration* from the two tracks' zone lengths via
+`computeTransitionDurationMs()` in `autoMix.ts`. Again **no digger-repo change**. ⚠️ At the
+time this used `duration − mixOutStart` on the outgoing side and the bare `mixInStart` on
+the incoming side, which assumed each zone ran all the way to the track's own boundary — the
+exact bug the marker-vocabulary change below exists to kill. **Fixed by Phase 8
+(2026-09-20)**: Digger gained real `mixInEnd`/`mixOutEnd` markers (see "Marker vocabulary and
+mix points" below), and `computeTransitionDurationMs()` now derives duration from two real
+measured lengths, `mixOutEnd − mixOutStart` and `mixInEnd − mixInStart`, via the single
+`effectiveZones()` resolver that both this engine and `MarkerPanel` read — so they can't
+disagree about which markers count. Know this before reading a short transition as a bug:
+`_derive_mix_points()` sets `mix_in_start = beat_times[0]`, the **first tracked beat**,
+usually well under a second — an un-migrated/un-backfilled track has no `mixInEnd` at all,
+so its intro side contributes nothing and the duration comes from the outro zone alone.
+`MIN_ZONE_SEC = 2` is the floor that keeps a too-short zone (both ends present but under 2s
+apart) from being used at all, rather than collapsing every blend to the 2s minimum.
 
-⚠️ **Manual mix_in/mix_out writes must DELETE before they insert.** `track_cuemark()` picks
+⚠️ **Manual mix-marker writes must DELETE before they insert.** `track_cuemark()` picks
 the *first* marker of a type by `position_ms` — not most-recent like it does for `downbeat`,
-and not manual-first — so a manually-pushed second `mix_out` silently loses to an
+and not manual-first — so a manually-pushed second marker of a type silently loses to an
 auto-derived one sitting earlier in the track. Phase 4 declined to ship a manual control for
 exactly this reason; phase 6 (2026-08-30) ships one and works around it: `setMixMarker()`
 (`api.ts`) deletes every existing marker of that type (`GET /tracks/{id}` for the ids —
 `/cuemark` flattens them away — then `DELETE /markers/{id}`) before POSTing, leaving one
-unambiguous row. 🔴 **Still worth fixing in the digger repo** (rank `source='manual'` first,
-or upsert): re-running `analyze_audio.py` re-creates a `detected` marker alongside the manual
-one and the ambiguity returns.
+unambiguous row. Since 2026-09-20 the type is one of the four
+`mix_in_start`/`mix_in_end`/`mix_out_start`/`mix_out_end`, and clearing a zone's *start* in
+`MarkerPanel` clears its *end* too — an end with no start is inert to `effectiveZones()` but
+would silently start constraining the zone again the moment a new start was placed.
+
+✅ **The "🔴 still worth fixing: re-analysis re-creates a detected marker alongside the manual
+one" note that used to close this paragraph was wrong, and is removed** (corrected
+2026-09-20). It contradicted this file's own "Manual placement already wins" section above:
+`_upsert_mix_marker()` backs off entirely for a type that already has any non-`detected` row,
+and every cuemark POST lands as `source='manual'`, so a re-analysis is a no-op for that type.
+The one real residual is unchanged and is stated there: a *cleared* marker is re-derived on
+the next analysis run — moved is durable, cleared is not.
 
 ⚠️ **The crossfade ramp's completion branch must clear the outgoing deck's `source`, not
 just `playing`** (fixed 2026-08-24, `autoMix.ts`'s `startCrossfadeRamp`) — leaving a
@@ -423,10 +440,11 @@ the EOS fallback is *silent* in the log; what you can see is everything around i
 `checkAutoMixTrigger`/`checkAutoPreloadTrigger`'s own `[auto-dj]` lines telling you what the
 lookahead path did or didn't do, and the Rust-side lines telling you what actually happened
 to each deck's pipeline. The second incident (a track that auto-mixed in and was replaced
-again within 8 seconds) was a **data** bug, not a logic one: `nearEndReference()`'s clamp on
-`Deck.outroPoint` only ever protected the high end (never past EOS) — a Digger-derived
-marker sitting suspiciously early in the track (a bad beat-grid fit) was never sanity-checked
-on the low end until this fix.
+again within 8 seconds) was a **data** bug, not a logic one: the near-end reference's clamp
+on what is now `Deck.mixOutStart` (`Deck.outroPoint` at the time, and the clamp itself was
+`nearEndReference()` — since folded into `effectiveZones()`'s outro POINT rule) only ever
+protected the high end (never past EOS) — a Digger-derived marker sitting suspiciously early
+in the track (a bad beat-grid fit) was never sanity-checked on the low end until this fix.
 
 ## Queue played-tracking (added 2026-08-24)
 

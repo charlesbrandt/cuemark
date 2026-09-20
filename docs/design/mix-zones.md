@@ -1,8 +1,13 @@
 # Mix zones: four-point vocabulary, and deriving the points algorithmically
 
-**Status: design + handoff, nothing built (2026-09-20).** Two linked pieces of work, in the
-order they should be done. Written as a cold-start brief for a new session — read this first,
-then only the two docs it names.
+**Status (2026-09-20): §1 BUILT — cuemark + Digger, tests green, NOT live-verified, and the
+production migration + backfill NOT yet run. §2 unstarted, but its gating measurement is
+answered (see below).** Two linked pieces of work, in the order they should be done. Written as
+a cold-start brief for a new session — read this first, then only the two docs it names.
+
+Build notes for §1 live in [`auto-dj-transitions.md`](auto-dj-transitions.md) "Phase 8",
+including the two defects a property sweep caught that example tests did not. What is left
+before §1 can be called done is at the bottom of §1.
 
 **Prior reading, in this order and no further:**
 1. [`auto-dj-transitions.md`](auto-dj-transitions.md) — "Phase 7", "Phase 7b", and the numbered
@@ -105,6 +110,35 @@ keeps working unchanged. That removes the only real argument for keeping the old
    `introZoneSec` rejects it because 0.5 s is not a usable *zone*. That split only makes sense
    once the two values exist separately, which is why it waits for this phase.
 
+### ✅ Built 2026-09-20 — what actually shipped, and what changed from this plan
+
+All four build-order steps landed. Three deviations from the plan above, each deliberate:
+
+1. **cuemark's `Deck` fields were renamed, not extended.** The plan said `Deck.introEnd`/
+   `outroEnd`, keeping `introPoint`/`outroPoint` as the starts. But `introPoint` is the exact
+   name that got read as both a length and a start — leaving it in place would have left the
+   ambiguity in the one place the bug lived, while fixing it everywhere else. The fields are
+   `mixInStart`/`mixInEnd`/`mixOutStart`/`mixOutEnd`, matching the storage vocabulary
+   one-for-one. Nothing persists these except the recovery snapshot, which normalizes the four
+   to `null` at rehydration (`bootRestore.ts`) — an old snapshot's missing fields would
+   otherwise arrive as `undefined`, which passes every `!== null` guard in the engine.
+2. **`mixInEnd` got no duration fallback**, unlike `mixOutEnd`. See Phase 8's note: a missing
+   mix-out end is the track's end (the pre-existing implicit value), but a missing mix-in end
+   must mean *no length*, because inventing one is the original bug.
+3. **A delivery floor, `INTRO_SEEK_MIN_SEC` (1 s), sits between the point rule and the seek.**
+   The rule split is real — `effectiveZones().inStart` accepts a 0.5 s hand-placed mix-in
+   exactly as this plan asked — but *acting* on a sub-second target costs a pipeline flush plus
+   a settle stage at the worst possible moment, so the seek is declined below 1 s. This keeps
+   Digger's auto-derived values behaving exactly as they do today. It is a taste knob and is
+   flagged as one.
+
+**Before §1 is done:**
+- 🔴 Run `migrate.py` step 54 and then `importers/backfill_mix_points.py --execute` against
+  production (192.168.2.99). Neither has been run. Until then the library carries legacy
+  `mix_in`/`mix_out` rows — harmless, because the payload falls back to them — and no `_end`
+  markers, so the intro side contributes no length to any transition.
+- Live-verify. Nothing in phases 5–8 has been heard.
+
 ---
 
 ## §2 — Deriving a mix-in point better than "the beginning of the song"
@@ -142,6 +176,24 @@ has a `waveform_cache` row, on the **production** instance (192.168.2.99 — the
 a different database with the same catalog and almost no analysis, see the
 `digger-integration` skill). If coverage is low, an envelope-only approach loses its advantage
 and the decision changes. One query; do not skip it.
+
+### ✅ Measured 2026-09-20 — coverage is effectively total, so the envelope plan holds
+
+| | count |
+|---|---|
+| tracks total | 66,105 |
+| tracks with `bpm` | 49,762 |
+| tracks with `beat_anchor_ms` | 49,723 |
+| **`waveform_cache` rows** | **50,382** |
+| **cached envelope AND beat anchor** (both inputs present) | **49,723** |
+| analysed tracks with *no* cached envelope | **5** |
+
+Every analysed track bar five already has both inputs cached, so candidate **A** is backfillable
+over the whole library with **zero audio decode**. Envelope blobs are float32 at 210 Hz
+(247,908 bytes for a 295.1 s track ≈ 4 B × 210/s), in their own 12.8 GB `waveform_cache.db`
+off the backup path. The marker side, for sizing the write: 50,379 `mix_in` + 50,380 `mix_out`
+rows, of which exactly **2 and 1 respectively are `source='manual'`** — three hand-placed rows
+in the entire library, and `_upsert_mix_marker` already refuses to touch them.
 
 ### Candidate signals, cheapest first
 
