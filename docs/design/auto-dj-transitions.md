@@ -756,7 +756,7 @@ blind.
 3. 🟡 **Cross-track compatibility scoring (key/energy) as an input to the transition.**
    Explicitly out of scope here, and adjacent to the transition-mining work Digger reserves
    as a server-side job — noted only so it isn't re-derived as a new idea.
-4. 🔴 **Digger's mix_in/mix_out resolution should be most-recent- or manual-first.** Phase 6
+4. ✅ **FIXED 2026-09-20 (digger, manual-first then newest-created, tested, deployed, verified live against hand-placed tracks).** *Original note:* **Digger's mix_in/mix_out resolution should be most-recent- or manual-first.** Phase 6
    works around "first marker by `position_ms` wins" by deleting before inserting, which is
    correct from cuemark's side but does not survive a re-run of `analyze_audio.py` (a fresh
    `detected` marker reappears alongside the manual one, and whichever sits earlier wins).
@@ -1010,9 +1010,7 @@ early "failures" were exactly that artifact.
 
 ### Still outstanding
 
-- 🔴 **The migration and the backfill have NOT been run against production.** Until they are,
-  the library still carries `mix_in`/`mix_out` rows (the payload's legacy fallback keeps
-  everything working) and no `_end` markers at all, so the intro side contributes no length.
+- ✅ **Migration and backfill run against production 2026-09-20**, including the duration correction that widened it from 2,096 to ~49.7k tracks — see `mix-zones.md`.
 - Nothing in phases 5–8 has been live-verified. See `[[feedback_live_set_no_rebuild]]`.
 - §2 of `mix-zones.md` — deriving a mix-in better than "the beginning of the song" — is
   unstarted, and is what makes any of this matter on an un-marked library.
