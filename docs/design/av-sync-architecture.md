@@ -75,6 +75,21 @@ a rebuild is in progress, the new WebKit pipeline re-reads GStreamer's current p
 pre-seek value) and overwrites `v.currentTime` with it, silently undoing the seek. The `pendingSeekTarget`
 filter in the RAF loop catches this race for programmatic seeks, but the correct fix is ordering.
 
+⚠️ **The rule bites the "obvious" optimisation.** Issuing the seek *before* the rate write looks like it
+buys the seek a free settle window (the rate's own), and it does not — it walks straight into the failure
+above, because the rebuild is what overwrites `v.currentTime`, and it does so with whatever GStreamer says
+*at rebuild time*, which for a fire-and-forget `audio_seek` is still the pre-seek value. Both orderings put a
+seek next to a rebuild; only one of them puts the seek *after* it. Hit in review on 2026-09-19 building Auto
+DJ phase 7b (`auto-dj-transitions.md`), where it would have read as "the mix-in marker does nothing on some
+tracks" — silent, and only on legacy-path decks.
+
+**Corollary — two seeks in one settle cost one settle.** When a paused deck needs both a rate change and
+*more than one* position write (phase 7b: seek to the mix-in marker, then phase-nudge relative to it), they
+all belong in a single callback after the rate settle, not in a stage each. `seekDeck` updates the
+frontend's own position sources *synchronously* (`el.currentTime` for a legacy deck, `pendingSeekTarget` for
+a codec one, both read back by `getDeckTime`) ahead of the IPC, so a consumer in the same tick reads the
+value the previous seek just wrote and can refine it. Only the last write has to be settled before play.
+
 **Device routing**: default output uses `autoaudiosink` (selects PipeWire/PulseAudio/ALSA automatically).
 A specific sink is targeted via `pipewiresink target-object=<node-name>`; falls back to `autoaudiosink` if
 the `gstreamer1.0-pipewire` plugin is absent.

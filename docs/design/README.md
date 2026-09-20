@@ -40,6 +40,7 @@ to finish right now.
 | [`button-to-audio-latency.md`](button-to-audio-latency.md) | Exploration only, nothing built. Open decisions listed at the tail. |
 | [`cross-platform-windows-mac.md`](cross-platform-windows-mac.md) | Not started. Guidance-only doc for a future port. |
 | [`preroll-latency.md`](preroll-latency.md) | Design only, nothing built — direct follow-on from `queue-prefetch-cache.md`'s phase-1 gate. |
+| [`mix-zones.md`](mix-zones.md) | Design + handoff, nothing built. Four-point marker vocabulary (`mix_in_start`/`mix_in_end`/`mix_out_start`/`mix_out_end`) and deriving a real mix-in point from the cached envelope instead of `beat_times[0]`. Start here for the next Auto DJ session. |
 | [`scratch-feeder-underruns.md`](scratch-feeder-underruns.md) | Open, not yet investigated. |
 
 ## 🟡 Partially resolved — core work is done, something specific remains

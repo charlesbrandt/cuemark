@@ -899,3 +899,8 @@ zone's shading on the waveform plus the panel's zone figure. A "starts here" mar
 `introPoint`, read the way the cue point's line reads, would make that legible — small, and
 `drawMarkers()` already draws a boundary line per zone.
 
+➡️ **Both of the above, plus the thing that makes any of it matter on an un-marked library
+(deriving a real mix-in point instead of `beat_times[0]`), are specced in
+[`mix-zones.md`](mix-zones.md).** That is the handoff doc for the next session on this —
+start there rather than here.
+

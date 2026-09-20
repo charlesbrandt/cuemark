@@ -168,6 +168,58 @@ run repeatedly), then without `--dry-run` to apply. The `api` service isn't alwa
 `docker compose ps` to check, `docker compose up -d api` to start it (host port **8200**, maps
 to the container's 8000; `docker compose logs api` to confirm it's serving before hitting it).
 
+## Marker vocabulary and mix points (added 2026-09-20)
+
+**Adding a marker type is free; changing one is not.** `markers.type` is `TEXT NOT NULL
+DEFAULT 'cue'` with **no CHECK constraint** (`db.py`), and `MarkerIn.type` is a bare `str`
+(`models.py`), so a *new* type needs no `db.py` edit and no numbered `migrate.py` step —
+pure vocabulary, unlike the column-adding dance in the section above. Verified 2026-09-19.
+⚠️ That is only true for **additions**. *Renaming* `mix_in`/`mix_out`, or redefining what one
+means, is a data migration over every existing row — still no schema change, but a real
+numbered `migrate.py` step plus every reader and writer on both sides. "No schema change"
+and "no migration" are different claims; the second one is the expensive one.
+
+**The wire payload is a separate contract from the storage vocabulary.**
+`_build_cuemark_payload()` maps marker rows to `mixIn`/`mixOut` (seconds) — so the stored
+types can be renamed while the payload keys stay put, and an older cuemark build keeps
+working. Reach for that whenever a vocabulary change looks like it would break compatibility.
+
+**Naming rule, learned the hard way (2026-09-19, twice in two phases): a marker that bounds a
+region must say *which end* it is.** A bare `mix_in` was read as a zone *length* by cuemark's
+duration math and as a *start point* by Digger's own spec, both defensibly, and the two
+readings silently disagreed the moment a marker was hand-placed. Same class of bug had just
+been fixed on the outro side. Prefer `mix_in_start` / `mix_in_end` / `mix_out_start` /
+`mix_out_end` over `mix_in` + `intro_end`: symmetrical, self-describing, and it keeps all four
+in the `mix_*` namespace, which says these are *transition* markers rather than musicology
+("intro" is a property of the song; "mix-in zone" is a property of the mix). Live plan:
+`docs/design/mix-zones.md` in the cuemark repo.
+
+**Manual placement already wins — the old warning is stale.** `_upsert_mix_marker()` backs off
+entirely (derives nothing for that type) if **any** marker of that type has
+`source IS NULL OR source != 'detected'`, and `create_marker()` defaults `source` to
+`'manual'`, which is what every cuemark POST gets. So re-running `analyze_audio.py` over a
+hand-edited track is a **no-op for that marker type**. Three comments in cuemark
+(`api.ts`, `MarkerPanel.svelte`, the design doc's open decision #4) still warn otherwise —
+they are wrong. **Residual, and real**: `clearMixMarker` deletes all rows of the type, so the
+next analysis run re-derives a `detected` one. *Moved* is durable; *cleared* is not.
+
+⚠️ **The two sides write markers differently.** Digger derives with a true upsert (one row per
+type, updated in place). cuemark's `setMixMarker()` is **delete-then-insert with no
+transaction** — if the POST fails, or the app dies between the two, the track ends up with
+*no* marker of that type, which is worse than before the edit. It is written that way on
+purpose (`_build_cuemark_payload` resolves "first marker of the type by `position_ms`", so
+leaving exactly one row is what makes the result unambiguous). The clean fix is Digger-side:
+let `MarkerPatchIn` accept `position_ms` so cuemark can `PATCH` in place. Not built.
+
+**Who touches mix markers** — the full inventory, for any change to the vocabulary:
+- Digger: `importers/analyze_audio.py` (`_derive_mix_points`, `_upsert_mix_marker`),
+  `importers/backfill_mix_points.py`, `routers/tracks.py` (`_build_cuemark_payload`,
+  `create_marker`).
+- cuemark: `queueStore.ts` (`loadQueueItemToDeck`), `api.ts`
+  (`setMixMarker`/`clearMixMarker`/`pushMarker`/`getTrackMarkers`/`deleteMarker`),
+  `MarkerPanel.svelte`, `autoMix.ts` (`introZoneSec`/`outroZoneSec`/`introStartSec`),
+  `WaveformCanvas.svelte` (`drawMarkers`), `types.ts` (`Deck.introPoint`/`outroPoint`).
+
 ## Beat-grid precision + waveform cache (added 2026-08-23)
 
 `bpm.ts`'s comb-fit algorithm is now ported to Digger (`importers/beatgrid.py`) so

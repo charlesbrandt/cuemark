@@ -179,6 +179,14 @@ because `appsink` is not a `GstAudioBaseSink`.
 | **🛑 Known trap** | With a usable outro marker the blend **starts at `outroPoint`** (since 2026-09-19) and the "start mixing N s out" threshold no longer moves it; it still governs tracks with no marker. Turning that setting and seeing nothing change on a marked track is by design. |
 | **Marker panel says "ignored"** | The engine discards the value: zone < 2 s, outro inside the first third, or intro past it. Digger's auto `mix_in` (first tracked beat, <1 s) is always ignored — only a hand-placed intro counts. |
 | **Preview** | Resets itself `PREVIEW_TAIL_MS` after the fade (fader, incoming deck position/rate). Touching the fader aborts the reset on purpose. |
+| **🛑 The intro side is inert on an un-marked library** | Since 2026-09-19 the incoming deck is *seeked* to `introPoint` before it starts — but on the same `introZoneSec` gate, so on a track whose `mix_in` is Digger's auto value it does **nothing**, and correctly so. **Hand-place a mix-in in the MarkerPanel before concluding this is broken.** The log tells you which happened: `[auto-dj] intro: deck-N starting at its mix-in marker …` fires only when the marker is trusted, and the `[auto-dj] preview:` line always names the incoming deck's start as either `…s (mix-in)` or `0.0s (no mix-in)`. |
+
+**The generalisable one, worth carrying past this entry: a feature gated on data the library
+does not have yet is indistinguishable from a broken feature.** Before live-testing anything
+marker-, grid- or analysis-driven, check that at least one loaded track actually carries the
+input — otherwise the whole session measures the gate, concludes "no effect", and the real
+question (is the *behaviour* right when the data is there?) never gets asked. The cheap move
+is to hand-author the input on one track first, then test.
 
 ---
 
