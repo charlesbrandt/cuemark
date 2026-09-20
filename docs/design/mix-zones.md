@@ -1,8 +1,9 @@
 # Mix zones: four-point vocabulary, and deriving the points algorithmically
 
-**Status (2026-09-20): §1 BUILT — cuemark + Digger, tests green, NOT live-verified, and the
-production migration + backfill NOT yet run. §2 unstarted, but its gating measurement is
-answered (see below).** Two linked pieces of work, in the order they should be done. Written as
+**Status (2026-09-20): §1 BUILT and DEPLOYED — cuemark + Digger, tests green, migration and
+backfill run against production. NOT live-verified. The backfill reached only 2,096 tracks
+because `duration_ms` is missing library-wide; see "Before §1 is done". §2 unstarted, but its
+gating measurement is answered (see below).** Two linked pieces of work, in the order they should be done. Written as
 a cold-start brief for a new session — read this first, then only the two docs it names.
 
 Build notes for §1 live in [`auto-dj-transitions.md`](auto-dj-transitions.md) "Phase 8",
@@ -133,10 +134,45 @@ All four build-order steps landed. Three deviations from the plan above, each de
    flagged as one.
 
 **Before §1 is done:**
-- 🔴 Run `migrate.py` step 54 and then `importers/backfill_mix_points.py --execute` against
-  production (192.168.2.99). Neither has been run. Until then the library carries legacy
-  `mix_in`/`mix_out` rows — harmless, because the payload falls back to them — and no `_end`
-  markers, so the intro side contributes no length to any transition.
+- ✅ **Migration + backfill run against production 2026-09-20.** Deployed `2d69173` to
+  192.168.2.99, backed up first (`~/backups/digger/digger-20260920-150357.db.gz`, 100,023,501
+  bytes, mirrored to T7), then `migrate.py` (step 54) and
+  `importers/backfill_mix_points.py --execute`. Marker counts:
+
+  | type | before | after migration | after backfill |
+  |---|---|---|---|
+  | `mix_in` | 50,379 detected + 2 manual | — | — |
+  | `mix_out` | 50,380 detected + 1 manual | — | — |
+  | `mix_in_start` | — | 50,379 detected + 2 manual | 50,380 detected + 2 manual |
+  | `mix_out_start` | — | 50,380 detected + 1 manual | 50,381 detected + 1 manual |
+  | `mix_in_end` | — | — | 2,096 detected |
+  | `mix_out_end` | — | — | 2,096 detected |
+
+  The three hand-placed rows came through untouched — same row ids, same `position_ms`, same
+  `source='manual'`, only the type string renamed. Step 54 re-run afterwards reported
+  "Renaming 0", so it is idempotent on the real database, not just in the code.
+
+- 🔴 **The backfill reached 2,096 tracks, not ~50,000, and the blocker is `duration_ms`.**
+  `_TARGET_SET` requires `duration_ms > 0` (it needs the track length for the `duration/3`
+  ceiling and for `mix_out_end`), and only **6,604 of 66,105** tracks have one at all — of
+  the 50,381 tracks carrying a `mix_in_start`, just **2,096** do. So ~48k analysed tracks now
+  have two of the four markers and will contribute **no intro length** to any transition
+  until their durations are populated. This is not a defect in §1; it is a pre-existing
+  library-metadata gap that §1 is the first feature to depend on. Populating `duration_ms`
+  (ffprobe pass, or from the files table) is the prerequisite for a second backfill run —
+  and it is also worth checking before §2, whose own coverage numbers were measured on
+  `waveform_cache` rows rather than on `duration_ms`.
+
+- Dry-run sanity over the 2,096, for the record: no degenerate zones (`start == end`), no
+  inverted outro zones, and **zero** `_mix_in_end_ms()` `None` returns — the sub-one-bar
+  guard is real (unit test + property sweep) but production data never hit it. Mix-in zone
+  lengths ran 3.03s min / 32.01s median / 65.42s max, one under 5s and none under 2s. Six
+  tracks looked like ceiling violations and five were float-epsilon artefacts sitting exactly
+  *on* a ceiling (0 ms over). The sixth, track 62624, genuinely exceeds `duration/3` by 37.6s
+  because its `mix_in_start` (78.3s) is already past the third — the documented fallback that
+  drops the taste ceiling while the inviolable no-overlap ceiling still holds. Working as
+  designed; cuemark's own point rule rejects that `inStart` anyway.
+
 - Live-verify. Nothing in phases 5–8 has been heard.
 
 ---
