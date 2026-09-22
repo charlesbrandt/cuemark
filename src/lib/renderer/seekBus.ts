@@ -186,6 +186,21 @@ export function setDeckAudioTime(deckId: string, t: number): void {
   audioTimes.set(deckId, t);
 }
 
+// Drop a deck's cached audio-clock position without touching `els`/`pendingSeekTarget` —
+// the rest of `unregisterVideoEl`'s cleanup is legacy-<video>-specific and wrong to run for
+// a codec-path deck. Needed because `unregisterVideoEl` (the only other place this map is
+// cleared, short of an actual seek) is itself only called from `destroyLegacyVideoEl`, which
+// is a documented no-op for codec-path decks (see legacyVideo.ts). Without this, a webcodecs
+// deck's `audioTimes` entry survives its own teardown+reload: `getDeckTime()` keeps returning
+// wherever the *previous* track was last polled playing, and a caller that reads it right
+// after a fresh load (e.g. `nudgePhaseToMaster`'s paused-seek branch, called with no intro
+// marker to override it) seeks the new track to that stale position instead of near its
+// start — live-hit 2026-09-22, an Auto DJ transition landing "Carte Sim" 221s into a 355s
+// track. Call this everywhere `resetPositionTracking` (positionPoll.ts) is called.
+export function clearDeckAudioTime(deckId: string): void {
+  audioTimes.delete(deckId);
+}
+
 export function getDeckTime(deckId: string): number | null {
   // A live scrub target outranks everything: it is where the user is pointing *now*,
   // while every other source here is a measurement of where the audio has got to. The

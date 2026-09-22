@@ -11,6 +11,7 @@ import { recordPollSample, maybePingIpc } from "./pollStats";
 import { session } from "../state/session";
 import {
   setDeckAudioTime,
+  clearDeckAudioTime,
   getPendingSeekTarget,
   clearPendingSeekTarget,
   type CodecPlayerHandle,
@@ -44,9 +45,18 @@ const pendingPos = new Map<string, boolean>();
 // across the gap, instead of a single instantaneous snapshot (see averageRateOverWindow).
 const contentPosTracker = new Map<string, { audioPos: number; contentPos: number; tsMs: number }>();
 
-/** Drop a deck's integration state — on teardown, or when a new file is loaded onto it. */
+/**
+ * Drop a deck's integration state — on teardown, or when a new file is loaded onto it.
+ * Also clears seekBus's `audioTimes` cache (`clearDeckAudioTime`): for a codec-path deck,
+ * `unregisterVideoEl` — the only other thing that clears it — never runs (it's reached only
+ * via `destroyLegacyVideoEl`, a no-op for decks with no `<video>` element), so without this
+ * `getDeckTime()` keeps answering with the deck's *previous* track's last polled position
+ * until something happens to seek. See `clearDeckAudioTime`'s doc comment for the live
+ * incident this caused (an Auto DJ transition landing 221s into a fresh 355s track).
+ */
 export function resetPositionTracking(deckId: string): void {
   contentPosTracker.delete(deckId);
+  clearDeckAudioTime(deckId);
 }
 
 /**
