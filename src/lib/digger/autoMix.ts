@@ -119,6 +119,39 @@ export function markHandledOutgoing(deckId: string, filePath: string | undefined
   if (filePath !== undefined) handledOutgoing.set(deckId, filePath);
 }
 
+/**
+ * Called from autoDj.ts's `handleDeckEos()` before it fetches a fresh pick for the deck
+ * that just hit real EOS. Handles the case the near-end crossfade never reached: this
+ * deck's crossfader-mapped counterpart may already be sitting on the very track
+ * `pickNextTrack` would pick next — `checkAutoPreloadTrigger` got there early, but the
+ * near-end trigger itself never fired (e.g. a mix-out marker that leaves too little real
+ * track left to run its own derived-duration blend, which `checkAutoMixTrigger` correctly
+ * declines and defers to this same EOS fallback — see its "not enough real time for the
+ * blend" comment). Fetching+loading again in that state put the same track on both mapped
+ * decks at once, with the fresh load stepping on whatever the counterpart was doing
+ * (live-hit 2026-09-22: next track loaded onto both decks, previous track cut off mid-load).
+ *
+ * Snaps the crossfader straight to the counterpart rather than running a timed ramp — the
+ * outgoing deck has already gone silent (real EOS already paused its pipeline), so there is
+ * nothing left to fade against. Returns true when it handled the switch (caller should stop),
+ * false when there's nothing preloaded to promote (caller falls through to its own fetch).
+ */
+export function promotePreloadedCounterpart(outgoingId: string): boolean {
+  const s = get(session);
+  const { left, right } = s.crossfaderMapping;
+  if (outgoingId !== left && outgoingId !== right) return false;
+  const counterpartId = outgoingId === left ? right : left;
+  const counterpart = getDeck(counterpartId);
+  if (!counterpart || counterpart.source === null || counterpart.playing) return false;
+
+  debugLog(`[auto-dj] EOS: deck-${counterpartId} already has the next track preloaded — starting it instead of loading a second copy onto deck-${outgoingId}`);
+  cancelRateDriftBack(outgoingId, "outgoing deck freed");
+  updateDeck(outgoingId, { playing: false, source: null, syncLocked: false, diggerTrackId: null, diggerFileId: null });
+  setCrossfader(counterpartId === right ? 1 : 0);
+  updateDeck(counterpartId, { playing: true });
+  return true;
+}
+
 // ── Manual/auto interaction — see docs/design/auto-dj-transitions.md "Manual/auto
 // interaction" ────────────────────────────────────────────────────────────────────
 //

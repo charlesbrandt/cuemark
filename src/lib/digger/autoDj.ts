@@ -25,7 +25,7 @@ import { getQueue, queueNext, type DiggerQueueItem } from "./api";
 import { loadQueueItemToDeck } from "./queueStore";
 import { currentDj, currentDjOrNull } from "./djSelector";
 import { updateDeck, getDeck } from "../state/session";
-import { wasAutoMixTriggered } from "./autoMix";
+import { wasAutoMixTriggered, promotePreloadedCounterpart } from "./autoMix";
 import { isPlayed, isSkipped } from "./playedTracks";
 import { showToast } from "../ui/toast";
 
@@ -112,6 +112,10 @@ export async function handleDeckEos(deckId: string): Promise<void> {
   const outgoingDeck = getDeck(deckId);
   const outgoingSource = outgoingDeck?.source;
   if (wasAutoMixTriggered(deckId, outgoingSource?.type === "video" ? outgoingSource.filePath : undefined)) return;
+  // The lookahead may have already preloaded the next track onto this deck's mapped
+  // counterpart without ever firing the crossfade itself — see promotePreloadedCounterpart's
+  // own comment. Start that instead of fetching a second copy of the same pick.
+  if (promotePreloadedCounterpart(deckId)) return;
   const owner = currentDjOrNull(get(currentDj));
   // Captured before loadQueueItemToDeck overwrites this deck's diggerTrackId below.
   const currentTrackId = outgoingDeck?.diggerTrackId ?? null;

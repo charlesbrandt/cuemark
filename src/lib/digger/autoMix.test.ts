@@ -843,6 +843,61 @@ describe('notifyManualPlay (Tier 2, silent)', () => {
   });
 });
 
+// Live-hit 2026-09-22: checkAutoMixTrigger never fired for a pair (deferred to the EOS
+// fallback, per its own "not enough real time for the blend" comment), but
+// checkAutoPreloadTrigger had already preloaded the next track onto the idle mapped deck.
+// handleDeckEos's old unconditional fetch+load put a second copy of that same track on the
+// deck that had just gone silent. promotePreloadedCounterpart is the fix: start what's
+// already preloaded instead of fetching again.
+describe('promotePreloadedCounterpart (EOS-fallback / preload coordination)', () => {
+  it('starts the preloaded counterpart and clears the deck that hit EOS, without touching the queue', async () => {
+    const { autoMixMod, sessionMod, resetSession } = await setup();
+    resetSession([
+      baseDeck('deck-0', { playing: false, source: null }),
+      baseDeck('deck-1', { playing: false, source: videoSource('next.mp4', 200), diggerTrackId: 8 }),
+    ]);
+
+    const handled = autoMixMod.promotePreloadedCounterpart('deck-0');
+
+    expect(handled).toBe(true);
+    const s = get(sessionMod.session);
+    expect(s.decks.find((d) => d.id === 'deck-1')!.playing).toBe(true);
+    expect(s.decks.find((d) => d.id === 'deck-0')!.source).toBe(null);
+    expect(s.crossfaderValue).toBe(1); // deck-1 is crossfaderMapping.right
+  });
+
+  it('does nothing when the counterpart has no preloaded track', async () => {
+    const { autoMixMod, resetSession } = await setup();
+    resetSession([
+      baseDeck('deck-0', { playing: false, source: null }),
+      baseDeck('deck-1', { playing: false, source: null }),
+    ]);
+
+    expect(autoMixMod.promotePreloadedCounterpart('deck-0')).toBe(false);
+  });
+
+  it('does nothing when the counterpart is already playing (a real overlap, not an idle preload)', async () => {
+    const { autoMixMod, resetSession } = await setup();
+    resetSession([
+      baseDeck('deck-0', { playing: false, source: null }),
+      baseDeck('deck-1', { playing: true, source: videoSource('next.mp4', 200) }),
+    ]);
+
+    expect(autoMixMod.promotePreloadedCounterpart('deck-0')).toBe(false);
+  });
+
+  it('does nothing for a deck outside crossfaderMapping', async () => {
+    const { autoMixMod, resetSession } = await setup();
+    resetSession([
+      baseDeck('deck-0', { playing: false, source: null }),
+      baseDeck('deck-1', { playing: false, source: videoSource('next.mp4', 200) }),
+      baseDeck('deck-2', { playing: false, source: null }),
+    ]);
+
+    expect(autoMixMod.promotePreloadedCounterpart('deck-2')).toBe(false);
+  });
+});
+
 // ── Phase 5 (2026-08-30) ─────────────────────────────────────────────────────────────
 // docs/design/auto-dj-transitions.md "Phase 5". computeTransitionDurationMs is pure, so
 // it's tested directly rather than only through the trigger — the trigger tests below

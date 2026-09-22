@@ -663,6 +663,22 @@ still catching the genuine case where lookahead never triggered. Built as `handl
 `wasAutoMixTriggered` in `autoMix.ts`; extended 2026-08-26 to also cover a **manual** takeover
 of one deck, not just the automated ramp — see "Manual/auto interaction" above.
 
+🟢 **Fixed 2026-09-22 — the genuine-fallback case still collided with the preload.**
+`wasAutoMixTriggered` only covers "the crossfade actually started." It says nothing about
+`checkAutoPreloadTrigger` having *already loaded* the next track onto the idle mapped deck
+while the near-end crossfade itself never fired — which happens whenever
+`checkAutoMixTrigger`'s own "not enough real time for the blend" guard declines (a mix-out
+marker that leaves less real track than the derived transition needs) and deliberately defers
+to this same EOS fallback. `handleDeckEos()` used to fetch+load unconditionally in that case,
+putting a second copy of the same pick on the deck that had just gone silent while the first
+copy sat preloaded, idle, on its counterpart — live-hit: "Confetti" (deck-1) hit real EOS,
+"Starlight" was already preloaded on deck-0, and `handleDeckEos` loaded *another* copy of
+"Starlight" onto deck-1 instead. Fixed by `promotePreloadedCounterpart()` in `autoMix.ts`,
+called from `handleDeckEos()` before it ever calls `pickNextTrack`: if the counterpart already
+has a loaded, non-playing track, start that (crossfader snapped straight to it — the outgoing
+deck already went silent, so there's nothing left to fade against) instead of fetching again.
+Not yet live-verified.
+
 ## Proposed phased plan
 
 1. 🟢 **DONE 2026-08-24 — Lookahead + crossfade ramp, fixed threshold only, no auto-preload.** Build the two
@@ -1014,3 +1030,13 @@ early "failures" were exactly that artifact.
 - Nothing in phases 5–8 has been live-verified. See `[[feedback_live_set_no_rebuild]]`.
 - §2 of `mix-zones.md` — deriving a mix-in better than "the beginning of the song" — is
   unstarted, and is what makes any of this matter on an un-marked library.
+- 🟢 **Fixed 2026-09-22**: "the deck starts where it was parked" (Phase 7b's no-marker path,
+  still true under Phase 8's `INTRO_SEEK_MIN_SEC` gate) assumed "parked" meant "freshly loaded,
+  near 0." It didn't, for a codec-path deck: `getDeckTime()` — what `nudgePhaseToMaster`'s
+  paused-seek branch reads as "current position" before adding its phase correction — was
+  reading a stale leftover from the deck's *previous* track, because the per-deck Map behind it
+  (`seekBus.ts`'s `audioTimes`) was only ever cleared via the legacy-`<video>`-only
+  `unregisterVideoEl`. Live symptom: Auto DJ landed "Fasme - Carte Sim" 221s into its 355s
+  runtime with no marker involved at all. Fixed in `seekBus.ts`/`positionPoll.ts`; full
+  writeup in `av-sync-architecture.md`'s "last-seen-value guard Map" section and memory
+  `project_stale_audio_time_seek_bug`. Not yet live-verified.

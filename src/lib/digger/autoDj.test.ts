@@ -26,7 +26,11 @@ vi.mock('../state/session', () => ({
 }));
 
 const wasAutoMixTriggered = vi.fn().mockReturnValue(false);
-vi.mock('./autoMix', () => ({ wasAutoMixTriggered: (...a: unknown[]) => wasAutoMixTriggered(...a) }));
+const promotePreloadedCounterpart = vi.fn().mockReturnValue(false);
+vi.mock('./autoMix', () => ({
+  wasAutoMixTriggered: (...a: unknown[]) => wasAutoMixTriggered(...a),
+  promotePreloadedCounterpart: (...a: unknown[]) => promotePreloadedCounterpart(...a),
+}));
 
 const isPlayed = vi.fn().mockReturnValue(false);
 const isSkipped = vi.fn().mockReturnValue(false);
@@ -42,6 +46,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   getDeck.mockReturnValue(undefined);
   wasAutoMixTriggered.mockReturnValue(false);
+  promotePreloadedCounterpart.mockReturnValue(false);
   isPlayed.mockReturnValue(false);
   isSkipped.mockReturnValue(false);
   autoDjEnabled.set(false);
@@ -54,6 +59,17 @@ describe('handleDeckEos', () => {
     expect(getQueue).not.toHaveBeenCalled();
     expect(loadQueueItemToDeck).not.toHaveBeenCalled();
     expect(updateDeck).not.toHaveBeenCalled();
+  });
+
+  it('defers to promotePreloadedCounterpart and does not also fetch/load a track (2026-09-22 double-load bug)', async () => {
+    autoDjEnabled.set(true);
+    promotePreloadedCounterpart.mockReturnValue(true);
+
+    await handleDeckEos('deck-0');
+
+    expect(promotePreloadedCounterpart).toHaveBeenCalledWith('deck-0');
+    expect(getQueue).not.toHaveBeenCalled();
+    expect(loadQueueItemToDeck).not.toHaveBeenCalled();
   });
 
   it('loads the front of the queue when non-empty, without removing it', async () => {
