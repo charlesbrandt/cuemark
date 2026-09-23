@@ -255,3 +255,21 @@ still what the Map remembers — that assertion breaks the moment the receiving 
 from scratch (reload, backend teardown, deck removal + ID reuse), so every such Map needs a
 `.delete(deckId)` alongside the other per-deck Maps (`stallWatch`, `backendState`,
 `contentPosTracker`, etc.) in whichever teardown path rebuilds that deck's backend.
+
+**A second instance of the same rule, found live 2026-09-22: `seekBus.ts`'s `audioTimes`
+Map only had ONE clearing path, and it was legacy-`<video>`-only.** `getDeckTime()` prefers
+`audioTimes` over every other position source. It used to be cleared only by `seekDeck()`
+itself and by `unregisterVideoEl()` — and `unregisterVideoEl()` is reached solely through
+`destroyLegacyVideoEl()`, a documented no-op for codec-path (webcodecs) decks (no `<video>`
+element to remove). `resetPositionTracking()` (`positionPoll.ts`), called from both
+`App.svelte` teardown paths, cleared `contentPosTracker` but not `audioTimes` — so a
+codec-path deck's stale position from its *previous* track survived teardown + reload.
+Auto DJ's `nudgePhaseToMaster()` paused-seek branch (`phaseNudge.ts`) reads `getDeckTime()`
+and adds a small phase correction to it; with no intro-marker seek to override it first (the
+common case — see `auto-dj-transitions.md`), it seeked a freshly loaded 355s track to 221s,
+i.e. wherever the *previous* track last happened to be polled. Fixed by adding
+`clearDeckAudioTime()` to `seekBus.ts` and calling it from `resetPositionTracking()`
+alongside the `contentPosTracker` clear — same shape as the `_prevCueStates` fix above, and
+worth checking for again: any per-deck-ID Map with more than one clearing path is a claim
+that all of them run on every teardown, and that claim needs re-verifying whenever a new
+teardown path (like the legacy/codec split) is added after the Map already existed.
