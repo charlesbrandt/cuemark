@@ -1,5 +1,8 @@
 # todo
 
+ docs/design/track-visual-override.md
+
+ 
 ### Load-time / button-to-audio latency during live mixing [measured 2026-08-30, redirected]
 
 Surfaced during the first real multi-listener session, carried over from digger's todo.md
