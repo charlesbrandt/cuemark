@@ -1,5 +1,7 @@
 import { DeckFBO } from "./fbo";
 import { debugLog } from "../debugLog";
+import { IsfInstance, type IsfFrameInputs } from "./isf/instance";
+import type { ParsedIsf } from "./isf/parser";
 
 // Full-screen quad: two triangles covering clip space
 const QUAD_VERTS = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
@@ -52,8 +54,10 @@ export class Compositor {
   // One FBO per deck; keyed by deck id. Created/destroyed as decks are added/removed.
   private fbos = new Map<string, DeckFBO>();
   // Single global visualization layer — composited above all decks, not tied to a deck id.
-  private vizFbo: DeckFBO;
-  private vizProgram: { program: WebGLProgram | null; src: string } | null = null;
+  // An instance owns its own program(s) and render target, so switching plugins is
+  // dispose-then-create and nothing here has to know how many passes a plugin has.
+  private vizInstance: IsfInstance | null = null;
+  private vizTexture: WebGLTexture | null = null;
 
   readonly width: number;
   readonly height: number;
@@ -70,7 +74,6 @@ export class Compositor {
     this.height = canvas.height;
     this.blitProgram = linkProgram(gl, VERT_SRC, FRAG_BLIT);
     this.quadVAO = this.buildQuad();
-    this.vizFbo = new DeckFBO(gl, this.width, this.height);
 
     // One line, once per context. Kept from the Bug A investigation because the decisive
     // fact there was that the corruption is machine-specific — it reproduces on this 2012
@@ -130,52 +133,25 @@ export class Compositor {
     return this.fbos.get(deckId);
   }
 
-  // Render the global visualization shader into its own FBO (not a deck's). Composited
-  // above all decks in composite() — selecting a visualization never touches deck audio/video.
-  renderVisualization(
-    fragmentSrc: string,
-    customUniforms: Record<string, number>,
-    time: number,
-    analysis: { bass: number; mid: number; high: number },
-  ) {
-    const { gl, quadVAO } = this;
+  /**
+   * Replace the global visualization. `null` clears it. Throws `IsfError` (compile/link/
+   * unsupported) with the layer left empty, so a broken plugin shows nothing rather than
+   * the previous one, and the caller can report why.
+   */
+  setVisualization(parsed: ParsedIsf | null, label: string) {
+    this.vizInstance?.dispose();
+    this.vizInstance = null;
+    this.vizTexture = null;
+    if (parsed) this.vizInstance = new IsfInstance(this.gl, parsed, this.width, this.height, label);
+  }
 
-    let cached = this.vizProgram;
-    if (!cached || cached.src !== fragmentSrc) {
-      if (cached?.program) gl.deleteProgram(cached.program);
-      let program: WebGLProgram | null = null;
-      try {
-        program = linkProgram(gl, VERT_SRC, fragmentSrc);
-      } catch (e) {
-        console.error('[visualization] compile error:', e);
-      }
-      cached = { program, src: fragmentSrc };
-      this.vizProgram = cached;
-    }
-    if (!cached.program) return;
-
-    const fbo = this.vizFbo;
-    fbo.bind();
-    gl.clearColor(0, 0, 0, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-
-    gl.useProgram(cached.program);
-    gl.bindVertexArray(quadVAO);
-
-    const p = cached.program;
-    gl.uniform1f(gl.getUniformLocation(p, 'u_time'), time);
-    gl.uniform2f(gl.getUniformLocation(p, 'u_resolution'), fbo.width, fbo.height);
-    gl.uniform1f(gl.getUniformLocation(p, 'u_bass'), analysis.bass);
-    gl.uniform1f(gl.getUniformLocation(p, 'u_mid'), analysis.mid);
-    gl.uniform1f(gl.getUniformLocation(p, 'u_high'), analysis.high);
-    for (const [name, value] of Object.entries(customUniforms)) {
-      const loc = gl.getUniformLocation(p, name);
-      if (loc !== null) gl.uniform1f(loc, value);
-    }
-
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    gl.bindVertexArray(null);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  // Render the global visualization into the instance's own target (not a deck's).
+  // Composited above all decks in composite() — selecting a visualization never touches
+  // deck audio/video.
+  renderVisualization(frame: IsfFrameInputs) {
+    if (!this.vizInstance) return;
+    this.vizTexture = this.vizInstance.render(frame, this.quadVAO);
+    // The instance leaves the default framebuffer bound; composite() sets its own viewport.
   }
 
   // Alpha-composite all deck FBOs back-to-front onto the output canvas, then blend the
@@ -208,9 +184,9 @@ export class Compositor {
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
 
-    if (visualizationOpacity > 0) {
+    if (visualizationOpacity > 0 && this.vizTexture) {
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, this.vizFbo.texture);
+      gl.bindTexture(gl.TEXTURE_2D, this.vizTexture);
       gl.uniform1i(uTex, 0);
       gl.uniform1f(uOpacity, visualizationOpacity);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);

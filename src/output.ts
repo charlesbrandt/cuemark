@@ -15,10 +15,13 @@
 import { invoke } from '@tauri-apps/api/core';
 import { debugLog } from './lib/debugLog';
 import { Compositor } from './lib/renderer/compositor';
+import { parseIsf, IsfError } from './lib/renderer/isf/parser';
 import {
   OUTPUT_CHANNEL,
   OUTPUT_ALIVE_INTERVAL_MS,
   type OutputMessage,
+  type OutputVizErrorMessage,
+  type VizPluginPayload,
 } from './lib/renderer/outputProtocol';
 
 const channel = new BroadcastChannel(OUTPUT_CHANNEL);
@@ -104,7 +107,45 @@ document.addEventListener('fullscreenchange', () => {
   settleResize(rect.width, rect.height);
 });
 
-let vizSrc: string | null = null;
+// The active plugin, or null. `vizLoadedAt` is its TIME origin: ISF's TIME counts from when
+// the shader was loaded, and a small TIME keeps `sin(TIME*k)` precise in float32.
+let vizPluginId: string | null = null;
+let vizLoadedAt = 0;
+let vizLastTime = 0;
+let vizFrameIndex = 0;
+
+function loadVisualization(plugin: VizPluginPayload | null) {
+  vizPluginId = null;
+  try {
+    // Parse before touching the compositor, so a header error leaves nothing half-built.
+    const parsed = plugin ? parseIsf(plugin.source, plugin.vertexSource) : null;
+    compositor.setVisualization(parsed, plugin ? `viz/${plugin.id}` : 'viz');
+  } catch (e) {
+    compositor.setVisualization(null, 'viz');
+    const stage: OutputVizErrorMessage['stage'] = e instanceof IsfError ? e.stage : 'runtime';
+    const message = e instanceof Error ? e.message : String(e);
+    debugLog(`[output] visualization ${plugin!.id} failed (${stage}): ${message}`);
+    channel.postMessage({ kind: 'vizError', pluginId: plugin!.id, stage, message });
+    return;
+  }
+  if (!plugin) {
+    debugLog('[output] visualization cleared');
+    return;
+  }
+  vizPluginId = plugin.id;
+  vizLoadedAt = performance.now();
+  vizLastTime = 0;
+  vizFrameIndex = 0;
+  debugLog(`[output] visualization ${plugin.id} loaded (${plugin.source.length} chars)`);
+  channel.postMessage({ kind: 'vizOk', pluginId: plugin.id });
+}
+
+function isfDate(): [number, number, number, number] {
+  const d = new Date();
+  const secs = d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds() + d.getMilliseconds() / 1000;
+  return [d.getFullYear(), d.getMonth() + 1, d.getDate(), secs];
+}
+
 let lastFrameAt = performance.now();
 let frameCount = 0;
 let loggedFirstUpload = false;
@@ -114,8 +155,7 @@ channel.onmessage = (e: MessageEvent<OutputMessage>) => {
   if (!msg) return;
 
   if (msg.kind === 'viz') {
-    vizSrc = msg.src;
-    debugLog(`[output] visualization ${msg.src ? `set (${msg.src.length} chars)` : 'cleared'}`);
+    loadVisualization(msg.plugin);
     return;
   }
   if (msg.kind !== 'frame') return;
@@ -140,10 +180,29 @@ channel.onmessage = (e: MessageEvent<OutputMessage>) => {
     d.bitmap.close();
   }
 
-  if (vizSrc && msg.vizOpacity > 0) {
-    compositor.renderVisualization(vizSrc, msg.vizUniforms, msg.time, msg.analysis);
+  if (vizPluginId && msg.vizOpacity > 0) {
+    const time = (performance.now() - vizLoadedAt) / 1000;
+    try {
+      compositor.renderVisualization({
+        time,
+        timeDelta: time - vizLastTime,
+        frameIndex: vizFrameIndex++,
+        date: isfDate(),
+        params: msg.vizParams,
+        bindings: msg.bindings,
+      });
+    } catch (e) {
+      // Drop the plugin rather than throw on every frame: an exception here would otherwise
+      // repeat at 60fps and take the deck composite below down with it.
+      const message = e instanceof Error ? e.message : String(e);
+      debugLog(`[output] visualization ${vizPluginId} render failed: ${message}`);
+      channel.postMessage({ kind: 'vizError', pluginId: vizPluginId, stage: 'runtime', message });
+      compositor.setVisualization(null, 'viz');
+      vizPluginId = null;
+    }
+    vizLastTime = time;
   }
-  compositor.composite(msg.decks, vizSrc ? msg.vizOpacity : 0);
+  compositor.composite(msg.decks, vizPluginId ? msg.vizOpacity : 0);
 
   if (frameCount === 1) {
     noSignal.style.display = 'none';

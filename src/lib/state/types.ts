@@ -18,10 +18,16 @@ export type DeckSource =
 
 // Global visualization layer, composited above all decks in the output stage —
 // not tied to any single deck, so selecting one never interrupts deck playback.
+//
+// A visualization is a *plugin* (docs/design/visualization-plugins.md): an ISF shader, either
+// a built-in (`builtin:<name>`) or a file in the plugins folder, whose id is its path relative
+// to that folder. The source is resolved and shipped to the output window separately — it is
+// never stored here. Persisted snapshots from before 2026-09-25 held `{ fragmentSrc, uniforms,
+// name }`; `migrateVisualization()` in lib/viz/vizPlugins.ts converts them.
 export interface Visualization {
-  fragmentSrc: string;
-  uniforms: Record<string, number>;
-  name?: string;
+  pluginId: string;
+  /** User parameter values by ISF input NAME. Unset inputs use the shader's DEFAULT. */
+  params: Record<string, number | number[] | boolean>;
 }
 
 // Realised in GStreamer as one `equalizer-nbands` (num-bands=3) per deck, sitting

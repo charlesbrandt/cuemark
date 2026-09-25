@@ -11,6 +11,7 @@ import { clearSavedGrid } from "../audio/gridSource";
 import { cueGain } from "../audio/audioSettings";
 import { slotDeck } from "../midi/handler";
 import { debugLog } from "../debugLog";
+import { migrateVisualization } from "../viz/vizPlugins";
 import type { Session } from "./types";
 
 // Decks awaiting adoption after a recovery boot: the Rust pipeline survived the
@@ -106,6 +107,7 @@ export async function restoreSessionOnBoot(): Promise<BootRestoreResult> {
           });
         }
       }
+      restored.visualization = migrateVisualization(restored.visualization);
       session.set(restored);
     } else if (recovery.snapshot) {
       // Not a recovery boot — no live pipeline to adopt, so decks stay at their fresh
@@ -156,7 +158,7 @@ export async function restoreSessionOnBoot(): Promise<BootRestoreResult> {
         // (undefined) picks up the new default. Same principle the crossfaderValue restore
         // incident established — never let a default silently overrule a stored choice.
         compactControls: restored.compactControls ?? true,
-        visualization: restored.visualization,
+        visualization: migrateVisualization(restored.visualization),
         visualizationOpacity: restored.visualizationOpacity,
       }));
       globalsRestoredFromSnapshot = true;

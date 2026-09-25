@@ -26,7 +26,7 @@
  *
  * ## Shape of the traffic
  *
- * `viz` is sent only when the shader source changes — it is a large string and has no
+ * `viz` is sent only when the plugin changes — its source is a large string and has no
  * business on a per-frame path. `frame` is sent once per composited tick, and carries a
  * bitmap only for decks that actually produced a new frame; `bitmap: null` means "reuse
  * what you already have in that deck's FBO". A paused deck therefore costs nothing per
@@ -47,16 +47,54 @@ export interface OutputFrameMessage {
   kind: 'frame';
   decks: OutputDeckFrame[];
   vizOpacity: number;
-  vizUniforms: Record<string, number>;
-  /** Seconds, for the visualization's `u_time`. */
+  /** User parameter values for the active plugin, by ISF input NAME. */
+  vizParams: Record<string, number | number[] | boolean>;
+  /** Values for every `CUEMARK_BIND` name (bass, mid, high, …), refreshed each frame. */
+  bindings: Record<string, number>;
+  /**
+   * Control-window clock, seconds. Not used as the shader's TIME any more: the output
+   * window counts TIME from when the plugin was loaded, as ISF hosts do, which also keeps it
+   * small enough for float precision (`performance.now()/1000` after hours of uptime makes
+   * `sin(TIME*k)` visibly step).
+   */
   time: number;
   analysis: { bass: number; mid: number; high: number };
 }
 
-/** Sent on change only — `fragmentSrc` is far too big for the per-frame path. */
+/** What the output window needs to build a plugin. */
+export interface VizPluginPayload {
+  id: string;
+  format: 'isf';
+  /** ISF fragment shader, header included. */
+  source: string;
+  /** Optional ISF vertex shader (`<name>.vs`). */
+  vertexSource?: string;
+  /** Asset file name → URL the output window can fetch. Unused until image inputs land. */
+  assets: Record<string, string>;
+}
+
+/** Sent on change only — plugin source is far too big for the per-frame path. */
 export interface OutputVizMessage {
   kind: 'viz';
-  src: string | null;
+  plugin: VizPluginPayload | null;
+}
+
+/**
+ * Output → control: the active plugin failed to build. The output window is the only place
+ * a shader is compiled, so without this a broken plugin is just a silently black layer.
+ * It is also `debugLog`ged on the output side so it reaches cuemark.log.
+ */
+export interface OutputVizErrorMessage {
+  kind: 'vizError';
+  pluginId: string;
+  stage: 'parse' | 'compile' | 'link' | 'unsupported' | 'runtime';
+  message: string;
+}
+
+/** Output → control: the active plugin built cleanly (clears a stale error badge). */
+export interface OutputVizOkMessage {
+  kind: 'vizOk';
+  pluginId: string;
 }
 
 /**
@@ -97,5 +135,7 @@ export const OUTPUT_ALIVE_TIMEOUT_MS = 3000;
 export type OutputMessage =
   | OutputFrameMessage
   | OutputVizMessage
+  | OutputVizErrorMessage
+  | OutputVizOkMessage
   | OutputHelloMessage
   | OutputAliveMessage;

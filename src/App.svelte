@@ -18,7 +18,8 @@
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { listen } from "@tauri-apps/api/event";
   import { getDeckTime, isScratching, registerCodecPlayer, unregisterCodecPlayer, getCodecPlayer, codecPlayerDeckIds } from "./lib/renderer/seekBus";
-  import { postFrame, takeResendRequest, releaseDeck, type DeckFrameSource } from "./lib/renderer/outputBus";
+  import { postFrame, takeResendRequest, releaseDeck, onVizReport, type DeckFrameSource } from "./lib/renderer/outputBus";
+  import { activeVizPayload, startVizPluginSync, refreshPluginList } from "./lib/viz/vizPlugins";
   import DeckCard from "./components/DeckCard.svelte";
   import Crossfader from "./components/Crossfader.svelte";
   import WaveformCanvas from "./components/WaveformCanvas.svelte";
@@ -255,6 +256,9 @@
     // Session-of-record rehydration (docs/design/freeze-watchdog.md phase 2), before any
     // other init that would otherwise construct decks from the default empty session.
     const { isRecoveryBoot, globalsRestoredFromSnapshot } = await restoreSessionOnBoot();
+    // After the restore, so the first selection it sees is the restored one.
+    startVizPluginSync(session, onVizReport);
+    void refreshPluginList();
     if (!isRecoveryBoot) await restoreMidiControlState(globalsRestoredFromSnapshot);
 
     stopSessionSync = startSessionSync();
@@ -787,8 +791,10 @@
         }
         // Global visualization layer — rendered by the output window's compositor, above all
         // decks, so picking a visualization never interrupts deck audio/video. It animates
-        // continuously (u_time), so it always marks the frame dirty; only the uniforms and
-        // time ride along per frame, never the shader source (see outputProtocol.ts).
+        // continuously (TIME), so it always marks the frame dirty; only params and bindings
+        // ride along per frame, never the plugin source (see outputProtocol.ts).
+        // It keeps animating with every deck paused — the screensaver behaviour decided in
+        // visualization-plugins.md. With the output window closed, postFrame() does nothing.
         if (visualization) {
           dirty = true;
         }
@@ -803,9 +809,10 @@
         if (dirty) {
           postFrame({
             decks: outputDecks,
-            vizSrc: visualization?.fragmentSrc ?? null,
+            vizPlugin: activeVizPayload(),
             vizOpacity: visualization ? visualizationOpacity : 0,
-            vizUniforms: visualization?.uniforms ?? {},
+            vizParams: visualization?.params ?? {},
+            bindings: { bass, mid, high },
             time: timeSecs,
             analysis,
           });

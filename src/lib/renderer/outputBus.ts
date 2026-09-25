@@ -5,6 +5,8 @@ import {
   OUTPUT_ALIVE_TIMEOUT_MS,
   type OutputDeckFrame,
   type OutputMessage,
+  type OutputVizErrorMessage,
+  type VizPluginPayload,
 } from './outputProtocol';
 
 const channel = new BroadcastChannel(OUTPUT_CHANNEL);
@@ -17,9 +19,11 @@ export type DeckFrameSource =
 export interface OutputPostState {
   /** Back-to-front render order. `source: null` = unchanged this tick, send no bitmap. */
   decks: Array<{ id: string; opacity: number; source: DeckFrameSource | null }>;
-  vizSrc: string | null;
+  /** Compared by reference: the caller keeps the same object until the plugin changes. */
+  vizPlugin: VizPluginPayload | null;
   vizOpacity: number;
-  vizUniforms: Record<string, number>;
+  vizParams: Record<string, number | number[] | boolean>;
+  bindings: Record<string, number>;
   time: number;
   analysis: { bass: number; mid: number; high: number };
 }
@@ -35,8 +39,16 @@ let inFlight = false;
 // rationale in postFrame() below.
 let previousBitmaps: ImageBitmap[] = [];
 
-let lastVizSrc: string | null = null;
+let lastVizPlugin: VizPluginPayload | null = null;
 let vizSrcSent = false;
+
+type VizReport = OutputVizErrorMessage | { kind: 'vizOk'; pluginId: string };
+let vizReportHandler: ((r: VizReport) => void) | null = null;
+
+/** Receive the output window's build result for each plugin it is sent. */
+export function onVizReport(fn: (r: VizReport) => void) {
+  vizReportHandler = fn;
+}
 
 // Set when the output window announces itself, and when a send is skipped while sources
 // were pending. App.svelte consumes this via takeResendRequest() and clears its
@@ -48,6 +60,10 @@ let resendAll = false;
 let listenerLastSeenAt = 0;
 
 channel.onmessage = (e: MessageEvent<OutputMessage>) => {
+  if (e.data?.kind === 'vizError' || e.data?.kind === 'vizOk') {
+    vizReportHandler?.(e.data);
+    return;
+  }
   if (e.data?.kind === 'hello') {
     listenerLastSeenAt = performance.now();
     resendAll = true;
@@ -184,10 +200,10 @@ export function postFrame(state: OutputPostState): void {
   }
 
   // The shader source is large and changes rarely — never put it on the per-frame path.
-  if (!vizSrcSent || state.vizSrc !== lastVizSrc) {
-    lastVizSrc = state.vizSrc;
+  if (!vizSrcSent || state.vizPlugin !== lastVizPlugin) {
+    lastVizPlugin = state.vizPlugin;
     vizSrcSent = true;
-    channel.postMessage({ kind: 'viz', src: state.vizSrc });
+    channel.postMessage({ kind: 'viz', plugin: state.vizPlugin });
   }
 
   if (inFlight) {
@@ -230,7 +246,8 @@ export function postFrame(state: OutputPostState): void {
         kind: 'frame',
         decks,
         vizOpacity: state.vizOpacity,
-        vizUniforms: state.vizUniforms,
+        vizParams: state.vizParams,
+        bindings: state.bindings,
         time: state.time,
         analysis: state.analysis,
       });

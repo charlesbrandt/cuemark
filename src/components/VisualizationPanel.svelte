@@ -1,8 +1,31 @@
 <script lang="ts">
   import { session, setVisualization, setVisualizationOpacity } from "../lib/state/session";
-  import { BUILT_IN_SHADERS } from "../lib/renderer/shaders";
+  import { BUILTIN_ISF } from "../lib/renderer/isf/builtins";
+  import { diskPlugins, vizErrors, refreshPluginList, mediaUrl } from "../lib/viz/vizPlugins";
 
   let visualization = $derived($session.visualization);
+  let selectedId = $derived(visualization?.pluginId ?? null);
+  let refreshing = $state(false);
+
+  // Thumbnail URLs resolve asynchronously (the media server port is fetched once).
+  let thumbs = $state<Record<string, string>>({});
+  $effect(() => {
+    for (const p of $diskPlugins) {
+      if (p.thumbnailPath && !thumbs[p.id]) {
+        const id = p.id;
+        mediaUrl(p.thumbnailPath).then((u) => { thumbs = { ...thumbs, [id]: u }; });
+      }
+    }
+  });
+
+  function select(pluginId: string | null) {
+    setVisualization(pluginId === null ? null : { pluginId, params: {} });
+  }
+
+  async function refresh() {
+    refreshing = true;
+    try { await refreshPluginList(); } finally { refreshing = false; }
+  }
 </script>
 
 <div class="visualization-panel">
@@ -11,17 +34,47 @@
   <div class="settings-row">
     <button
       class="viz-btn"
-      class:viz-active={visualization === null}
-      onclick={() => setVisualization(null)}
+      class:viz-active={selectedId === null}
+      onclick={() => select(null)}
     >None</button>
-    {#each BUILT_IN_SHADERS as shader}
+    {#each BUILTIN_ISF as p (p.id)}
       <button
         class="viz-btn"
-        class:viz-active={visualization?.name === shader.name}
-        onclick={() => setVisualization({ fragmentSrc: shader.src, uniforms: {}, name: shader.name })}
-      >{shader.name}</button>
+        class:viz-active={selectedId === p.id}
+        class:viz-broken={!!$vizErrors[p.id]}
+        title={$vizErrors[p.id] ?? ""}
+        onclick={() => select(p.id)}
+      >{p.name}{#if $vizErrors[p.id]} ⚠{/if}</button>
     {/each}
   </div>
+
+  <div class="settings-row">
+    <span class="row-label">Plugins</span>
+    {#each $diskPlugins as p (p.id)}
+      {@const err = $vizErrors[p.id] ?? p.error}
+      <button
+        class="viz-btn"
+        class:viz-active={selectedId === p.id}
+        class:viz-broken={!!err}
+        title={err ?? [p.description, p.credit].filter(Boolean).join(" — ")}
+        onclick={() => select(p.id)}
+      >
+        {#if thumbs[p.id]}<img class="viz-thumb" src={thumbs[p.id]} alt="" />{/if}
+        {p.name}{#if err} ⚠{/if}
+      </button>
+    {:else}
+      <span class="hint" title="~/.local/share/com.cuemark.app/visualizations/">
+        None found. Drop ISF (.fs) files in the app's visualizations folder.
+      </span>
+    {/each}
+    <button class="viz-btn" onclick={refresh} disabled={refreshing}>
+      {refreshing ? "…" : "Rescan"}
+    </button>
+  </div>
+
+  {#if selectedId && ($vizErrors[selectedId] ?? $diskPlugins.find((p) => p.id === selectedId)?.error)}
+    <div class="viz-error">{$vizErrors[selectedId] ?? $diskPlugins.find((p) => p.id === selectedId)?.error}</div>
+  {/if}
 
   <div class="settings-row">
     <span class="row-label">Opacity</span>
@@ -95,6 +148,32 @@
     background: #7ec8e3;
     border-color: #7ec8e3;
     color: #0b1c22;
+  }
+
+  .viz-btn.viz-broken {
+    border-color: #e04040;
+  }
+
+  .viz-thumb {
+    width: 24px;
+    height: 14px;
+    object-fit: cover;
+    vertical-align: middle;
+    margin-right: 4px;
+    border-radius: 2px;
+  }
+
+  .hint {
+    color: color-mix(in srgb, var(--text) 45%, transparent);
+  }
+
+  .viz-error {
+    color: #e04040;
+    font-family: monospace;
+    font-size: calc(11px * var(--font-scale));
+    white-space: pre-wrap;
+    max-height: 6em;
+    overflow: auto;
   }
 
   .opacity-val {

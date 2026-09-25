@@ -165,8 +165,9 @@ echo "=== Scenario: global visualization layer animating ==="
 # Visualizations are a global Session.visualization layer (composited above all decks),
 # not a per-deck DeckSource — there is no 'shader' deck source type anymore (see
 # CLAUDE.md "Visualization layer"). Drive it via setVisualization()/setVisualizationOpacity().
-SHADER='#version 300 es\nprecision highp float;\nuniform float u_time;\nout vec4 fragColor;\nvoid main(){ fragColor = vec4(0.5+0.5*sin(u_time), 0.0, 0.0, 1.0); }'
-js "window.__cuemarkDebug.setVisualization({fragmentSrc: \"$SHADER\", uniforms: {}}); window.__cuemarkDebug.setVisualizationOpacity(1.0);" >/dev/null
+# Since 2026-09-25 a visualization is a plugin id (docs/design/visualization-plugins.md);
+# the built-in ISF Plasma stands in for the old hand-written test shader.
+js "window.__cuemarkDebug.setVisualization({pluginId: 'builtin:plasma', params: {}}); window.__cuemarkDebug.setVisualizationOpacity(1.0);" >/dev/null
 run_scenario "visualization-layer-animating"
 js "window.__cuemarkDebug.setVisualization(null); window.__cuemarkDebug.setVisualizationOpacity(0.5);" >/dev/null
 
