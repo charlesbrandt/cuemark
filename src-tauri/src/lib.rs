@@ -7,6 +7,7 @@ pub mod midi;
 pub mod midi_state;
 pub mod session_store;
 pub mod video_demux;
+pub mod viz_plugins;
 pub mod watchdog;
 
 use std::sync::Arc;
@@ -251,6 +252,8 @@ pub fn run() {
             audio::audio_analyze_file,
             video_demux::video_demux_load,
             video_demux::video_demux_unload,
+            viz_plugins::viz_list_plugins,
+            viz_plugins::viz_read_plugin,
         ])
         // A closed window must stop being watched. Otherwise its heartbeat entry goes
         // stale, trips the watchdog's silence threshold, and drives the full recovery
