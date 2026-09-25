@@ -10,6 +10,8 @@
 import { describe, expect, it } from "vitest";
 import { parseIsf, IsfError } from "./parser";
 import { BUILTIN_ISF } from "./builtins";
+import { extractImported, resolveAssetUrl, resolveImportedImages, generateTestPattern } from "./instance";
+import { formatBindings, newBindingWindow, noteBindings } from "./bindingSummary";
 
 // GLSL ES 3.00-only tokens the vendored parser's output must never contain —
 // its skeleton emits plain GLSL ES 1.00 (attribute/varying/gl_FragColor/
@@ -204,5 +206,51 @@ describe("parseIsf — CUEMARK_BIND preservation", () => {
     expect(parsed.inputs[0].CUEMARK_BIND).toBe("beatPhase");
     // And it doesn't leak into the generated GLSL — it's host-side only.
     expect(parsed.fragmentShader).not.toContain("CUEMARK_BIND");
+  });
+});
+
+describe("IMPORTED asset resolution", () => {
+  const src = `/*{"INPUTS":[],"IMPORTED":{"tex":{"PATH":"sub/noise.png"},"b":"b.jpg","c":{"PATH":"missing.png"}}}*/\nvoid main(){}`;
+  it("extracts both IMPORTED forms", () => {
+    expect(extractImported(src)).toEqual({ tex: "sub/noise.png", b: "b.jpg", c: "missing.png" });
+    expect(extractImported("void main(){}")).toEqual({});
+    expect(extractImported("/* not json */")).toEqual({});
+  });
+  it("resolves by exact path then basename, dropping unmatched", () => {
+    const assets = { "noise.png": "http://x/noise.png", "b.jpg": "http://x/b.jpg" };
+    expect(resolveAssetUrl("sub/noise.png", assets)).toBe("http://x/noise.png");
+    expect(resolveImportedImages(src, assets)).toEqual({ tex: "http://x/noise.png", b: "http://x/b.jpg" });
+  });
+});
+
+describe("test pattern", () => {
+  it("is deterministic, opaque, and not blank", () => {
+    const a = generateTestPattern(256);
+    expect(a.length).toBe(256 * 256 * 4);
+    expect(Array.from(a.slice(0, 64))).toEqual(Array.from(generateTestPattern(256).slice(0, 64)));
+    let opaque = true;
+    let nonzero = 0;
+    for (let i = 0; i < a.length; i += 4) {
+      if (a[i + 3] !== 255) opaque = false;
+      if (a[i] || a[i + 1] || a[i + 2]) nonzero++;
+    }
+    expect(opaque).toBe(true);
+    expect(nonzero).toBeGreaterThan(256 * 200);
+  });
+});
+
+describe("binding summary", () => {
+  it("formats keys with 3 decimals and bass range", () => {
+    const w = newBindingWindow();
+    noteBindings(w, { bass: 0.1, mid: 0.2, high: 0.3 });
+    noteBindings(w, { bass: 0.9, mid: 0.2, high: 0.3 });
+    expect(formatBindings("builtin:plasma", { bass: 0.9, mid: 0.2, high: 0.3 }, w)).toBe(
+      "[viz] bindings builtin:plasma bass=0.900 mid=0.200 high=0.300 bass_range=0.100..0.900 (frames=2)",
+    );
+  });
+  it("omits the range when bass is absent", () => {
+    const w = newBindingWindow();
+    noteBindings(w, { beat: 1 });
+    expect(formatBindings("p", { beat: 1 }, w)).toBe("[viz] bindings p beat=1.000 (frames=1)");
   });
 });

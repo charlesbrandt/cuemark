@@ -16,6 +16,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { debugLog } from './lib/debugLog';
 import { Compositor } from './lib/renderer/compositor';
 import { parseIsf, IsfError } from './lib/renderer/isf/parser';
+import { resolveImportedImages } from './lib/renderer/isf/instance';
+import { formatBindings, newBindingWindow, noteBindings } from './lib/renderer/isf/bindingSummary';
 import {
   OUTPUT_CHANNEL,
   OUTPUT_ALIVE_INTERVAL_MS,
@@ -113,13 +115,17 @@ let vizPluginId: string | null = null;
 let vizLoadedAt = 0;
 let vizLastTime = 0;
 let vizFrameIndex = 0;
+// `[viz] bindings` instrumentation: at most one line per second, only while a viz is drawn.
+let bindingWindow = newBindingWindow();
+let bindingLogAt = 0;
 
 function loadVisualization(plugin: VizPluginPayload | null) {
   vizPluginId = null;
   try {
     // Parse before touching the compositor, so a header error leaves nothing half-built.
     const parsed = plugin ? parseIsf(plugin.source, plugin.vertexSource) : null;
-    compositor.setVisualization(parsed, plugin ? `viz/${plugin.id}` : 'viz');
+    const images = plugin ? resolveImportedImages(plugin.source, plugin.assets ?? {}) : {};
+    compositor.setVisualization(parsed, plugin ? `viz/${plugin.id}` : 'viz', images);
   } catch (e) {
     compositor.setVisualization(null, 'viz');
     const stage: OutputVizErrorMessage['stage'] = e instanceof IsfError ? e.stage : 'runtime';
@@ -136,6 +142,8 @@ function loadVisualization(plugin: VizPluginPayload | null) {
   vizLoadedAt = performance.now();
   vizLastTime = 0;
   vizFrameIndex = 0;
+  bindingWindow = newBindingWindow();
+  bindingLogAt = 0;
   debugLog(`[output] visualization ${plugin.id} loaded (${plugin.source.length} chars)`);
   channel.postMessage({ kind: 'vizOk', pluginId: plugin.id });
 }
@@ -201,6 +209,15 @@ channel.onmessage = (e: MessageEvent<OutputMessage>) => {
       vizPluginId = null;
     }
     vizLastTime = time;
+    if (vizPluginId) {
+      noteBindings(bindingWindow, msg.bindings);
+      const now = performance.now();
+      if (now - bindingLogAt >= 1000) {
+        if (bindingLogAt !== 0) debugLog(formatBindings(vizPluginId, msg.bindings, bindingWindow));
+        bindingLogAt = now;
+        bindingWindow = newBindingWindow();
+      }
+    }
   }
   compositor.composite(msg.decks, vizPluginId ? msg.vizOpacity : 0);
 

@@ -138,11 +138,16 @@ export class Compositor {
    * unsupported) with the layer left empty, so a broken plugin shows nothing rather than
    * the previous one, and the caller can report why.
    */
-  setVisualization(parsed: ParsedIsf | null, label: string) {
+  setVisualization(
+    parsed: ParsedIsf | null,
+    label: string,
+    /** IMPORTED image uniform name -> URL; see `resolveImportedImages`. */
+    importedImages: Record<string, string> = {},
+  ) {
     this.vizInstance?.dispose();
     this.vizInstance = null;
     this.vizTexture = null;
-    if (parsed) this.vizInstance = new IsfInstance(this.gl, parsed, this.width, this.height, label);
+    if (parsed) this.vizInstance = new IsfInstance(this.gl, parsed, this.width, this.height, label, importedImages);
   }
 
   // Render the global visualization into the instance's own target (not a deck's).

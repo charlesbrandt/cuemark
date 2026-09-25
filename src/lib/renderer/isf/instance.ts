@@ -32,6 +32,76 @@ const SAMPLER_TYPES = new Set(["image", "audio", "audioFFT"]);
 // in vendor/ISFParser.ts), independent of the plugin's own INPUTS.
 const STANDARD_UNIFORMS = ["TIME", "TIMEDELTA", "FRAMEINDEX", "DATE", "RENDERSIZE", "PASSINDEX"];
 
+/**
+ * Pulls the `IMPORTED` map out of an ISF header. The vendored parser consumes
+ * it (declaring one sampler uniform per key) but `ParsedIsf` doesn't expose
+ * it, so read the header JSON again here. Returns uniform name -> file path.
+ * ISF allows `{"name": {"PATH": "x.png"}}` or `{"name": "x.png"}`.
+ */
+export function extractImported(source: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const m = /\/\*([\s\S]*?)\*\//.exec(source);
+  if (!m) return out;
+  let header: unknown;
+  try {
+    header = JSON.parse(m[1]);
+  } catch {
+    return out;
+  }
+  const imp = (header as { IMPORTED?: unknown } | null)?.IMPORTED;
+  if (!imp || typeof imp !== "object") return out;
+  for (const [name, v] of Object.entries(imp as Record<string, unknown>)) {
+    const path = typeof v === "string" ? v : (v as { PATH?: unknown } | null)?.PATH;
+    if (typeof path === "string") out[name] = path;
+  }
+  return out;
+}
+
+/**
+ * Resolves an IMPORTED path against the payload's `assets` (file name -> URL).
+ * Tries the exact path, then its basename (assets are keyed by bare file name).
+ */
+export function resolveAssetUrl(path: string, assets: Record<string, string>): string | undefined {
+  if (assets[path]) return assets[path];
+  const base = path.split(/[\\/]/).pop() ?? path;
+  return assets[base];
+}
+
+/** Uniform name -> URL for every IMPORTED image that has a matching asset. */
+export function resolveImportedImages(
+  source: string,
+  assets: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, path] of Object.entries(extractImported(source))) {
+    const url = resolveAssetUrl(path, assets);
+    if (url) out[name] = url;
+  }
+  return out;
+}
+
+export const TEST_PATTERN_SIZE = 256;
+
+/**
+ * Deterministic RGBA test image for non-imported `image` inputs (filter
+ * shaders' `inputImage`): a 32px checker tinted by an x/y colour gradient, so a
+ * filter visibly does something. Opaque.
+ */
+export function generateTestPattern(size = TEST_PATTERN_SIZE): Uint8Array {
+  const data = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const i = (y * size + x) * 4;
+      const checker = ((x >> 5) + (y >> 5)) & 1 ? 1 : 0.55;
+      data[i] = Math.round((x / (size - 1)) * 255 * checker);
+      data[i + 1] = Math.round((y / (size - 1)) * 255 * checker);
+      data[i + 2] = Math.round((1 - x / (size - 1)) * 200 * checker + 40);
+      data[i + 3] = 255;
+    }
+  }
+  return data;
+}
+
 function compileShader(
   gl: WebGL2RenderingContext,
   type: number,
@@ -85,6 +155,13 @@ export class IsfInstance {
   private readonly fragShader: WebGLShader;
   private readonly fbo: DeckFBO;
   private readonly blankTexture: WebGLTexture;
+  /** Built-in checker/gradient for image inputs that aren't IMPORTED. */
+  private readonly testTexture: WebGLTexture;
+  /** IMPORTED image uniform name -> its (async-loaded) texture state. */
+  private readonly imported = new Map<
+    string,
+    { url: string; texture: WebGLTexture | null; width: number; height: number }
+  >();
   private readonly inputs: IsfInput[];
   private readonly uniformLocs = new Map<string, WebGLUniformLocation | null>();
   private readonly loggedUnfed = new Set<string>();
@@ -98,6 +175,8 @@ export class IsfInstance {
     width: number,
     height: number,
     label: string,
+    /** IMPORTED image uniform name -> URL (see `resolveImportedImages`). */
+    importedImages: Record<string, string> = {},
   ) {
     // Phase 1 is single-pass only. A plugin that declares more than one pass,
     // or a single pass with a TARGET (i.e. it wants a persistent/offscreen
@@ -148,6 +227,11 @@ export class IsfInstance {
     this.fragShader = fragShader;
     this.fbo = new DeckFBO(gl, width, height);
     this.blankTexture = this.createBlankTexture();
+    this.testTexture = this.createTestTexture();
+    for (const [name, url] of Object.entries(importedImages)) {
+      this.imported.set(name, { url, texture: null, width: 1, height: 1 });
+      this.loadImported(name);
+    }
     this.cacheUniformLocations();
   }
 
@@ -181,6 +265,70 @@ export class IsfInstance {
     return tex;
   }
 
+  // 256x256 generated checker/gradient (`generateTestPattern`). Non-imported
+  // `image` inputs get this rather than transparent black so filter shaders
+  // (`inputImage`) visibly do something. Uploaded from a typed array: no
+  // readback, no pixel-store flags.
+  private createTestTexture(): WebGLTexture {
+    const { gl } = this;
+    const tex = gl.createTexture();
+    if (!tex) throw new IsfError("runtime", "Failed to create test input texture");
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, TEST_PATTERN_SIZE, TEST_PATTERN_SIZE, 0, gl.RGBA, gl.UNSIGNED_BYTE, generateTestPattern());
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    return tex;
+  }
+
+  // Async, never blocks render: the sampler stays blank until the image lands.
+  // The image is flipped on a 2D canvas (ISF images are bottom-up) and the
+  // canvas uploaded with no UNPACK_FLIP_Y, because WebKitGTK's flip handling
+  // is unreliable for some sources (CLAUDE.md "Orientation"). No GL readback.
+  private loadImported(name: string): void {
+    const entry = this.imported.get(name);
+    if (!entry) return;
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      if (this.disposed) return;
+      try {
+        const w = img.naturalWidth;
+        const h = img.naturalHeight;
+        const c = document.createElement("canvas");
+        c.width = w;
+        c.height = h;
+        const ctx = c.getContext("2d");
+        if (!ctx) throw new Error("no 2D context");
+        ctx.translate(0, h);
+        ctx.scale(1, -1);
+        ctx.drawImage(img, 0, 0);
+        const { gl } = this;
+        const tex = gl.createTexture();
+        if (!tex) throw new Error("createTexture failed");
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.bindTexture(gl.TEXTURE_2D, null);
+        entry.texture = tex;
+        entry.width = w;
+        entry.height = h;
+        debugLog(`[isf/${this.label}] imported image '${name}' loaded (${w}x${h})`);
+      } catch (e) {
+        debugLog(`[isf/${this.label}] imported image '${name}' upload failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    };
+    img.onerror = () => {
+      debugLog(`[isf/${this.label}] imported image '${name}' failed to load from ${entry.url} (missing file or CORS?) - staying blank`);
+    };
+    img.src = entry.url;
+  }
+
   private cacheUniformLocations(): void {
     const { gl, program } = this;
     const names = [...STANDARD_UNIFORMS];
@@ -189,6 +337,9 @@ export class IsfInstance {
       if (SAMPLER_TYPES.has(input.TYPE)) {
         names.push(`_${input.NAME}_imgRect`, `_${input.NAME}_imgSize`, `_${input.NAME}_flip`);
       }
+    }
+    for (const name of this.imported.keys()) {
+      names.push(name, `_${name}_imgRect`, `_${name}_imgSize`, `_${name}_flip`);
     }
     for (const name of names) {
       this.uniformLocs.set(name, gl.getUniformLocation(program, name));
@@ -236,6 +387,16 @@ export class IsfInstance {
       }
     }
 
+    for (const [name, entry] of this.imported) {
+      gl.activeTexture(gl.TEXTURE0 + textureUnit);
+      gl.bindTexture(gl.TEXTURE_2D, entry.texture ?? this.blankTexture);
+      gl.uniform1i(this.loc(name), textureUnit);
+      gl.uniform2f(this.loc(`_${name}_imgSize`), entry.width, entry.height);
+      gl.uniform4f(this.loc(`_${name}_imgRect`), 0, 0, 1, 1);
+      gl.uniform1i(this.loc(`_${name}_flip`), 0);
+      textureUnit += 1;
+    }
+
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.bindVertexArray(null);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -245,21 +406,23 @@ export class IsfInstance {
 
   private bindSamplerInput(input: IsfInput, textureUnit: number): void {
     const { gl } = this;
+    const isImage = input.TYPE === "image";
     if (!this.loggedUnfed.has(input.NAME)) {
       this.loggedUnfed.add(input.NAME);
       const reason =
         input.TYPE === "audioFFT"
-          ? "audioFFT spectrum texture arrives in phase 3"
+          ? "audioFFT spectrum texture arrives in phase 3 (blank)"
           : input.TYPE === "audio"
-            ? "audio (PCM) texture arrives in phase 5"
-            : "image asset loading arrives in a later step";
-      debugLog(`[isf/${this.label}] input '${input.NAME}' (${input.TYPE}) not yet fed — ${reason}`);
+            ? "audio (PCM) texture arrives in phase 5 (blank)"
+            : "bound to the built-in 256x256 test pattern";
+      debugLog(`[isf/${this.label}] input '${input.NAME}' (${input.TYPE}) not fed by the host - ${reason}`);
     }
 
     gl.activeTexture(gl.TEXTURE0 + textureUnit);
-    gl.bindTexture(gl.TEXTURE_2D, this.blankTexture);
+    gl.bindTexture(gl.TEXTURE_2D, isImage ? this.testTexture : this.blankTexture);
+    const size = isImage ? TEST_PATTERN_SIZE : 1;
     gl.uniform1i(this.loc(input.NAME), textureUnit);
-    gl.uniform2f(this.loc(`_${input.NAME}_imgSize`), 1, 1);
+    gl.uniform2f(this.loc(`_${input.NAME}_imgSize`), size, size);
     gl.uniform4f(this.loc(`_${input.NAME}_imgRect`), 0, 0, 1, 1);
     gl.uniform1i(this.loc(`_${input.NAME}_flip`), 0);
   }
@@ -310,6 +473,11 @@ export class IsfInstance {
     gl.deleteShader(this.vertShader);
     gl.deleteShader(this.fragShader);
     gl.deleteTexture(this.blankTexture);
+    gl.deleteTexture(this.testTexture);
+    for (const entry of this.imported.values()) {
+      if (entry.texture) gl.deleteTexture(entry.texture);
+      entry.texture = null;
+    }
     this.fbo.destroy();
     this.uniformLocs.clear();
     this.disposed = true;
