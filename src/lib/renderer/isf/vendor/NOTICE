@@ -1,0 +1,64 @@
+This directory contains code vendored from two upstream projects, converted
+from CommonJS/plain-JS to TypeScript ES modules with local patches. See the
+header comment of each file for what was changed and why.
+
+================================================================================
+interactive-shader-format (ISFParser.ts, MetadataExtractor.ts)
+================================================================================
+
+Source: npm package `interactive-shader-format`, version 2.8.1
+(published 2020-03-02, "latest" as of 2026-09), files `src/ISFParser.js` and
+`src/MetadataExtractor.js`.
+Upstream repository: https://github.com/msfeldstein/interactive-shader-format-js
+Author: Michael Feldstein
+
+Licence on npm (2.8.1, ISC):
+
+    ISC License
+
+    Copyright (c) 2016, Michael Feldstein
+
+    Permission to use, copy, modify, and/or distribute this software for any
+    purpose with or without fee is hereby granted, provided that the above
+    copyright notice and this permission notice appear in all copies.
+
+    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+    ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+The upstream GitHub repository was relicensed MIT on 2025-12-31; either
+licence is permissive and compatible with this project's Apache-2.0 goal.
+ISC is used here as the licence in effect for the specific npm version
+(2.8.1) the vendored code was taken from.
+
+Only `ISFParser.js` and `MetadataExtractor.js` were vendored (not
+`ISFRenderer.js`, `ISFBuffer.js`, `ISFGLProgram.js`, `ISFGLState.js`,
+`ISFLineMapper.js`, `ISFTexture.js`, or `ISFUpgrader.js`) — see the header
+comment in `../instance.ts` and `ISFParser.ts` for why. Local patches to
+`ISFParser.ts` (audio/audioFFT input support, a vertex/fragment varying-name
+mismatch fix) are documented in that file's own header comment.
+
+================================================================================
+json_parse.js / json_parse.ts (vendor/json_parse.ts)
+================================================================================
+
+Source: `interactive-shader-format@2.8.1`'s own `vendor/json_parse.js`,
+which is itself Douglas Crockford's public-domain reference JSON parser.
+Upstream: https://github.com/douglascrockford/JSON-js
+
+    json_parse.js
+    2016-05-02
+
+    Public Domain.
+
+    NO WARRANTY EXPRESSED OR IMPLIED. USE AT YOUR OWN RISK.
+
+    This is a reference implementation. You are free to copy, modify, or
+    redistribute.
+
+Converted to an ES module (see that file's own header comment for details);
+no parsing logic was changed.
