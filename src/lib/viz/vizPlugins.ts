@@ -7,6 +7,7 @@
 import { writable, get, type Readable } from 'svelte/store';
 import { invoke } from '@tauri-apps/api/core';
 import { debugLog } from '../debugLog';
+import { startVizHotReload } from './vizHotReload';
 import { parseIsf, type IsfInput } from '../renderer/isf/parser';
 import { BUILTIN_ISF } from '../renderer/isf/builtins';
 import type { VizPluginPayload } from '../renderer/outputProtocol';
@@ -168,6 +169,28 @@ export function startVizPluginSync(
 
   let currentId: string | null = null;
   let seq = 0;
+
+  // Hot reload: the Rust watcher reports changed plugin ids. Always rescan the list (adds and
+  // removals), and re-resolve the active plugin if it is one of them — a fresh payload object
+  // is what makes outputBus re-send the source and the output window rebuild it.
+  startVizHotReload((ids) => {
+    void refreshPluginList();
+    const id = currentId;
+    if (id === null || !ids.includes(id) || isBuiltinId(id)) return;
+    const mySeq = ++seq;
+    resolvePlugin(id).then(
+      (payload) => {
+        if (mySeq !== seq) return;
+        debugLog(`[viz] hot reload: ${id}`);
+        setActivePayload(payload);
+      },
+      (e) => {
+        if (mySeq !== seq) return;
+        debugLog(`[viz] hot reload: could not read ${id}: ${e}`);
+        setVizError(id, `read: ${e}`);
+      },
+    );
+  }).catch((e) => debugLog(`[viz] hot reload listener failed: ${e}`));
   sessionStore.subscribe((s) => {
     const id = s.visualization?.pluginId ?? null;
     if (id === currentId) return;

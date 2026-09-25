@@ -1,6 +1,8 @@
 # Visualization plugins (ISF + Milkdrop)
 
-**Status (2026-09-25): Phase 1 DONE** (ISF loader, built-ins ported, plugin folder, error
+**Status (2026-09-25, late): Phase 2 BUILT, not verified live** (params UI, hot reload,
+image inputs; see "Phase 2 → Result"). Phase 3 step 0 instrumentation + `bass-test.fs` built,
+not yet judged by the user. Earlier: **Phase 1 DONE** (ISF loader, built-ins ported, plugin folder, error
 reporting). Verified headlessly on `mele` and by the user in the live output window, see
 "Phase 1 → Result". **Next: phase 2.** Phases 2–7 not started. Scope was decided with the user in
 conversation: build on **ISF** and **Milkdrop** (via Butterchurn); **no arbitrary JS plugins**.
@@ -367,6 +369,19 @@ seconds, and its parameter slider values survive an app restart.
 MIDI mapping of parameters is **not** in this phase. It depends on the controller profile
 system (`controller-mapping.md`) and a MIDI-learn flow that don't exist yet. Record it as a
 follow-up.
+
+**Result (2026-09-25): BUILT, headless/live verification pending.** Commits `aec4f6a` (params
+UI: `vizParamControls.ts`, `activeInputs` store, `setVisualizationParams`), `9427a11` (image
+inputs + `[viz] bindings` log), `7b32c6a` (asset paths → media-server URLs; `viz_read_plugin`
+returns absolute paths), `c954f65` + integration (Rust mtime-poll watcher, 2 s, emits
+`viz-plugins-changed` with changed ids; `startVizPluginSync` rescans the list and re-resolves
+the active plugin, whose fresh payload object makes outputBus re-send).
+- Deviation: params persist with the session snapshot (only while that plugin stays selected),
+  not `cuemark:vizParams:<id>`, for the same shared-localStorage reason as Phase 1.
+- Non-imported `image` inputs bind a generated 256×256 test pattern, not black.
+- Known nits: the event button holds `true` ~100 ms (≈6 frames); `long` inputs without numeric
+  `VALUES` get no control; image orientation (flipped on a 2D canvas) unconfirmed.
+- Not done: MIDI mapping of params (follow-up, depends on controller-mapping.md).
 
 ### Phase 3: audio routing and bindings
 
