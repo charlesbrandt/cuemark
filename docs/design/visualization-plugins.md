@@ -3,6 +3,9 @@
 **Status (2026-09-25): DESIGN ONLY, nothing built.** Scope was decided with the user in
 conversation: build on **ISF** and **Milkdrop** (via Butterchurn); **no arbitrary JS plugins**.
 Richer and controllable visualizations are to be explored separately later (see "Out of scope").
+Open questions 1–3 were researched on 2026-09-25 (package source read, parser run on test
+shaders, `mixer.rs` traced); the answers are folded into the sections below and summarised
+under "Open questions".
 
 Written to be picked up phase by phase, possibly by a smaller model. Each phase has its own
 files, steps and a "done when". **Read "Hazards" before starting any phase.**
@@ -49,7 +52,10 @@ with any track metadata that could inform the visual.
   <https://github.com/mrRay/ISF_Spec> (ISFVSN 2.0).
 - **Milkdrop presets via Butterchurn** (npm `butterchurn`, MIT) are the second format. This is
   the classic screensaver-style visualizer with a large preset library. It gets its own
-  renderer; it's never translated into ISF.
+  renderer; it's never translated into ISF. ⚠️ **Milkdrop presets are code**: Butterchurn
+  compiles each preset's equations with `new Function` (verified, `butterchurn.js`
+  `loadPreset`). So Butterchurn runs in a **sandboxed iframe with no IPC** (see "Milkdrop
+  renderer"), which is what the "no arbitrary JS" rule below requires anyway.
 - **No arbitrary JS plugins.** The output window has Tauri IPC access
   (`src-tauri/capabilities/default.json` lists `"output"`), so untrusted JS there could call any
   command. A slow plugin would also stall the projector. If this is ever wanted, it needs a
@@ -160,23 +166,36 @@ moves analysis to the output node. Note it in the UI tooltip rather than faking 
 
 ### ISF renderer (`src/lib/renderer/isf/`)
 
-- **Parser**: npm `interactive-shader-format` (MIT, the reference JS implementation) has
-  `ISFParser`, which parses the header and converts the ISF dialect into complete GLSL. It
-  targets **WebGL 1**. Options:
-  1. use its parser output and do a small GLSL 1.00 → ES 3.00 rewrite (`gl_FragColor` →
-     `out vec4`, `texture2D` → `texture`, `varying` → `in`) to share the compositor's WebGL2
-     context, or
-  2. compile ISF shaders as GLSL ES 1.00, which WebGL2 still accepts. **Prefer this**: no
-     source rewriting at all. Check the parser's output compiles unmodified on WebGL2 first.
-
-  Fallback if the package is unsuitable: the header is plain JSON and the ISF helper macros
-  (`IMG_PIXEL`, `IMG_NORM_PIXEL`, `IMG_THIS_PIXEL`, `isf_FragNormCoord`…) are a short list.
-  Writing our own is a day's work. **Check the package's licence and its last-release date
-  before depending on it.**
+- **Parser: vendor a patched copy of `ISFParser.js` + `MetadataExtractor.js`** from
+  `interactive-shader-format` into `src/lib/renderer/isf/vendor/` (keep its licence header and
+  add a `NOTICE` line). Researched 2026-09-25:
+  - Licence: ISC on npm (2.8.1), relicensed MIT on GitHub (2025-12-31). Permissive either way.
+  - Maintenance: last npm release 2020-03-02 (2.8.1 is `latest`; a stray 2.9.0 from 2018
+    exists, ignore it). 31 open issues. Effectively unmaintained, hence vendoring.
+  - ❌ **It can't parse audio-reactive shaders as shipped.** `typeUniformMap` has no `audio` or
+    `audioFFT` entry, so `parse()` throws `Unknown input type [audioFFT]` (verified by running
+    it). Patch: add `audio: 'sampler2D', audioFFT: 'sampler2D'` (the ISF spec exposes both as
+    2D textures). Also add `IMG_SIZE_<name>` handling for them if the parser doesn't already
+    emit it for every sampler; check with a test shader.
+  - The parser is separate from its `ISFRenderer` (which takes a caller-supplied `gl` and is
+    not used here). `parse(frag, vert?)` gives `.fragmentShader`, `.vertexShader`, `.inputs`,
+    `.passes` (`{target, persistent, float, width, height}`), `.type`.
+  - Output is plain **GLSL ES 1.00**: no `#version`, no `#extension`, `attribute`/`varying`,
+    `gl_FragColor`, `texture2D`, explicit `precision highp`. WebGL2 accepts ES 1.00 when both
+    stages agree, so **compile it unmodified** in the compositor's WebGL2 context, as its own
+    program. Not compile-checked yet (no `glslangValidator` on the research box): the first
+    step of phase 1 is compiling the parser output for the 5 ported built-ins in the real
+    output window.
+  - Its only runtime dependency, `mathjs-expression-parser`, is used by the renderer, not the
+    parser. Don't bring it in (see phase 4 for `WIDTH`/`HEIGHT` expressions).
+  - `dist/build.js` references `window` at load time, which breaks under plain Node (vitest).
+    Another reason to vendor the `src/` files rather than import the bundle.
 - **`IsfInstance`** class: owns its program(s), one FBO per `PASSES` entry with a `TARGET`,
   ping-pong pairs for `PERSISTENT` passes, textures for `image`/`audio`/`audioFFT` inputs, and
-  a `render(inputs) → WebGLTexture` method. `FLOAT: true` passes need `EXT_color_buffer_float`:
-  check for it and fall back to 8-bit with a single log line.
+  a `render(inputs) → WebGLTexture` method. Pass orchestration (the `PASSINDEX` loop, ping-pong
+  swaps) is ours to write: it lives in the upstream renderer, which isn't used. `FLOAT: true`
+  passes need `EXT_color_buffer_float`: check for it and fall back to 8-bit with a single log
+  line. (Upstream's renderer silently ignores `FLOAT` altogether; don't copy that.)
 - `Compositor` replaces `vizFbo`/`vizProgram` with `vizInstance: VizRenderer | null`.
   `composite()` blits the instance's final texture exactly as it blits `vizFbo` now.
 - **Dispose on switch**: delete programs, FBOs and textures. Switching plugins 50 times in a
@@ -184,28 +203,48 @@ moves analysis to the output node. Note it in the UI tooltip rather than faking 
 
 ### Milkdrop renderer (Butterchurn)
 
-Butterchurn is built around Web Audio: `createVisualizer(audioContext, canvas, opts)`, then
-`connectAudio(node)`, and it reads **time-domain samples** from an `AnalyserNode`. Cuemark has
-no Web Audio on the playback path. Two things to verify in a spike before building anything:
+Researched 2026-09-25 against `butterchurn@2.6.7` (MIT, last published 2025-07-13), by reading
+the un-minified `lib/butterchurn.js` in the npm tarball:
 
-1. **Feeding it audio without Web Audio.** Butterchurn's `render()` accepts an `audioLevels`
-   override (`timeByteArray`, `timeByteArrayL`, `timeByteArrayR`, Uint8 arrays of 1024
-   samples). Confirm this in the version being installed. Either way, **Milkdrop requires the
-   PCM tap from phase 5a**; it can't run from 32 bands. So Milkdrop comes after phase 5a.
-2. **Getting its pixels into the output without GPU→CPU readback.** Butterchurn creates its
-   own WebGL context on the canvas it's given. Uploading that canvas into the compositor's
-   context (`texImage2D(butterchurnCanvas)`) may go through readback, which is **broken on the
-   MacBook Pro's `crocus` driver** (see CLAUDE.md), and would fail silently as transparent
-   pixels. The recommended approach avoids the question: **stack Butterchurn's canvas above
-   the compositor canvas in `output.html` and set CSS `opacity` to `vizOpacity`.** The global
-   viz is always the top layer, so DOM compositing gives the same result as the blit. Only a
-   per-deck Milkdrop (track-visual-override) would need the texture route, and that is out of
-   scope here.
+1. **No Web Audio needed.** `createVisualizer(null, canvas, opts)` is supported: every
+   `AnalyserNode` setup in `AudioProcessor` is behind `if (context)`, and `AudioLevels` falls
+   back to a 44100 Hz sample rate for its band edges. Never call `connectAudio`.
+2. **Audio goes in through `render({ audioLevels, elapsedTime? })`**, which calls
+   `updateAudio(timeByteArray, timeByteArrayL, timeByteArrayR)`. Each must be a
+   **`Uint8Array` of exactly 1024** time-domain samples, unsigned and centred on 128 (the
+   `getByteTimeDomainData` format). They're copied with `.set()`, so a shorter array leaves
+   stale bytes in the tail. Butterchurn runs its own FFT on them, so it needs PCM, not bands:
+   **Milkdrop requires phase 5a.** At 48 kHz, 1024 samples is ~21 ms, so one window per frame
+   at 60 Hz covers the signal.
+3. **Getting its pixels on screen without readback.** Butterchurn calls
+   `canvas.getContext('webgl2', { alpha: false, premultipliedAlpha: false, … })` on the canvas
+   it's given (WebGL2 only, no WebGL1 fallback; only optional extension is anisotropic
+   filtering). `readPixels`/`toDataURL` appear only in its opt-in `toDataURL()` methods,
+   never in `render()`. **Never call those** (readback is broken on the MacBook Pro's `crocus`
+   driver). So: **stack Butterchurn's canvas above the compositor canvas in `output.html` and
+   set CSS `opacity` to `vizOpacity`.** The global viz is always the top layer, so DOM
+   compositing gives the same result as the blit. Because the canvas is opaque
+   (`alpha: false`), **whole-layer opacity is the only blend available**. No per-pixel alpha,
+   no additive mode unless CSS `mix-blend-mode` on the element turns out to work in WebKitGTK
+   (untested). Only a per-deck Milkdrop (track-visual-override) would need the texture route,
+   and that is out of scope here.
+4. **Sandboxing.** Preset equations become JS via `new Function` on every `loadPreset`. The
+   output window has Tauri IPC, so run Butterchurn in an `<iframe sandbox="allow-scripts">`
+   (no `allow-same-origin`) served from the media server, positioned where the stacked canvas
+   would be. The output window `postMessage`s it `{preset}` on change and
+   `{timeByteArray, timeByteArrayL, timeByteArrayR}` per frame (transfer the buffers). Verify
+   in the phase-6 spike that: WebGL2 works inside a sandboxed iframe on WebKitGTK; the iframe
+   gets no `window.__TAURI__` / `__TAURI_INTERNALS__`; and per-frame `postMessage` of 3 KB
+   doesn't cost measurable frame time.
 
 Preset formats: Butterchurn ships presets as converted JSON (`butterchurn-presets`); raw `.milk`
-files need `milkdrop-preset-converter`. Support the JSON first. ⚠️ **Check the licensing of any
-preset pack before bundling it.** Milkdrop preset collections have mixed or unknown licences.
-Bundle none by default; let the user drop packs into the folder.
+files need `milkdrop-preset-converter` (MIT, last published 2022). Support the JSON first. The
+JSON holds `baseVals`, `shapes`, `waves`, `init_eqs_str`/`frame_eqs_str`/`pixel_eqs_str` (JS,
+see sandboxing above) and `warp`/`comp` (GLSL bodies). ⚠️ **Don't bundle a preset pack.**
+`butterchurn-presets` (2.4.7, last published 2022) is MIT for the package, but the presets
+themselves are by many authors, credited only in filenames, with no per-preset licence. That's
+an unresolved question for the public Apache-2.0 repo. Let the user drop packs into the
+folder.
 
 ### Transport changes (`outputProtocol.ts`)
 
@@ -263,8 +302,11 @@ Each phase is independently useful and live-testable. Do them in order unless no
    `[{ id, format, name, description, credit, categories, thumbnailPath?, licensePath?, error? }]`
    plus `viz_read_plugin(id)` returning sources and absolute asset paths. Parse only enough in
    Rust to list; full ISF parsing happens in TS.
-2. TS: `src/lib/renderer/isf/` with the parser wrapper and `IsfInstance`. Single pass only in
-   this phase; `PASSES` is phase 4.
+2. TS: `src/lib/renderer/isf/` with the vendored, patched parser (see "ISF renderer"), a
+   vitest suite that parses a float-input, an `audioFFT`-input and a multipass test shader,
+   and `IsfInstance`. First compile the parser's output for one ported built-in in the real
+   output window, before building anything else. That's the one unverified assumption.
+   Single pass only in this phase; `PASSES` is phase 4.
 3. Port the 5 built-ins to ISF files that use `CUEMARK_BIND` for `bass`/`mid`/`high`. They must
    look the same as before; compare side by side on the output window.
 4. `VisualizationPanel` lists built-ins plus discovered plugins, with name, thumbnail and an
@@ -311,7 +353,10 @@ track (watch it, and check a deck without a grid reports `hasBeatGrid = 0`).
 ### Phase 4: multipass and persistent buffers
 
 `PASSES` with `TARGET`, `PERSISTENT`, `WIDTH`/`HEIGHT` expressions and `FLOAT`. Rewrite the
-Feedback built-in to use a real persistent buffer.
+Feedback built-in to use a real persistent buffer. `WIDTH`/`HEIGHT` are expressions like
+`"$WIDTH/2"` or `"floor($WIDTH*$scale)"` (`$` names are `RENDERSIZE` and float inputs).
+Evaluate them with a tiny hand-written evaluator: numbers, `$names`, `+ - * /`, parentheses,
+`floor`/`ceil`/`max`/`min`. **Never `eval`/`new Function`**: plugins are data.
 
 **Done when:** a feedback/trails ISF shader from the ISF examples renders its trails, and
 switching plugins 50 times doesn't grow the output window's memory (compare
@@ -319,16 +364,32 @@ switching plugins 50 times doesn't grow the output window's memory (compare
 
 ### Phase 5a: PCM tap (Rust), needed by Milkdrop and the ISF `audio` input
 
-- Tap point: the **shared output graph node** (`audio/mixer.rs`, `OutputGraph`), after the
-  `audiomixer`, so it is genuinely the post-fader, post-EQ mix. For `'deck:<id>'` / `'cue'`
-  sources, either add per-deck taps or accept that the waveform always shows the mix (decide
-  in the phase; the mix-only version is much smaller).
+- **Tap point (decided 2026-09-25): before master volume**, in the shared output graph node
+  (`audio/mixer.rs`, `create_node()`). The node is `mixer → caps_el → master_volume_el → sink`
+  (linked at `mixer.rs` ~518–522; no tee exists there today). Insert a `tee` between `caps_el`
+  and `master_volume_el`. Master volume is the whole node's master fader ("Gain staging" in
+  `shared-output-pipeline.md`), so a post-volume tap would go dark when it's pulled to 0 and
+  dim as the room gets quieter. The visuals should follow the music, not the room level.
+  It's still post-fader and post-EQ per deck, because those are applied on the deck side,
+  upstream of the node.
+- **Which node, which channels.** An `OutputNode` doesn't know whether it carries main or cue.
+  That lives in the branch key (`("deck-0","main0")` / `"cue"` / `"record"`). Tap the node
+  that deck `main0` branches attach to. ⚠️ **On a 4-channel device (the Starlight) main and
+  cue share one node** (`two_branches_share_one_node` test): main on channels 0–1, cue on
+  2–3. Take only the main branch's channel pair (read it from the same remap that builds the
+  branch's mix-matrix), or the headphone cue leaks into the projector. Node caps are
+  48 kHz F32LE interleaved, 2 or 4 channels. Never tap the `__record__` node.
 - `queue leaky=downstream max-size-buffers=2` → `appsink drop=true max-buffers=1 sync=false`,
   downmix to mono plus L/R, 1024 samples, quantised to Uint8 (Milkdrop's native shape), and
   emitted at ≤60 Hz. Measure the IPC cost with `[poll-stats]`-style logging before and after.
-- `master volume` is applied at the node's `volume` element (see CLAUDE.md). Tap **before**
-  it so the visual doesn't die when the booth is turned down, or after it deliberately.
-  Decide, and write the decision in this doc.
+- Emitting: follow the `audio-fft` pattern (`pipeline.rs` spectrum bus handler →
+  `app.emit("audio-fft", AudioFftEvent{…})`, listened for in `App.svelte`) with a new
+  `audio-pcm` event. `OutputGraph` has no `AppHandle` today (`DeckAudioPipeline` does), so
+  thread one in. The control window forwards the bytes in the frame message's `pcm` field.
+- Only emit while the output window is alive (`viz_set_listening(bool)`, see open question 4).
+  A closed projector must cost no PCM work.
+- `'deck:<id>'` / `'cue'` sources: the mix-only tap always shows the main mix. Per-deck PCM
+  is out of scope for this phase. Record it as a follow-up if it's missed live.
 
 **Done when:** a 600 s soak with the tap on shows no new `output_queue` warnings compared
 with the same soak with it off, and a waveform ISF shader shows a waveform.
@@ -340,8 +401,12 @@ the gain-weighted pre-EQ approximation. Only if phase 3's approximation feels wr
 
 ### Phase 6: Milkdrop via Butterchurn
 
-1. Spike the two questions in "Milkdrop renderer" first and write the answers here.
-2. `MilkdropInstance` driving a stacked canvas in `output.html`, fed from `pcm`.
+1. Spike the three sandboxed-iframe checks in "Milkdrop renderer" item 4 first, and write
+   the results here. (The audio-feed and readback questions were answered by reading the
+   source on 2026-09-25.)
+2. `MilkdropInstance`: a sandboxed iframe stacked above the compositor canvas in
+   `output.html`, running `createVisualizer(null, canvas)` and fed from `pcm` via
+   `postMessage`.
 3. List `milkdrop/*.json` presets in the picker (with a "Milkdrop" group). Preset blend time is
    a parameter.
 4. Auto-cycle (screensaver behaviour): an optional "next preset every N bars/seconds", using
@@ -372,9 +437,24 @@ and auto-cycle changes presets on a beat.
 
 ## Open questions
 
-1. `interactive-shader-format` package: licence, maintenance, and whether its GLSL ES 1.00
-   output compiles unmodified in WebGL2. (Phase 1, first thing.)
-2. Butterchurn's `audioLevels` override and the stacked-canvas approach. (Phase 6 spike.)
-3. PCM tap before or after master volume. (Phase 5a.)
-4. Should the viz pause when every deck is paused? Today it animates continuously. The
-   screensaver framing suggests "keep going".
+1. ~~`interactive-shader-format` package~~ **Answered 2026-09-25**: ISC/MIT, unmaintained
+   since 2020, parser can't handle `audio`/`audioFFT` → vendor and patch it (see "ISF
+   renderer"). Its ES 1.00 output has no extensions, so it should compile unmodified in WebGL2,
+   **but that's still unverified in the real output window**: phase 1, step 2.
+2. ~~Butterchurn `audioLevels` and stacked canvas~~ **Answered 2026-09-25**: both work as
+   planned (no AudioContext, 3× `Uint8Array(1024)`, own WebGL2 context, no readback in
+   `render()`). New finding: presets execute JS, so Butterchurn goes in a sandboxed iframe.
+   The iframe checks are the phase-6 spike. Opaque canvas, so opacity is the only blend.
+3. ~~PCM tap before or after master volume~~ **Decided 2026-09-25: before**, main channel pair
+   only (see phase 5a).
+4. ~~Should the viz pause when every deck is paused?~~ **Decided 2026-09-25 (user): keep
+   animating whenever the output window is open, whether or not any deck is playing.** Audio
+   bindings decay to 0, so the picture settles instead of freezing. **When the output window is
+   closed, pause everything viz-related**: no viz-driven dirty frames in `App.svelte`, no
+   binding/param computation, and the phase-5a PCM tap stops emitting `audio-pcm`. Gate all of
+   it on the same `alive`-beacon liveness that `postFrame()` already uses (3 s of silence = gone;
+   see CLAUDE.md "Rendering pipeline"). Don't add a second liveness signal. For the Rust tap,
+   the simplest version is a `viz_set_listening(bool)` command driven by that liveness, and the
+   appsink callback returns early when it's false.
+5. Preset-pack licensing for anything cuemark might ever ship or link to (see "Preset
+   formats"). Not blocking: packs are user-supplied.

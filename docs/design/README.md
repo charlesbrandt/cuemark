@@ -42,7 +42,7 @@ to finish right now.
 | [`preroll-latency.md`](preroll-latency.md) | Design only, nothing built — direct follow-on from `queue-prefetch-cache.md`'s phase-1 gate. |
 | [`scratch-feeder-underruns.md`](scratch-feeder-underruns.md) | Open, not yet investigated. |
 | [`track-visual-override.md`](track-visual-override.md) | Design only (2026-09-20), nothing built. Per-deck viz / alternate video per track, stored in Digger. |
-| [`visualization-plugins.md`](visualization-plugins.md) | Design only (2026-09-25), nothing built. ISF + Milkdrop (Butterchurn) plugin visualizations, audio routing, `CUEMARK_BIND` metadata bindings; 7 phases, each with "done when". |
+| [`visualization-plugins.md`](visualization-plugins.md) | Design only (2026-09-25), nothing built. ISF + Milkdrop (Butterchurn) plugin visualizations, audio routing, `CUEMARK_BIND` metadata bindings; 7 phases, each with "done when". Open questions 1–4 answered 2026-09-25 (vendor+patch the ISF parser; Butterchurn in a sandboxed iframe; PCM tap before master volume; pause only when the output window is closed). |
 
 ## 🟡 Partially resolved — core work is done, something specific remains
 
