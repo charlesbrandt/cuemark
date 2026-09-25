@@ -370,7 +370,7 @@ MIDI mapping of parameters is **not** in this phase. It depends on the controlle
 system (`controller-mapping.md`) and a MIDI-learn flow that don't exist yet. Record it as a
 follow-up.
 
-**Result (2026-09-25): BUILT, headless/live verification pending.** Commits `aec4f6a` (params
+**Result (2026-09-25): BUILT, headless-verified on mele (hot reload, `speed` slider, filter test pattern, IMPORTED png from a *folder* plugin, `[viz] bindings` non-zero and moving with real music); user has not yet judged it live.** Commits `aec4f6a` (params
 UI: `vizParamControls.ts`, `activeInputs` store, `setVisualizationParams`), `9427a11` (image
 inputs + `[viz] bindings` log), `7b32c6a` (asset paths → media-server URLs; `viz_read_plugin`
 returns absolute paths), `c954f65` + integration (Rust mtime-poll watcher, 2 s, emits
@@ -381,6 +381,7 @@ the active plugin, whose fresh payload object makes outputBus re-send).
 - Non-imported `image` inputs bind a generated 256×256 test pattern, not black.
 - Known nits: the event button holds `true` ~100 ms (≈6 frames); `long` inputs without numeric
   `VALUES` get no control; image orientation (flipped on a 2D canvas) unconfirmed.
+- Observed by the headless run: `IMPORTED` in a bare-file plugin is silent and renders black (assets exist only for folder plugins) — worth a warning; bands **freeze at their last value while a deck is paused** rather than decaying (Phase 3 routing should decide this); deleting the active plugin file leaves it selected with a `read:` error.
 - Not done: MIDI mapping of params (follow-up, depends on controller-mapping.md).
 
 ### Phase 3: audio routing and bindings
