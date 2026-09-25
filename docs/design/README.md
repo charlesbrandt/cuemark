@@ -42,7 +42,6 @@ to finish right now.
 | [`preroll-latency.md`](preroll-latency.md) | Design only, nothing built — direct follow-on from `queue-prefetch-cache.md`'s phase-1 gate. |
 | [`scratch-feeder-underruns.md`](scratch-feeder-underruns.md) | Open, not yet investigated. |
 | [`track-visual-override.md`](track-visual-override.md) | Design only (2026-09-20), nothing built. Per-deck viz / alternate video per track, stored in Digger. |
-| [`visualization-plugins.md`](visualization-plugins.md) | Design only (2026-09-25), nothing built. ISF + Milkdrop (Butterchurn) plugin visualizations, audio routing, `CUEMARK_BIND` metadata bindings; 7 phases, each with "done when". Open questions 1–4 answered 2026-09-25 (vendor+patch the ISF parser; Butterchurn in a sandboxed iframe; PCM tap before master volume; pause only when the output window is closed). |
 
 ## 🟡 Partially resolved — core work is done, something specific remains
 
@@ -60,6 +59,7 @@ to finish right now.
 | [`output-noise-and-track-reload-silence.md`](output-noise-and-track-reload-silence.md) | Bugs A–D (output noise, silent reload, choppy audio, cue-enabled silence) all resolved | Bug E (UI freeze) — superseded into `freeze-watchdog.md` / `webcodecs-video-path.md`, not tracked here anymore |
 | [`queue-prefetch-cache.md`](queue-prefetch-cache.md) | — | *(listed here as reference; see 🟢 below — closed with a negative result, not left open)* |
 | [`rate-position-drift.md`](rate-position-drift.md) | Two bugs found and fixed | One confirmed-still-open mechanism (slow steady-state drift), root cause not pinned down |
+| [`visualization-plugins.md`](visualization-plugins.md) | Phase 1 (2026-09-25): ISF loader, 5 built-ins ported to ISF, plugin folder + Rescan, build errors in panel and log. Headless-verified on `mele`, user-verified live | Phases 2–7 (next: parameters + hot reload). Audio reactivity never confirmed live (phase 3 step 0). Filter-type ISF shaders render black until image inputs load |
 | [`waveform-scrub.md`](waveform-scrub.md) | Core scrub + position-mode scratch DONE, live-verified end to end | Latest addendum (platter inertia / jerk damping) not yet verified live — "the default is a guess at someone else's taste" |
 | [`webcodecs-video-path.md`](webcodecs-video-path.md) | Phases 1–7 all ran; VP9 shipped on WebCodecs | AV1 explicitly refused — `isConfigSupported` lies, every real decode fails |
 

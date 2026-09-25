@@ -1,6 +1,8 @@
 # Visualization plugins (ISF + Milkdrop)
 
-**Status (2026-09-25): DESIGN ONLY, nothing built.** Scope was decided with the user in
+**Status (2026-09-25): Phase 1 DONE** (ISF loader, built-ins ported, plugin folder, error
+reporting). Verified headlessly on `mele` and by the user in the live output window, see
+"Phase 1 → Result". **Next: phase 2.** Phases 2–7 not started. Scope was decided with the user in
 conversation: build on **ISF** and **Milkdrop** (via Butterchurn); **no arbitrary JS plugins**.
 Richer and controllable visualizations are to be explored separately later (see "Out of scope").
 Open questions 1–3 were researched on 2026-09-25 (package source read, parser run on test
@@ -319,8 +321,39 @@ Each phase is independently useful and live-testable. Do them in order unless no
 dropped into the folder appears in the picker and renders; a deliberately broken one shows an
 error in the panel and a line in `cuemark.log` instead of a black layer.
 
+**Result (2026-09-25): DONE.** Commits `0d048ba` (Rust discovery), `e8b6206` (vendored
+parser, `IsfInstance`, built-in ports, 13 vitest tests), `4cc598b` (integration).
+
+- Verified headlessly on `mele` (Xvfb, isolated `XDG_*` dirs, see the verify-ui skill): all 5
+  built-ins, a drop-in generator and an `audioFFT` shader load; a GLSL error fails with the
+  driver's message (`failed (compile): fragment shader: ERROR: 0:32: 'gl_FragColor' : syntax
+  error`); a bad JSON header is flagged by `viz_list_plugins` *and* by the TS parser. A
+  screenshot of Plasma was real pixels (readback works on `mele`). Then verified by the user
+  in the live output window: built-ins look as before, the drop-in `good-glow.fs` renders.
+- **The parser's GLSL ES 1.00 output does compile unmodified in WebGL2 on WebKitGTK** — the
+  one open assumption from the research.
+- Deviations from the steps above:
+  - Selection persists through the session snapshot (`session-recovery.json`, restored in
+    `bootRestore.ts` via `migrateVisualization()`), **not** `cuemark:vizPluginId` in
+    localStorage: the snapshot already carried `Session.visualization`, and localStorage is
+    shared with test harnesses (Hazards).
+  - `TIME` counts from plugin load in the output window, not the control window's clock.
+  - A single explicit pass with a `TARGET` is rejected as `unsupported` (phase 4), same as
+    real multipass.
+  - `image` inputs bind a blank 1×1 texture (logged once), so **filter-type ISF shaders
+    (`inputImage`) render black** until image loading lands (phase 2 or a small follow-up;
+    assets are already listed by `viz_read_plugin` and served by the media server).
+  - Parser patch beyond `audio`/`audioFFT`: the vertex skeleton now writes the
+    `isf_FragCoord` varying the fragment skeleton declares (upstream mismatch).
+- ⚠️ **Audio reactivity was not confirmed.** The user noticed `good-glow.fs` doesn't react
+  to audio. That one is expected: it has no `CUEMARK_BIND` input, and most web ISF shaders
+  won't either. But the user also isn't sure the built-ins *ever* visibly reacted. Phase 3
+  starts by checking that (below).
+
 ### Phase 2: parameters
 
+0. Optional small follow-up that fits here: load `image` inputs from `assets` (URLs via the
+   media server) so filter-type ISF shaders stop rendering black.
 1. Generate controls from ISF `INPUTS` (float → slider, bool → toggle, color → picker,
    point2D → two sliders, long → select from `VALUES`/`LABELS`, event → button). Hide inputs
    that have `CUEMARK_BIND`.
@@ -337,6 +370,11 @@ follow-up.
 
 ### Phase 3: audio routing and bindings
 
+0. **First, prove audio reaches a shader at all.** Log the `bindings` values the output
+   window receives (throttled, e.g. once a second) with a deck playing, and look at them
+   before and after this phase. The built-ins' reactions are subtle by design (Plasma's
+   `pulse = 1.0 + bass * 0.3`), and the user has never been sure they react. Write a test
+   plugin that maps `bass` straight to brightness so the answer is visible.
 1. Keep the 32 bands from `audio-fft` in `deckAnalysis` (currently dropped).
 2. Implement `Session.vizAudioSource` (`'mix'` / `'deck:<id>'` / `'cue'`) with gain weighting
    that reuses the existing crossfader gain function (see Routing).

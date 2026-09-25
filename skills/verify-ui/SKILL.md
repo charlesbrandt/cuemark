@@ -241,7 +241,7 @@ session mutators and audio IPC helpers directly via WebDriver:
 |---|---|---|
 | `updateDeck(id, patch)` | sync | Mutate session state (source, playing, rate, …) |
 | `addDeck()` / `removeDeck(id)` | sync | Add or remove decks |
-| `setVisualization(v)` / `setVisualizationOpacity(n)` | sync | Drive the global visualization layer |
+| `setVisualization(v)` / `setVisualizationOpacity(n)` | sync | Drive the global visualization layer. `v` is `{ pluginId, params }` since 2026-09-25 (e.g. `{pluginId: 'builtin:plasma', params: {}}`), or `null` |
 | `getSession()` | sync | Read current session snapshot |
 | `getVideoTime(deckId)` | sync | Returns `video.currentTime` for the deck's `<video>` element |
 | `getAudioTime(deckId)` | sync | Returns `getDeckTime(deckId)` — the waveform's content-position clock (rate-corrected from GStreamer) |
@@ -272,6 +272,24 @@ VITE_ENABLE_DEBUG_HOOK=1 cargo tauri build --debug --no-bundle
 ```
 Sanity-check before trusting a test run: `grep -q '__cuemarkDebug' dist/assets/*.js`
 should match.
+
+### 🟢 Full state isolation: point the XDG dirs at a scratch directory
+
+Worked 2026-09-25 on `mele` (ISF visualization verification): launching the test binary with
+`XDG_DATA_HOME`, `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` all pointed at fresh directories
+under the session scratchpad moved **everything** under `com.cuemark.app/` there — the log
+file (`<scratch>/data/com.cuemark.app/logs/cuemark.log`, so read *that* log, not the real
+one), `session-recovery.json`, and the visualizations plugins folder (so test plugins can be
+dropped in without touching the user's). localStorage lives under the same data dir, so it
+should follow too. That is not separately confirmed; check for
+`<scratch>/data/com.cuemark.app/localstorage/` before relying on it.
+
+**Use this whenever a test writes state or the user's app may be running.** It turns the
+storage-sharing hazard below into a non-issue. Prove it held: record the real
+`~/.local/share/com.cuemark.app/session-recovery.json` mtime before and after, and see that
+the scratch log exists. (In that run the real file's mtime *did* change, but a
+`cargo tauri dev` the lead had started mid-run was the writer, not the test. When the mtime
+moves, check what else is running before blaming the test.)
 
 ### 🔴 This "isolated" instance shares localStorage with the user's real app — but only sometimes, and it depends on which URL it loaded
 

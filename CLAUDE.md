@@ -482,41 +482,48 @@ Load a file, loop, control playback rate. `<video>` element → WebGL texture.
 
 ## Visualization layer
 
-Shader visualizations (Plasma, Tunnel, Particles, Feedback, Scope, …) are **not** a deck
-source. They live as a single global layer on `Session.visualization` (`fragmentSrc`,
-`uniforms`, `name`) with its own `Session.visualizationOpacity` (default `0.5`, so deck
-video stays visible underneath — turn it up to 1.0 for visualization-only).
+Visualizations are **plugins** (since 2026-09-25): ISF shaders (Interactive Shader Format,
+ISFVSN 2), either the five built-ins (`src/lib/renderer/builtin-isf/*.fs`, ids
+`builtin:plasma` etc.) or `.fs` files dropped into
+`~/.local/share/com.cuemark.app/visualizations/` (id = path relative to that folder).
+**`docs/design/visualization-plugins.md` is the plan and status** — phases 1–7, hazards,
+decisions (ISF + Milkdrop via Butterchurn, no arbitrary JS plugins). Read it before touching
+any of this.
+
+They are **not** a deck source. They live as a single global layer on `Session.visualization`
+(`{ pluginId, params }`, never the shader source) with its own
+`Session.visualizationOpacity` (default `0.5`, so deck video stays visible underneath).
 
 **Why this is a separate layer, not a per-deck source (architecture decision, 2026-06-21)**:
-the original design let a deck's source switch between `'video'` and `'shader'`. Selecting
-a visualization on a deck replaced that deck's source, and `syncVideoElements()` in
-`App.svelte` treats any non-video source as "tear this deck down" — it called
-`audioUnload()`, killing music playback the instant a visualization was picked. Since VJs
-want visualizations *blended over* a playing track, not swapped in for it, the fix is
-structural: visualizations never touch deck state at all.
+the original design let a deck's source switch between `'video'` and `'shader'`, and
+`syncVideoElements()` in `App.svelte` treats any non-video source as "tear this deck down" —
+it called `audioUnload()`, killing music playback the instant a visualization was picked.
+Visualizations never touch deck state at all. (Per-deck visuals are designed separately in
+`docs/design/track-visual-override.md`; the renderer is instance-based so that can reuse it.)
 
-**Rendering**: `Compositor` (`src/lib/renderer/compositor.ts`) holds one extra `DeckFBO`
-(`vizFbo`) and one cached GLSL program (`vizProgram`) outside the per-deck `fbos`/
-`shaderPrograms` maps — there is always at most one active visualization, so no map is
-needed. `renderVisualization(fragmentSrc, uniforms, time, analysis)` renders into `vizFbo`
-exactly like `renderShader()` does for a deck. `composite(decks, visualizationOpacity)`
-blends all deck FBOs back-to-front as before, then — if `visualizationOpacity > 0` — blits
-`vizFbo` on top as a final pass using the same shared blit shader.
+**Flow**: the control window resolves the plugin id (`lib/viz/vizPlugins.ts` — built-in, or
+the `viz_read_plugin` Tauri command in `src-tauri/src/viz_plugins.rs`) and ships the source
+to the output window **only when it changes** (`OutputVizMessage`). The output window
+(`src/output.ts`) parses it with the vendored, patched ISF parser (`lib/renderer/isf/vendor/`,
+see its header for the patches), builds an `IsfInstance` (`lib/renderer/isf/instance.ts`) in
+the compositor's WebGL2 context — the parser's GLSL ES 1.00 output compiles unmodified there,
+verified 2026-09-25 — and replies `vizOk` / `vizError`. **A build failure shows in the panel
+and in `cuemark.log` (`[output] visualization <id> failed (<stage>): …`), never as a silent
+black layer.** Per frame only `vizParams` and `bindings` travel.
 
-Since 2026-08-03 all of this runs in the **output window** (`src/output.ts`), driven by the
-frame messages it receives rather than by `App.svelte`'s `frame()` loop. The shader *source*
-is sent only when it changes — it is far too large for a per-frame path — while `u_time`, the
-audio-analysis bands and any custom uniforms ride along with every frame. `App.svelte` still
-decides *when* a frame is due (an active visualization animates continuously, so it always
-marks the frame dirty); it just no longer renders it.
+**Audio and metadata reach a shader only through `CUEMARK_BIND`**: an ordinary ISF `float`
+input with an extra `"CUEMARK_BIND": "bass"` key, which cuemark drives each frame and other
+ISF hosts ignore (they show a slider). A shader with no bound inputs — e.g. most shaders
+downloaded from the web — does not react to audio, by design. Today only `bass`/`mid`/`high`
+exist (max across decks' pre-EQ spectrum); the full vocabulary and routing arrive in phase 3.
+⚠️ Whether the built-ins *visibly* react to audio has never been confirmed live — check the
+band values before blaming a shader.
 
-Standard uniforms fed to every visualization shader: `u_time`, `u_resolution`,
-`u_bass`/`u_mid`/`u_high` (from `AudioAnalysis`, max-across-playing-decks), plus any custom
-uniforms declared on `Visualization.uniforms`.
+`TIME` counts from when the plugin was loaded, in the output window (ISF convention, and
+keeps float precision) — animations restart on every switch.
 
-**UI**: controls live in `src/components/VisualizationPanel.svelte` (shader picker + opacity
-slider), toggled from a toolbar button in `App.svelte` — mirrors the existing `Audio`/`Queue`
-panel-toggle pattern. `DeckCard.svelte` no longer has any shader-picker UI.
+**UI**: `src/components/VisualizationPanel.svelte` (built-ins, discovered plugins with error
+badges and thumbnails, Rescan, opacity), toggled from the toolbar.
 
 ## Active architecture plan (2026-07-25)
 
@@ -552,6 +559,7 @@ this section; check it before assuming a design doc's headline framing is curren
 - FFT uniforms fed to shader (bass/mid/high, waveform)
 - Built-in shaders: plasma, tunnel, particle field, feedback, scope
 - BPM detection
+- Plugin visualizations (ISF, then Milkdrop): `docs/design/visualization-plugins.md`
 
 ### Phase 3 — Polish
 - MIDI learn mode
