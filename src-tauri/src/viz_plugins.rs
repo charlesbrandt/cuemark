@@ -398,6 +398,160 @@ fn read_plugin_source(dir: &Path, id: &str) -> Result<VizPluginSource, String> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Hot reload (phase 2 step 3): poll mtimes, emit `viz-plugins-changed` with the changed ids
+// ---------------------------------------------------------------------------------------------
+
+/// relpath (forward slashes) -> (mtime nanos since epoch, size)
+pub type Snapshot = std::collections::BTreeMap<String, (u128, u64)>;
+
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+const MAX_SCAN_DEPTH: usize = 4;
+
+/// Editor swap/backup/temp files that must never trigger a reload.
+fn is_ignored_name(name: &str) -> bool {
+    is_hidden(name) // covers dotfiles, .swp, .#lock, .~lock
+        || name.ends_with('~')
+        || name.ends_with(".swp")
+        || name.ends_with(".swo")
+        || name.ends_with(".tmp")
+        || name.ends_with(".bak")
+}
+
+fn scan_into(root: &Path, dir: &Path, depth: usize, out: &mut Snapshot) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else { continue };
+        if is_ignored_name(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = fs::metadata(&path) else { continue };
+        if meta.is_dir() {
+            if depth == 0 && name.eq_ignore_ascii_case("milkdrop") {
+                continue; // phase 6
+            }
+            if depth < MAX_SCAN_DEPTH {
+                scan_into(root, &path, depth + 1, out);
+            }
+        } else if meta.is_file() {
+            let Ok(rel) = path.strip_prefix(root) else { continue };
+            let rel = rel
+                .components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .collect::<Vec<_>>()
+                .join("/");
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            out.insert(rel, (mtime, meta.len()));
+        }
+    }
+}
+
+pub fn scan_snapshot(dir: &Path) -> Snapshot {
+    let mut out = Snapshot::new();
+    scan_into(dir, dir, 0, &mut out);
+    out
+}
+
+/// Diffs two snapshots into the sorted, de-duplicated plugin ids affected. Id scheme matches
+/// `discover_plugins`: a bare top-level `x.fs` is `x.fs`; a folder plugin's shader is
+/// `folder/x.fs`. A non-`.fs` file inside a folder (thumbnail, asset, `.vs`, LICENSE) maps to
+/// every `.fs` directly in that folder (in either snapshot, so a removed folder still reports);
+/// a top-level `x.vs` maps to `x.fs`. Anything else (top-level non-plugin files) is ignored.
+pub fn diff_changed_ids(old: &Snapshot, new: &Snapshot) -> Vec<String> {
+    let mut changed: Vec<&String> = Vec::new();
+    for (k, v) in new {
+        if old.get(k) != Some(v) {
+            changed.push(k);
+        }
+    }
+    for k in old.keys() {
+        if !new.contains_key(k) {
+            changed.push(k);
+        }
+    }
+
+    let is_fs = |n: &str| n.len() > 3 && n[n.len() - 3..].eq_ignore_ascii_case(".fs");
+    let mut ids = std::collections::BTreeSet::new();
+    for rel in changed {
+        match rel.split_once('/') {
+            None => {
+                if is_fs(rel) {
+                    ids.insert(rel.clone());
+                } else if let Some(stem) = rel.strip_suffix(".vs") {
+                    ids.insert(format!("{stem}.fs"));
+                }
+            }
+            Some((folder, rest)) => {
+                if !rest.contains('/') && is_fs(rest) {
+                    ids.insert(rel.clone());
+                } else {
+                    let prefix = format!("{folder}/");
+                    for k in old.keys().chain(new.keys()) {
+                        if let Some(r) = k.strip_prefix(&prefix) {
+                            if !r.contains('/') && is_fs(r) {
+                                ids.insert(k.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ids.into_iter().collect()
+}
+
+/// Starts the polling watcher thread. Never blocks, holds no shared state; failures only warn.
+pub fn spawn_watcher(app: tauri::AppHandle) {
+    use tauri::Emitter;
+    let dir = match viz_plugins_dir(&app) {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("[viz] hot reload disabled: {e}");
+            return;
+        }
+    };
+    let spawned = std::thread::Builder::new()
+        .name("viz-plugin-watch".into())
+        .spawn(move || {
+            let mut baseline = scan_snapshot(&dir);
+            loop {
+                std::thread::sleep(POLL_INTERVAL);
+                let mut cur = scan_snapshot(&dir);
+                if cur == baseline {
+                    continue;
+                }
+                // Settle: editors write in two steps; wait until two scans agree.
+                loop {
+                    std::thread::sleep(SETTLE);
+                    let next = scan_snapshot(&dir);
+                    if next == cur {
+                        break;
+                    }
+                    cur = next;
+                }
+                let ids = diff_changed_ids(&baseline, &cur);
+                baseline = cur;
+                if ids.is_empty() {
+                    continue;
+                }
+                log::info!("[viz] plugins changed: {}", ids.join(", "));
+                if let Err(e) = app.emit("viz-plugins-changed", &ids) {
+                    log::warn!("[viz] failed to emit viz-plugins-changed: {e}");
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("[viz] could not start plugin watcher thread: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------
 
@@ -597,6 +751,52 @@ void main() { gl_FragColor = vec4(1.0); }
         assert!(resolve_plugin_path(&dir.0, "../x.fs").is_err());
         assert!(resolve_plugin_path(&dir.0, "/etc/passwd").is_err());
         assert!(resolve_plugin_path(&dir.0, "a/../../x.fs").is_err());
+    }
+
+    fn snap(items: &[(&str, u128, u64)]) -> Snapshot {
+        items.iter().map(|(k, m, s)| (k.to_string(), (*m, *s))).collect()
+    }
+
+    #[test]
+    fn diff_add_remove_modify_bare() {
+        let old = snap(&[("a.fs", 1, 10), ("b.fs", 1, 10)]);
+        let new = snap(&[("a.fs", 2, 10), ("c.fs", 1, 5)]);
+        assert_eq!(diff_changed_ids(&old, &new), vec!["a.fs", "b.fs", "c.fs"]);
+        assert!(diff_changed_ids(&old, &old).is_empty());
+    }
+
+    #[test]
+    fn diff_folder_thumbnail_maps_to_folder_plugin() {
+        let old = snap(&[("star/star.fs", 1, 1), ("star/thumbnail.png", 1, 1)]);
+        let new = snap(&[("star/star.fs", 1, 1), ("star/thumbnail.png", 2, 1)]);
+        assert_eq!(diff_changed_ids(&old, &new), vec!["star/star.fs"]);
+    }
+
+    #[test]
+    fn diff_folder_removed_and_multi_fs_extra() {
+        let old = snap(&[("pack/a.fs", 1, 1), ("pack/b.fs", 1, 1), ("pack/LICENSE", 1, 1)]);
+        let new = snap(&[("pack/a.fs", 1, 1), ("pack/b.fs", 1, 1), ("pack/LICENSE", 2, 1)]);
+        assert_eq!(diff_changed_ids(&old, &new), vec!["pack/a.fs", "pack/b.fs"]);
+        let gone = Snapshot::new();
+        assert_eq!(diff_changed_ids(&old, &gone), vec!["pack/a.fs", "pack/b.fs", ]);
+    }
+
+    #[test]
+    fn diff_ignores_stray_top_level_and_maps_vs() {
+        let old = snap(&[]);
+        let new = snap(&[("notes.txt", 1, 1), ("x.vs", 1, 1)]);
+        assert_eq!(diff_changed_ids(&old, &new), vec!["x.fs"]);
+    }
+
+    #[test]
+    fn scan_ignores_editor_files() {
+        let dir = TempDir::new();
+        fs::write(dir.0.join("a.fs"), "x").unwrap();
+        fs::write(dir.0.join(".a.fs.swp"), "x").unwrap();
+        fs::write(dir.0.join("a.fs~"), "x").unwrap();
+        fs::write(dir.0.join(".#a.fs"), "x").unwrap();
+        let s = scan_snapshot(&dir.0);
+        assert_eq!(s.keys().collect::<Vec<_>>(), vec!["a.fs"]);
     }
 
     #[test]

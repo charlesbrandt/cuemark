@@ -287,6 +287,8 @@ pub fn run() {
             let output_graph = app.state::<audio::AudioState>().lock().unwrap().output_graph();
             census::spawn(output_graph);
 
+            viz_plugins::spawn_watcher(app.handle().clone());
+
             // See media_cache.rs — resolved here (not at builder-config time, before
             // media_server::start()) because it needs app.path(), which requires an
             // AppHandle only available inside setup().
