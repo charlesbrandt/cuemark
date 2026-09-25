@@ -8,6 +8,8 @@
  * one unverified assumption these tests can't cover).
  */
 import { describe, expect, it } from "vitest";
+import fftSrc from "./testplugins/fft-bars.fs?raw";
+import { fftTextureWidth, packFft } from "./instance";
 import { parseIsf, IsfError } from "./parser";
 import { BUILTIN_ISF } from "./builtins";
 import { extractImported, resolveAssetUrl, resolveImportedImages, generateTestPattern } from "./instance";
@@ -252,5 +254,28 @@ describe("binding summary", () => {
     const w = newBindingWindow();
     noteBindings(w, { beat: 1 });
     expect(formatBindings("p", { beat: 1 }, w)).toBe("[viz] bindings p beat=1.000 (frames=1)");
+  });
+});
+
+describe("audioFFT input support", () => {
+
+  it("parses the fft-bars sample and declares the spectrum as a sampler2D", () => {
+    const parsed = parseIsf(fftSrc);
+    expect(parsed.inputs.map((i) => [i.NAME, i.TYPE])).toEqual([["spectrum", "audioFFT"]]);
+    expect(parsed.fragmentShader).toMatch(/uniform sampler2D spectrum;/);
+    expect(parsed.fragmentShader).toMatch(/_spectrum_imgSize/);
+    assertIsEs100(parsed.fragmentShader);
+  });
+
+  it("fftTextureWidth honours MAX, capped at 32", () => {
+    expect(fftTextureWidth({})).toBe(32);
+    expect(fftTextureWidth({ MAX: 16 })).toBe(16);
+    expect(fftTextureWidth({ MAX: 512 })).toBe(32);
+    expect(fftTextureWidth({ MAX: 0 })).toBe(1);
+  });
+
+  it("packFft clamps, zero-fills and normalises to bytes", () => {
+    expect(Array.from(packFft([0, 0.5, 1, 2, -1, NaN], 8))).toEqual([0, 128, 255, 255, 0, 0, 0, 0]);
+    expect(Array.from(packFft(undefined, 3))).toEqual([0, 0, 0]);
   });
 });

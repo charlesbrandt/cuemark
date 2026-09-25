@@ -24,6 +24,8 @@ export interface OutputPostState {
   vizOpacity: number;
   vizParams: Record<string, number | number[] | boolean>;
   bindings: Record<string, number>;
+  /** Routed spectrum for `audioFFT` inputs (up to 32 floats, 0-1); optional. */
+  vizFft?: number[];
   time: number;
   analysis: { bass: number; mid: number; high: number };
 }
@@ -248,6 +250,7 @@ export function postFrame(state: OutputPostState): void {
         vizOpacity: state.vizOpacity,
         vizParams: state.vizParams,
         bindings: state.bindings,
+        vizFft: state.vizFft,
         time: state.time,
         analysis: state.analysis,
       });

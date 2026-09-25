@@ -198,6 +198,7 @@ channel.onmessage = (e: MessageEvent<OutputMessage>) => {
         date: isfDate(),
         params: msg.vizParams,
         bindings: msg.bindings,
+        fft: msg.vizFft,
       });
     } catch (e) {
       // Drop the plugin rather than throw on every frame: an exception here would otherwise

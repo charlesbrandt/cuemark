@@ -21,6 +21,30 @@ export interface IsfFrameInputs {
   params: Record<string, number | number[] | boolean>;
   /** Every `CUEMARK_BIND` value cuemark currently knows, keyed by bind name. */
   bindings: Record<string, number>;
+  /** Routed spectrum, up to FFT_MAX_BINS floats in 0-1; absent = silence. Feeds `audioFFT` inputs. */
+  fft?: number[];
+}
+
+/** Widest `audioFFT` texture: the 32 bands the analysis produces. */
+export const FFT_MAX_BINS = 32;
+
+/** Texture width for an `audioFFT` input: min(32, MAX) when MAX is a positive number. */
+export function fftTextureWidth(input: { MAX?: unknown }): number {
+  const max =
+    typeof input.MAX === "number" && Number.isFinite(input.MAX)
+      ? Math.floor(input.MAX)
+      : FFT_MAX_BINS;
+  return Math.max(1, Math.min(FFT_MAX_BINS, max));
+}
+
+/** Packs 0-1 floats into `width` R8 bytes (clamped, NaN -> 0, missing -> 0). */
+export function packFft(fft: number[] | undefined, width: number, out?: Uint8Array): Uint8Array {
+  const bytes = out ?? new Uint8Array(width);
+  for (let i = 0; i < width; i++) {
+    const v = fft?.[i];
+    bytes[i] = typeof v === "number" && v > 0 ? Math.round(Math.min(1, v) * 255) : 0;
+  }
+  return bytes;
 }
 
 // The only ISF input TYPEs the vendored parser maps to `sampler2D` (see
@@ -165,6 +189,11 @@ export class IsfInstance {
   private readonly inputs: IsfInput[];
   private readonly uniformLocs = new Map<string, WebGLUniformLocation | null>();
   private readonly loggedUnfed = new Set<string>();
+  // One R8 Nx1 texture per audioFFT input, created lazily; empty for shaders without one.
+  private readonly fftTextures = new Map<
+    string,
+    { tex: WebGLTexture; width: number; bytes: Uint8Array }
+  >();
   private disposed = false;
 
   readonly label: string;
@@ -233,6 +262,9 @@ export class IsfInstance {
       this.loadImported(name);
     }
     this.cacheUniformLocations();
+    if (this.inputs.some((i) => i.TYPE === "audioFFT")) {
+      debugLog(`[isf/${label}] plugin declares audioFFT input(s); fed from the routed spectrum (vizFft)`);
+    }
   }
 
   // A single 1x1 transparent-black texture, shared across every image/audio/
@@ -380,7 +412,7 @@ export class IsfInstance {
     let textureUnit = 0;
     for (const input of this.inputs) {
       if (SAMPLER_TYPES.has(input.TYPE)) {
-        this.bindSamplerInput(input, textureUnit);
+        this.bindSamplerInput(input, textureUnit, frame);
         textureUnit += 1;
       } else {
         this.setValueInput(input, frame);
@@ -404,17 +436,49 @@ export class IsfInstance {
     return this.fbo.texture;
   }
 
-  private bindSamplerInput(input: IsfInput, textureUnit: number): void {
+  // R8 (not R32F): filterable with no extension, and 8 bits is ample for a display spectrum.
+  // Sampled as `.r` in 0-1 by the shader.
+  private bindFftInput(input: IsfInput, textureUnit: number, frame: IsfFrameInputs): void {
+    const { gl } = this;
+    let entry = this.fftTextures.get(input.NAME);
+    if (!entry) {
+      const tex = gl.createTexture();
+      if (!tex) throw new IsfError("runtime", "Failed to create audioFFT texture");
+      const width = fftTextureWidth(input);
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, width, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(width));
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      entry = { tex, width, bytes: new Uint8Array(width) };
+      this.fftTextures.set(input.NAME, entry);
+    }
+    gl.activeTexture(gl.TEXTURE0 + textureUnit);
+    gl.bindTexture(gl.TEXTURE_2D, entry.tex);
+    packFft(frame.fft, entry.width, entry.bytes);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, entry.width, 1, gl.RED, gl.UNSIGNED_BYTE, entry.bytes);
+    gl.uniform1i(this.loc(input.NAME), textureUnit);
+    gl.uniform2f(this.loc(`_${input.NAME}_imgSize`), entry.width, 1);
+    gl.uniform4f(this.loc(`_${input.NAME}_imgRect`), 0, 0, 1, 1);
+    gl.uniform1i(this.loc(`_${input.NAME}_flip`), 0);
+  }
+
+  private bindSamplerInput(input: IsfInput, textureUnit: number, frame: IsfFrameInputs): void {
+    if (input.TYPE === "audioFFT") {
+      this.bindFftInput(input, textureUnit, frame);
+      return;
+    }
     const { gl } = this;
     const isImage = input.TYPE === "image";
     if (!this.loggedUnfed.has(input.NAME)) {
       this.loggedUnfed.add(input.NAME);
       const reason =
-        input.TYPE === "audioFFT"
-          ? "audioFFT spectrum texture arrives in phase 3 (blank)"
-          : input.TYPE === "audio"
-            ? "audio (PCM) texture arrives in phase 5 (blank)"
-            : "bound to the built-in 256x256 test pattern";
+        input.TYPE === "audio"
+          ? "audio (PCM) texture arrives in phase 5 (blank)"
+          : "bound to the built-in 256x256 test pattern";
       debugLog(`[isf/${this.label}] input '${input.NAME}' (${input.TYPE}) not fed by the host - ${reason}`);
     }
 
@@ -478,6 +542,8 @@ export class IsfInstance {
       if (entry.texture) gl.deleteTexture(entry.texture);
       entry.texture = null;
     }
+    for (const e of this.fftTextures.values()) gl.deleteTexture(e.tex);
+    this.fftTextures.clear();
     this.fbo.destroy();
     this.uniformLocs.clear();
     this.disposed = true;

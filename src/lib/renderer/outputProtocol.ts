@@ -51,6 +51,8 @@ export interface OutputFrameMessage {
   vizParams: Record<string, number | number[] | boolean>;
   /** Values for every `CUEMARK_BIND` name (bass, mid, high, …), refreshed each frame. */
   bindings: Record<string, number>;
+  /** Routed spectrum for `audioFFT` inputs: up to 32 floats, 0-1. Absent = silence. */
+  vizFft?: number[];
   /**
    * Control-window clock, seconds. Not used as the shader's TIME any more: the output
    * window counts TIME from when the plugin was loaded, as ISF hosts do, which also keeps it
