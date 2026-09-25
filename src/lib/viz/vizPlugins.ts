@@ -4,9 +4,10 @@
 // folder), resolves the selected plugin id to its source, and collects errors reported by
 // the output window, which is the only place a shader is actually compiled.
 
-import { writable, get } from 'svelte/store';
+import { writable, get, type Readable } from 'svelte/store';
 import { invoke } from '@tauri-apps/api/core';
 import { debugLog } from '../debugLog';
+import { parseIsf, type IsfInput } from '../renderer/isf/parser';
 import { BUILTIN_ISF } from '../renderer/isf/builtins';
 import type { VizPluginPayload } from '../renderer/outputProtocol';
 import type { Visualization } from '../state/types';
@@ -118,6 +119,27 @@ export function migrateVisualization(v: unknown): Visualization | null {
 // ── Active plugin → output window ────────────────────────────────────────────────────────
 
 let activePayload: VizPluginPayload | null = null;
+const activeInputsStore = writable<IsfInput[]>([]);
+
+/** Parsed `INPUTS` of the selected plugin, for the generated parameter controls. */
+export const activeInputs: Readable<IsfInput[]> = { subscribe: activeInputsStore.subscribe };
+
+/**
+ * Set the active payload and the inputs parsed from it together. A parse failure yields no
+ * controls; the output window reports the same error through `vizError`.
+ */
+export function setActivePayload(payload: VizPluginPayload | null) {
+  activePayload = payload;
+  let inputs: IsfInput[] = [];
+  if (payload) {
+    try {
+      inputs = parseIsf(payload.source, payload.vertexSource).inputs;
+    } catch {
+      inputs = [];
+    }
+  }
+  activeInputsStore.set(inputs);
+}
 
 /**
  * The resolved payload for `Session.visualization`, for `postFrame()`. Stays the same
@@ -149,16 +171,16 @@ export function startVizPluginSync(
     currentId = id;
     const mySeq = ++seq;
     if (id === null) {
-      activePayload = null;
+      setActivePayload(null);
       return;
     }
     resolvePlugin(id).then(
       (payload) => {
-        if (mySeq === seq) activePayload = payload;
+        if (mySeq === seq) setActivePayload(payload);
       },
       (e) => {
         if (mySeq !== seq) return;
-        activePayload = null;
+        setActivePayload(null);
         debugLog(`[viz] could not read plugin ${id}: ${e}`);
         setVizError(id, `read: ${e}`);
       },

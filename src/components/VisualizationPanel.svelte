@@ -1,7 +1,28 @@
 <script lang="ts">
-  import { session, setVisualization, setVisualizationOpacity } from "../lib/state/session";
+  import { session, setVisualization, setVisualizationOpacity, setVisualizationParams } from "../lib/state/session";
   import { BUILTIN_ISF } from "../lib/renderer/isf/builtins";
-  import { diskPlugins, vizErrors, refreshPluginList, mediaUrl } from "../lib/viz/vizPlugins";
+  import { diskPlugins, vizErrors, refreshPluginList, mediaUrl, activeInputs } from "../lib/viz/vizPlugins";
+  import { describeInputs, colorToHex, hexToColor, type SliderAxis } from "../lib/viz/vizParamControls";
+
+  let controls = $derived(describeInputs($activeInputs));
+  let params = $derived($session.visualization?.params ?? {});
+
+  const numParam = (name: string, def: number): number => {
+    const v = params[name];
+    return typeof v === "number" ? v : def;
+  };
+  const pairParam = (name: string, axes: [SliderAxis, SliderAxis]): number[] => {
+    const v = params[name];
+    return Array.isArray(v) && v.length >= 2 ? v : [axes[0].default, axes[1].default];
+  };
+  const colorParam = (name: string, def: number[]): number[] => {
+    const v = params[name];
+    return Array.isArray(v) && v.length >= 3 ? v : def;
+  };
+  function fire(name: string) {
+    setVisualizationParams({ [name]: true });
+    setTimeout(() => setVisualizationParams({ [name]: false }), 100);
+  }
 
   let visualization = $derived($session.visualization);
   let selectedId = $derived(visualization?.pluginId ?? null);
@@ -74,6 +95,46 @@
 
   {#if selectedId && ($vizErrors[selectedId] ?? $diskPlugins.find((p) => p.id === selectedId)?.error)}
     <div class="viz-error">{$vizErrors[selectedId] ?? $diskPlugins.find((p) => p.id === selectedId)?.error}</div>
+  {/if}
+
+  {#if selectedId}
+    {#each controls as c (c.name)}
+      <div class="settings-row">
+        <span class="row-label" title={c.name}>{c.label}</span>
+        {#if c.kind === "slider"}
+          {@const v = numParam(c.name, c.axis.default)}
+          <input type="range" min={c.axis.min} max={c.axis.max} step={c.axis.step} value={v}
+            oninput={(e) => setVisualizationParams({ [c.name]: +e.currentTarget.value })} />
+          <span class="opacity-val">{v.toFixed(2)}</span>
+        {:else if c.kind === "point2d"}
+          {@const pv = pairParam(c.name, c.axes)}
+          {#each [0, 1] as i}
+            <input type="range" min={c.axes[i].min} max={c.axes[i].max} step={c.axes[i].step} value={pv[i]}
+              oninput={(e) => {
+                const next = [...pv];
+                next[i] = +e.currentTarget.value;
+                setVisualizationParams({ [c.name]: next });
+              }} />
+            <span class="opacity-val">{pv[i].toFixed(2)}</span>
+          {/each}
+        {:else if c.kind === "toggle"}
+          <input type="checkbox"
+            checked={typeof params[c.name] === "boolean" ? (params[c.name] as boolean) : c.default}
+            onchange={(e) => setVisualizationParams({ [c.name]: e.currentTarget.checked })} />
+        {:else if c.kind === "select"}
+          <select value={numParam(c.name, c.default)}
+            onchange={(e) => setVisualizationParams({ [c.name]: +e.currentTarget.value })}>
+            {#each c.options as o (o.value)}<option value={o.value}>{o.label}</option>{/each}
+          </select>
+        {:else if c.kind === "color"}
+          {@const col = colorParam(c.name, c.default)}
+          <input type="color" value={colorToHex(col)}
+            oninput={(e) => setVisualizationParams({ [c.name]: hexToColor(e.currentTarget.value, col) })} />
+        {:else if c.kind === "button"}
+          <button class="viz-btn" onclick={() => fire(c.name)}>Trigger</button>
+        {/if}
+      </div>
+    {/each}
   {/if}
 
   <div class="settings-row">

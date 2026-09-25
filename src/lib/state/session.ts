@@ -233,6 +233,15 @@ export function setVisualization(visualization: Visualization | null) {
   session.update((s) => ({ ...s, visualization }));
 }
 
+/** Merge parameter values into the active visualization. No-op when there is none. */
+export function setVisualizationParams(patch: Record<string, number | number[] | boolean>) {
+  session.update((s) =>
+    s.visualization
+      ? { ...s, visualization: { ...s.visualization, params: { ...s.visualization.params, ...patch } } }
+      : s,
+  );
+}
+
 export function setVisualizationOpacity(value: number) {
   session.update((s) => ({ ...s, visualizationOpacity: value }));
 }
