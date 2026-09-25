@@ -147,7 +147,7 @@ export function setMasterVolume(value: number) {
   session.update((s) => ({ ...s, masterVolume: value }));
 }
 
-function applyCurve(v: number, curve: CrossfaderCurve): [number, number] {
+export function applyCurve(v: number, curve: CrossfaderCurve): [number, number] {
   switch (curve) {
     case "equal-power":
       return [Math.cos(v * Math.PI * 0.5), Math.sin(v * Math.PI * 0.5)];
