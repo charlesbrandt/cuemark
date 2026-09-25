@@ -170,4 +170,11 @@ export interface Session {
   effects: Effect[];      // global post-process chain
   visualization: Visualization | null; // global layer, composited above all decks
   visualizationOpacity: number;        // 0–1 — how it blends over the deck output
+  // Which audio feeds the visualization's CUEMARK_BIND analysis: 'mix' (max across decks),
+  // 'cue' (headphone-cued decks), or 'deck:<deck.id>'. Analysis is pre-EQ. Invariant: a
+  // 'deck:<id>' value names an existing deck — removeDeck() resets it to 'mix'. Old snapshots
+  // lacking the field must restore as 'mix'.
+  // Optional only so pre-existing Session literals (tests, old snapshots) still type-check;
+  // readers must treat undefined as 'mix'.
+  vizAudioSource?: string;
 }

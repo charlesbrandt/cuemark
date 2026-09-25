@@ -56,6 +56,7 @@ function resetSession(decks: ReturnType<typeof baseDeck>[]) {
     effects: [],
     visualization: null,
     visualizationOpacity: 0.5,
+    vizAudioSource: 'mix',
   });
 }
 

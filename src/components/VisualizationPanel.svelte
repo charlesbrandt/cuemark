@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { session, setVisualization, setVisualizationOpacity, setVisualizationParams } from "../lib/state/session";
+  import { session, setVisualization, setVisualizationOpacity, setVisualizationParams, setVizAudioSource } from "../lib/state/session";
   import { BUILTIN_ISF } from "../lib/renderer/isf/builtins";
   import { diskPlugins, vizErrors, refreshPluginList, mediaUrl, activeInputs } from "../lib/viz/vizPlugins";
   import { describeInputs, colorToHex, hexToColor, type SliderAxis } from "../lib/viz/vizParamControls";
@@ -41,6 +41,12 @@
 
   function select(pluginId: string | null) {
     setVisualization(pluginId === null ? null : { pluginId, params: {} });
+  }
+
+  // Matches the app's `deck-<n>` ids; falls back to list position for any other id.
+  function deckNumber(id: string, index: number): number {
+    const m = id.match(/^deck-(\d+)$/);
+    return m ? parseInt(m[1], 10) : index + 1;
   }
 
   async function refresh() {
@@ -149,6 +155,23 @@
     />
     <span class="opacity-val">{$session.visualizationOpacity.toFixed(2)}</span>
   </div>
+
+  <div class="settings-row">
+    <span class="row-label">Audio</span>
+    <select
+      class="source-select"
+      value={$session.vizAudioSource ?? 'mix'}
+      title="Analysis is pre-EQ: a bass kill won't show in the visual."
+      onchange={(e) => setVizAudioSource(e.currentTarget.value)}
+    >
+      <option value="mix">Mix</option>
+      <option value="cue">Cue</option>
+      {#each $session.decks as d, i (d.id)}
+        <option value={`deck:${d.id}`}>Deck {deckNumber(d.id, i)}</option>
+      {/each}
+    </select>
+    <span class="source-hint">Analysis is pre-EQ: a bass kill won't show in the visual.</span>
+  </div>
 </div>
 
 <style>
@@ -241,5 +264,19 @@
     min-width: 32px;
     color: color-mix(in srgb, var(--text) 55%, transparent);
     font-variant-numeric: tabular-nums;
+  }
+
+  .source-select {
+    background: var(--bg, transparent);
+    color: var(--text);
+    border: 1px solid var(--divider);
+    border-radius: 4px;
+    padding: 2px 6px;
+    font: inherit;
+  }
+
+  .source-hint {
+    color: color-mix(in srgb, var(--text) 45%, transparent);
+    font-size: calc(10px * var(--font-scale));
   }
 </style>

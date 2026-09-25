@@ -50,6 +50,7 @@ const initial: Session = {
   effects: [],
   visualization: null,
   visualizationOpacity: 0.5,
+  vizAudioSource: 'mix',
 };
 
 export const session = writable<Session>(initial);
@@ -73,7 +74,13 @@ export function addDeck() {
 export function removeDeck(id: string) {
   session.update((s) => {
     const decks = s.decks.filter((d) => d.id !== id);
-    let next: Session = { ...s, decks, masterDeckId: s.masterDeckId === id ? null : s.masterDeckId };
+    let next: Session = {
+      ...s,
+      decks,
+      masterDeckId: s.masterDeckId === id ? null : s.masterDeckId,
+      // Removing the deck a viz is listening to falls back to the mix (done here, not at read time).
+      vizAudioSource: s.vizAudioSource === `deck:${id}` ? 'mix' : s.vizAudioSource,
+    };
     next = reconcileMaster(next);
     return applyLockedRates(next);
   });
@@ -244,4 +251,9 @@ export function setVisualizationParams(patch: Record<string, number | number[] |
 
 export function setVisualizationOpacity(value: number) {
   session.update((s) => ({ ...s, visualizationOpacity: value }));
+}
+
+/** 'mix' | 'cue' | 'deck:<deck.id>' — see Session.vizAudioSource. */
+export function setVizAudioSource(source: string) {
+  session.update((s) => ({ ...s, vizAudioSource: source }));
 }

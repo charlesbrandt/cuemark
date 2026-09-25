@@ -160,6 +160,7 @@ export async function restoreSessionOnBoot(): Promise<BootRestoreResult> {
         compactControls: restored.compactControls ?? true,
         visualization: migrateVisualization(restored.visualization),
         visualizationOpacity: restored.visualizationOpacity,
+        vizAudioSource: restored.vizAudioSource ?? 'mix',
       }));
       globalsRestoredFromSnapshot = true;
     }
