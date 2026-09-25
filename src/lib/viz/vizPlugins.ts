@@ -76,12 +76,15 @@ export async function resolvePlugin(id: string): Promise<VizPluginPayload> {
   const b = BUILTIN_ISF.find((p) => p.id === id);
   if (b) return { id, format: 'isf', source: b.source, assets: {} };
   const src = await invoke<VizPluginSource>('viz_read_plugin', { id });
+  // viz_read_plugin returns absolute paths; the output window can only fetch http URLs.
+  const assets: Record<string, string> = {};
+  for (const [name, path] of Object.entries(src.assets)) assets[name] = await mediaUrl(path);
   return {
     id,
     format: 'isf',
     source: src.fragmentSource,
     vertexSource: src.vertexSource ?? undefined,
-    assets: src.assets,
+    assets,
   };
 }
 

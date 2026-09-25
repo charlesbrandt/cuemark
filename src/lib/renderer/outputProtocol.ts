@@ -69,7 +69,7 @@ export interface VizPluginPayload {
   source: string;
   /** Optional ISF vertex shader (`<name>.vs`). */
   vertexSource?: string;
-  /** Asset file name → URL the output window can fetch. Unused until image inputs land. */
+  /** Asset file name → http URL (media server) the output window can fetch. */
   assets: Record<string, string>;
 }
 
