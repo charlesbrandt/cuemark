@@ -41,6 +41,8 @@ to finish right now.
 | [`cross-platform-windows-mac.md`](cross-platform-windows-mac.md) | Not started. Guidance-only doc for a future port. |
 | [`preroll-latency.md`](preroll-latency.md) | Design only, nothing built — direct follow-on from `queue-prefetch-cache.md`'s phase-1 gate. |
 | [`scratch-feeder-underruns.md`](scratch-feeder-underruns.md) | Open, not yet investigated. |
+| [`track-visual-override.md`](track-visual-override.md) | Design only (2026-09-20), nothing built. Per-deck viz / alternate video per track, stored in Digger. |
+| [`visualization-plugins.md`](visualization-plugins.md) | Design only (2026-09-25), nothing built. ISF + Milkdrop (Butterchurn) plugin visualizations, audio routing, `CUEMARK_BIND` metadata bindings; 7 phases, each with "done when". |
 
 ## 🟡 Partially resolved — core work is done, something specific remains
 
