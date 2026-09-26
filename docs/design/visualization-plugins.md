@@ -462,6 +462,38 @@ idle on a viz, so no per-switch leak of the 16 MB float buffers.
   fired right after selecting particles/scope, recovered).
 - ⚠️ A `TARGET` named `half` (or any GLSL reserved word) fails to compile; it does surface visibly.
 
+### Result (2026-09-26, late): RSS creep, stall hunt, Phase 2 live-check (mele, Xvfb, `CUEMARK_DISABLE_DMABUF=1`)
+
+Isolated XDG dirs, one webview at a time, own build (`fc07a9f`), output-window `WebKitWebProcess` RSS sampled every 30 s, slope fitted after a 2 min warm-up. The main window and the app process stayed flat in every arm (<= +0.1 MB/min).
+
+**A. Output-window RSS creep: reproduced, NOT viz-specific, no fix made.**
+
+| arm (12 min unless noted) | output RssAnon slope |
+|---|---|
+| no viz | +0.40 MB/min |
+| `builtin:feedback` | +1.62 |
+| `builtin:plasma` (single pass) | +1.85 |
+| plasma, opacity 0 (viz never rendered, decks still composited) | +1.78 |
+| plasma, 40 min | +1.55 (49 -> 122 MB) |
+| bisect: frame messages received, **no GL call** | flat / sawtooth (dropped 92 -> 60 MB once) |
+| bisect: only `gl.clear()` per frame, no viz, no composite | +1.86 |
+| bisect: same, canvas `preserveDrawingBuffer:false` | +0.32 |
+| plasma, `preserveDrawingBuffer:false` | +0.88 |
+| plasma, `preserveDrawingBuffer:false`, 25 min | +2.06 |
+
+Reading: the growth needs per-frame GL work in the output process, and is the same size for a single-pass shader, the multipass feedback buffer, and a bare clear, so `instance.ts` (uniforms, textures, pass buffers), `BroadcastChannel` payloads and the message handler are ruled out (receive-only arm is flat). `preserveDrawingBuffer` looked like the cause in the short bisect but the 25 min run refutes it as a fix, so it was not changed. Most likely WebKit/Mesa (llvmpipe, software compositing forced by `CUEMARK_DISABLE_DMABUF=1`) allocation behind the WebGL canvas, possibly collected lazily (one sawtooth drop seen). Unverified on a hardware-composited run, which needs a real display; the user's live app is the place to check whether it exists there. Hoisting `getUniformLocation` out of `composite()` was tried: within noise, not kept.
+
+**B. 6.1 s output stall after selecting particles/scope: NOT reproduced.** 402 selections in total (72 at 1 s spacing, 120 at 0.5 s with a deck loaded, 180 at 0.1 s; every built-in plus None, each pass), 0 failures, 0 `[watchdog]` lines, output process alive throughout. Consistent with the earlier stall being a one-off (a first shader compile on a busy driver or a window-manager event), not a repeatable per-selection cost.
+
+**C. Phase 2 live-check: PASS.**
+- Controls: a plugin with float, bool, color, point2D, long and event inputs rendered slider, checkbox, colour picker, two sliders, select and Trigger button.
+- Params reach the shader (read from the real screen via `xwd`, not WebGL readback): level 0.2 -> 0.8 moved centre pixel (51,51,0) -> (204,51,0); bool added blue; colour to green; long select moved red; point2D confirmed (0,0,0) -> (128,64,0) at (0.5,0.25); event button held true for ~6 frames then reset.
+- Hot reload: file rewritten, output pixel changed after 2.06 s; log `[viz] plugins changed` -> `hot reload` -> `loaded`.
+- Compile error: panel `.viz-error` "compile: fragment shader: ERROR: 0:40: 'BROKEN' : syntax error", button badged and `viz-broken`, log `[output] visualization paramtest.fs failed (compile)`. Fixing the file recovered without a restart. A bad JSON header shows `parse: ...` in the panel.
+- Not covered: persistence of params across restart, and MIDI.
+
+Harness (not committed): scratchpad `h/vizh.py`, `rss_arm.py`, `cycle_b.py`, `item_c.py`.
+
 ### Phase 5a: PCM tap (Rust), needed by Milkdrop and the ISF `audio` input
 
 - **Tap point (decided 2026-09-25): before master volume**, in the shared output graph node
