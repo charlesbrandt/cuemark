@@ -27,6 +27,70 @@ pub fn list_audio_devices() -> Vec<AudioDevice> {
     }
 }
 
+/// The PipeWire node name the system default sink currently resolves to (`pw-dump`'s
+/// `default` metadata, key `default.audio.sink` — the *effective* default, not
+/// `default.configured.audio.sink`, which may be a placeholder such as `auto_null`).
+/// `None` when it cannot be determined; callers then treat `""` as its own device.
+pub fn default_sink_name() -> Option<String> {
+    let out = std::process::Command::new("pw-dump").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_default_sink(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_default_sink(json_text: &str) -> Option<String> {
+    let objs: Vec<serde_json::Value> = serde_json::from_str(json_text).ok()?;
+    for obj in &objs {
+        if obj.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Metadata") {
+            continue;
+        }
+        if obj.pointer("/props/metadata.name").and_then(|v| v.as_str()) != Some("default") {
+            continue;
+        }
+        for entry in obj.get("metadata").and_then(|m| m.as_array()).into_iter().flatten() {
+            if entry.get("key").and_then(|k| k.as_str()) != Some("default.audio.sink") {
+                continue;
+            }
+            // Spa:String:JSON — `{"name": "..."}`, sometimes delivered as a JSON string.
+            let value = entry.get("value")?;
+            let name = match value {
+                serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s)
+                    .ok()
+                    .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string)),
+                v => v.get("name").and_then(|n| n.as_str()).map(str::to_string),
+            };
+            return name.filter(|n| !n.is_empty());
+        }
+    }
+    None
+}
+
+/// Removes main-output ids that would put the same audio into the same device twice.
+///
+/// `""` means "the system default", so `["", "<the default sink's node name>"]` is one
+/// device listed twice — and each entry gets its own `pulsesink` stream, the two streams
+/// meet in the DAC at a slightly different delay, and the listener hears the track doubled
+/// (live 2026-09-26). De-duplicating by id *string* could not see this. Ids are compared as
+/// full strings after resolving `""`, so `dev@front` and `dev@rear` (deliberately two
+/// branches on one node, different channel pairs) are **not** duplicates. The first
+/// occurrence wins. Returns `(kept, dropped)`.
+pub fn dedupe_main_devices(ids: &[String], default_sink: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let mut kept: Vec<String> = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    let mut dropped = Vec::new();
+    for id in ids {
+        let canon: &str = if id.is_empty() { default_sink.unwrap_or("") } else { id };
+        if seen.contains(&canon) {
+            dropped.push(id.clone());
+        } else {
+            seen.push(canon);
+            kept.push(id.clone());
+        }
+    }
+    (kept, dropped)
+}
+
 // ── pw-dump (PipeWire native) ─────────────────────────────────────────────────
 
 fn query_pw_dump() -> Result<Vec<AudioDevice>, Box<dyn std::error::Error>> {
@@ -196,7 +260,68 @@ fn parse_pactl_sinks(text: &str) -> Vec<AudioDevice> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_pw_dump, parse_pactl_sinks};
+    use super::{dedupe_main_devices, parse_default_sink, parse_pactl_sinks, parse_pw_dump};
+
+    const CODEC: &str = "alsa_output.usb-BurrBrown.analog-stereo";
+    const STARLIGHT: &str = "alsa_output.usb-Guillemot.analog-surround-40";
+
+    fn v(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn default_and_its_explicit_id_are_one_device() {
+        // The 2026-09-26 doubling: ["", CODEC] with the default being CODEC.
+        let (kept, dropped) = dedupe_main_devices(&v(&["", CODEC]), Some(CODEC));
+        assert_eq!(kept, v(&[""]));
+        assert_eq!(dropped, v(&[CODEC]));
+        // Order does not matter for detection; first wins.
+        let (kept, dropped) = dedupe_main_devices(&v(&[CODEC, ""]), Some(CODEC));
+        assert_eq!(kept, v(&[CODEC]));
+        assert_eq!(dropped, v(&[""]));
+    }
+
+    #[test]
+    fn distinct_devices_are_untouched() {
+        let ids = v(&["", STARLIGHT]);
+        let (kept, dropped) = dedupe_main_devices(&ids, Some(CODEC));
+        assert_eq!(kept, ids);
+        assert!(dropped.is_empty());
+        // Unknown default: "" stays its own entry, nothing is guessed.
+        let ids = v(&["", CODEC]);
+        let (kept, dropped) = dedupe_main_devices(&ids, None);
+        assert_eq!(kept, ids);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn channel_pair_variants_on_one_node_are_not_duplicates() {
+        let front = format!("{STARLIGHT}@front");
+        let rear = format!("{STARLIGHT}@rear");
+        let ids = vec![front.clone(), rear.clone()];
+        let (kept, dropped) = dedupe_main_devices(&ids, Some(STARLIGHT));
+        assert_eq!(kept, ids);
+        assert!(dropped.is_empty());
+        // ...but an exact repeat is.
+        let (kept, dropped) = dedupe_main_devices(&[front.clone(), front.clone()], None);
+        assert_eq!(kept, vec![front.clone()]);
+        assert_eq!(dropped, vec![front]);
+    }
+
+    #[test]
+    fn default_sink_read_from_metadata() {
+        let json = r#"[
+          {"type":"PipeWire:Interface:Metadata","props":{"metadata.name":"settings"},"metadata":[]},
+          {"type":"PipeWire:Interface:Metadata","props":{"metadata.name":"default"},"metadata":[
+            {"subject":0,"key":"default.configured.audio.sink","type":"Spa:String:JSON","value":{"name":"auto_null"}},
+            {"subject":0,"key":"default.audio.sink","type":"Spa:String:JSON","value":{"name":"alsa_output.x"}}
+          ]}]"#;
+        assert_eq!(parse_default_sink(json).as_deref(), Some("alsa_output.x"));
+        let as_string = json.replace(r#"{"name":"alsa_output.x"}"#, r#""{\"name\":\"alsa_output.y\"}""#);
+        assert_eq!(parse_default_sink(&as_string).as_deref(), Some("alsa_output.y"));
+        assert_eq!(parse_default_sink("[]"), None);
+        assert_eq!(parse_default_sink("not json"), None);
+    }
 
     #[test]
     fn pw_dump_extracts_audio_sinks() {

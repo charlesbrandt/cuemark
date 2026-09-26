@@ -1,10 +1,19 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { listAudioDevices, type AudioDevice } from "../lib/audio/pipeline";
+  import { listAudioDevices, defaultAudioSink, type AudioDevice } from "../lib/audio/pipeline";
   import { mainOutputDeviceIds, cueOutputDeviceId, networkOutputs, outputAttachStatus } from "../lib/audio/audioSettings";
 
   let localDevices = $state<AudioDevice[]>([]);
   let error = $state("");
+  let defaultSink = $state<string | null>(null);
+
+  // "Default" and the device it currently points at are one device. Ticking both is ignored
+  // by the backend (it would play the track through two streams into one DAC, heard as a
+  // double), so say so here instead of leaving two ticked boxes that do not mean what they show.
+  let defaultLabel = $derived(localDevices.find(d => d.id === defaultSink)?.label ?? null);
+  let defaultTickedTwice = $derived(
+    defaultSink !== null && $mainOutputDeviceIds.includes("") && $mainOutputDeviceIds.includes(defaultSink)
+  );
 
   // Network targets are configured rather than enumerated, so they are merged in here — see
   // the `networkOutputs` store. They must be part of `devices` before the stale-id auto-heal
@@ -81,6 +90,7 @@
   onMount(async () => {
     try {
       localDevices = await listAudioDevices();
+      defaultSink = await defaultAudioSink().catch(() => null);
     } catch (e) {
       error = String(e);
       console.error("[AudioSettings] device enumeration failed:", e);
@@ -130,7 +140,7 @@
             checked={$mainOutputDeviceIds.includes("")}
             onchange={(e) => toggleMainDevice("", e.currentTarget.checked)}
           />
-          Default
+          Default{defaultLabel ? ` (${defaultLabel})` : ""}
         </label>
         {#each devices as d (d.id)}
           <label class="device-check">
@@ -144,6 +154,15 @@
         {/each}
       </div>
     </div>
+
+    {#if defaultTickedTwice}
+      <div class="settings-row">
+        <span class="error">
+          "Default" is {defaultLabel ?? "the device"} — ticking both plays through it only once.
+          Untick one to make that explicit.
+        </span>
+      </div>
+    {/if}
 
     <div class="settings-row">
       <span class="row-label">🎧</span>

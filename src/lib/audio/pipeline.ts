@@ -19,6 +19,11 @@ export function listAudioDevices(): Promise<AudioDevice[]> {
   return invoke("list_audio_devices");
 }
 
+/** Node name the system default sink currently is, or null when it cannot be determined. */
+export function defaultAudioSink(): Promise<string | null> {
+  return invoke("audio_default_sink");
+}
+
 /**
  * Declare how far behind this app a device's listeners actually are, in milliseconds.
  *

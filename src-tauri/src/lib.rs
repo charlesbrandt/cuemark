@@ -227,6 +227,7 @@ pub fn run() {
             grid_store::grid_get_saved,
             grid_store::grid_save,
             audio::list_audio_devices,
+            audio::audio_default_sink,
             audio::audio_load,
             audio::audio_unload,
             audio::audio_play,

@@ -174,6 +174,16 @@ pub fn list_audio_devices(_state: State<'_, AudioState>) -> Vec<AudioDevice> {
     devices::list_audio_devices()
 }
 
+/// The node name the system default sink currently is, so Settings can say what "Default"
+/// means and warn when it is ticked alongside that same device.
+#[tauri::command]
+pub async fn audio_default_sink() -> Option<String> {
+    tauri::async_runtime::spawn_blocking(devices::default_sink_name)
+        .await
+        .ok()
+        .flatten()
+}
+
 // Async + spawn_blocking, same pattern as audio_analyze_file/video_demux_load below —
 // necessary since ensure_cached() can now block on a multi-second network fetch (Digger
 // fallback, media_cache.rs) rather than just a fast local stat/copy. A synchronous
@@ -572,6 +582,12 @@ pub fn audio_set_output_latency(
 #[tauri::command]
 pub async fn audio_set_main_devices(app: tauri::AppHandle, device_ids: Vec<String>) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // Never let one device be listed twice (`""` = system default = some named sink):
+        // each entry would get its own pulsesink stream into the same DAC and the listener
+        // hears the track doubled. Done before the no-op guard so that guard compares the
+        // *effective* list, not the raw one.
+        let (device_ids, duplicates) =
+            devices::dedupe_main_devices(&device_ids, devices::default_sink_name().as_deref());
         let state = app.state::<AudioState>();
         let (deck_ids, now_claiming, releasing): (Vec<String>, Vec<String>, Vec<snapcontrol::Claim>) = {
             let mut mgr = state.lock().unwrap();
@@ -587,6 +603,13 @@ pub async fn audio_set_main_devices(app: tauri::AppHandle, device_ids: Vec<Strin
             // `audio_set_cue_device` below.
             if mgr.main_devices == device_ids {
                 return Ok(());
+            }
+            if !duplicates.is_empty() {
+                log::warn!(
+                    "[audio] main outputs {duplicates:?} resolve to a device already in the list \
+                     (the system default is one of them) — ignored, so the same audio is not \
+                     sent to one device through two streams"
+                );
             }
             let previous = mgr.main_devices.clone();
             mgr.main_devices = device_ids.clone();
