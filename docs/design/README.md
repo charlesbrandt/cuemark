@@ -40,6 +40,7 @@ to finish right now.
 | [`button-to-audio-latency.md`](button-to-audio-latency.md) | Exploration only, nothing built. Open decisions listed at the tail. |
 | [`cross-platform-windows-mac.md`](cross-platform-windows-mac.md) | Not started. Guidance-only doc for a future port. |
 | [`preroll-latency.md`](preroll-latency.md) | Design only, nothing built — direct follow-on from `queue-prefetch-cache.md`'s phase-1 gate. |
+| [`sink-clock-stall.md`](sink-clock-stall.md) | Open (2026-09-26). Decks silent, or audio delayed by minutes, after the output graph idles; shared `GstPulseSinkClock` stalls/steps. Mechanism proposed (H1), not proven; instrumentation (§6) and clock-pinning fix (§5) next. Includes a corrected reading of the gdb stacks. |
 | [`scratch-feeder-underruns.md`](scratch-feeder-underruns.md) | Open, not yet investigated. |
 | [`track-visual-override.md`](track-visual-override.md) | Design only (2026-09-20), nothing built. Per-deck viz / alternate video per track, stored in Digger. |
 

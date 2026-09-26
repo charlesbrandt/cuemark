@@ -38,6 +38,7 @@ use gstreamer_app::{AppSink, AppSinkCallbacks, AppSrc};
 use super::pipeline::{
     deck_output_caps, make_sink, parse_device_remap, parse_snapcast_device, ChannelRemap,
 };
+use super::clock_watch::{self, NodeFlow};
 use super::record::RecordFormat;
 
 /// Jitter buffer between a deck's handoff and the mixer pad.
@@ -66,6 +67,12 @@ pub type BranchKey = (String, String);
 /// The clock `docs/design/shared-output-pipeline.md`'s clock section describes. Anything
 /// else is warned about once per graph — see `create_node()`.
 const EXPECTED_SHARED_CLOCK: &str = "GstSystemClock";
+
+/// Whether output nodes are pinned to `GstSystemClock` (the default). `CUEMARK_SHARED_CLOCK=sink`
+/// restores the old behaviour — the sink's own clock when it offers one — for A/B comparison.
+fn shared_clock_pinned() -> bool {
+    !matches!(std::env::var("CUEMARK_SHARED_CLOCK").as_deref(), Ok("sink"))
+}
 
 /// Elements of one attached branch, kept so it can be detached again cleanly.
 struct Branch {
@@ -527,15 +534,32 @@ impl OutputGraph {
         }
         let sink = tail.last().expect("tail is non-empty").clone();
 
-        // Stamp the graph's last-delivery clock on every buffer that reaches a real
-        // device. Not the record node: a file sink says nothing about whether the
+        // Stamp the graph's last-delivery clock on every buffer that carries *audio* into a
+        // real device. Not the record node: a file sink says nothing about whether the
         // *outputs* are idle, which is the only thing this measures. One relaxed store
         // per buffer, no allocation — see `device_activity_handle()`.
+        //
+        // ⚠️ **GAP-flagged buffers do not count** (2026-09-26, sink-clock-stall.md §6.1). The
+        // keepalive's silence — and the mixer's output when no deck is feeding it — is GAP,
+        // and this probe used to stamp those too, so `play: … graph idle` read ~0.0s on the
+        // very run where the graph had been idle for six hours. The variable it exists to
+        // report was blind to itself. `flow` keeps both counts for the clock watch.
+        let flow = Arc::new(NodeFlow::default());
         if node_name != RECORD_DEVICE_KEY {
             if let Some(pad) = sink.static_pad("sink") {
                 let activity = self.last_device_buffer_ms.clone();
-                pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
-                    activity.store(crate::epoch_ms() as u64, Ordering::Relaxed);
+                let flow_p = flow.clone();
+                pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                    let is_gap = matches!(
+                        &info.data,
+                        Some(gst::PadProbeData::Buffer(b)) if b.flags().contains(gst::BufferFlags::GAP)
+                    );
+                    if is_gap {
+                        flow_p.gap.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        flow_p.real.fetch_add(1, Ordering::Relaxed);
+                        activity.store(crate::epoch_ms() as u64, Ordering::Relaxed);
+                    }
                     gst::PadProbeReturn::Ok
                 });
             }
@@ -546,6 +570,19 @@ impl OutputGraph {
         // why it must be the sole consumer of its own bus, for its entire life.
         if node_name != RECORD_DEVICE_KEY {
             watch_bus(&pipeline, &node_name);
+        }
+
+        // ⚠️ **Pin the node to `GstSystemClock`** unless `CUEMARK_SHARED_CLOCK=sink`
+        // (sink-clock-stall.md §5 fix 1). Left alone, which clock the pipeline ends up on is a
+        // race — `GstAudioBaseSink` only provides a clock once its ringbuffer is acquired, and
+        // the log shows runs on both — and the `GstPulseSinkClock` runs are the ones that
+        // stalled or stepped after the graph idled (2026-09-19, 2026-09-25, 2026-09-26).
+        // `pulsesink` then slaves its device to the system clock (`slave-method=skew`, its
+        // default), which is the configuration this design assumed and 2026-08-11 verified.
+        // Not live-verified as a *fix* — see the doc's §7.
+        let pin_system = shared_clock_pinned();
+        if pin_system && node_name != RECORD_DEVICE_KEY {
+            pipeline.use_clock(Some(&gst::SystemClock::obtain()));
         }
 
         // A live pipeline: NO_PREROLL is the expected answer and is itself a check that
@@ -631,14 +668,29 @@ impl OutputGraph {
             // sink's clock after PLAYING and push it to every deck — do not assume that is
             // already happening because this doc comment mentions it.
             let from_sink = sink.provide_clock();
-            let chosen = from_sink.clone().or_else(|| pipeline.clock());
+            // H2 (sink-clock-stall.md §3): record what the pipeline *itself* ended up on next
+            // to what the sink offers — the log used to report only the latter.
+            log::info!(
+                "[audio/out/{}] clocks at build: pipeline={} sink={} policy={}",
+                short(&node_name),
+                pipeline.clock().map(|c| c.type_().name().to_string()).unwrap_or_else(|| "none".into()),
+                from_sink.as_ref().map(|c| c.type_().name().to_string()).unwrap_or_else(|| "none yet".into()),
+                if pin_system { "pinned to GstSystemClock" } else { "CUEMARK_SHARED_CLOCK=sink (legacy: sink's own clock if available)" },
+            );
+            let chosen = if pin_system {
+                Some(gst::SystemClock::obtain())
+            } else {
+                from_sink.clone().or_else(|| pipeline.clock())
+            };
             if let Some(clock) = chosen {
                 let kind = clock.type_().name().to_string();
                 log::info!(
                     "[audio/out/{}] shared clock for every deck pipeline: {} [{kind}] ({})",
                     short(&node_name),
                     clock.name(),
-                    if from_sink.is_some() {
+                    if pin_system {
+                        "pinned: GstSystemClock, pulsesink slaves its device to it"
+                    } else if from_sink.is_some() {
                         "the sink's own audio clock"
                     } else {
                         "pipeline fallback — pulsesink slaves its device to this; see OutputGraph::create_node"
@@ -670,6 +722,10 @@ impl OutputGraph {
                     short(&node_name)
                 );
             }
+        }
+
+        if node_name != RECORD_DEVICE_KEY {
+            clock_watch::spawn(&short(&node_name), &pipeline, &sink, flow);
         }
 
         Ok(OutputNode {

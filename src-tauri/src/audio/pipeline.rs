@@ -665,6 +665,10 @@ fn spawn_delivery_reporter(
         /// Ticks to baseline-only after a resume before measuring. See the skip below.
         const RESUME_SKIP_TICKS: u8 = 2;
         let mut resume_skip = RESUME_SKIP_TICKS;
+        // Consecutive 1s ticks, while Playing, in which *no* probe saw a buffer. See
+        // `DRY_WARN_TICKS`.
+        let mut dry_ticks = 0u32;
+        let mut dry_warned = false;
 
         loop {
             std::thread::sleep(Duration::from_secs(1));
@@ -700,6 +704,8 @@ fn spawn_delivery_reporter(
                 }
                 samples = 0;
                 resume_skip = RESUME_SKIP_TICKS;
+                dry_ticks = 0;
+                dry_warned = false;
                 continue;
             }
             if resume_skip > 0 {
@@ -720,9 +726,11 @@ fn spawn_delivery_reporter(
                 continue;
             }
 
+            let mut tick_total = 0u64;
             for (i, p) in probes.iter().enumerate() {
                 let now = p.count.load(Ordering::Relaxed);
                 let delta = now.saturating_sub(last_counts[i]);
+                tick_total += delta;
                 last_counts[i] = now;
                 win_total[i] += delta;
                 win_min[i] = win_min[i].min(delta as f64);
@@ -733,6 +741,32 @@ fn spawn_delivery_reporter(
                 }
             }
             samples += 1;
+
+            // "Playing but nothing is arriving." The one fault every other instrument here
+            // was silent about on 2026-09-26: the deck reads Playing, the bus reports no
+            // error, and the counters simply stop — while `margin` keeps repeating its last
+            // healthy value. Verify the effect, not the call (silent-failure-inventory.md).
+            if tick_total == 0 {
+                dry_ticks += 1;
+                if dry_ticks >= DRY_WARN_TICKS && !dry_warned {
+                    dry_warned = true;
+                    log::warn!(
+                        "[audio/{deck_id}] PLAY PRODUCED NO AUDIO — Playing on node {node} but \
+                         zero buffers reached any sink for {dry_ticks}s. Not an error on the \
+                         bus and not a UI freeze. Read the `[audio/out/…] CLOCK STALLED/STEPPED` \
+                         and `node-tel` lines: this is the signature of a stalled or stepped \
+                         output clock (deck appsinks wait on it). See \
+                         docs/design/sink-clock-stall.md."
+                    );
+                }
+            } else {
+                if dry_warned {
+                    log::info!("[audio/{deck_id}] audio flowing again after a {dry_ticks}s dry spell");
+                }
+                dry_ticks = 0;
+                dry_warned = false;
+            }
+
             if samples < 5 {
                 continue;
             }
@@ -745,6 +779,11 @@ fn spawn_delivery_reporter(
                     let min = if win_min[i] == f64::MAX { 0.0 } else { win_min[i] };
                     let margin = if win_margin_last[i] == i64::MIN {
                         "no ts".to_string()
+                    } else if win_total[i] == 0 {
+                        // No buffer this window, so the margin is the last one seen — not a
+                        // reading. It used to be printed as if live (`+101ms` for minutes
+                        // on the 2026-09-26 wedge).
+                        format!("STALE(no buffers; last {:+.0}ms)", win_margin_last[i] as f64 / 1000.0)
                     } else {
                         format!(
                             "{:+.0}ms(min {:+.0}ms)",
@@ -823,6 +862,13 @@ fn spawn_delivery_reporter(
 /// sustained offset: long enough that nothing transient survives it, short enough to name
 /// the fault while the set is still running.
 const MARGIN_WATCHDOG_WINDOWS: u32 = 2;
+
+/// Seconds a Playing deck may go with no buffer reaching any of its sinks before
+/// `PLAY PRODUCED NO AUDIO` is logged. The reporter already skips the two ticks after a
+/// resume (device reopen legitimately reads 0/s), so this counts from a settled deck; three
+/// more seconds is well past any healthy gap and short enough to name the fault while the
+/// person is still looking at a silent deck.
+const DRY_WARN_TICKS: u32 = 3;
 
 /// |margin| past which a window counts as a breach. A healthy deck sits in the low
 /// hundreds of milliseconds at most; the incident run read −689,001,487 ms, so the

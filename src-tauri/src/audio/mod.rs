@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod clock_watch;
 pub mod devices;
 pub mod mixer;
 pub mod pcm_buffer;
