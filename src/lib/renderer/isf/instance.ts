@@ -1,7 +1,8 @@
 /**
  * `IsfInstance` — compiles one ISF plugin into its own WebGL2 program and
- * renders it into its own `DeckFBO`, single-pass only (Phase 1; multipass
- * arrives in Phase 4 per `docs/design/visualization-plugins.md`).
+ * renders it into its own `DeckFBO`. `PASSES` with a `TARGET` render into named
+ * offscreen buffers (`PassTarget`); `PERSISTENT` ones ping-pong so a pass reads
+ * last frame's result while writing this frame's. The last pass is the output.
  *
  * Not wired into `Compositor` yet — that integration (replacing
  * `vizFbo`/`vizProgram` with an `IsfInstance`) is the lead's job per the
@@ -9,7 +10,8 @@
  */
 import { DeckFBO } from "../fbo";
 import { debugLog } from "../../debugLog";
-import { IsfError, type IsfInput, type ParsedIsf } from "./parser";
+import { IsfError, type IsfInput, type IsfPass, type ParsedIsf } from "./parser";
+import { evalExpr, exprNames, parseExpr, type Expr } from "./expr";
 
 export interface IsfFrameInputs {
   time: number;
@@ -172,6 +174,104 @@ function typeZero(type: string): number | number[] {
   }
 }
 
+/** Largest pass-buffer edge we will allocate, whatever a WIDTH/HEIGHT expression evaluates to. */
+const MAX_PASS_EDGE = 4096;
+
+/**
+ * One named offscreen buffer for a `TARGET` pass. Persistent buffers hold two
+ * textures and ping-pong: `cur` is the one being written, the other holds the
+ * previous result. `swap()` after each writing pass makes the fresh result the
+ * readable one for later passes and for the next frame.
+ */
+class PassTarget {
+  width = 0;
+  height = 0;
+  private tex: WebGLTexture[] = [];
+  private fbo: WebGLFramebuffer[] = [];
+  private cur = 0;
+
+  constructor(
+    private readonly gl: WebGL2RenderingContext,
+    readonly name: string,
+    readonly persistent: boolean,
+    readonly float: boolean,
+  ) {}
+
+  /** (Re)allocates when the size changed; contents are cleared to transparent black. */
+  resize(w: number, h: number): void {
+    if (w === this.width && h === this.height) return;
+    this.free();
+    const { gl } = this;
+    const n = this.persistent ? 2 : 1;
+    for (let i = 0; i < n; i++) {
+      const tex = gl.createTexture();
+      const fbo = gl.createFramebuffer();
+      if (!tex || !fbo) throw new IsfError("runtime", `Failed to allocate pass buffer '${this.name}'`);
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      if (this.float) {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+      } else {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      }
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      // texImage2D(null) leaves contents undefined; a persistent buffer is read before it is written.
+      gl.viewport(0, 0, w, h);
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      this.tex.push(tex);
+      this.fbo.push(fbo);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    this.width = w;
+    this.height = h;
+    this.cur = 0;
+  }
+
+  /** Binds the write side as the render target and clears it if it is not persistent. */
+  bindWrite(): void {
+    const { gl } = this;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo[this.cur]);
+    gl.viewport(0, 0, this.width, this.height);
+    if (!this.persistent) {
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+  }
+
+  /** The latest finished result (persistent: last write). */
+  get readTexture(): WebGLTexture {
+    return this.persistent ? this.tex[1 - this.cur] : this.tex[0];
+  }
+
+  /** What the writing pass itself may sample: persistent -> previous frame; else nothing (feedback loop). */
+  get selfReadTexture(): WebGLTexture | null {
+    return this.persistent ? this.tex[1 - this.cur] : null;
+  }
+
+  swap(): void {
+    if (this.persistent) this.cur = 1 - this.cur;
+  }
+
+  private free(): void {
+    const { gl } = this;
+    for (const t of this.tex) gl.deleteTexture(t);
+    for (const f of this.fbo) gl.deleteFramebuffer(f);
+    this.tex = [];
+    this.fbo = [];
+    this.width = this.height = 0;
+  }
+
+  dispose(): void {
+    this.free();
+  }
+}
+
 export class IsfInstance {
   private readonly gl: WebGL2RenderingContext;
   private readonly program: WebGLProgram;
@@ -194,6 +294,10 @@ export class IsfInstance {
     string,
     { tex: WebGLTexture; width: number; bytes: Uint8Array }
   >();
+  private readonly passes: IsfPass[];
+  private readonly passSizeExprs: Array<{ w: Expr; h: Expr }>;
+  /** TARGET name -> buffer, created for every non-final pass that names one. */
+  private readonly targets = new Map<string, PassTarget>();
   private disposed = false;
 
   readonly label: string;
@@ -207,18 +311,11 @@ export class IsfInstance {
     /** IMPORTED image uniform name -> URL (see `resolveImportedImages`). */
     importedImages: Record<string, string> = {},
   ) {
-    // Phase 1 is single-pass only. A plugin that declares more than one pass,
-    // or a single pass with a TARGET (i.e. it wants a persistent/offscreen
-    // buffer), needs pass orchestration that doesn't exist yet — see Phase 4
-    // in the design doc. Fail loudly rather than silently rendering only
-    // part of what the plugin asked for.
-    if (parsed.passes.length > 1 || parsed.passes.some((p) => p.target)) {
-      throw new IsfError("unsupported", "multipass arrives in phase 4");
-    }
-
     this.gl = gl;
     this.label = label;
     this.inputs = parsed.inputs;
+    this.passes = parsed.passes;
+    this.passSizeExprs = this.compilePassSizes(parsed);
 
     const vertShader = compileShader(gl, gl.VERTEX_SHADER, parsed.vertexShader, "vertex");
     let fragShader: WebGLShader;
@@ -255,6 +352,7 @@ export class IsfInstance {
     this.vertShader = vertShader;
     this.fragShader = fragShader;
     this.fbo = new DeckFBO(gl, width, height);
+    this.createTargets();
     this.blankTexture = this.createBlankTexture();
     this.testTexture = this.createTestTexture();
     for (const [name, url] of Object.entries(importedImages)) {
@@ -361,6 +459,38 @@ export class IsfInstance {
     img.src = entry.url;
   }
 
+  /** Parses every pass's WIDTH/HEIGHT and rejects names that are neither $WIDTH/$HEIGHT nor a float input. */
+  private compilePassSizes(parsed: ParsedIsf): Array<{ w: Expr; h: Expr }> {
+    const known = new Set(["WIDTH", "HEIGHT"]);
+    for (const i of parsed.inputs) if (i.TYPE === "float") known.add(i.NAME);
+    return parsed.passes.map((p) => {
+      const w = parseExpr(p.width);
+      const h = parseExpr(p.height);
+      for (const n of [...exprNames(w), ...exprNames(h)]) {
+        if (!known.has(n)) {
+          throw new IsfError("parse", `pass size expression uses unknown $${n} (only $WIDTH, $HEIGHT and float inputs)`);
+        }
+      }
+      return { w, h };
+    });
+  }
+
+  private createTargets(): void {
+    const { gl } = this;
+    const wantsFloat = this.passes.some((p, i) => p.float && i < this.passes.length - 1 && p.target);
+    const floatOk = wantsFloat && !!gl.getExtension("EXT_color_buffer_float");
+    if (wantsFloat && !floatOk) {
+      debugLog(`[isf/${this.label}] FLOAT pass buffers need EXT_color_buffer_float, which is unavailable - using 8-bit`);
+    }
+    this.passes.forEach((p, i) => {
+      // The final pass is the output; its TARGET (if any) is not a separate buffer.
+      if (!p.target || i === this.passes.length - 1 || this.targets.has(p.target)) return;
+      this.targets.set(p.target, new PassTarget(gl, p.target, p.persistent, p.float && floatOk));
+    });
+    const persistent = [...this.targets.values()].filter((t) => t.persistent).length;
+    debugLog(`[isf/${this.label}] passes=${this.passes.length} buffers=${this.targets.size} persistent=${persistent}${floatOk ? " float" : ""}`);
+  }
+
   private cacheUniformLocations(): void {
     const { gl, program } = this;
     const names = [...STANDARD_UNIFORMS];
@@ -372,6 +502,9 @@ export class IsfInstance {
     }
     for (const name of this.imported.keys()) {
       names.push(name, `_${name}_imgRect`, `_${name}_imgSize`, `_${name}_flip`);
+    }
+    for (const p of this.passes) {
+      if (p.target) names.push(p.target, `_${p.target}_imgRect`, `_${p.target}_imgSize`, `_${p.target}_flip`);
     }
     for (const name of names) {
       this.uniformLocs.set(name, gl.getUniformLocation(program, name));
@@ -389,10 +522,6 @@ export class IsfInstance {
     }
     const { gl } = this;
 
-    this.fbo.bind();
-    gl.clearColor(0, 0, 0, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-
     gl.useProgram(this.program);
     gl.bindVertexArray(vao);
 
@@ -406,8 +535,6 @@ export class IsfInstance {
       frame.date[2],
       frame.date[3],
     );
-    gl.uniform2f(this.loc("RENDERSIZE"), this.fbo.width, this.fbo.height);
-    gl.uniform1i(this.loc("PASSINDEX"), 0);
 
     let textureUnit = 0;
     for (const input of this.inputs) {
@@ -429,7 +556,58 @@ export class IsfInstance {
       textureUnit += 1;
     }
 
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    // Size every buffer up front so a pass may read a target that a later pass writes.
+    const last = this.passes.length - 1;
+    const sizeVars: Record<string, number> = { WIDTH: this.fbo.width, HEIGHT: this.fbo.height };
+    for (const input of this.inputs) {
+      if (input.TYPE === "float") sizeVars[input.NAME] = toNumber(this.effectiveValue(input, frame));
+    }
+    const sizes = this.passes.map((p, i) => {
+      if (i === last || !p.target) return { w: this.fbo.width, h: this.fbo.height };
+      const ex = this.passSizeExprs[i];
+      const clamp = (v: number) => Math.min(MAX_PASS_EDGE, Math.max(1, Math.floor(Number.isFinite(v) ? v : 1)));
+      return { w: clamp(evalExpr(ex.w, sizeVars)), h: clamp(evalExpr(ex.h, sizeVars)) };
+    });
+    this.passes.forEach((p, i) => {
+      if (i !== last && p.target) this.targets.get(p.target)!.resize(sizes[i].w, sizes[i].h);
+    });
+
+    const targetBase = textureUnit;
+    for (let i = 0; i <= last; i++) {
+      const p = this.passes[i];
+      const writing = i !== last && p.target ? this.targets.get(p.target)! : null;
+      if (writing) {
+        writing.bindWrite();
+      } else {
+        this.fbo.bind();
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+      }
+      gl.uniform2f(this.loc("RENDERSIZE"), sizes[i].w, sizes[i].h);
+      gl.uniform1i(this.loc("PASSINDEX"), i);
+
+      let unit = targetBase;
+      for (const [name, t] of this.targets) {
+        gl.activeTexture(gl.TEXTURE0 + unit);
+        const tex = t === writing ? t.selfReadTexture : t.readTexture;
+        gl.bindTexture(gl.TEXTURE_2D, tex ?? this.blankTexture);
+        gl.uniform1i(this.loc(name), unit);
+        gl.uniform2f(this.loc(`_${name}_imgSize`), t.width, t.height);
+        gl.uniform4f(this.loc(`_${name}_imgRect`), 0, 0, 1, 1);
+        gl.uniform1i(this.loc(`_${name}_flip`), 0);
+        unit += 1;
+      }
+      // A TARGET the final pass names has no buffer; keep its sampler on a valid texture.
+      const lastTarget = this.passes[last].target;
+      if (lastTarget && !this.targets.has(lastTarget)) {
+        gl.activeTexture(gl.TEXTURE0 + unit);
+        gl.bindTexture(gl.TEXTURE_2D, this.blankTexture);
+        gl.uniform1i(this.loc(lastTarget), unit);
+      }
+
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      writing?.swap();
+    }
     gl.bindVertexArray(null);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
@@ -491,13 +669,17 @@ export class IsfInstance {
     gl.uniform1i(this.loc(`_${input.NAME}_flip`), 0);
   }
 
+  private effectiveValue(input: IsfInput, frame: IsfFrameInputs): unknown {
+    const bind = input.CUEMARK_BIND;
+    return bind
+      ? (frame.bindings[bind] ?? input.DEFAULT ?? 0)
+      : (frame.params[input.NAME] ?? input.DEFAULT ?? typeZero(input.TYPE));
+  }
+
   private setValueInput(input: IsfInput, frame: IsfFrameInputs): void {
     const { gl } = this;
     const loc = this.loc(input.NAME);
-    const bind = input.CUEMARK_BIND;
-    const raw: unknown = bind
-      ? (frame.bindings[bind] ?? input.DEFAULT ?? 0)
-      : (frame.params[input.NAME] ?? input.DEFAULT ?? typeZero(input.TYPE));
+    const raw = this.effectiveValue(input, frame);
 
     switch (input.TYPE) {
       case "float":
@@ -529,7 +711,7 @@ export class IsfInstance {
     }
   }
 
-  /** Deletes the program, shaders, FBO and blank texture. Safe to call twice. */
+  /** Deletes the program, shaders, FBO, pass buffers and textures. Safe to call twice. */
   dispose(): void {
     if (this.disposed) return;
     const { gl } = this;
@@ -542,6 +724,8 @@ export class IsfInstance {
       if (entry.texture) gl.deleteTexture(entry.texture);
       entry.texture = null;
     }
+    for (const t of this.targets.values()) t.dispose();
+    this.targets.clear();
     for (const e of this.fftTextures.values()) gl.deleteTexture(e.tex);
     this.fftTextures.clear();
     this.fbo.destroy();

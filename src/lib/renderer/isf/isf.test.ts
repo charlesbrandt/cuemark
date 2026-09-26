@@ -39,7 +39,7 @@ describe("parseIsf — built-in shaders", () => {
     it(`parses ${builtin.id} (${builtin.name})`, () => {
       const parsed = parseIsf(builtin.source);
       expect(parsed.type).toBe("generator");
-      expect(parsed.passes.length).toBe(1);
+      expect(parsed.passes.length).toBe(builtin.id === "builtin:feedback" ? 2 : 1);
 
       const binds = parsed.inputs.map((input) => input.CUEMARK_BIND).filter(Boolean);
       expect(binds.sort()).toEqual([...expectedBinds[builtin.id]].sort());
