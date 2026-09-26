@@ -168,6 +168,19 @@ DISPLAY=:99 tauri-driver --port 4444 --native-driver "$WEBKIT_DRIVER" > /tmp/tau
 echo $! > /tmp/tauri-driver.pid
 sleep 1
 ```
+🔴 **`DISPLAY=:99` alone does NOT keep the app off the user's screen on a Wayland session.**
+GTK prefers Wayland whenever `WAYLAND_DISPLAY` is set, so the app ignores `DISPLAY`, opens
+its control + output windows on the real desktop, and plays audio through the real output
+(caught 2026-09-25: a verify agent ran ~4 minutes that way; state stayed isolated via XDG
+dirs, the screen and speakers did not). Launch with the Wayland variables removed and X11
+forced:
+```sh
+env -u WAYLAND_DISPLAY GDK_BACKEND=x11 DISPLAY=:99 tauri-driver --port 4444 --native-driver "$WEBKIT_DRIVER" ...
+```
+**Prove it before trusting the run:** `xwininfo -root -tree -display :99` must list the
+cuemark windows; an empty tree means they are on the real desktop. Put this line in any
+verify-agent prompt.
+
 `tauri-driver` proxies the W3C WebDriver protocol to `WebKitWebDriver`, which it
 launches itself — it inherits `DISPLAY` from its own environment, so the app appears
 on `:99`, not the real screen.

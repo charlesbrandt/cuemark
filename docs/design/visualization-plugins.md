@@ -1,8 +1,8 @@
 # Visualization plugins (ISF + Milkdrop)
 
-**Status (2026-09-25, late): Phase 2 BUILT, not verified live** (params UI, hot reload,
-image inputs; see "Phase 2 → Result"). Phase 3 step 0 instrumentation + `bass-test.fs` built,
-not yet judged by the user. Earlier: **Phase 1 DONE** (ISF loader, built-ins ported, plugin folder, error
+**Status (2026-09-26): Phase 3 BUILT + headless-verified on `mele`, not yet judged live** (see
+"Phase 3 → Result"). Phase 2 BUILT, not verified live (params UI, hot reload, image inputs; see
+"Phase 2 → Result"). **Next: user judges `bass-test.fs` / `fft-bars.fs` live, then phase 4.** Earlier: **Phase 1 DONE** (ISF loader, built-ins ported, plugin folder, error
 reporting). Verified headlessly on `mele` and by the user in the live output window, see
 "Phase 1 → Result". **Next: phase 2.** Phases 2–7 not started. Scope was decided with the user in
 conversation: build on **ISF** and **Milkdrop** (via Butterchurn); **no arbitrary JS plugins**.
@@ -404,6 +404,27 @@ the left deck; moving it right moves the reaction with it; `'deck:<id>'` follows
 regardless of the crossfader. A shader bound to `beatPhase` flashes on the beat of a gridded
 track (watch it, and check a deck without a grid reports `hasBeatGrid = 0`).
 
+**Result (2026-09-26): BUILT, headless-verified on mele; the user has not yet judged it live.**
+Commits `615b015` (`src/lib/viz/vizBindings.ts`: `routeAudio`, `effectiveDeckGain`,
+`computeBindings`, unit-tested), `d3b0c00` (`audioFFT` → 32×1 R8 texture from `vizFft`,
+`isf/testplugins/fft-bars.fs`), `1898df3` (`Session.vizAudioSource`, panel selector), `68178bc`
+(`App.svelte` integration, `bootRestore` restore, `[viz] dominant` log). Verified: bindings move
+with music; crossfader 0→1→0 moves the dominant deck; `deck:<id>` ignores the fader; `cue`
+follows `cueEnabled` (`none` when nothing is cued); a deck without a grid logs `hasBeatGrid=0`
+with `bpm` still non-zero; fft-bars bars visibly move in a real screen grab.
+- Decisions: a **paused deck is silent** under `mix`/`cue` (bands no longer freeze); `deck:<id>`
+  keeps a paused deck's last values. Crossfader ties go right (`pos >= 0.5`).
+- ⚠️ `setCrossfader` already writes the curve gain into `deck.volume` when `crossfaderTargets`
+  includes `volume`; `effectiveDeckGain` therefore skips the curve unless
+  `crossfaderInVolume:false`. Applying it again would square it — the same class of bug as the
+  master-volume one in `shared-output-pipeline.md` "Gain staging".
+- `deck.bpm` is the native tempo; the `bpm` binding is `bpm × playbackRate`.
+- `Session.vizAudioSource` is **optional** in the type (old test fixtures); readers treat
+  `undefined` as `'mix'`. It is persisted via `bootRestore.ts`, which restores globals field by
+  field — any new global needs a line there or it silently resets on restart.
+- **Not done:** `inMixOut` and `liked` bindings are hardcoded 0 (need `effectiveZones()` +
+  Digger markers, and `is_liked` on the deck). Not judged by ear/eye by the user.
+
 ### Phase 4: multipass and persistent buffers
 
 `PASSES` with `TARGET`, `PERSISTENT`, `WIDTH`/`HEIGHT` expressions and `FLOAT`. Rewrite the
@@ -478,6 +499,17 @@ and auto-cycle changes presets on a beat.
   evaluated on dominant-deck change. A per-track override from `track-visual-override.md`
   always wins over a rule.
 - Numeric Digger fields (mood scores, energy, if they exist) become new `CUEMARK_BIND` names.
+- **Idea (2026-09-26, user): lyrics and the CLAP-derived song description as visualization
+  inputs.** Unverified what Digger actually stores — check the `digger` skill, the lyrics
+  importer and `music-lab`'s `mood-analyze` output before designing. GLSL can't read text, so
+  three routes, cheapest first: (a) **numeric** — CLAP mood/energy scores as `CUEMARK_BIND`
+  floats, lyrics reduced to numbers (`hasLyrics`, current-line progress if lines are
+  timestamped); (b) **rules layer** above — description keywords/tags pick a plugin (already
+  this phase); (c) **text as texture** — the host rasterises the current lyric line, title or
+  description onto a 2D canvas and binds it to an `image` input carrying
+  `"CUEMARK_BIND": "lyricLine"` (host-side, no arbitrary JS in plugins; needs a new
+  `CUEMARK_BIND` image kind and a timestamped-lyrics source). Note the doc's rule: bindings
+  that look right but are random are worse than none, so gate (c) on lyrics having timestamps.
 
 ## Out of scope (explore separately)
 
