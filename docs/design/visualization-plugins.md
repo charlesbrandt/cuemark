@@ -437,6 +437,18 @@ Evaluate them with a tiny hand-written evaluator: numbers, `$names`, `+ - * /`, 
 switching plugins 50 times doesn't grow the output window's memory (compare
 `WebKitWebProcess` RSS before and after).
 
+**Result (2026-09-26): BUILT (`6e362d3`), headless-verified on mele; user has not judged Feedback live.**
+`expr.ts` (safe evaluator), `PassTarget` in `instance.ts` (ping-pong for PERSISTENT, 16F for FLOAT,
+8-bit fallback), Feedback built-in rewritten around a persistent buffer. Verified under Xvfb/X11:
+Feedback accumulates trails then plateaus at ~11.6% non-black after ~2s; a quarter-size `TARGET` pass
+renders at 480x270; bad expressions surface as `failed (parse)` in the panel and log; 400 plugin
+switches added ~16.5 MB of output-process RSS (~40 kB/switch), matching the ~2 MB/min creep seen
+idle on a viz, so no per-switch leak of the 16 MB float buffers.
+- Not verified: audio reaction of Feedback; the ~2 MB/min creep while a viz is active (source unknown,
+  isolate with a long idle run on Feedback alone); one unreproduced 6.1s output-window stall (watchdog
+  fired right after selecting particles/scope, recovered).
+- ⚠️ A `TARGET` named `half` (or any GLSL reserved word) fails to compile; it does surface visibly.
+
 ### Phase 5a: PCM tap (Rust), needed by Milkdrop and the ISF `audio` input
 
 - **Tap point (decided 2026-09-25): before master volume**, in the shared output graph node
