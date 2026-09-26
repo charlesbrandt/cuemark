@@ -1,22 +1,19 @@
 # Visualization plugins (ISF + Milkdrop)
 
-**Status (2026-09-26): Phase 4 BUILT + headless-verified (multipass, persistent/float buffers, safe
-size expressions, real Feedback built-in; see "Phase 4 → Result"); user judged Feedback good live.
-Phase 3 judged live: `fft-bars` "a bit muted" but visibly reacts (bars go flat when paused).**
-Open follow-ups: `inMixOut`/`liked` bindings (hardcoded 0), a warning when a bare-file plugin uses
-`IMPORTED`, the deleted-active-plugin `read:` error, Phase 2 params/hot reload still not judged live.
-Phase 2 BUILT, not verified live (params UI, hot reload, image inputs; see
-"Phase 2 → Result"). Earlier: **Phase 1 DONE** (ISF loader, built-ins ported, plugin folder, error
-reporting). Verified headlessly on `mele` and by the user in the live output window, see
-"Phase 1 → Result". **Next: phase 2.** Phases 2–7 not started. Scope was decided with the user in
-conversation: build on **ISF** and **Milkdrop** (via Butterchurn); **no arbitrary JS plugins**.
-Richer and controllable visualizations are to be explored separately later (see "Out of scope").
-**Open follow-ups (2026-09-26):** `inMixOut`/`liked` (removed from the vocabulary until a
-dominant-deck source exists, see "Cuemark bindings"); IMPORTED warning and missing-plugin
-fallback are DONE (see "Follow-up result 2026-09-26"); still open: `beatPhase`/`bpm`/dominant
-deck, `~2MB/min` RSS creep. Open questions 1–3 were researched on 2026-09-25 (package source read, parser run on test
-shaders, `mixer.rs` traced); the answers are folded into the sections below and summarised
-under "Open questions".
+**Status (2026-09-26):** Phases 1-4 BUILT; Phase 1 and the Feedback built-in (phase 4) judged
+good live, Phase 3 judged live ("a bit muted", `fft-bars` visibly reacts). Phase 2 (params UI,
+hot reload, image inputs) **verified headless on mele** ("Result 2026-09-26, late" item C), not
+yet judged by the user. **Follow-ups 1-3 DONE** (IMPORTED warning, missing-plugin fallback,
+`inMixOut`/`liked` removed from the binding vocabulary; see "Follow-up result 2026-09-26").
+**Phase 6 iframe spike: PASS** (see Phase 6 step 1). Output-window **RSS creep reproduced but
+unattributed** (not viz-specific, no fix); the **6 s output stall after selecting particles/scope
+was not reproduced** in 402 selections. Phases 5-7 not started. Still open: `beatPhase`/`bpm`
+live judgement, params persistence across restart and MIDI (Phase 2, uncovered), `inMixOut`/`liked` (need a real source; see
+"Cuemark bindings"). Scope was decided with the user in conversation: build on **ISF** and
+**Milkdrop** (via Butterchurn); **no arbitrary JS plugins**. Richer and controllable
+visualizations are to be explored separately later (see "Out of scope"). Open questions 1-3
+were researched on 2026-09-25 (package source read, parser run on test shaders, `mixer.rs`
+traced); the answers are folded into the sections below and summarised under "Open questions".
 
 Written to be picked up phase by phase, possibly by a smaller model. Each phase has its own
 files, steps and a "done when". **Read "Hazards" before starting any phase.**
@@ -140,13 +137,13 @@ this doc:
 | `trackProgress` | float 0–1 | Position / duration | Deck position + `DeckSource.duration` |
 | `crossfader` | float 0–1 | Crossfader position | `Session` |
 
-**Removed 2026-09-26: `inMixOut` and `liked`.** They were listed here but never implemented
-(the code exposes only `bass`/`mid`/`high`; nothing was hardcoded to 0, they simply did not
-exist). The raw data does exist (`Deck.mixOutStart/mixOutEnd` + position for `effectiveZones()`;
-`DiggerQueueItem.is_liked` matched by `Deck.diggerTrackId`), but both need a **dominant deck**,
-and that concept is not built (bands are a max across all decks). Guessing the deck would make
-them look right and be wrong, so they come back with Phase 3's dominant-deck routing, not
-before. `liked` is also queue-scoped: a track loaded from search results has no queue row.
+**Removed 2026-09-26: `inMixOut` and `liked`.** The Phase 3 code hardcoded both to 0 (`inMixOut: 0`,
+`liked: false` in `App.svelte`), so a shader binding them silently saw a constant; they are gone
+from `BINDING_NAMES`/`computeBindings` now, and a `CUEMARK_BIND` naming them simply gets no
+value. The raw data exists (`Deck.mixOutStart/mixOutEnd` + position for `effectiveZones()`;
+`DiggerQueueItem.is_liked` matched by `Deck.diggerTrackId`) and the dominant deck now exists
+(`routeAudio`), so they can come back once wired to real values. `liked` is queue-scoped: a
+track loaded from search results has no queue row.
 
 ⚠️ **`beatPhase` is per beat, not per bar.** `deck.downbeat` is a beat-level anchor
 (`beatmatching.md`); nothing detects bar-beat-1. Don't add a `barPhase` binding until bar
@@ -435,8 +432,9 @@ with `bpm` still non-zero; fft-bars bars visibly move in a real screen grab.
 - `Session.vizAudioSource` is **optional** in the type (old test fixtures); readers treat
   `undefined` as `'mix'`. It is persisted via `bootRestore.ts`, which restores globals field by
   field — any new global needs a line there or it silently resets on restart.
-- **Not done:** `inMixOut` and `liked` bindings are hardcoded 0 (need `effectiveZones()` +
-  Digger markers, and `is_liked` on the deck). Not judged by ear/eye by the user.
+- **Not done:** `inMixOut` and `liked` bindings were hardcoded 0 and were removed from the
+  vocabulary in the 2026-09-26 follow-up (need `effectiveZones()` + Digger markers, and
+  `is_liked` on the deck). Not judged by ear/eye by the user.
 
 ### Phase 4: multipass and persistent buffers
 
