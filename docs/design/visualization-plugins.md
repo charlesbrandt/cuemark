@@ -504,6 +504,36 @@ the gain-weighted pre-EQ approximation. Only if phase 3's approximation feels wr
 1. Spike the three sandboxed-iframe checks in "Milkdrop renderer" item 4 first, and write
    the results here. (The audio-feed and readback questions were answered by reading the
    source on 2026-09-25.)
+
+   **Spike result (2026-09-26, `mele`, real cuemark debug binary via tauri-driver + Xvfb with
+   `CUEMARK_DISABLE_DMABUF=1`, butterchurn 2.6.7 + butterchurn-presets 2.4.7 Minimal pack;
+   `scripts/probes/milkdrop_sandbox_iframe_probe.py`, re-runnable in ~1 min, exits 0 on pass):**
+
+   | # | Check | Verdict |
+   |---|---|---|
+   | 1 | WebGL2 works inside `<iframe sandbox="allow-scripts">` | **PASS.** `getContext('webgl2')` gives `WebGL 2.0`; `createVisualizer(null, canvas, opts)` succeeds; a preset (`Flexi, fishbrain, Geiss + Martin - tokamak witchery`) rendered 400+ frames with no error; `readPixels` *inside* the iframe shows 4096/4096 sampled pixels lit (a black canvas cannot pass). `new Function` (preset equations) works. The preset JSON object reached the iframe via `postMessage` structured clone and `loadPreset` accepted it. |
+   | 2 | iframe has no `window.__TAURI__` / `__TAURI_INTERNALS__` | **PASS.** Top frame: both `object` (control arm, so the check can fail). Sandboxed iframe: both `undefined`, no IPC fn to call, `window.parent.document` throws `SecurityError`, `self.origin === "null"`. **Stronger than the sandbox:** a *same-origin, unsandboxed* control child frame also has neither. Tauri's init script is not injected into child frames on this build, so the sandbox is defence in depth for IPC and is what actually blocks parent DOM access. Keep it. |
+   | 3 | Per-frame `postMessage` of 3 x 1024 B costs no measurable frame time | **PASS.** Call cost p95 <= 1 ms (p50 rounds to 0; timers here are 1 ms-quantised). Host rAF delta p50: baselines 14/17/17 ms, 3 KB-per-frame arms 17/17 ms (inside the run's own 14 -> 17 ms baseline drift). Control arm (32 MB structured clone per frame) moves the call to p95 9-10 ms, so the instrument can see a cost. Butterchurn render inside the iframe p50 ~5 ms. |
+
+   Also observed: with the iframe stacked over a canvas via CSS, `elementFromPoint` returns the
+   iframe and computed `opacity` is `0.5`, so the layering and whole-layer opacity from item 3
+   apply. **The pixels of the composite were not looked at** (WebDriver screenshots hang here,
+   and WebGL readback is not a valid check of what is *displayed*); look at the window live.
+   `mix-blend-mode` is still untested.
+
+   **Consequences for the design:**
+   - Design in "Milkdrop renderer" item 4 stands unchanged; go ahead with `MilkdropInstance`.
+   - Send presets as JSON via `postMessage` (no need to serve them as files); PCM as three
+     transferred `Uint8Array(1024)` per frame is safe.
+   - **Not covered, verify in phase 6 proper:** (a) the probe page was `http://localhost:1420`
+     embedding `http://127.0.0.1:1420`; production's output window is `tauri://localhost`
+     embedding an `http://127.0.0.1:<media-server-port>` frame, a mixed-scheme case not tested
+     and one that `media_server.rs` must also serve the right `Content-Type` for; (b) numbers
+     are software GL under Xvfb (~22 fps at 640x360), so they bound *IPC cost*, not GPU cost;
+     re-check render time against the ~8 ms frame budget on the projector's hardware; (c) the
+     MacBook Pro (`crocus`) was not run, so check 1's pixel assertion would `SKIP` there;
+     (d) that audio PCM visibly *drives* the preset was not asserted (the frames rendered and
+     `recv` counted, nothing more).
 2. `MilkdropInstance`: a sandboxed iframe stacked above the compositor canvas in
    `output.html`, running `createVisualizer(null, canvas)` and fed from `pcm` via
    `postMessage`.
