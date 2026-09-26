@@ -524,6 +524,62 @@ Harness (not committed): scratchpad `h/vizh.py`, `rss_arm.py`, `cycle_b.py`, `it
 **Done when:** a 600 s soak with the tap on shows no new `output_queue` warnings compared
 with the same soak with it off, and a waveform ISF shader shows a waveform.
 
+### Phase 5a → Result (2026-09-26, branch `viz-phase5a-pcm-tap`, mele, headless)
+
+**Built.** `audio/pcm_tap.rs` (pure logic + gate) and `audio/mixer.rs`. Every real-device node
+now has a `tee` between `caps_el` and `master_volume_el` (a pass-through with one branch; the
+record node has none). The tap branch `tee → valve → queue leaky=downstream max-size-buffers=2
+→ appsink drop=true max-buffers=1 sync=false async=false` is built **lazily** on a running node
+the first time `viz_set_listening(true)` arrives while a main branch exists, and is then only
+gated by the valve (never removed from a PLAYING node). Channels come from the main branch's own
+mix-matrix (`main_pair()`), never from the node's first two channels; cue/record keys never
+qualify; one node owns the tap. Frame = `mono|L|R`, 1024 samples each, 128 = silence, emitted as
+base64 (`audio-pcm`, 4 KB rather than ~12 KB of JSON numbers) on a drift-corrected 60 Hz
+schedule. `OutputGraph::set_pcm_emit()` takes a closure built from the `AppHandle` in `lib.rs`
+(so `mixer.rs` stays Tauri-free); `viz_set_listening` flips a lock-free flag and reconciles on a
+thread (it never waits on the graph mutex). Frontend: `lib/viz/vizPcm.ts` decodes, forwards in
+the frame message's `pcm` field, and drives the gate. **The gate is narrower than the doc**: the
+tap is on only while the output window's `alive` beacon is fresh, a visualization is selected,
+**and the plugin declares an ISF `audio` input** (`pluginWantsPcm`). None of the five built-ins do,
+so normal use never builds the tap. Phase 6 must extend `pluginWantsPcm` for Milkdrop.
+ISF `audio` inputs are fed: R8 1024x2 texture, row 0 = left, row 1 = right, 0.5 = zero
+(`testplugins/waveform.fs` is the sample; not shipped as a built-in).
+
+**Soak (600 s each, real binary, Xvfb + `CUEMARK_DISABLE_DMABUF=1`, isolated XDG dirs, looped
+H.264/AAC clip playing on deck-0, audio to a temporary 4-channel PipeWire null sink: main
+`FL,FR`, cue `RL,RR`, cue enabled, so the shared 4-ch node was exercised).**
+OFF arm = `builtin:plasma` (tap never built); ON arm = `waveform.fs` (tap built, emitting).
+
+| | OFF | ON |
+|---|---|---|
+| WARN / ERROR lines | 0 / 0 | 0 / 0 |
+| `output_queue` lines, underrun, xrun, stall, clock warnings, watchdog | 0 | 0 |
+| `[deliver-tel]` sink margin | +56 ms | +56 ms |
+| `[deliver-tel]` cue margin | -9 ms | -9 ms |
+| RSS (app / control webview) | flat | flat (322 MB / ~275 MB) |
+| tap emit rate | n/a | 57/s average (<=60), 601 in 10 s at best |
+| tap emit (Tauri `emit`) cost | n/a | mean 0.64 ms, max ~10 ms |
+
+No regression, so the tap stays wired as above (it is opt-in by plugin, not by a flag). Emit rate
+dips (23-40/s in some 10 s windows) track the sink's buffer arrival rate on this headless box, not
+the tap.
+
+**Content checks.** `cargo test -- --ignored pcm_tap_reads_main_only` (needs a 4-ch null sink,
+see the test's doc comment) runs the real graph: main = -0.25/+0.25, cue = loud 0.9, master
+volume 0. Result: PCM shows exactly the main pair's values (pre-master-volume: not scaled, not
+silent at volume 0), the cue level appears nowhere, <100 frames in 1.5 s, and closing the gate
+stops emission. The margins above match between arms, so `position()`'s latency correction is
+undisturbed (the tap is a side branch of the tee and adds nothing to the path to the sink).
+Rust unit tests cover channel selection (front/rear/mono/none), downmix, quantise, window, base64.
+
+**NOT verified.** Live listening / any real device (only a null sink); the 2-channel default-device
+path and a real Starlight (only the 4-ch null-sink layout); a visible waveform on screen (WebGL
+pixels cannot be checked headlessly here; the texture path is unit-tested and the `audio-pcm`
+->`pcm`->texture chain ran without errors, but nobody looked at a picture); the IPC cost at the
+control window's frame budget (only Rust-side emit time was measured, not `[raf]`/`[poll-stats]`
+with the tap on); a second main device on another node (one owns the tap); hours-long behavior;
+the MacBook Pro. Tap teardown is intentionally absent (valve only).
+
 ### Phase 5b (optional): move band analysis to the output node
 
 A `spectrum` element on the node makes `'mix'` reflect EQ kills and the real mix, instead of

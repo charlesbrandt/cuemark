@@ -1032,7 +1032,8 @@ fn build_tap(node: &mut OutputNode, emit: PcmEmit, shared: Arc<PcmShared>) -> Re
     let mut window = PcmWindow::new();
     let mut scratch: Vec<u8> = Vec::with_capacity(pcm_tap::PCM_FRAME_BYTES);
     let mut samples: Vec<f32> = Vec::new();
-    let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let period = std::time::Duration::from_micros(1_000_000 / 60);
+    let mut next_due = std::time::Instant::now();
     let mut stat_start = std::time::Instant::now();
     let (mut emitted, mut emit_us_sum, mut emit_us_max, mut buffers) = (0u64, 0u64, 0u64, 0u64);
     let stat_label = label.clone();
@@ -1052,8 +1053,11 @@ fn build_tap(node: &mut OutputNode, emit: PcmEmit, shared: Arc<PcmShared>) -> Re
                 );
                 window.push_interleaved(&samples, channels, pair);
                 buffers += 1;
-                if last_emit.elapsed().as_millis() as u64 >= pcm_tap::MIN_EMIT_INTERVAL_MS {
-                    last_emit = std::time::Instant::now();
+                let now = std::time::Instant::now();
+                if now >= next_due {
+                    // Drift-corrected 60 Hz schedule: buffers arrive every ~15ms, so a plain
+                    // "17ms since last emit" gate would emit every 2nd one (~30/s).
+                    next_due = if now > next_due + period * 2 { now + period } else { next_due + period };
                     window.encode(&mut scratch);
                     let t = std::time::Instant::now();
                     emit(&scratch);

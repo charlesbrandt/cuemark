@@ -28,8 +28,7 @@ use std::sync::Arc;
 pub const PCM_LEN: usize = 1024;
 /// Bytes per emitted frame: mono | left | right, each `PCM_LEN` long.
 pub const PCM_FRAME_BYTES: usize = PCM_LEN * 3;
-/// Minimum time between emits: 1/60 s, rounded up so the rate is never above 60 Hz.
-pub const MIN_EMIT_INTERVAL_MS: u64 = 17;
+// Emit rate: a drift-corrected 60 Hz schedule lives in the tap callback (mixer.rs build_tap).
 
 /// "No pair" sentinel for [`PackedPair`].
 const NO_PAIR: u32 = u32::MAX;
