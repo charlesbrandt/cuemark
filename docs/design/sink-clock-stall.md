@@ -171,6 +171,34 @@ warning at all, H1 is wrong and the gdb-and-journal route reopens.
   whether fix 2 is meaningful.
 - Not live-verified: any fix. Never rebuild/deploy during a live set (see memory).
 
+## 9. Third incident, 2026-09-26 16:13–16:19 UTC — self-recovered, clock pinned (evidence only)
+
+User report: a deck played silent, then audio "came back on its own", no restart. Findings from
+`cuemark.log` (all UTC):
+
+- **Trigger looks the same as §2.** deck-0 was loaded and played at 16:13:18 with `graph idle
+  5873.2s` (98 min). Its margins were degraded from the first buffer and stayed so: `sink0 +63ms`,
+  `sink1 -0ms` (min -15ms). A first play after 1137s idle at 14:33 was healthy (+99ms).
+- **Recovery coincided with a different pipeline, not a drain.** Auto DJ played deck-1 (loaded
+  16:18:08, played 16:18:42, `graph idle 0.0s`): margins `+101ms / +36ms`. deck-0 was detached at
+  16:19:02. deck-0 reloaded 16:22:29 and replayed 16:23:04 with healthy `+100 / +36`. So a fresh
+  pipeline on the now-active graph is healthy; the pipeline that first played after the idle was not.
+- **The sink clock did NOT drain.** `CLOCK STALLED` (sink `GstAudioClock` advanced 0ms/5s, cumulative
+  drift +4803s at 16:26 and falling 5s per 5s, i.e. frozen ~80 min ahead) kept firing, unchanged,
+  while audio was audible again. Decks are on the pinned `GstSystemClock` (`e19c255`), and node-tel
+  read `real=100/s gap=0/s` throughout: the node emitted real audio to the pulsesink the whole time.
+  **A stalled sink clock is therefore neither necessary nor sufficient for silence with the pin.**
+- ⚠️ **Retracted signals.** `pw-top` showing the USB sinks `R` with quantum 0 / rate 0 read identically
+  while silent and while audible, and `CLOCK STALLED` did too. Neither discriminates. Do not diagnose
+  "silent" from them.
+- The window overlapped headless verify-agent instances (isolated XDG dirs, same PipeWire). Stall
+  warnings doubled from 12 to 24/min at 16:08 (an extra instance's nodes?). Not ruled out as a cause.
+- **Unknown, and the missing instrument:** whether the samples reached PipeWire. Next time it
+  happens, capture the sink's monitor (`pw-record --target <sink>.monitor`, or `pw-cat`) for a few
+  seconds while silent, and check `zero%`. Better: a post-mixer level probe per node (6.x) so the log
+  itself says whether a node emitted signal. Until then the mechanism stays unproven.
+- Workaround supported by the data: reload the deck (a fresh pipeline on an active graph played fine).
+
 ## 8. Evidence index
 
 - Logs: `~/.local/share/com.cuemark.app/logs/cuemark_2026-09-26_*.log` (incident 12:53 UTC),
