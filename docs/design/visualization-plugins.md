@@ -1,8 +1,12 @@
 # Visualization plugins (ISF + Milkdrop)
 
-**Status (2026-09-26): Phase 3 BUILT + headless-verified on `mele`, not yet judged live** (see
-"Phase 3 → Result"). Phase 2 BUILT, not verified live (params UI, hot reload, image inputs; see
-"Phase 2 → Result"). **Next: user judges `bass-test.fs` / `fft-bars.fs` live, then phase 4.** Earlier: **Phase 1 DONE** (ISF loader, built-ins ported, plugin folder, error
+**Status (2026-09-26): Phase 4 BUILT + headless-verified (multipass, persistent/float buffers, safe
+size expressions, real Feedback built-in; see "Phase 4 → Result"); user judged Feedback good live.
+Phase 3 judged live: `fft-bars` "a bit muted" but visibly reacts (bars go flat when paused).**
+Open follow-ups: `inMixOut`/`liked` bindings (hardcoded 0), a warning when a bare-file plugin uses
+`IMPORTED`, the deleted-active-plugin `read:` error, Phase 2 params/hot reload still not judged live.
+Phase 2 BUILT, not verified live (params UI, hot reload, image inputs; see
+"Phase 2 → Result"). Earlier: **Phase 1 DONE** (ISF loader, built-ins ported, plugin folder, error
 reporting). Verified headlessly on `mele` and by the user in the live output window, see
 "Phase 1 → Result". **Next: phase 2.** Phases 2–7 not started. Scope was decided with the user in
 conversation: build on **ISF** and **Milkdrop** (via Butterchurn); **no arbitrary JS plugins**.

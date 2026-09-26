@@ -538,3 +538,34 @@ self-healing or graph rebuilding until that data exists.
 - A candidate self-heal, if data supports it: rebuild the *output graph* when no deck is
   playing. Ranked above a per-deck rebuild by this evidence, and still unbuilt.
 
+
+## Duplicate main outputs — one DAC, two streams (fixed 2026-09-26)
+
+**Symptom**: "two versions of the same audio playing at once" — an echo/comb/flanger-like
+doubling of the same track, on every play, not one track. Live-hit on the track "Moonrise".
+
+**Cause**: `cuemark:mainOutputDeviceIds` was `["", "<PCM2902 node name>"]`. `""` is the system
+default, and the system default *was* the PCM2902, so the same DAC was listed twice. Each entry is
+a separate node and a separate `pulsesink` stream (`out/default`, `out/analog-stereo`), both linked
+to the same `alsa_output…:playback_FL/FR`; the two streams reach the DAC at slightly different
+delays (the deck-side `deliver-tel` margins differed by ~64ms, `sink0 +64` vs `sink1 -0`) and the
+listener hears the sum. Appeared with a Settings change (five rapid `set_devices` rounds, 13:07 UTC
+that day); before it the pair was PCM2902 + Starlight, two different DACs.
+
+**Why nothing caught it**: the graph de-duplicates by device id *string* (`node_key`), and `""` ≠
+the named sink. Same failure class as the original "two `pulsesink`s on one PipeWire node".
+
+**Fix** (`91f2deb`): `devices::dedupe_main_devices` in `audio_set_main_devices`, before the no-op
+guard (the guard now compares the *effective* list). `""` is resolved via `pw-dump`'s `default`
+metadata (`default.audio.sink`, the effective default — not `default.configured.audio.sink`, which
+here is `auto_null`). Ids compare as full strings after that, so `dev@front`/`dev@rear` (one node,
+two channel pairs, deliberate) are **not** duplicates. First occurrence wins; a `[audio] main
+outputs [...] resolve to a device already in the list` warning is logged. Settings shows what
+"Default" is and warns when both are ticked. The persisted setting is not rewritten.
+
+**Known limit**: the default is resolved when the list is applied; changing the system default later
+does not re-check until the next change/restart.
+
+**Diagnose in seconds**: `pw-link -l | grep -A3 <sink>` — two `cuemark:output_*` links on each
+playback port of one sink is the tell. Also `grep 'attached deck-N/main' cuemark.log` (two different
+nodes) and the persisted `mainOutputDeviceIds`.

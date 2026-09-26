@@ -777,6 +777,38 @@ mechanism (a `master_volume` omission in `load()`'s volume-application, unrelate
 pipeline teardown) — see that doc's "Recurrence" note under Bug B before assuming either
 write-up fully explains the other.
 
+### "Two copies of the same audio at once" (echo / comb / flanger) — check for one DAC reached twice (2026-09-26, FIXED)
+
+**First check, 10 seconds**: `pw-link -l | grep -A3 <your-sink>` — two `cuemark:output_FL` links on
+one playback port means the same device is being fed by two `pulsesink` streams. Then
+`grep 'attached deck-N/main' cuemark.log` (two different nodes, e.g. `out/default` and
+`out/analog-stereo`) and the persisted `cuemark:mainOutputDeviceIds`. The usual shape is
+`["", "<named sink>"]` where `""` (system default) *is* that named sink. It is not a per-track
+fault: every play is doubled from the moment the setting changed (find the `set_devices` burst).
+Fixed by `devices::dedupe_main_devices` (see `shared-output-pipeline.md` "Duplicate main
+outputs"). The `deliver-tel` `sink0`/`sink1` margins differing by ~a buffer is a *symptom
+neighbour*, not the audible offset — the real offset lives in each stream's pulse/PipeWire
+buffering and was never measured (`pw-record --target <node>` ×2 + cross-correlate if it matters).
+Rule out the other doublers before blaming routing: cue/Snapcast branch, a second cuemark or app
+on the same sink, both decks holding the same track (Auto DJ crossfade, the EOS double-load).
+
+### ⚠️ Signals that do NOT discriminate "silent" from "audible" (learned 2026-09-26)
+
+A diagnosis of "the sink is wedged" was built on `pw-top` showing the USB sinks `R` with
+`QUANT 0 / RATE 0`, and on `[audio/out/…] CLOCK STALLED`. **Both read identically while audio
+was audible again** — with the clock pinned to `GstSystemClock`, a frozen `GstAudioClock` on the
+pulsesink is neither necessary nor sufficient for silence. Same rule as "an instrument that
+cannot vary with the fault carries no information about it". What *did* discriminate: the
+deliver-tel margins per deck (a first play after a long graph idle read `+63 / -0`; a fresh deck
+on the active graph read `+101 / +36`) and the timeline of which pipeline was playing. What is
+still missing is whether samples reached PipeWire: while it is silent, capture the sink monitor
+(`pw-record --target <sink>.monitor`) *before touching anything* and read `zero%`; better, add a
+post-mixer level probe per node. `pactl` is not installed on this machine — use `pw-dump`/`wpctl`.
+
+Also: a recovery with no restart usually coincides with a *different pipeline* taking over (Auto
+DJ playing the other deck, a reload), not a buffer draining — check the `auto-dj`/`load()`
+timeline first, and remember the sink-clock drift kept ticking down unchanged.
+
 ### Silent or bursty audio on a long-running instance — read `margin` first, and it is NOT pipeline age (2026-09-19, OPEN)
 
 **Symptom**: hours-to-days uptime; decks reach `Playing`, no bus `ERROR`, but nothing is

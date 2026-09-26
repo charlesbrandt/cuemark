@@ -516,8 +516,17 @@ input with an extra `"CUEMARK_BIND": "bass"` key, which cuemark drives each fram
 ISF hosts ignore (they show a slider). A shader with no bound inputs — e.g. most shaders
 downloaded from the web — does not react to audio, by design. Today only `bass`/`mid`/`high`
 exist (max across decks' pre-EQ spectrum); the full vocabulary and routing arrive in phase 3.
-⚠️ Whether the built-ins *visibly* react to audio has never been confirmed live — check the
-band values before blaming a shader.
+Confirmed live 2026-09-26 for `fft-bars.fs` (reacts; bars go flat when paused; looks "a bit
+muted") — the other built-ins' reaction is still unjudged, so check the band values before
+blaming a shader.
+
+**Multipass (phase 4, 2026-09-26)**: `PASSES` with `TARGET` render into named offscreen buffers
+(`PassTarget` in `isf/instance.ts`); `PERSISTENT` ones ping-pong (a pass reads last frame's result
+while writing this frame's), `FLOAT` uses 16-bit buffers (8-bit fallback + one log line without
+`EXT_color_buffer_float`), the last pass is the output. `WIDTH`/`HEIGHT` go through the hand-written
+evaluator in `isf/expr.ts` — plugins are data, never `eval`. ⚠️ A `TARGET` named with a GLSL reserved
+word (`half`, …) fails to compile (visibly, in the panel). `builtin:feedback` is a real persistent-buffer
+feedback loop now.
 
 `TIME` counts from when the plugin was loaded, in the output window (ISF convention, and
 keeps float precision) — animations restart on every switch.

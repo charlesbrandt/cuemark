@@ -682,6 +682,24 @@ post-reload state:
 
 ## Gotchas
 
+- **A delegated verify agent's instance is not audio-isolated (2026-09-26).** Pointing
+  `XDG_DATA/CONFIG/CACHE_HOME` at a scratch dir isolates the log, localStorage and plugin folder,
+  but not PipeWire or MIDI: the headless instance opened the real controller's MIDI *output*
+  port (it can send LED messages to the real hardware) and created its own output nodes on the
+  real sinks. Its window overlapped a "no audio" report on the same machine and could not be
+  ruled out as a cause. For viz/UI verification that does not need audio, say so in the agent
+  brief; when the user reports audio faults during an agent run, list the agent's instances
+  as a suspect and check `ps` for leftovers.
+- **Pixel readback of the output compositor (works on `mele`, not on the MacBook Pro's crocus).**
+  Open the output window with `invoke('open_output_window')`, switch WebDriver handles to it, and
+  add a `BroadcastChannel('cuemark-output')` listener in that page: after each compositor draw,
+  copy the 1920x1080 canvas to a 2D canvas and count non-black pixels. Sample twice a few seconds
+  apart to prove accumulation (feedback trails), and read the process RSS of *that* window's
+  `WebKitWebProcess` for leak checks — 50-switch batches at 250ms, several batches, plus an idle
+  control on the same plugin, because a slow ~2 MB/min creep appeared with a viz active either way.
+- **Test-plugin naming**: ISF `TARGET`/input names are GLSL identifiers, so reserved words
+  (`half`, `input`, `output`, …) fail with `Illegal use of reserved word`. Not a cuemark bug.
+
 - **`simulateMidiRateBurst`'s fire-and-forget `setInterval` can outlive the WebDriver
   `/execute/async` call that started it** — found live 2026-07-25 verifying
   `docs/design/webcodecs-video-path.md` phase 3: under enough CPU load (two decks

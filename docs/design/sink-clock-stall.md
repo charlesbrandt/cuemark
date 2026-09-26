@@ -3,7 +3,7 @@
 Status: 🔴 **OPEN (2026-09-26).** Two incidents on file (2026-09-19, 2026-09-26) plus a
 week of `CLOCK REFERENCE OFF BY` warnings that are the same fault in its milder form.
 Mechanism **proposed, not proven**. Instrumentation (§6) and the clock pin (§5 fix 1) are
-built but uncommitted and not live-verified — see §6a. This doc supersedes the "Clock reference drifting while idle" section of
+built and committed (`e19c255`); the pin is live but did not prevent the 09-26 16:13 incident — see §9 and §6a. This doc supersedes the "Clock reference drifting while idle" section of
 `shared-output-pipeline.md` as the place to read; that section keeps the 09-19 measurements.
 
 Read `shared-output-pipeline.md` first (one `pulsesink` per device node, `audiomixer` summing
