@@ -58,14 +58,15 @@ describe("routeAudio", () => {
 describe("computeBindings", () => {
   const routed = routeAudio("mix", [deck("a", 0.5, 1)], opts);
   it("null beatPhase -> 0 and hasBeatGrid 0", () => {
-    const b = computeBindings(routed, { beatPhase: null, bpm: 120, trackProgress: 0.1, inMixOut: 0, crossfader: 0.5, liked: true });
+    const b = computeBindings(routed, { beatPhase: null, bpm: 120, trackProgress: 0.1, crossfader: 0.5 });
     expect(b.beatPhase).toBe(0);
     expect(b.hasBeatGrid).toBe(0);
-    expect(b.liked).toBe(1);
+    expect(b.liked).toBeUndefined();
+    expect(b.inMixOut).toBeUndefined();
     expect(Object.keys(b).sort()).toEqual([...BINDING_NAMES].sort());
   });
   it("beatPhase present", () => {
-    const b = computeBindings(routed, { beatPhase: 0.25, bpm: 0, trackProgress: 0, inMixOut: 0, crossfader: 0, liked: false });
+    const b = computeBindings(routed, { beatPhase: 0.25, bpm: 0, trackProgress: 0, crossfader: 0 });
     expect(b.beatPhase).toBe(0.25);
     expect(b.hasBeatGrid).toBe(1);
   });

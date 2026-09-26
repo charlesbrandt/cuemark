@@ -809,9 +809,7 @@
             beatPhase: dom ? getPhase(dom.id) : null,
             bpm: dom?.bpm ? dom.bpm * dom.playbackRate : 0,
             trackProgress: domT !== null && domDur > 0 ? Math.min(1, Math.max(0, domT / domDur)) : 0,
-            inMixOut: 0, // TODO(phase 3 follow-up): needs effectiveZones() + Digger markers
             crossfader: s.crossfaderValue,
-            liked: false, // TODO: Digger is_liked isn't on Deck yet
           });
           if (vizRouted.dominantDeckId !== lastVizDominant) {
             lastVizDominant = vizRouted.dominantDeckId;

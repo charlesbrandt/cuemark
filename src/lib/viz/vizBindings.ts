@@ -122,7 +122,7 @@ export function routeAudio(source: string, decks: DeckAudioSample[], opts: Route
 
 export const BINDING_NAMES: readonly string[] = [
   "bass", "mid", "high", "level", "beatPhase", "hasBeatGrid",
-  "bpm", "trackProgress", "inMixOut", "crossfader", "liked",
+  "bpm", "trackProgress", "crossfader",
 ];
 
 /**
@@ -134,7 +134,7 @@ export function computeBindings(
   routed: RoutedAudio,
   meta: {
     beatPhase: number | null; bpm: number; trackProgress: number;
-    inMixOut: number; crossfader: number; liked: boolean;
+    crossfader: number;
   },
 ): Record<string, number> {
   return {
@@ -146,8 +146,6 @@ export function computeBindings(
     hasBeatGrid: meta.beatPhase !== null ? 1 : 0,
     bpm: meta.bpm,
     trackProgress: meta.trackProgress,
-    inMixOut: meta.inMixOut,
     crossfader: meta.crossfader,
-    liked: meta.liked ? 1 : 0,
   };
 }

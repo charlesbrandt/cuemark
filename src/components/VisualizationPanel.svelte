@@ -1,7 +1,8 @@
 <script lang="ts">
   import { session, setVisualization, setVisualizationOpacity, setVisualizationParams, setVizAudioSource } from "../lib/state/session";
   import { BUILTIN_ISF } from "../lib/renderer/isf/builtins";
-  import { diskPlugins, vizErrors, refreshPluginList, mediaUrl, activeInputs } from "../lib/viz/vizPlugins";
+  import { diskPlugins, vizErrors, vizWarnings, vizFallback, refreshPluginList, mediaUrl, pluginName, activeInputs } from "../lib/viz/vizPlugins";
+  import { fallbackNote } from "../lib/viz/vizHealth";
   import { describeInputs, colorToHex, hexToColor, type SliderAxis } from "../lib/viz/vizParamControls";
 
   let controls = $derived(describeInputs($activeInputs));
@@ -101,6 +102,13 @@
 
   {#if selectedId && ($vizErrors[selectedId] ?? $diskPlugins.find((p) => p.id === selectedId)?.error)}
     <div class="viz-error">{$vizErrors[selectedId] ?? $diskPlugins.find((p) => p.id === selectedId)?.error}</div>
+  {/if}
+
+  {#if selectedId && $vizFallback && $vizFallback.requestedId === selectedId}
+    <div class="viz-warning">{fallbackNote($vizFallback, pluginName)}</div>
+  {/if}
+  {#if selectedId && $vizWarnings[selectedId]}
+    <div class="viz-warning">Warning: {selectedId} {$vizWarnings[selectedId]}</div>
   {/if}
 
   {#if selectedId}
@@ -258,6 +266,11 @@
     white-space: pre-wrap;
     max-height: 6em;
     overflow: auto;
+  }
+
+  .viz-warning {
+    color: #e0a040;
+    font-size: calc(11px * var(--font-scale));
   }
 
   .opacity-val {
