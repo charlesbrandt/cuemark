@@ -17,7 +17,8 @@
   import { restoreSessionOnBoot, restoreMidiControlState, hasPendingAdoption, takePendingAdoption } from "./lib/state/bootRestore";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { listen } from "@tauri-apps/api/event";
-  import { getDeckTime, isScratching, registerCodecPlayer, unregisterCodecPlayer, getCodecPlayer, codecPlayerDeckIds } from "./lib/renderer/seekBus";
+  import { getDeckTime, getPhase, isScratching, registerCodecPlayer, unregisterCodecPlayer, getCodecPlayer, codecPlayerDeckIds } from "./lib/renderer/seekBus";
+  import { routeAudio, computeBindings, effectiveDeckGain, type DeckAudioSample, type RoutedAudio } from "./lib/viz/vizBindings";
   import { postFrame, takeResendRequest, releaseDeck, onVizReport, type DeckFrameSource } from "./lib/renderer/outputBus";
   import { activeVizPayload, startVizPluginSync, refreshPluginList } from "./lib/viz/vizPlugins";
   import DeckCard from "./components/DeckCard.svelte";
@@ -105,7 +106,7 @@
     document.documentElement.style.setProperty("--font-scale", String($fontScale));
   });
 
-  type BandAnalysis = { bass: number; mid: number; high: number };
+  type BandAnalysis = { bass: number; mid: number; high: number; bands?: number[] };
 
   // The control window no longer composites. Since 2026-08-03 it ships each deck's current
   // frame to the output window, which runs the Compositor itself — snapshotting a WebGL
@@ -115,6 +116,7 @@
   let rendererReady = $state(false);
   // Per-deck FFT analysis received from GStreamer spectrum bus messages via Tauri events.
   const deckAnalysis = new Map<string, BandAnalysis>();
+  let lastVizDominant: string | null = null;
   let fftUnlisten: (() => void) | undefined;
   let rafId: number;
   // Timestamp of the previous rAF tick, used to report main-thread stalls. This used to
@@ -281,7 +283,7 @@
 
     rendererReady = true;
     let fftEventCount = 0;
-    fftUnlisten = await listen<{ deckId: string; bass: number; mid: number; high: number }>(
+    fftUnlisten = await listen<{ deckId: string; bass: number; mid: number; high: number; bands?: number[] }>(
       'audio-fft',
       (event) => {
         deckAnalysis.set(event.payload.deckId, event.payload);
@@ -766,6 +768,8 @@
           lastUploadedCodecPts.clear();
         }
         // Combine per-deck FFT data from GStreamer spectrum events: max across all playing decks.
+        // (Deck-level `analysis` below stays the max across all decks, for the legacy path;
+        // the visualization layer gets its own routed values — see routeAudio.)
         let bass = 0, mid = 0, high = 0;
         for (const a of deckAnalysis.values()) {
           bass = Math.max(bass, a.bass);
@@ -773,6 +777,47 @@
           high = Math.max(high, a.high);
         }
         const analysis: BandAnalysis = { bass, mid, high };
+        let vizRouted: RoutedAudio | null = null;
+        let vizBindingValues: Record<string, number> = { bass, mid, high };
+        if (visualization) {
+          const s = get(session);
+          const xfIn = s.crossfaderTargets.includes('volume');
+          const samples: DeckAudioSample[] = decks.map((d) => {
+            const a = deckAnalysis.get(d.id);
+            return {
+              deckId: d.id,
+              bands: a?.bands ?? [],
+              bass: a?.bass ?? 0, mid: a?.mid ?? 0, high: a?.high ?? 0,
+              gain: effectiveDeckGain({
+                deckId: d.id, volume: d.volume, masterVolume: s.masterVolume,
+                crossfaderPos: s.crossfaderValue,
+                crossfaderLeftId: s.crossfaderMapping.left, crossfaderRightId: s.crossfaderMapping.right,
+                audioCurve: s.audioCurve, crossfaderInVolume: xfIn,
+              }),
+              cueEnabled: d.cueEnabled,
+              playing: d.playing,
+            };
+          });
+          vizRouted = routeAudio(s.vizAudioSource ?? 'mix', samples, {
+            crossfaderPos: s.crossfaderValue,
+            crossfaderLeftId: s.crossfaderMapping.left, crossfaderRightId: s.crossfaderMapping.right,
+          });
+          const dom = decks.find((d) => d.id === vizRouted!.dominantDeckId);
+          const domT = dom ? getDeckTime(dom.id) : null;
+          const domDur = dom?.source?.type === 'video' ? dom.source.duration : 0;
+          vizBindingValues = computeBindings(vizRouted, {
+            beatPhase: dom ? getPhase(dom.id) : null,
+            bpm: dom?.bpm ? dom.bpm * dom.playbackRate : 0,
+            trackProgress: domT !== null && domDur > 0 ? Math.min(1, Math.max(0, domT / domDur)) : 0,
+            inMixOut: 0, // TODO(phase 3 follow-up): needs effectiveZones() + Digger markers
+            crossfader: s.crossfaderValue,
+            liked: false, // TODO: Digger is_liked isn't on Deck yet
+          });
+          if (vizRouted.dominantDeckId !== lastVizDominant) {
+            lastVizDominant = vizRouted.dominantDeckId;
+            debugLog(`[viz] dominant ${lastVizDominant ?? 'none'} (gain ${vizRouted.dominantGain.toFixed(2)}, source ${s.vizAudioSource ?? 'mix'})`);
+          }
+        }
         // Any visualization (continuous u_time animation) or a video frame that actually
         // advanced/seeked this tick makes the output stale.
         // A resend must produce a message even when nothing else changed — otherwise a fresh
@@ -812,7 +857,8 @@
             vizPlugin: activeVizPayload(),
             vizOpacity: visualization ? visualizationOpacity : 0,
             vizParams: visualization?.params ?? {},
-            bindings: { bass, mid, high },
+            bindings: vizBindingValues,
+            vizFft: vizRouted?.bands,
             time: timeSecs,
             analysis,
           });
