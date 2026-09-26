@@ -5,7 +5,10 @@ reporting). Verified headlessly on `mele` and by the user in the live output win
 "Phase 1 → Result". **Next: phase 2.** Phases 2–7 not started. Scope was decided with the user in
 conversation: build on **ISF** and **Milkdrop** (via Butterchurn); **no arbitrary JS plugins**.
 Richer and controllable visualizations are to be explored separately later (see "Out of scope").
-Open questions 1–3 were researched on 2026-09-25 (package source read, parser run on test
+**Open follow-ups (2026-09-26):** `inMixOut`/`liked` (removed from the vocabulary until a
+dominant-deck source exists, see "Cuemark bindings"); IMPORTED warning and missing-plugin
+fallback are DONE (see "Follow-up result 2026-09-26"); still open: `beatPhase`/`bpm`/dominant
+deck, `~2MB/min` RSS creep. Open questions 1–3 were researched on 2026-09-25 (package source read, parser run on test
 shaders, `mixer.rs` traced); the answers are folded into the sections below and summarised
 under "Open questions".
 
@@ -129,9 +132,15 @@ this doc:
 | `hasBeatGrid` | bool | Whether `beatPhase` means anything | `getPhase() !== null` |
 | `bpm` | float | Dominant deck's BPM, 0 if unknown | `deck.bpm` × playback rate. ⚠️ Confirm whether `deck.bpm` already includes the rate before multiplying |
 | `trackProgress` | float 0–1 | Position / duration | Deck position + `DeckSource.duration` |
-| `inMixOut` | float 0–1 | Ramp from 0 to 1 across the outgoing mix zone, 0 elsewhere | `effectiveZones()` in `autoMix.ts`; 0 without markers |
 | `crossfader` | float 0–1 | Crossfader position | `Session` |
-| `liked` | bool | Track is liked in Digger | `is_liked` |
+
+**Removed 2026-09-26: `inMixOut` and `liked`.** They were listed here but never implemented
+(the code exposes only `bass`/`mid`/`high`; nothing was hardcoded to 0, they simply did not
+exist). The raw data does exist (`Deck.mixOutStart/mixOutEnd` + position for `effectiveZones()`;
+`DiggerQueueItem.is_liked` matched by `Deck.diggerTrackId`), but both need a **dominant deck**,
+and that concept is not built (bands are a max across all decks). Guessing the deck would make
+them look right and be wrong, so they come back with Phase 3's dominant-deck routing, not
+before. `liked` is also queue-scoped: a track loaded from search results has no queue row.
 
 ⚠️ **`beatPhase` is per beat, not per bar.** `deck.downbeat` is a beat-level anchor
 (`beatmatching.md`); nothing detects bar-beat-1. Don't add a `barPhase` binding until bar
@@ -462,6 +471,20 @@ and auto-cycle changes presets on a beat.
   evaluated on dominant-deck change. A per-track override from `track-visual-override.md`
   always wins over a rule.
 - Numeric Digger fields (mood scores, energy, if they exist) become new `CUEMARK_BIND` names.
+
+### Follow-up result 2026-09-26
+
+- **IMPORTED without assets**: `vizHealth.ts` `importedWarning()` checks the header's
+  `IMPORTED` against the assets `viz_read_plugin` returned (folder plugins only). A bare `.fs`
+  or a folder missing its image now shows an amber warning in the panel and a
+  `[viz] warning: …` line in `cuemark.log` when the plugin loads. It still renders (black);
+  the point is that it says why.
+- **Missing plugin file**: a failed read of a *disk* plugin renders the default built-in
+  (`DEFAULT_VIZ_ID`, Plasma) and shows a panel note; `vizFallback` store. **`Session.visualization`
+  is deliberately not rewritten**, so a file that is only briefly gone (editor save-by-rename,
+  unmounted drive) is picked up again: Rescan re-runs the read, or reselect. There is no
+  periodic rescan, by choice (mid-set disk polling). Trade-off: the persisted id is never
+  garbage-collected; picking anything else, or None, replaces it.
 
 ## Out of scope (explore separately)
 

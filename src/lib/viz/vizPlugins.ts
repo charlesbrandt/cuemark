@@ -10,6 +10,7 @@ import { debugLog } from '../debugLog';
 import { BUILTIN_ISF } from '../renderer/isf/builtins';
 import type { VizPluginPayload } from '../renderer/outputProtocol';
 import type { Visualization } from '../state/types';
+import { importedWarning, chooseFallback, type VizFallback } from './vizHealth';
 
 /** One row of `viz_list_plugins` (src-tauri/src/viz_plugins.rs). */
 export interface VizPluginInfo {
@@ -41,6 +42,24 @@ export const diskPlugins = writable<VizPluginInfo[]>([]);
  */
 export const vizErrors = writable<Record<string, string>>({});
 
+/** Non-fatal warnings per plugin id (renders, but probably not as its author intended). */
+export const vizWarnings = writable<Record<string, string>>({});
+
+/** Set while the selected disk plugin can't be read and a built-in is rendered instead. */
+export const vizFallback = writable<VizFallback | null>(null);
+
+/** What a missing plugin falls back to. */
+export const DEFAULT_VIZ_ID = BUILTIN_ISF[0].id;
+
+function setVizWarning(pluginId: string, message: string | null) {
+  vizWarnings.update((m) => {
+    const next = { ...m };
+    if (message === null) delete next[pluginId];
+    else next[pluginId] = message;
+    return next;
+  });
+}
+
 export function setVizError(pluginId: string, message: string | null) {
   vizErrors.update((m) => {
     const next = { ...m };
@@ -54,6 +73,7 @@ export async function refreshPluginList(): Promise<void> {
   try {
     const list = await invoke<VizPluginInfo[]>('viz_list_plugins');
     diskPlugins.set(list);
+    retryActive?.();
   } catch (e) {
     debugLog(`[viz] viz_list_plugins failed: ${e}`);
   }
@@ -143,25 +163,59 @@ export function startVizPluginSync(
 
   let currentId: string | null = null;
   let seq = 0;
-  sessionStore.subscribe((s) => {
-    const id = s.visualization?.pluginId ?? null;
-    if (id === currentId) return;
-    currentId = id;
+
+  // Resolve `id` into activePayload. A read failure of a disk plugin renders the default
+  // built-in and records `vizFallback`, but NEVER touches Session.visualization: the
+  // persisted choice survives a file that is only temporarily gone (editor save-by-rename,
+  // unmounted drive, mid-set rescan), and `retryActive` (run after every Rescan) restores it.
+  const apply = (id: string | null) => {
     const mySeq = ++seq;
     if (id === null) {
       activePayload = null;
+      vizFallback.set(null);
       return;
     }
     resolvePlugin(id).then(
       (payload) => {
-        if (mySeq === seq) activePayload = payload;
-      },
-      (e) => {
         if (mySeq !== seq) return;
-        activePayload = null;
+        activePayload = payload;
+        vizFallback.set(null);
+        const w = importedWarning(id, payload.source, payload.assets);
+        setVizWarning(id, w);
+        if (w) debugLog(`[viz] warning: ${id} ${w}`);
+      },
+      async (e) => {
+        if (mySeq !== seq) return;
+        const reason = `read: ${e}`;
         debugLog(`[viz] could not read plugin ${id}: ${e}`);
-        setVizError(id, `read: ${e}`);
+        setVizError(id, reason);
+        const fb = chooseFallback(id, reason, DEFAULT_VIZ_ID);
+        if (!fb) {
+          activePayload = null;
+          return;
+        }
+        vizFallback.set(fb);
+        debugLog(`[viz] ${id} unavailable, rendering ${fb.usingId} (persisted choice kept)`);
+        try {
+          const p = await resolvePlugin(fb.usingId);
+          if (mySeq === seq) activePayload = p;
+        } catch {
+          if (mySeq === seq) activePayload = null;
+        }
       },
     );
+  };
+
+  retryActive = () => {
+    if (currentId !== null && get(vizFallback)?.requestedId === currentId) apply(currentId);
+  };
+
+  sessionStore.subscribe((s) => {
+    const id = s.visualization?.pluginId ?? null;
+    if (id === currentId) return;
+    currentId = id;
+    apply(id);
   });
 }
+
+let retryActive: (() => void) | null = null;

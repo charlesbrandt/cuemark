@@ -1,7 +1,8 @@
 <script lang="ts">
   import { session, setVisualization, setVisualizationOpacity } from "../lib/state/session";
   import { BUILTIN_ISF } from "../lib/renderer/isf/builtins";
-  import { diskPlugins, vizErrors, refreshPluginList, mediaUrl } from "../lib/viz/vizPlugins";
+  import { diskPlugins, vizErrors, vizWarnings, vizFallback, refreshPluginList, mediaUrl, pluginName } from "../lib/viz/vizPlugins";
+  import { fallbackNote } from "../lib/viz/vizHealth";
 
   let visualization = $derived($session.visualization);
   let selectedId = $derived(visualization?.pluginId ?? null);
@@ -74,6 +75,13 @@
 
   {#if selectedId && ($vizErrors[selectedId] ?? $diskPlugins.find((p) => p.id === selectedId)?.error)}
     <div class="viz-error">{$vizErrors[selectedId] ?? $diskPlugins.find((p) => p.id === selectedId)?.error}</div>
+  {/if}
+
+  {#if selectedId && $vizFallback && $vizFallback.requestedId === selectedId}
+    <div class="viz-warning">{fallbackNote($vizFallback, pluginName)}</div>
+  {/if}
+  {#if selectedId && $vizWarnings[selectedId]}
+    <div class="viz-warning">Warning: {selectedId} {$vizWarnings[selectedId]}</div>
   {/if}
 
   <div class="settings-row">
@@ -174,6 +182,11 @@
     white-space: pre-wrap;
     max-height: 6em;
     overflow: auto;
+  }
+
+  .viz-warning {
+    color: #e0a040;
+    font-size: calc(11px * var(--font-scale));
   }
 
   .opacity-val {
