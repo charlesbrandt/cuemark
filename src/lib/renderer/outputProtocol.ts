@@ -53,6 +53,8 @@ export interface OutputFrameMessage {
   bindings: Record<string, number>;
   /** Routed spectrum for `audioFFT` inputs: up to 32 floats, 0-1. Absent = silence. */
   vizFft?: number[];
+  /** Phase 5a PCM tap: mono[1024]|left[1024]|right[1024], 128 = silence; absent = no tap data. */
+  pcm?: Uint8Array;
   /**
    * Control-window clock, seconds. Not used as the shader's TIME any more: the output
    * window counts TIME from when the plugin was loaded, as ISF hosts do, which also keeps it

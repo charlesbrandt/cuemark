@@ -3,6 +3,7 @@ pub mod clock_watch;
 pub mod devices;
 pub mod mixer;
 pub mod pcm_buffer;
+pub mod pcm_tap;
 pub mod pipeline;
 pub mod record;
 pub mod snapcontrol;
@@ -514,6 +515,30 @@ pub fn audio_get_position(state: State<'_, AudioState>, deck_id: String) -> Posi
     drop(mgr); // don't hold the lock across the exit timestamp
 
     PositionSample { pos, entry_ms, lock_ms, query_ms, exit_ms: crate::epoch_ms() }
+}
+
+/// Handle for `viz_set_listening`: the graph (to reconcile the tap) and the gate itself.
+/// Managed separately from `AudioState` so flipping the gate never waits on the audio mutex.
+pub struct PcmControl {
+    pub graph: Arc<Mutex<OutputGraph>>,
+    pub shared: Arc<pcm_tap::PcmShared>,
+}
+
+/// Tell the PCM tap whether anything is consuming `audio-pcm` (the output window is alive
+/// and showing a visualization). False costs zero PCM work; see `pcm_tap`.
+///
+/// The flag flips immediately and lock-free; building/opening the tap needs the graph mutex
+/// (which a slow device attach can hold), so that part runs on its own thread and the command
+/// returns at once. `refresh_tap()` reads the *current* flag, so racing flips converge.
+#[tauri::command]
+pub fn viz_set_listening(ctl: State<'_, PcmControl>, listening: bool) {
+    let prev = ctl.shared.listening.swap(listening, std::sync::atomic::Ordering::Relaxed);
+    if prev == listening {
+        return;
+    }
+    log::info!("[pcm-tap] viz_set_listening({listening})");
+    let graph = ctl.graph.clone();
+    std::thread::spawn(move || graph.lock().unwrap().refresh_tap());
 }
 
 #[tauri::command]

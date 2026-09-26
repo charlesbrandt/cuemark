@@ -19,7 +19,8 @@
   import { listen } from "@tauri-apps/api/event";
   import { getDeckTime, getPhase, isScratching, registerCodecPlayer, unregisterCodecPlayer, getCodecPlayer, codecPlayerDeckIds } from "./lib/renderer/seekBus";
   import { routeAudio, computeBindings, effectiveDeckGain, type DeckAudioSample, type RoutedAudio } from "./lib/viz/vizBindings";
-  import { postFrame, takeResendRequest, releaseDeck, onVizReport, type DeckFrameSource } from "./lib/renderer/outputBus";
+  import { postFrame, takeResendRequest, releaseDeck, onVizReport, hasListener as outputHasListener, type DeckFrameSource } from "./lib/renderer/outputBus";
+  import { startVizPcm, stopVizPcm, noteActivePlugin, latestPcm } from "./lib/viz/vizPcm";
   import { activeVizPayload, startVizPluginSync, refreshPluginList } from "./lib/viz/vizPlugins";
   import DeckCard from "./components/DeckCard.svelte";
   import Crossfader from "./components/Crossfader.svelte";
@@ -292,6 +293,8 @@
         }
       },
     );
+    // Phase 5a PCM tap: decode `audio-pcm`, and gate the Rust tap on output-window liveness.
+    startVizPcm(outputHasListener).catch((e) => console.error("[vizPcm]", e));
     rafId = requestAnimationFrame(frame);
 
     // When a deck reaches EOS, mark it stopped so syncVideoElements doesn't auto-restart it.
@@ -372,6 +375,7 @@
     clearInterval(watchdogIntervalId);
     cancelAnimationFrame(rafId);
     fftUnlisten?.();
+    stopVizPcm();
     for (const id of legacyVideoDeckIds()) {
       destroyLegacyVideoEl(id);
       audioUnload(id).catch(console.error);
@@ -841,6 +845,10 @@
         if (visualization) {
           dirty = true;
         }
+        // The plugin payload is resolved once per tick: it feeds both postFrame and the PCM
+        // gate (does the active plugin declare an `audio` input?).
+        const vizPayload = activeVizPayload();
+        noteActivePlugin(vizPayload);
         // Catch changes that don't come from per-frame video/visualization advancement:
         // opacity (crossfader), source swaps, deck add/remove, visualization toggle.
         const sig = `${visualization ? visualizationOpacity : 0}|` +
@@ -852,11 +860,12 @@
         if (dirty) {
           postFrame({
             decks: outputDecks,
-            vizPlugin: activeVizPayload(),
+            vizPlugin: vizPayload,
             vizOpacity: visualization ? visualizationOpacity : 0,
             vizParams: visualization?.params ?? {},
             bindings: vizBindingValues,
             vizFft: vizRouted?.bands,
+            pcm: latestPcm(),
             time: timeSecs,
             analysis,
           });

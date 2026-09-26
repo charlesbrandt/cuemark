@@ -25,6 +25,30 @@ export interface IsfFrameInputs {
   bindings: Record<string, number>;
   /** Routed spectrum, up to FFT_MAX_BINS floats in 0-1; absent = silence. Feeds `audioFFT` inputs. */
   fft?: number[];
+  /**
+   * Phase 5a PCM tap, `mono[1024] | left[1024] | right[1024]`, bytes with 128 = silence.
+   * Feeds `audio` inputs (row 0 = left, row 1 = right); absent = a flat silent waveform.
+   */
+  pcm?: Uint8Array;
+}
+
+/** Samples per channel in the PCM tap frame (matches `PCM_LEN` in `audio/pcm_tap.rs`). */
+export const PCM_LEN = 1024;
+/** Rows in an `audio` input texture: one per channel, left then right. */
+export const PCM_ROWS = 2;
+
+/**
+ * Packs the tap frame into the `audio` texture's bytes: row 0 = left, row 1 = right, R8.
+ * Absent or malformed input gives a flat waveform at 128 (0.5 = zero crossing).
+ */
+export function packPcmRows(pcm: Uint8Array | undefined, out?: Uint8Array): Uint8Array {
+  const bytes = out ?? new Uint8Array(PCM_LEN * PCM_ROWS);
+  if (pcm && pcm.length >= PCM_LEN * 3) {
+    bytes.set(pcm.subarray(PCM_LEN, PCM_LEN * 3));
+  } else {
+    bytes.fill(128);
+  }
+  return bytes;
 }
 
 /** Widest `audioFFT` texture: the 32 bands the analysis produces. */
@@ -294,6 +318,8 @@ export class IsfInstance {
     string,
     { tex: WebGLTexture; width: number; bytes: Uint8Array }
   >();
+  // One R8 1024x2 texture per `audio` input (row 0 = left, row 1 = right), created lazily.
+  private readonly pcmTextures = new Map<string, { tex: WebGLTexture; bytes: Uint8Array }>();
   private readonly passes: IsfPass[];
   private readonly passSizeExprs: Array<{ w: Expr; h: Expr }>;
   /** TARGET name -> buffer, created for every non-final pass that names one. */
@@ -644,9 +670,44 @@ export class IsfInstance {
     gl.uniform1i(this.loc(`_${input.NAME}_flip`), 0);
   }
 
+  // Waveform: R8, 1024 wide, one row per channel. Linear filtering, so a shader sampling
+  // between texels gets a smooth line; centred on 0.5.
+  private bindPcmInput(input: IsfInput, textureUnit: number, frame: IsfFrameInputs): void {
+    const { gl } = this;
+    let entry = this.pcmTextures.get(input.NAME);
+    if (!entry) {
+      const tex = gl.createTexture();
+      if (!tex) throw new IsfError("runtime", "Failed to create audio texture");
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      const bytes = packPcmRows(undefined);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, PCM_LEN, PCM_ROWS, 0, gl.RED, gl.UNSIGNED_BYTE, bytes);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      entry = { tex, bytes };
+      this.pcmTextures.set(input.NAME, entry);
+      debugLog(`[isf/${this.label}] audio input '${input.NAME}' fed from the PCM tap (${PCM_LEN}x${PCM_ROWS}, L/R rows)`);
+    }
+    gl.activeTexture(gl.TEXTURE0 + textureUnit);
+    gl.bindTexture(gl.TEXTURE_2D, entry.tex);
+    packPcmRows(frame.pcm, entry.bytes);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, PCM_LEN, PCM_ROWS, gl.RED, gl.UNSIGNED_BYTE, entry.bytes);
+    gl.uniform1i(this.loc(input.NAME), textureUnit);
+    gl.uniform2f(this.loc(`_${input.NAME}_imgSize`), PCM_LEN, PCM_ROWS);
+    gl.uniform4f(this.loc(`_${input.NAME}_imgRect`), 0, 0, 1, 1);
+    gl.uniform1i(this.loc(`_${input.NAME}_flip`), 0);
+  }
+
   private bindSamplerInput(input: IsfInput, textureUnit: number, frame: IsfFrameInputs): void {
     if (input.TYPE === "audioFFT") {
       this.bindFftInput(input, textureUnit, frame);
+      return;
+    }
+    if (input.TYPE === "audio") {
+      this.bindPcmInput(input, textureUnit, frame);
       return;
     }
     const { gl } = this;
@@ -654,9 +715,7 @@ export class IsfInstance {
     if (!this.loggedUnfed.has(input.NAME)) {
       this.loggedUnfed.add(input.NAME);
       const reason =
-        input.TYPE === "audio"
-          ? "audio (PCM) texture arrives in phase 5 (blank)"
-          : "bound to the built-in 256x256 test pattern";
+        "bound to the built-in 256x256 test pattern";
       debugLog(`[isf/${this.label}] input '${input.NAME}' (${input.TYPE}) not fed by the host - ${reason}`);
     }
 

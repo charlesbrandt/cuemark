@@ -199,6 +199,7 @@ channel.onmessage = (e: MessageEvent<OutputMessage>) => {
         params: msg.vizParams,
         bindings: msg.bindings,
         fft: msg.vizFft,
+        pcm: msg.pcm,
       });
     } catch (e) {
       // Drop the plugin rather than throw on every frame: an exception here would otherwise

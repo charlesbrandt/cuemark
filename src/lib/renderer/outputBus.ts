@@ -26,6 +26,8 @@ export interface OutputPostState {
   bindings: Record<string, number>;
   /** Routed spectrum for `audioFFT` inputs (up to 32 floats, 0-1); optional. */
   vizFft?: number[];
+  /** Phase 5a PCM tap: mono[1024]|left[1024]|right[1024], 128 = silence; absent = no tap data. */
+  pcm?: Uint8Array;
   time: number;
   analysis: { bass: number; mid: number; high: number };
 }
@@ -85,7 +87,7 @@ channel.onmessage = (e: MessageEvent<OutputMessage>) => {
 };
 
 /** True while the output window is believed to be listening. */
-function hasListener(): boolean {
+export function hasListener(): boolean {
   return listenerLastSeenAt !== 0 && performance.now() - listenerLastSeenAt < OUTPUT_ALIVE_TIMEOUT_MS;
 }
 
@@ -251,6 +253,7 @@ export function postFrame(state: OutputPostState): void {
         vizParams: state.vizParams,
         bindings: state.bindings,
         vizFft: state.vizFft,
+        pcm: state.pcm,
         time: state.time,
         analysis: state.analysis,
       });

@@ -39,6 +39,7 @@ use super::pipeline::{
     deck_output_caps, make_sink, parse_device_remap, parse_snapcast_device, ChannelRemap,
 };
 use super::clock_watch::{self, NodeFlow};
+use super::pcm_tap::{self, PackedPair, PcmEmit, PcmShared, PcmWindow};
 use super::record::RecordFormat;
 
 /// Jitter buffer between a deck's handoff and the mixer pad.
@@ -80,6 +81,20 @@ struct Branch {
     /// appsrc → queue → audioconvert(mix-matrix) → capsfilter, in link order.
     els: Vec<gst::Element>,
     mixer_pad: gst::Pad,
+    /// For a **main** branch: the node channel indices its mix-matrix feeds — what the PCM
+    /// tap reads. `None` for cue/record, which the tap must never see.
+    main_pair: Option<(usize, usize)>,
+}
+
+/// The PCM tap's branch on a node's `tee`: `valve → queue(leaky) → appsink`.
+struct TapBranch {
+    // Kept for a future teardown path; the tap is deliberately never removed from a PLAYING
+    // node today (a closed valve is free) — see `refresh_tap()`.
+    #[allow(dead_code)]
+    els: Vec<gst::Element>,
+    #[allow(dead_code)]
+    tee_pad: gst::Pad,
+    valve: gst::Element,
 }
 
 /// One physical output device: exactly one `pulsesink`, however many decks are playing.
@@ -102,6 +117,21 @@ struct OutputNode {
     /// The part of `latency_ns` GStreamer measured, kept so a change to the configured
     /// network offset can be re-applied without re-querying (or rebuilding) the node.
     queried_latency_ns: u64,
+    /// `caps_el → tee → master_volume_el`: the pre-master-volume tap point (Phase 5a). `None`
+    /// on the record node, which is never tapped.
+    tee: Option<gst::Element>,
+    tap: Option<TapBranch>,
+    /// Channel pair the tap callback reads; kept current by `refresh_tap()`.
+    tap_pair: Arc<PackedPair>,
+}
+
+impl OutputNode {
+    /// The channel pair the tap should read: the first (by key) main branch's own pair.
+    fn main_pair(&self) -> Option<(usize, usize)> {
+        let mut keys: Vec<&BranchKey> = self.branches.keys().collect();
+        keys.sort();
+        keys.into_iter().find_map(|k| self.branches[k].main_pair)
+    }
 }
 
 /// Registry of output pipelines, keyed by bare PipeWire node name (`""` = system default).
@@ -127,6 +157,11 @@ pub struct OutputGraph {
     /// Epoch milliseconds of the last buffer *any* node handed to a real device (0 = none
     /// yet) — see `device_activity_handle()`.
     last_device_buffer_ms: Arc<AtomicU64>,
+    /// PCM tap gate, shared with the Tauri command and every tap callback. See `pcm_tap`.
+    pcm: Arc<PcmShared>,
+    /// Where tap frames go. `None` until `set_pcm_emit()` (unit tests, legacy path): a tap
+    /// built without one would decode PCM for nobody, so none is built.
+    pcm_emit: Option<PcmEmit>,
 }
 
 /// What `[census]` reports about this graph. `appsrcs` is counted by walking each node's
@@ -147,7 +182,69 @@ impl OutputGraph {
             extra_latency: HashMap::new(),
             record_target: None,
             last_device_buffer_ms: Arc::new(AtomicU64::new(0)),
+            pcm: Arc::new(PcmShared::new()),
+            pcm_emit: None,
         }
+    }
+
+    /// The tap's shared gate — handed to the Tauri layer so `viz_set_listening` can flip it
+    /// without taking any lock.
+    pub fn pcm_shared(&self) -> Arc<PcmShared> {
+        self.pcm.clone()
+    }
+
+    /// Give the graph somewhere to send tap frames (the app's `AppHandle`, wrapped in a
+    /// closure so this module stays free of Tauri). Must precede the first `refresh_tap()`.
+    pub fn set_pcm_emit(&mut self, emit: PcmEmit) {
+        self.pcm_emit = Some(emit);
+    }
+
+    /// Reconcile the tap with `pcm.listening` and the current branches. Idempotent; called
+    /// on attach/detach of a main branch and whenever listening flips.
+    ///
+    /// One node owns the tap (a second main device would otherwise emit a second,
+    /// interleaved stream): the node that already has one, else the first (by name) with a
+    /// main branch. Every other node's valve is closed. Turning listening off closes the
+    /// valve rather than tearing the branch down — removing elements from a PLAYING node is
+    /// the risky operation, and a closed valve drops buffers at the tee for free.
+    pub fn refresh_tap(&mut self) {
+        let listening = self.pcm.listening.load(Ordering::Relaxed);
+        let mut names: Vec<&String> = self
+            .nodes
+            .iter()
+            .filter(|(n, node)| n.as_str() != RECORD_DEVICE_KEY && node.main_pair().is_some())
+            .map(|(n, _)| n)
+            .collect();
+        names.sort();
+        let owner: Option<String> = names
+            .iter()
+            .find(|n| self.nodes[n.as_str()].tap.is_some())
+            .or_else(|| names.first())
+            .map(|n| (*n).clone());
+
+        let emit = self.pcm_emit.clone();
+        let pcm = self.pcm.clone();
+        for (name, node) in self.nodes.iter_mut() {
+            node.tap_pair.set(node.main_pair());
+            let is_owner = owner.as_deref() == Some(name.as_str());
+            let open = listening && is_owner && emit.is_some();
+            if open && node.tap.is_none() {
+                match build_tap(node, emit.clone().unwrap(), pcm.clone()) {
+                    Ok(t) => node.tap = Some(t),
+                    Err(e) => {
+                        log::warn!("[pcm-tap/{}] could not build tap: {e}", short(name));
+                        continue;
+                    }
+                }
+            }
+            if let Some(t) = &node.tap {
+                t.valve.set_property("drop", !open);
+            }
+        }
+        log::info!(
+            "[pcm-tap] refresh: listening={listening} owner={}",
+            owner.as_deref().map(short).unwrap_or_else(|| "none".into())
+        );
     }
 
     /// Epoch milliseconds of the last buffer any node delivered to a real device — the
@@ -361,10 +458,21 @@ impl OutputGraph {
 
         let master_volume = self.master_volume;
         let node = self.nodes.get_mut(&node_name).expect("just inserted");
-        let branch = build_branch(node, &remap, &key, label)?;
+        let mut branch = build_branch(node, &remap, &key, label)?;
+        if pcm_tap::is_main_key(&key.1) {
+            branch.main_pair = match &remap {
+                Some(r) => pcm_tap::main_pair(&r.matrix_rows),
+                None => Some(pcm_tap::default_pair()),
+            };
+        }
+        let is_main = branch.main_pair.is_some();
         let appsrc = branch.appsrc.clone();
         node.branches.insert(key.clone(), branch);
         node.master_volume_el.set_property("volume", master_volume as f64);
+        if is_main {
+            self.refresh_tap();
+        }
+        let node = self.nodes.get(&node_name).expect("just inserted");
 
         log::info!(
             "[audio/out/{}] attached {}/{} ({} branch(es) now on this node, {} ch)",
@@ -378,6 +486,7 @@ impl OutputGraph {
     /// The node's pipeline is **retained** when its last branch leaves — see the note in
     /// `create_node`.
     pub fn detach(&mut self, key: &BranchKey) {
+        let mut was_main = false;
         for (name, node) in self.nodes.iter_mut() {
             let Some(branch) = node.branches.remove(key) else { continue };
             // Order matters: unlink before releasing the request pad, and stop the elements
@@ -396,7 +505,11 @@ impl OutputGraph {
                 "[audio/out/{}] detached {}/{} ({} branch(es) left)",
                 short(name), key.0, key.1, node.branches.len()
             );
-            return;
+            was_main = branch.main_pair.is_some();
+            break;
+        }
+        if was_main {
+            self.refresh_tap();
         }
     }
 
@@ -464,6 +577,17 @@ impl OutputGraph {
         );
         let master_volume_el = make("volume")?;
         master_volume_el.set_property("volume", self.master_volume as f64);
+        // Pre-master-volume PCM tap point (Phase 5a). Every real-device node gets the tee —
+        // with a single linked branch it is a pass-through — so the tap branch can be added
+        // later without relinking a PLAYING pipeline. Never on the record node.
+        let tee = if node_name == RECORD_DEVICE_KEY {
+            None
+        } else {
+            let t = make("tee")?;
+            // A tap pad that is momentarily unlinked must not fail the whole node.
+            t.set_property("allow-not-linked", true);
+            Some(t)
+        };
 
         // The record node has no real device sink — it terminates in an encoder/mux/filesink
         // chain instead of `make_sink()`'s pulsesink/tcpclientsink. `tail` is always at least
@@ -517,13 +641,21 @@ impl OutputGraph {
         pipeline
             .add_many([&keepalive, &keepalive_caps, &mixer, &caps_el, &master_volume_el])
             .map_err(|e| format!("[out/{}] add_many: {e}", short(&node_name)))?;
+        if let Some(t) = &tee {
+            pipeline
+                .add(t)
+                .map_err(|e| format!("[out/{}] add tee: {e}", short(&node_name)))?;
+        }
         pipeline
             .add_many(tail.iter().collect::<Vec<_>>())
             .map_err(|e| format!("[out/{}] add_many (tail): {e}", short(&node_name)))?;
         gst::Element::link_many([&keepalive, &keepalive_caps, &mixer])
             .map_err(|e| format!("[out/{}] keepalive link: {e}", short(&node_name)))?;
-        gst::Element::link_many([&mixer, &caps_el, &master_volume_el])
-            .map_err(|e| format!("[out/{}] link: {e}", short(&node_name)))?;
+        match &tee {
+            Some(t) => gst::Element::link_many([&mixer, &caps_el, t, &master_volume_el]),
+            None => gst::Element::link_many([&mixer, &caps_el, &master_volume_el]),
+        }
+        .map_err(|e| format!("[out/{}] link: {e}", short(&node_name)))?;
         master_volume_el
             .link(&tail[0])
             .map_err(|e| format!("[out/{}] master_volume→{}: {e}", short(&node_name), tail[0].name()))?;
@@ -738,6 +870,9 @@ impl OutputGraph {
             channel_mask,
             latency_ns,
             queried_latency_ns: latency,
+            tee,
+            tap: None,
+            tap_pair: Arc::new(PackedPair::new()),
         })
     }
 }
@@ -857,7 +992,111 @@ fn build_branch(
     }
 
     let _ = key; // key is the caller's bookkeeping; branches are anonymous in the graph
-    Ok(Branch { appsrc, els, mixer_pad })
+    Ok(Branch { appsrc, els, mixer_pad, main_pair: None })
+}
+
+/// Add the PCM tap branch to a (possibly PLAYING) node: `tee → valve → queue(leaky) →
+/// appsink`. The valve is created **closed**; `refresh_tap()` opens it.
+fn build_tap(node: &mut OutputNode, emit: PcmEmit, shared: Arc<PcmShared>) -> Result<TapBranch, String> {
+    let label = short(&node.name);
+    let tee = node.tee.clone().ok_or_else(|| "node has no tee".to_string())?;
+    let valve = make("valve")?;
+    valve.set_property("drop", true);
+    let queue = make("queue")?;
+    // leaky=downstream: never block the tee, drop the OLDEST buffers instead. The deck tee
+    // upstream has no per-branch queue — a tap that can block stalls the booth monitor.
+    queue.set_property_from_str("leaky", "downstream");
+    queue.set_property("max-size-buffers", 2u32);
+    queue.set_property("max-size-bytes", 0u32);
+    queue.set_property("max-size-time", 0u64);
+    let sink_el = make("appsink")?;
+    sink_el.set_property("drop", true);
+    sink_el.set_property("max-buffers", 1u32);
+    sink_el.set_property("sync", false);
+    // async=false: an observer must never take part in the pipeline's state-change accounting.
+    sink_el.set_property("async", false);
+    sink_el.set_property(
+        "caps",
+        gst::Caps::builder("audio/x-raw")
+            .field("format", "F32LE")
+            .field("layout", "interleaved")
+            .build(),
+    );
+    let sink = sink_el
+        .downcast_ref::<AppSink>()
+        .ok_or_else(|| "appsink is not an AppSink".to_string())?
+        .clone();
+
+    let channels = node.channels as usize;
+    let pair = node.tap_pair.clone();
+    let mut window = PcmWindow::new();
+    let mut scratch: Vec<u8> = Vec::with_capacity(pcm_tap::PCM_FRAME_BYTES);
+    let mut samples: Vec<f32> = Vec::new();
+    let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let mut stat_start = std::time::Instant::now();
+    let (mut emitted, mut emit_us_sum, mut emit_us_max, mut buffers) = (0u64, 0u64, 0u64, 0u64);
+    let stat_label = label.clone();
+    sink.set_callbacks(
+        AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                if !shared.listening.load(Ordering::Relaxed) {
+                    return Ok(gst::FlowSuccess::Ok);
+                }
+                let Some(pair) = pair.get() else { return Ok(gst::FlowSuccess::Ok) };
+                let Some(buf) = sample.buffer() else { return Ok(gst::FlowSuccess::Ok) };
+                let Ok(map) = buf.map_readable() else { return Ok(gst::FlowSuccess::Ok) };
+                samples.clear();
+                samples.extend(
+                    map.as_slice().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                );
+                window.push_interleaved(&samples, channels, pair);
+                buffers += 1;
+                if last_emit.elapsed().as_millis() as u64 >= pcm_tap::MIN_EMIT_INTERVAL_MS {
+                    last_emit = std::time::Instant::now();
+                    window.encode(&mut scratch);
+                    let t = std::time::Instant::now();
+                    emit(&scratch);
+                    let us = t.elapsed().as_micros() as u64;
+                    emitted += 1;
+                    emit_us_sum += us;
+                    emit_us_max = emit_us_max.max(us);
+                }
+                if stat_start.elapsed().as_secs() >= 10 {
+                    log::info!(
+                        "[pcm-tap/{stat_label}] {:.1}s: buffers={buffers} emitted={emitted} ({:.1}/s) \
+                         emit_us mean={} max={}",
+                        stat_start.elapsed().as_secs_f64(),
+                        emitted as f64 / stat_start.elapsed().as_secs_f64(),
+                        if emitted > 0 { emit_us_sum / emitted } else { 0 },
+                        emit_us_max
+                    );
+                    stat_start = std::time::Instant::now();
+                    (emitted, emit_us_sum, emit_us_max, buffers) = (0, 0, 0, 0);
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+
+    let els = vec![valve.clone(), queue, sink_el];
+    node.pipeline
+        .add_many(els.iter().collect::<Vec<_>>())
+        .map_err(|e| format!("add_many: {e}"))?;
+    for pair in els.windows(2) {
+        pair[0].link(&pair[1]).map_err(|e| format!("link {} → {}: {e}", pair[0].name(), pair[1].name()))?;
+    }
+    let tee_pad = tee.request_pad_simple("src_%u").ok_or_else(|| "tee refused a request pad".to_string())?;
+    let valve_sink = valve.static_pad("sink").ok_or_else(|| "valve has no sink pad".to_string())?;
+    tee_pad.link(&valve_sink).map_err(|e| format!("tee → valve: {e}"))?;
+    for el in &els {
+        el.sync_state_with_parent().map_err(|e| format!("sync_state_with_parent: {e}"))?;
+    }
+    log::info!(
+        "[pcm-tap/{label}] tap built on {}ch node (pre-master-volume, main pair {:?})",
+        node.channels, node.tap_pair.get()
+    );
+    Ok(TapBranch { els, tee_pad, valve })
 }
 
 /// Wire a deck's `appsink` to an output `appsrc`. This is the handoff.
@@ -1296,5 +1535,72 @@ mod tests {
         graph.detach(&main_key);
         graph.detach(&cue_key);
         assert_eq!(graph.nodes.values().next().unwrap().branches.len(), 0);
+    }
+
+    /// Needs a **4-channel PipeWire null sink** (never a real device: this plays audio), named
+    /// by `CUEMARK_TEST_SINK4`, hence `#[ignore]`. Create one with
+    /// `pw-cli create-object adapter factory.name=support.null-audio-sink node.name=cuemark-test4
+    /// media.class=Audio/Sink audio.channels=4 audio.position=FL,FR,RL,RR priority.session=1`, then
+    /// `CUEMARK_TEST_SINK4=cuemark-test4 cargo test -- --ignored --nocapture pcm_tap_reads_main_only`.
+    ///
+    /// Main (FL,FR) carries a quiet -0.25/+0.25 DC; cue (RL,RR) a loud DC 0.9. The tap must
+    /// show the main signal and never the cue's level, and must still show it with master
+    /// volume at 0 (pre-master-volume). This is the "cue absent from pcm" and "master volume
+    /// not applied" content check against a real graph.
+    #[test]
+    #[ignore]
+    fn pcm_tap_reads_main_only_and_ignores_master_volume() {
+        use std::sync::Mutex;
+        gst::init().expect("gst init");
+        let sink = std::env::var("CUEMARK_TEST_SINK4").expect("set CUEMARK_TEST_SINK4");
+        let front = format!("{sink}@FL,FR!{LAYOUT}");
+        let rear = format!("{sink}@RL,RR!{LAYOUT}");
+        let mut graph = OutputGraph::new();
+        let frames: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let f2 = frames.clone();
+        graph.set_pcm_emit(Arc::new(move |b: &[u8]| f2.lock().unwrap().push(b.to_vec())));
+        graph.pcm_shared().listening.store(true, Ordering::Relaxed);
+        graph.set_master_volume(0.0);
+
+        let main = graph.attach(&front, ("deck-0".into(), "main0".into()), "main").expect("attach main");
+        let cue = graph.attach(&rear, ("deck-0".into(), "cue".into()), "cue").expect("attach cue");
+        assert!(graph.nodes.values().next().unwrap().tap.is_some(), "tap built on main attach while listening");
+
+        let feed = |src: AppSrc, l: f32, r: f32| {
+            std::thread::spawn(move || {
+                for _ in 0..150 {
+                    let mut bytes = Vec::with_capacity(480 * 8);
+                    for _ in 0..480 {
+                        bytes.extend_from_slice(&l.to_le_bytes());
+                        bytes.extend_from_slice(&r.to_le_bytes());
+                    }
+                    let _ = src.push_buffer(gst::Buffer::from_slice(bytes));
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            })
+        };
+        let h1 = feed(main, -0.25, 0.25);
+        let h2 = feed(cue, 0.9, 0.9);
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        let got = frames.lock().unwrap().clone();
+        assert!(got.len() > 20, "expected a steady stream of frames, got {}", got.len());
+        assert!(got.len() < 100, "must respect <=60Hz (got {} in ~1.5s)", got.len());
+        let last = got.last().unwrap();
+        assert_eq!(last.len(), pcm_tap::PCM_FRAME_BYTES);
+        let (l, r) = (&last[1024..2048], &last[2048..]);
+        let cue_level = pcm_tap::quantise(0.9);
+        assert!(l.iter().chain(r.iter()).all(|&b| b != cue_level), "cue channels leaked into the tap");
+        assert_eq!(*l.last().unwrap(), pcm_tap::quantise(-0.25), "main L present at master volume 0");
+        assert_eq!(*r.last().unwrap(), pcm_tap::quantise(0.25), "main R present at master volume 0");
+
+        // Closing the gate stops emission.
+        graph.pcm_shared().listening.store(false, Ordering::Relaxed);
+        graph.refresh_tap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let n = frames.lock().unwrap().len();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(frames.lock().unwrap().len(), n, "not listening -> no frames");
     }
 }

@@ -244,6 +244,7 @@ pub fn run() {
             audio::audio_set_cue,
             audio::audio_get_position,
             audio::audio_set_master_volume,
+            audio::viz_set_listening,
             audio::audio_set_output_latency,
             audio::audio_set_main_devices,
             audio::audio_set_cue_device,
@@ -286,6 +287,18 @@ pub fn run() {
             // census.rs for what it records and why it is a *standing* line rather than
             // something switched on once a fault is suspected.
             let output_graph = app.state::<audio::AudioState>().lock().unwrap().output_graph();
+            // PCM tap (visualization-plugins.md Phase 5a): give the graph a way to emit
+            // `audio-pcm`, and manage the gate `viz_set_listening` flips. The tap is inert
+            // (no branch built, no work) until the output window reports it is listening.
+            {
+                use tauri::Emitter;
+                let mut g = output_graph.lock().unwrap();
+                let handle = app.handle().clone();
+                g.set_pcm_emit(std::sync::Arc::new(move |bytes: &[u8]| {
+                    let _ = handle.emit("audio-pcm", audio::pcm_tap::base64(bytes));
+                }));
+                app.manage(audio::PcmControl { graph: output_graph.clone(), shared: g.pcm_shared() });
+            }
             census::spawn(output_graph);
 
             viz_plugins::spawn_watcher(app.handle().clone());
