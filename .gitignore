@@ -6,3 +6,13 @@ dist/
 src-tauri/target/
 src-tauri/WixTools/
 src-tauri/gen/
+
+# Community visualization-plugin content (ISF shaders, Milkdrop presets) belongs only in
+# the user's local app-data folder (~/.local/share/com.cuemark.app/visualizations/), never
+# in this repo — per-file licenses in a downloaded pack are often unclear or unstated (see
+# docs/design/visualization-plugins.md's "Preset formats" section). This is belt-and-suspenders:
+# nothing in the normal workflow writes these paths inside the repo, but guard against an
+# accidental drop-in anyway.
+/visualizations/
+/plugins/milkdrop/
+*.milk
