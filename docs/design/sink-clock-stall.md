@@ -1,7 +1,8 @@
 # Sink clock stall — decks silent (or delayed by minutes) after the output graph has been idle
 
-Status: 🔴 **OPEN (2026-09-26).** Two incidents on file (2026-09-19, 2026-09-26) plus a
-week of `CLOCK REFERENCE OFF BY` warnings that are the same fault in its milder form.
+Status: 🔴 **OPEN (2026-09-27).** Three incidents on file (2026-09-19, 2026-09-26 ×2) plus a
+2026-09-27 live report (§10, USB device toggle) plus a week of `CLOCK REFERENCE OFF BY`
+warnings that are the same fault in its milder form.
 Mechanism **proposed, not proven**. Instrumentation (§6) and the clock pin (§5 fix 1) are
 built and committed (`e19c255`); the pin is live but did not prevent the 09-26 16:13 incident — see §9 and §6a. This doc supersedes the "Clock reference drifting while idle" section of
 `shared-output-pipeline.md` as the place to read; that section keeps the 09-19 measurements.
@@ -147,6 +148,7 @@ hardware-gated `two_branches_share_one_node` passes with `--ignored`):
 | 6.3 — clock sampler | new `audio/clock_watch.rs` | Per node, every 5s: pipeline clock **and** the pulsesink's own clock vs monotonic. WARN `CLOCK STALLED` / `CLOCK STEPPED` at >100ms error; INFO `node-tel: real=…/s gap=…/s | pipeline=… drift … | sink=… drift …` every 30s. The sink clock stays sampled even when the pin removes its consequences, so a pulse-clock step is still visible. |
 | 6.4 — stale margin | `pipeline.rs` `[deliver-tel]` | Window with no buffers prints `margin STALE(no buffers; last +101ms)`. |
 | 6.6 — dry watchdog | `pipeline.rs` reporter | Playing with zero buffers to any sink for 3s → WARN `PLAY PRODUCED NO AUDIO`, once per episode, plus an INFO when flow resumes. |
+| **post-mix level probe (§9's "missing instrument")** | `mixer.rs` `create_node()`, reuses `pipeline.rs`'s `instrument_level()` | 2026-09-27. Attached to each node's device-sink pad (post-master-volume, the last point in our own graph before the sink element), logging `[level/out/<node>] post-mix (to device): [L/zL% R/zR%] dBFS/zero% per ch  frames=N` once a second, same format as the existing `[level/deck-N]` lines. Settles §9 directly: `real`/`gap` buffer counts and `pcm-tap` throughput prove a buffer *reached* the pad, not that it carried signal (measured 2026-09-27: `analog-stereo` read 45 real buffers/s while the user heard silence) — this reads the samples. Still does not reach past our own pulsesink into PipeWire/the device; `pw-record --target <sink>.monitor` is still the next rung if this reads healthy and the device is still silent. `cargo check`/`cargo test --lib audio::mixer` clean; **not live-verified**. |
 
 **Not built yet:** 6.5 (forward pulsesink/audiobasesink warnings into the log — unclear that
 the overflow even produces a client-side warning, since it is a server-side event), 6.7
@@ -198,6 +200,38 @@ User report: a deck played silent, then audio "came back on its own", no restart
   seconds while silent, and check `zero%`. Better: a post-mixer level probe per node (6.x) so the log
   itself says whether a node emitted signal. Until then the mechanism stays unproven.
 - Workaround supported by the data: reload the deck (a fresh pipeline on an active graph played fine).
+
+## 10. Fourth incident, 2026-09-27 — manual Main-device toggle, live report
+
+User report: with Main output flipped between "None" and "USB AUDIO CODEC" repeatedly, audio was
+audible with Main **off** (routed to the `default` node) and **silent** with Main **on** (routed
+to the `analog-stereo` node) — the opposite of what the user expected from the setting's label.
+
+`cuemark.log` 17:44:32–17:51:16 shows the attach/detach bookkeeping itself is correct on every
+toggle (`set_devices` → detach old node → attach new node → `first buffer reached the sink`).
+The asymmetry is entirely in the two nodes' health, matching this doc's mechanism:
+
+- **`audio/out/default`**: `node-tel` reads clean for the whole ~7-minute window —
+  `real=100/s gap=0/s`, sink clock drift within ±13ms — including through an unrelated auto-dj
+  crossfade at 17:49:46 that played correctly.
+- **`audio/out/analog-stereo`** (the USB Audio Codec device): `CLOCK STEPPED` (jumps of
+  4.8–8.6s) on each of the three brief attach windows, settling into continuous `CLOCK STALLED`
+  (0ms/5s) the moment it went idle again, cumulative drift sitting around **+27,600s (~7.6h)** —
+  consistent with this node's pulsesink clock having wedged once, early in this long-running
+  instance, and never recovering, exactly as §3 (H1) predicts for a node that sat idle a long
+  time before first use.
+
+New data point for the §9 "missing instrument": `pcm-tap/analog-stereo` logged real (non-GAP)
+throughput during two of the attach windows — `45.0/s` and `12.5/s` — yet the user heard
+silence. So buffers reaching the mixer/tap is confirmed **not sufficient** evidence of audible
+output; whether they reached PipeWire/the physical device is still unmeasured. §9's suggested
+`pw-record --target <sink>.monitor` capture (or a post-mixer level probe, 6.x) remains the
+missing instrument and should be run the next time a device reproduces this rather than trusting
+`pcm-tap` counts or the `first buffer reached the sink` log line.
+
+Not a reversed-logic bug: device selection routes to the correct node every time. It only
+*looks* inverted because whichever node the user happens to be idling on is healthy and
+whichever one they just reactivated after a long idle is the one carrying the stale clock.
 
 ## 8. Evidence index
 

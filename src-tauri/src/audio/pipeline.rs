@@ -1624,7 +1624,13 @@ fn instrument_caps(element: &gst::Element, pad_name: &str, label: &str, deck_id:
 /// headphone feed, so an overall RMS would blur the one distinction that matters.
 ///
 /// Assumes F32LE, which `caps_48k` now pins on both selector inputs.
-fn instrument_level(element: &gst::Element, pad_name: &str, label: &str, deck_id: &str) {
+///
+/// **Reused per-node in `mixer.rs`** (2026-09-27, `sink-clock-stall.md` §9's "missing
+/// instrument") on each node's device-sink pad, post-master-volume — every deck-side probe
+/// in this file sits upstream of the node stage and cannot see whether a node's own output
+/// actually carried signal versus GAP silence. `deck_id` there is `out/<node>` rather than a
+/// deck id, and the log line reads the same way: `zero%` before `dBFS`.
+pub(super) fn instrument_level(element: &gst::Element, pad_name: &str, label: &str, deck_id: &str) {
     let Some(pad) = element.static_pad(pad_name) else { return };
     let label = label.to_string();
     let deck_id = deck_id.to_string();

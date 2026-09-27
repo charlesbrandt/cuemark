@@ -36,7 +36,8 @@ use gstreamer::{self as gst, prelude::*};
 use gstreamer_app::{AppSink, AppSinkCallbacks, AppSrc};
 
 use super::pipeline::{
-    deck_output_caps, make_sink, parse_device_remap, parse_snapcast_device, ChannelRemap,
+    deck_output_caps, instrument_level, make_sink, parse_device_remap, parse_snapcast_device,
+    ChannelRemap,
 };
 use super::clock_watch::{self, NodeFlow};
 use super::pcm_tap::{self, PackedPair, PcmEmit, PcmShared, PcmWindow};
@@ -695,6 +696,14 @@ impl OutputGraph {
                     gst::PadProbeReturn::Ok
                 });
             }
+            // Post-master-volume level probe — sink-clock-stall.md §9's "missing instrument".
+            // `pcm-tap` and the `real`/`gap` counts above only prove a buffer *reached* this
+            // pad, not that it carried audible signal — measured 2026-09-27: `analog-stereo`
+            // logged 45 real buffers/s while the user heard silence. This reads the samples
+            // themselves, at the last point in our own graph before the device sink, so a
+            // "flow looks fine but it's silent" report can be settled from the log instead of
+            // a live `pw-record` capture. See `instrument_level()`'s doc comment.
+            instrument_level(&sink, "sink", "post-mix (to device)", &format!("out/{}", short(&node_name)));
         }
 
         let latency_ns = Arc::new(AtomicU64::new(0));
