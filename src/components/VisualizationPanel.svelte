@@ -1,7 +1,8 @@
 <script lang="ts">
   import { session, setVisualization, setVisualizationOpacity, setVisualizationParams, setVizAudioSource } from "../lib/state/session";
   import { BUILTIN_ISF } from "../lib/renderer/isf/builtins";
-  import { diskPlugins, vizErrors, vizWarnings, vizFallback, refreshPluginList, mediaUrl, pluginName, activeInputs } from "../lib/viz/vizPlugins";
+  import { diskPlugins, vizErrors, vizWarnings, vizFallback, refreshPluginList, mediaUrl, pluginName, activeInputs, isMilkdropId } from "../lib/viz/vizPlugins";
+  import { cycleConfig, CYCLE_OFF, CYCLE_SECONDS, CYCLE_BARS, DEFAULT_BLEND_SECONDS } from "../lib/viz/vizCycle";
   import { fallbackNote } from "../lib/viz/vizHealth";
   import { describeInputs, colorToHex, hexToColor, type SliderAxis } from "../lib/viz/vizParamControls";
 
@@ -27,6 +28,11 @@
 
   let visualization = $derived($session.visualization);
   let selectedId = $derived(visualization?.pluginId ?? null);
+  let isfPlugins = $derived($diskPlugins.filter((p) => p.format !== "milkdrop"));
+  let milkdropPresets = $derived($diskPlugins.filter((p) => p.format === "milkdrop"));
+  let milkdropActive = $derived(isMilkdropId(selectedId));
+  let cycle = $derived(cycleConfig(params));
+  let blendTime = $derived(numParam("blendTime", DEFAULT_BLEND_SECONDS));
   let refreshing = $state(false);
 
   // Thumbnail URLs resolve asynchronously (the media server port is fetched once).
@@ -78,7 +84,7 @@
 
   <div class="settings-row">
     <span class="row-label">Plugins</span>
-    {#each $diskPlugins as p (p.id)}
+    {#each isfPlugins as p (p.id)}
       {@const err = $vizErrors[p.id] ?? p.error}
       <button
         class="viz-btn"
@@ -99,6 +105,65 @@
       {refreshing ? "…" : "Rescan"}
     </button>
   </div>
+
+  <div class="settings-row">
+    <span class="row-label">Milkdrop</span>
+    <select
+      class="source-select"
+      class:viz-broken={milkdropActive && !!$vizErrors[selectedId ?? ""]}
+      value={milkdropActive ? selectedId : ""}
+      title="Butterchurn presets: JSON files in the visualizations folder's milkdrop/ subfolder"
+      onchange={(e) => {
+        const v = e.currentTarget.value;
+        // Keep the blend/cycle settings when moving between presets; params are per-selection otherwise.
+        if (v) setVisualization({ pluginId: v, params: milkdropActive ? { ...params } : {} });
+        else select(null);
+      }}
+    >
+      <option value="">{milkdropPresets.length ? "— none —" : "— no presets found —"}</option>
+      {#each milkdropPresets as p (p.id)}
+        {@const err = $vizErrors[p.id] ?? p.error}
+        <option value={p.id}>{p.name}{err ? " ⚠" : ""}</option>
+      {/each}
+    </select>
+    {#if !milkdropPresets.length}
+      <span class="hint" title="~/.local/share/com.cuemark.app/visualizations/milkdrop/">
+        Drop converted Butterchurn preset .json files in the milkdrop/ subfolder, then Rescan.
+      </span>
+    {/if}
+  </div>
+
+  {#if milkdropActive}
+    <div class="settings-row">
+      <span class="row-label" title="Cross-fade from the previous preset">Blend</span>
+      <input type="range" min="0" max="10" step="0.5" value={blendTime}
+        oninput={(e) => setVisualizationParams({ blendTime: +e.currentTarget.value })} />
+      <span class="opacity-val">{blendTime.toFixed(1)}s</span>
+    </div>
+    <div class="settings-row">
+      <span class="row-label" title="Screensaver: switch to the next preset on a timer, or every N bars when the dominant deck has a beat grid (falls back to the seconds interval without one)">Cycle</span>
+      <select class="source-select" value={cycle.mode}
+        onchange={(e) => setVisualizationParams({ cycleMode: +e.currentTarget.value })}>
+        <option value={CYCLE_OFF}>Off</option>
+        <option value={CYCLE_SECONDS}>Every N seconds</option>
+        <option value={CYCLE_BARS}>Every N bars</option>
+      </select>
+      {#if cycle.mode === CYCLE_BARS}
+        <input type="range" min="1" max="64" step="1" value={cycle.bars}
+          oninput={(e) => setVisualizationParams({ cycleBars: +e.currentTarget.value })} />
+        <span class="opacity-val">{cycle.bars} bars</span>
+      {/if}
+      {#if cycle.mode !== CYCLE_OFF}
+        {#if cycle.mode === CYCLE_BARS}<span class="source-hint">no grid, then</span>{/if}
+        <input type="range" min="5" max="300" step="5" value={cycle.seconds}
+          oninput={(e) => setVisualizationParams({ cycleSeconds: +e.currentTarget.value })} />
+        <span class="opacity-val">{cycle.seconds}s</span>
+        <label class="source-hint"><input type="checkbox"
+          checked={numParam("cycleShuffle", 0) >= 0.5}
+          onchange={(e) => setVisualizationParams({ cycleShuffle: e.currentTarget.checked ? 1 : 0 })} /> shuffle</label>
+      {/if}
+    </div>
+  {/if}
 
   {#if selectedId && ($vizErrors[selectedId] ?? $diskPlugins.find((p) => p.id === selectedId)?.error)}
     <div class="viz-error">{$vizErrors[selectedId] ?? $diskPlugins.find((p) => p.id === selectedId)?.error}</div>

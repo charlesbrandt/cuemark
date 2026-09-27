@@ -30,7 +30,8 @@ const LICENSE_NAMES: &[&str] = &["LICENSE", "LICENSE.txt", "LICENSE.md"];
 #[serde(rename_all = "camelCase")]
 pub struct VizPluginInfo {
     pub id: String,
-    /// Always "isf" in this phase — Milkdrop (phase 6) will add "milkdrop".
+    /// "isf" or "milkdrop". A Milkdrop id is `milkdrop/<file>.json`, which can never collide
+    /// with an ISF id (those end in `.fs`, and the ISF scan skips the `milkdrop/` folder).
     pub format: String,
     pub name: String,
     pub description: Option<String>,
@@ -275,6 +276,60 @@ fn discover_folder_plugins(folder: &Path, folder_name: &str) -> Vec<VizPluginInf
         .collect()
 }
 
+/// The id prefix of every Milkdrop preset (the folder name; ids are paths relative to the
+/// plugins dir, like ISF ids).
+pub const MILKDROP_DIR: &str = "milkdrop";
+/// A preset larger than this is listed as an error rather than read (real presets are tens of
+/// KB; this only stops a stray multi-GB file from being slurped into the IPC).
+const MAX_PRESET_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Checks that `contents` is a Butterchurn preset: JSON object with a `baseVals` object (every
+/// converted preset has one; a `.milk` file renamed to `.json`, or a stray JSON file, does not).
+fn validate_milkdrop_preset(contents: &str) -> Result<(), String> {
+    let v: serde_json::Value = serde_json::from_str(contents.strip_prefix('\u{FEFF}').unwrap_or(contents))
+        .map_err(|e| format!("not valid JSON ({e}); raw .milk files must be converted first (milkdrop-preset-converter)"))?;
+    match v.get("baseVals") {
+        Some(b) if b.is_object() => Ok(()),
+        _ => Err("JSON has no baseVals object: not a Butterchurn/Milkdrop preset".to_string()),
+    }
+}
+
+/// Lists `*.json` directly inside `<plugins>/milkdrop/` (non-recursive, hidden skipped). A bad
+/// file is listed with `error` set, not dropped.
+pub fn discover_milkdrop_presets(folder: &Path) -> Vec<VizPluginInfo> {
+    let Ok(entries) = fs::read_dir(folder) else { return Vec::new() };
+    let mut out = Vec::new();
+    for entry in entries.filter_map(|e| e.ok()) {
+        let Some(file_name) = entry.file_name().to_str().map(|s| s.to_string()) else { continue };
+        let path = entry.path();
+        let is_json = path.extension().map(|e| e.eq_ignore_ascii_case("json")).unwrap_or(false);
+        if is_hidden(&file_name) || !is_json || !fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(&file_name).to_string();
+        let error = match fs::metadata(&path) {
+            Ok(m) if m.len() > MAX_PRESET_BYTES => Some(format!("preset is {} bytes (limit {MAX_PRESET_BYTES})", m.len())),
+            Ok(_) => match fs::read_to_string(&path) {
+                Ok(c) => validate_milkdrop_preset(&c).err(),
+                Err(e) => Some(format!("failed to read file: {e}")),
+            },
+            Err(e) => Some(format!("failed to read file: {e}")),
+        };
+        out.push(VizPluginInfo {
+            id: format!("{MILKDROP_DIR}/{file_name}"),
+            format: "milkdrop".to_string(),
+            name: stem,
+            description: None,
+            credit: None,
+            categories: Vec::new(),
+            thumbnail_path: None,
+            license_path: None,
+            error,
+        });
+    }
+    out
+}
+
 /// Scans the plugins directory (one level: bare `.fs` files and subfolders, `milkdrop/`
 /// skipped, hidden entries skipped) and returns a deterministically-sorted list. Never panics
 /// or fails on an unreadable entry — that entry just carries an `error` instead.
@@ -304,7 +359,9 @@ pub fn discover_plugins(dir: &Path) -> Vec<VizPluginInfo> {
             }
         } else if file_type.is_dir() {
             if file_name.eq_ignore_ascii_case("milkdrop") {
-                continue; // phase 6
+                // Milkdrop presets (Butterchurn JSON), phase 6: listed under their own ids.
+                out.extend(discover_milkdrop_presets(&entry.path()));
+                continue;
             }
             out.extend(discover_folder_plugins(&entry.path(), &file_name));
         }
@@ -324,9 +381,15 @@ pub fn discover_plugins(dir: &Path) -> Vec<VizPluginInfo> {
 /// filesystem (so a traversal attempt never gets far enough to canonicalize something like
 /// `/etc/passwd`), then canonicalizes both sides and checks containment as a second, filesystem-
 /// level guard against symlink tricks.
+fn is_milkdrop_id(id: &str) -> bool {
+    id.strip_prefix("milkdrop/")
+        .map(|rest| !rest.contains('/') && rest.len() > 5 && rest[rest.len() - 5..].eq_ignore_ascii_case(".json"))
+        .unwrap_or(false)
+}
+
 fn resolve_plugin_path(dir: &Path, id: &str) -> Result<PathBuf, String> {
-    if !id.ends_with(".fs") {
-        return Err(format!("plugin id must end in .fs: {id}"));
+    if !id.ends_with(".fs") && !is_milkdrop_id(id) {
+        return Err(format!("plugin id must end in .fs (or be milkdrop/<file>.json): {id}"));
     }
     if id.contains('\\') {
         return Err(format!("plugin id must not contain backslashes: {id}"));
@@ -359,6 +422,16 @@ fn resolve_plugin_path(dir: &Path, id: &str) -> Result<PathBuf, String> {
 /// a folder plugin (an id containing `/`) — the folder's image assets by file name.
 fn read_plugin_source(dir: &Path, id: &str) -> Result<VizPluginSource, String> {
     let path = resolve_plugin_path(dir, id)?;
+    if is_milkdrop_id(id) {
+        // The preset JSON travels in `fragment_source` (opaque text to Rust); no .vs, no assets.
+        if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_PRESET_BYTES {
+            return Err(format!("preset {id} is larger than {MAX_PRESET_BYTES} bytes"));
+        }
+        let fragment_source =
+            fs::read_to_string(&path).map_err(|e| format!("failed to read {id} as UTF-8: {e}"))?;
+        validate_milkdrop_preset(&fragment_source).map_err(|e| format!("{id}: {e}"))?;
+        return Ok(VizPluginSource { id: id.to_string(), fragment_source, vertex_source: None, assets: HashMap::new() });
+    }
     let fragment_source =
         fs::read_to_string(&path).map_err(|e| format!("failed to read {id} as UTF-8: {e}"))?;
     let vertex_source = fs::read_to_string(path.with_extension("vs")).ok();
@@ -429,7 +502,9 @@ fn scan_into(root: &Path, dir: &Path, depth: usize, out: &mut Snapshot) {
         let Ok(meta) = fs::metadata(&path) else { continue };
         if meta.is_dir() {
             if depth == 0 && name.eq_ignore_ascii_case("milkdrop") {
-                continue; // phase 6
+                // Presets are flat files in this folder: scan it one level only.
+                scan_into(root, &path, MAX_SCAN_DEPTH, out);
+                continue;
             }
             if depth < MAX_SCAN_DEPTH {
                 scan_into(root, &path, depth + 1, out);
@@ -480,6 +555,11 @@ pub fn diff_changed_ids(old: &Snapshot, new: &Snapshot) -> Vec<String> {
     let mut ids = std::collections::BTreeSet::new();
     for rel in changed {
         match rel.split_once('/') {
+            Some(("milkdrop", rest)) if !rest.contains('/') => {
+                if is_milkdrop_id(rel) {
+                    ids.insert(rel.clone());
+                }
+            }
             None => {
                 if is_fs(rel) {
                     ids.insert(rel.clone());
@@ -665,15 +745,70 @@ void main() { gl_FragColor = vec4(1.0); }
     }
 
     #[test]
-    fn milkdrop_folder_skipped_entirely() {
+    fn milkdrop_folder_is_never_scanned_for_isf() {
         let dir = TempDir::new();
         let folder = dir.0.join("milkdrop");
         fs::create_dir_all(&folder).unwrap();
-        // Even a well-formed .fs in here must not surface — phase 6 owns this folder.
+        // A well-formed .fs in here must not surface as an ISF plugin: this folder is Milkdrop's.
         fs::write(folder.join("preset.fs"), VALID_HEADER).unwrap();
 
         let plugins = discover_plugins(&dir.0);
         assert!(plugins.is_empty());
+    }
+
+    const PRESET: &str = r#"{"baseVals":{"decay":0.9},"shapes":[],"waves":[],"init_eqs_str":"","frame_eqs_str":"","pixel_eqs_str":"","warp":"","comp":""}"#;
+
+    #[test]
+    fn milkdrop_presets_listed_with_unambiguous_ids_and_bad_ones_flagged() {
+        let dir = TempDir::new();
+        let folder = dir.0.join("milkdrop");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("Good One.json"), PRESET).unwrap();
+        fs::write(folder.join("broken.json"), "{not json").unwrap();
+        fs::write(folder.join("notpreset.json"), r#"{"a":1}"#).unwrap();
+        fs::write(folder.join("readme.txt"), "x").unwrap();
+        fs::write(folder.join(".hidden.json"), PRESET).unwrap();
+        fs::write(dir.0.join("plain.fs"), VALID_HEADER).unwrap();
+
+        let plugins = discover_plugins(&dir.0);
+        let by_id = |id: &str| plugins.iter().find(|p| p.id == id).unwrap_or_else(|| panic!("missing {id}"));
+        assert_eq!(plugins.len(), 4);
+        assert_eq!(by_id("milkdrop/Good One.json").format, "milkdrop");
+        assert!(by_id("milkdrop/Good One.json").error.is_none());
+        assert_eq!(by_id("milkdrop/Good One.json").name, "Good One");
+        assert!(by_id("milkdrop/broken.json").error.is_some());
+        assert!(by_id("milkdrop/notpreset.json").error.as_deref().unwrap().contains("baseVals"));
+        assert_eq!(by_id("plain.fs").format, "isf");
+        // Every milkdrop id is distinguishable from every ISF id by its suffix.
+        assert!(plugins.iter().filter(|p| p.format == "milkdrop").all(|p| p.id.ends_with(".json")));
+        assert!(plugins.iter().filter(|p| p.format == "isf").all(|p| p.id.ends_with(".fs")));
+    }
+
+    #[test]
+    fn milkdrop_read_and_traversal_guard() {
+        let dir = TempDir::new();
+        let folder = dir.0.join("milkdrop");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("a.json"), PRESET).unwrap();
+        fs::write(folder.join("bad.json"), "nope").unwrap();
+        fs::write(dir.0.join("outside.json"), PRESET).unwrap();
+
+        let src = read_plugin_source(&dir.0, "milkdrop/a.json").unwrap();
+        assert_eq!(src.fragment_source, PRESET);
+        assert!(src.assets.is_empty() && src.vertex_source.is_none());
+        assert!(read_plugin_source(&dir.0, "milkdrop/bad.json").is_err());
+        // Only milkdrop/<file>.json: not a top-level json, not nested, not traversal.
+        assert!(read_plugin_source(&dir.0, "outside.json").is_err());
+        assert!(read_plugin_source(&dir.0, "milkdrop/../outside.json").is_err());
+        assert!(read_plugin_source(&dir.0, "milkdrop/sub/a.json").is_err());
+        assert!(read_plugin_source(&dir.0, "other/a.json").is_err());
+    }
+
+    #[test]
+    fn milkdrop_diff_maps_presets_only() {
+        let old = snap(&[("milkdrop/a.json", 1, 1), ("milkdrop/b.json", 1, 1)]);
+        let new = snap(&[("milkdrop/a.json", 2, 1), ("milkdrop/notes.txt", 1, 1)]);
+        assert_eq!(diff_changed_ids(&old, &new), vec!["milkdrop/a.json", "milkdrop/b.json"]);
     }
 
     #[test]

@@ -119,7 +119,69 @@ let vizFrameIndex = 0;
 let bindingWindow = newBindingWindow();
 let bindingLogAt = 0;
 
+// ── Milkdrop (phase 6) ──────────────────────────────────────────────────────────────────────
+// A sandboxed iframe stacked above the compositor canvas (lib/renderer/milkdrop/). The module,
+// and Butterchurn behind it, are loaded with a dynamic import on the FIRST Milkdrop preset, so
+// a session that never selects one pays nothing. The ISF path below is untouched: selecting an
+// ISF plugin (or None) only ever calls `teardownMilkdrop()`, a no-op when nothing was built.
+type MilkdropInstanceT = import('./lib/renderer/milkdrop/instance').MilkdropInstance;
+let milkdrop: MilkdropInstanceT | null = null;
+let milkdropId: string | null = null;
+let milkdropSeq = 0;
+let milkdropBlend = 2; // seconds; follows the `blendTime` param of the frame messages
+
+function teardownMilkdrop() {
+  milkdropSeq++; // invalidates an import still in flight
+  if (milkdrop) {
+    milkdrop.destroy();
+    debugLog('[output] milkdrop frame destroyed');
+  }
+  milkdrop = null;
+  milkdropId = null;
+}
+
+function reportVizError(pluginId: string, stage: OutputVizErrorMessage['stage'], message: string) {
+  debugLog(`[output] visualization ${pluginId} failed (${stage}): ${message}`);
+  channel.postMessage({ kind: 'vizError', pluginId, stage, message });
+}
+
+async function loadMilkdrop(plugin: VizPluginPayload) {
+  const seq = ++milkdropSeq;
+  // The ISF layer, if any, is switched off: only one visualization is ever active.
+  compositor.setVisualization(null, 'viz');
+  vizPluginId = null;
+  milkdropId = plugin.id;
+  try {
+    if (!milkdrop) {
+      const { MilkdropInstance } = await import('./lib/renderer/milkdrop/instance');
+      if (seq !== milkdropSeq) return; // superseded while the module loaded
+      milkdrop = new MilkdropInstance(document.body, {
+        onError: (id, stage, message) => reportVizError(id ?? milkdropId ?? plugin.id, stage, message),
+        onPresetOk: (id) => {
+          debugLog(`[output] visualization ${id} loaded (milkdrop)`);
+          channel.postMessage({ kind: 'vizOk', pluginId: id });
+        },
+        onStats: (st) =>
+          debugLog(
+            `[viz] plugin=${st.id} format=milkdrop frames=${st.frames} pcm_recv=${st.recv} ` +
+              `frame_ms p50=${st.renderP50} p95=${st.renderP95}` +
+              ((st.renderP50 ?? 0) > 8 ? ' SLOW(>8ms budget)' : ''),
+          ),
+      });
+      debugLog('[output] milkdrop frame created');
+    }
+    milkdrop.loadPreset(plugin.id, plugin.source, milkdropBlend);
+  } catch (e) {
+    reportVizError(plugin.id, 'runtime', e instanceof Error ? e.message : String(e));
+  }
+}
+
 function loadVisualization(plugin: VizPluginPayload | null) {
+  if (plugin?.format === 'milkdrop') {
+    void loadMilkdrop(plugin);
+    return;
+  }
+  teardownMilkdrop();
   vizPluginId = null;
   try {
     // Parse before touching the compositor, so a header error leaves nothing half-built.
@@ -186,6 +248,12 @@ channel.onmessage = (e: MessageEvent<OutputMessage>) => {
     // originals on its own schedule. Not closing here would leak multiple megabytes per
     // frame into the process that also runs this window's GL.
     d.bitmap.close();
+  }
+
+  if (milkdrop) {
+    if (typeof msg.vizParams?.blendTime === 'number') milkdropBlend = msg.vizParams.blendTime;
+    milkdrop.setOpacity(msg.vizOpacity);
+    milkdrop.pushPcm(msg.pcm);
   }
 
   if (vizPluginId && msg.vizOpacity > 0) {
