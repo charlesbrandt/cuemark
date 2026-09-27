@@ -5,6 +5,7 @@
   import { cycleConfig, CYCLE_OFF, CYCLE_SECONDS, CYCLE_BARS, DEFAULT_BLEND_SECONDS } from "../lib/viz/vizCycle";
   import { fallbackNote } from "../lib/viz/vizHealth";
   import { describeInputs, colorToHex, hexToColor, type SliderAxis } from "../lib/viz/vizParamControls";
+  import { buildVizOptionGroups } from "../lib/viz/vizPicker";
 
   let controls = $derived(describeInputs($activeInputs));
   let params = $derived($session.visualization?.params ?? {});
@@ -34,6 +35,10 @@
   let cycle = $derived(cycleConfig(params));
   let blendTime = $derived(numParam("blendTime", DEFAULT_BLEND_SECONDS));
   let refreshing = $state(false);
+  let optionGroups = $derived(buildVizOptionGroups(BUILTIN_ISF, isfPlugins, milkdropPresets, $vizErrors));
+  let selectedError = $derived(
+    selectedId ? ($vizErrors[selectedId] ?? $diskPlugins.find((p) => p.id === selectedId)?.error) : null,
+  );
 
   // Thumbnail URLs resolve asynchronously (the media server port is fetched once).
   let thumbs = $state<Record<string, string>>({});
@@ -48,6 +53,19 @@
 
   function select(pluginId: string | null) {
     setVisualization(pluginId === null ? null : { pluginId, params: {} });
+  }
+
+  // Single handler for the merged source <select>: built-in, disk ISF plugin, Milkdrop
+  // preset or "None", all through one control. Moving between two Milkdrop presets keeps the
+  // blend/cycle params (matches the old Milkdrop-only <select>'s onchange); every other
+  // transition — into or out of Milkdrop, or any ISF/built-in pick — resets params to {}
+  // (matches the old button-chip `select()`).
+  function selectViz(id: string | null) {
+    if (id !== null && isMilkdropId(id) && milkdropActive) {
+      setVisualization({ pluginId: id, params: { ...params } });
+    } else {
+      select(id);
+    }
   }
 
   // Matches the app's `deck-<n>` ids; falls back to list position for any other id.
@@ -66,69 +84,37 @@
   <span class="settings-title">Visualization</span>
 
   <div class="settings-row">
-    <button
-      class="viz-btn"
-      class:viz-active={selectedId === null}
-      onclick={() => select(null)}
-    >None</button>
-    {#each BUILTIN_ISF as p (p.id)}
-      <button
-        class="viz-btn"
-        class:viz-active={selectedId === p.id}
-        class:viz-broken={!!$vizErrors[p.id]}
-        title={$vizErrors[p.id] ?? ""}
-        onclick={() => select(p.id)}
-      >{p.name}{#if $vizErrors[p.id]} ⚠{/if}</button>
-    {/each}
-  </div>
-
-  <div class="settings-row">
-    <span class="row-label">Plugins</span>
-    {#each isfPlugins as p (p.id)}
-      {@const err = $vizErrors[p.id] ?? p.error}
-      <button
-        class="viz-btn"
-        class:viz-active={selectedId === p.id}
-        class:viz-broken={!!err}
-        title={err ?? [p.description, p.credit].filter(Boolean).join(" — ")}
-        onclick={() => select(p.id)}
-      >
-        {#if thumbs[p.id]}<img class="viz-thumb" src={thumbs[p.id]} alt="" />{/if}
-        {p.name}{#if err} ⚠{/if}
-      </button>
-    {:else}
-      <span class="hint" title="~/.local/share/com.cuemark.app/visualizations/">
-        None found. Drop ISF (.fs) files in the app's visualizations folder.
-      </span>
-    {/each}
+    <span class="row-label">Source</span>
+    <select
+      class="source-select"
+      class:viz-broken={!!selectedError}
+      value={selectedId ?? ""}
+      title={selectedError ?? ""}
+      onchange={(e) => selectViz(e.currentTarget.value || null)}
+    >
+      <option value="">None</option>
+      {#each optionGroups as g (g.label)}
+        <optgroup label={g.label}>
+          {#each g.options as o (o.id)}
+            <option value={o.id} title={o.title ?? ""}>{o.label}</option>
+          {/each}
+        </optgroup>
+      {/each}
+    </select>
+    {#if selectedId && thumbs[selectedId]}
+      <img class="viz-thumb-preview" src={thumbs[selectedId]} alt="" />
+    {/if}
     <button class="viz-btn" onclick={refresh} disabled={refreshing}>
       {refreshing ? "…" : "Rescan"}
     </button>
-  </div>
-
-  <div class="settings-row">
-    <span class="row-label">Milkdrop</span>
-    <select
-      class="source-select"
-      class:viz-broken={milkdropActive && !!$vizErrors[selectedId ?? ""]}
-      value={milkdropActive ? selectedId : ""}
-      title="Butterchurn presets: JSON files in the visualizations folder's milkdrop/ subfolder"
-      onchange={(e) => {
-        const v = e.currentTarget.value;
-        // Keep the blend/cycle settings when moving between presets; params are per-selection otherwise.
-        if (v) setVisualization({ pluginId: v, params: milkdropActive ? { ...params } : {} });
-        else select(null);
-      }}
-    >
-      <option value="">{milkdropPresets.length ? "— none —" : "— no presets found —"}</option>
-      {#each milkdropPresets as p (p.id)}
-        {@const err = $vizErrors[p.id] ?? p.error}
-        <option value={p.id}>{p.name}{err ? " ⚠" : ""}</option>
-      {/each}
-    </select>
+    {#if !isfPlugins.length}
+      <span class="hint" title="~/.local/share/com.cuemark.app/visualizations/">
+        No plugins found. Drop ISF (.fs) files in the app's visualizations folder.
+      </span>
+    {/if}
     {#if !milkdropPresets.length}
       <span class="hint" title="~/.local/share/com.cuemark.app/visualizations/milkdrop/">
-        Drop converted Butterchurn preset .json files in the milkdrop/ subfolder, then Rescan.
+        No Milkdrop presets found. Drop converted Butterchurn preset .json files in the milkdrop/ subfolder.
       </span>
     {/if}
   </div>
@@ -165,8 +151,8 @@
     </div>
   {/if}
 
-  {#if selectedId && ($vizErrors[selectedId] ?? $diskPlugins.find((p) => p.id === selectedId)?.error)}
-    <div class="viz-error">{$vizErrors[selectedId] ?? $diskPlugins.find((p) => p.id === selectedId)?.error}</div>
+  {#if selectedError}
+    <div class="viz-error">{selectedError}</div>
   {/if}
 
   {#if selectedId && $vizFallback && $vizFallback.requestedId === selectedId}
@@ -301,23 +287,13 @@
     color: #7ec8e3;
   }
 
-  .viz-btn.viz-active {
-    background: #7ec8e3;
-    border-color: #7ec8e3;
-    color: #0b1c22;
-  }
-
-  .viz-btn.viz-broken {
-    border-color: #e04040;
-  }
-
-  .viz-thumb {
+  .viz-thumb-preview {
     width: 24px;
     height: 14px;
     object-fit: cover;
     vertical-align: middle;
-    margin-right: 4px;
     border-radius: 2px;
+    border: 1px solid var(--divider);
   }
 
   .hint {
@@ -351,6 +327,10 @@
     border-radius: 4px;
     padding: 2px 6px;
     font: inherit;
+  }
+
+  .source-select.viz-broken {
+    border-color: #e04040;
   }
 
   .source-hint {
