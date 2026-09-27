@@ -29,6 +29,11 @@ describe("pluginWantsPcm", () => {
     expect(pluginWantsPcm(plugin(fftSrc))).toBe(false);
     expect(pluginWantsPcm(null)).toBe(false);
   });
+  it("is true for every Milkdrop preset (Butterchurn runs its own FFT), false for a plain ISF shader", () => {
+    const md = { id: "milkdrop/a.json", format: "milkdrop" as const, source: '{"baseVals":{}}', assets: {} };
+    expect(pluginWantsPcm(md)).toBe(true);
+    expect(pluginWantsPcm(plugin("/*{}*/ void main(){}"))).toBe(false);
+  });
 });
 
 describe("packPcmRows", () => {

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { get } from "svelte/store";
-  import { session, addDeck, updateDeck, setSnapToBeat } from "./lib/state/session";
+  import { session, addDeck, updateDeck, setSnapToBeat, setVisualization } from "./lib/state/session";
   import VisualizationPanel from "./components/VisualizationPanel.svelte";
   import { startMidiListener } from "./lib/midi/handler";
   import { syncHeadphoneCueLed, syncPlayLed, syncSyncLed } from "./lib/midi/ledSync";
@@ -21,7 +21,8 @@
   import { routeAudio, computeBindings, effectiveDeckGain, type DeckAudioSample, type RoutedAudio } from "./lib/viz/vizBindings";
   import { postFrame, takeResendRequest, releaseDeck, onVizReport, hasListener as outputHasListener, type DeckFrameSource } from "./lib/renderer/outputBus";
   import { startVizPcm, stopVizPcm, noteActivePlugin, latestPcm } from "./lib/viz/vizPcm";
-  import { activeVizPayload, startVizPluginSync, refreshPluginList } from "./lib/viz/vizPlugins";
+  import { activeVizPayload, startVizPluginSync, refreshPluginList, isMilkdropId, diskPlugins, vizErrors } from "./lib/viz/vizPlugins";
+  import { tickAutoCycle, resetAutoCycle } from "./lib/viz/vizCycle";
   import DeckCard from "./components/DeckCard.svelte";
   import Crossfader from "./components/Crossfader.svelte";
   import WaveformCanvas from "./components/WaveformCanvas.svelte";
@@ -815,6 +816,23 @@
             trackProgress: domT !== null && domDur > 0 ? Math.min(1, Math.max(0, domT / domDur)) : 0,
             crossfader: s.crossfaderValue,
           });
+          if (isMilkdropId(visualization.pluginId)) {
+            // Milkdrop auto-cycle: on a beat (bars mode + grid) or on a timer. A switch is an
+            // ordinary selection change, so it flows through the same resolve -> viz message path.
+            const beatPhase = dom ? getPhase(dom.id) : null;
+            const next = tickAutoCycle(
+              nowMs, visualization.pluginId, visualization.params,
+              { phase: beatPhase, bpm: dom?.bpm ? dom.bpm * dom.playbackRate : 0 },
+              !!dom?.playing,
+              get(diskPlugins).filter((p) => p.format === 'milkdrop' && !p.error && !get(vizErrors)[p.id]).map((p) => p.id),
+            );
+            if (next) {
+              debugLog(`[viz] auto-cycle -> ${next}`);
+              setVisualization({ pluginId: next, params: visualization.params });
+            }
+          } else {
+            resetAutoCycle();
+          }
           if (vizRouted.dominantDeckId !== lastVizDominant) {
             lastVizDominant = vizRouted.dominantDeckId;
             debugLog(`[viz] dominant ${lastVizDominant ?? 'none'} (gain ${vizRouted.dominantGain.toFixed(2)}, source ${s.vizAudioSource ?? 'mix'})`);

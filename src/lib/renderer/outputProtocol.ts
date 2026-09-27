@@ -68,8 +68,8 @@ export interface OutputFrameMessage {
 /** What the output window needs to build a plugin. */
 export interface VizPluginPayload {
   id: string;
-  format: 'isf';
-  /** ISF fragment shader, header included. */
+  format: 'isf' | 'milkdrop';
+  /** ISF fragment shader, header included; or, for `milkdrop`, the Butterchurn preset JSON text. */
   source: string;
   /** Optional ISF vertex shader (`<name>.vs`). */
   vertexSource?: string;

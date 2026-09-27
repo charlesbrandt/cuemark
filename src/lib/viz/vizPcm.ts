@@ -13,7 +13,7 @@
  * is switched on only while ALL of these hold: the output window is alive (the same `alive`
  * beacon `postFrame()` uses — no second liveness signal), a visualization is selected, and the
  * selected plugin declares an `audio` input (`pluginWantsPcm`). None of the five built-ins do,
- * so ordinary use never turns the tap on. Phase 6 (Milkdrop) extends `pluginWantsPcm`.
+ * so ordinary use never turns the tap on. Milkdrop presets always want it (phase 6).
  */
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -38,9 +38,14 @@ let unlisten: UnlistenFn | undefined;
 let timer: ReturnType<typeof setInterval> | undefined;
 let isOutputAlive: () => boolean = () => false;
 
-/** Does this plugin read PCM? An ISF `audio` input, and only that (`audioFFT` is a different type). */
+/**
+ * Does this plugin read PCM? An ISF `audio` input (`audioFFT` is a different type), or any
+ * Milkdrop preset: Butterchurn runs its own FFT on the raw samples, so it always needs the tap.
+ */
 export function pluginWantsPcm(plugin: VizPluginPayload | null | undefined): boolean {
-  if (!plugin || plugin.format !== 'isf') return false;
+  if (!plugin) return false;
+  if (plugin.format === 'milkdrop') return true;
+  if (plugin.format !== 'isf') return false;
   return /"TYPE"\s*:\s*"audio"/.test(plugin.source);
 }
 

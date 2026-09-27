@@ -531,8 +531,19 @@ feedback loop now.
 `TIME` counts from when the plugin was loaded, in the output window (ISF convention, and
 keeps float precision) — animations restart on every switch.
 
+**Milkdrop (phase 6, 2026-09-26, headless-verified only)**: presets are Butterchurn JSON files in
+`<plugins>/milkdrop/` (id `milkdrop/<file>.json`; user-supplied, no pack is bundled: the presets
+have no per-preset licence). The output window runs them in a `sandbox="allow-scripts"`
+`srcdoc` iframe stacked above the compositor canvas (`lib/renderer/milkdrop/`), because preset
+equations are `new Function` JS and this window has Tauri IPC. PCM comes from the phase-5a
+tap (`pluginWantsPcm` is true for Milkdrop); opacity is CSS opacity; Butterchurn and the frame
+are lazy and cost nothing until a preset is picked. Params `blendTime`, `cycleMode`/`Seconds`/
+`Bars`/`Shuffle` (auto-cycle, on a beat when the dominant deck has a grid). See "Phase 6 ->
+Result" in the design doc, including what was **not** verified (production build, listening,
+projector GPU).
+
 **UI**: `src/components/VisualizationPanel.svelte` (built-ins, discovered plugins with error
-badges and thumbnails, Rescan, opacity), toggled from the toolbar.
+badges and thumbnails, Milkdrop preset picker + blend/auto-cycle, Rescan, opacity), toggled from the toolbar.
 
 ## Active architecture plan (2026-07-25)
 

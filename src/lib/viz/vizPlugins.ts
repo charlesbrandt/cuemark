@@ -17,7 +17,7 @@ import { importedWarning, chooseFallback, type VizFallback } from './vizHealth';
 /** One row of `viz_list_plugins` (src-tauri/src/viz_plugins.rs). */
 export interface VizPluginInfo {
   id: string;
-  format: 'isf';
+  format: 'isf' | 'milkdrop';
   name: string;
   description?: string | null;
   credit?: string | null;
@@ -85,6 +85,11 @@ export function isBuiltinId(id: string): boolean {
   return id.startsWith('builtin:');
 }
 
+/** Milkdrop presets are `milkdrop/<file>.json`; ISF ids end in `.fs`, so the two cannot clash. */
+export function isMilkdropId(id: string | null | undefined): boolean {
+  return !!id && id.startsWith('milkdrop/') && id.endsWith('.json');
+}
+
 /** Display name for a plugin id, for the picker and log lines. */
 export function pluginName(id: string): string {
   const b = BUILTIN_ISF.find((p) => p.id === id);
@@ -97,6 +102,10 @@ export async function resolvePlugin(id: string): Promise<VizPluginPayload> {
   const b = BUILTIN_ISF.find((p) => p.id === id);
   if (b) return { id, format: 'isf', source: b.source, assets: {} };
   const src = await invoke<VizPluginSource>('viz_read_plugin', { id });
+  if (isMilkdropId(id)) {
+    // The preset JSON rides in fragmentSource; no assets, and no ISF parsing anywhere.
+    return { id, format: 'milkdrop', source: src.fragmentSource, assets: {} };
+  }
   // viz_read_plugin returns absolute paths; the output window can only fetch http URLs.
   const assets: Record<string, string> = {};
   for (const [name, path] of Object.entries(src.assets)) assets[name] = await mediaUrl(path);
@@ -155,7 +164,7 @@ export const activeInputs: Readable<IsfInput[]> = { subscribe: activeInputsStore
 export function setActivePayload(payload: VizPluginPayload | null) {
   activePayload = payload;
   let inputs: IsfInput[] = [];
-  if (payload) {
+  if (payload && payload.format === 'isf') {
     try {
       inputs = parseIsf(payload.source, payload.vertexSource).inputs;
     } catch {
@@ -206,7 +215,7 @@ export function startVizPluginSync(
         if (mySeq !== seq) return;
         setActivePayload(payload);
         vizFallback.set(null);
-        const w = importedWarning(id, payload.source, payload.assets);
+        const w = payload.format === 'isf' ? importedWarning(id, payload.source, payload.assets) : null;
         setVizWarning(id, w);
         if (w) debugLog(`[viz] warning: ${id} ${w}`);
       },

@@ -5,7 +5,8 @@ good live, Phase 3 judged live ("a bit muted", `fft-bars` visibly reacts). Phase
 hot reload, image inputs) **verified headless on mele** ("Result 2026-09-26, late" item C), not
 yet judged by the user. **Follow-ups 1-3 DONE** (IMPORTED warning, missing-plugin fallback,
 `inMixOut`/`liked` removed from the binding vocabulary; see "Follow-up result 2026-09-26").
-**Phase 6 iframe spike: PASS** (see Phase 6 step 1). Output-window **RSS creep reproduced but
+**Phase 6 BUILT 2026-09-26, headless-verified only** (see "Phase 6 → Result": not heard, not
+seen on a projector, not run in a production build). Phase 6 iframe spike: PASS. Output-window **RSS creep reproduced but
 unattributed** (not viz-specific, no fix); the **6 s output stall after selecting particles/scope
 was not reproduced** in 402 selections. Phases 5-7 not started. Still open: `beatPhase`/`bpm`
 live judgement, params persistence across restart and MIDI (Phase 2, uncovered), `inMixOut`/`liked` (need a real source; see
@@ -631,6 +632,113 @@ the gain-weighted pre-EQ approximation. Only if phase 3's approximation feels wr
 **Done when:** a preset from a user-supplied pack runs on the projector, reacts to the music,
 and auto-cycle changes presets on a beat.
 
+### Phase 6 → Result (2026-09-26, branch `viz-phase6-milkdrop`, mele, headless)
+
+**Built.** `lib/renderer/milkdrop/frameShell.ts` (the sandbox document + message protocol),
+`lib/renderer/milkdrop/instance.ts` (`MilkdropInstance`), `lib/viz/vizCycle.ts` (auto-cycle),
+`output.ts` (`loadMilkdrop`/`teardownMilkdrop`), `viz_plugins.rs` (`milkdrop/*.json` discovery,
+`viz_read_plugin`, hot-reload ids), `vizPlugins.ts`/`vizPcm.ts`/`VisualizationPanel.svelte`/
+`App.svelte` wiring. Dependency: **`butterchurn@2.6.7` (exact)**.
+
+- **Licences (checked 2026-09-26, `package.json` + shipped LICENSE files).** `butterchurn` MIT
+  (its two bundled runtime deps, `@babel/runtime` and `ecma-proposal-math-extensions`, MIT):
+  compatible with Apache-2.0, added. `butterchurn-presets@2.4.7`: the *package* is MIT, but the
+  presets inside are many authors' work with no per-preset licence, so it is **not** a
+  dependency and nothing from it is vendored; **presets are user-supplied only**
+  (`<plugins>/milkdrop/*.json`). The probe fetches the Minimal pack with `npm pack` into a temp
+  dir, exactly as the spike did. Open question 5 stays open for anything cuemark might ever ship.
+- **Cost when unused: nothing.** `output.ts` reaches Milkdrop through `import()` of `instance.ts`,
+  which itself lazy-`?raw`-imports `butterchurn.min.js` (193 KB, 40 KB gzip) as a separate
+  chunk on the first preset. Verified: after selecting an ISF plugin, no `<iframe>` exists and
+  neither chunk was requested (probe `isf/*`). Leaving Milkdrop `destroy()`s the frame.
+- **Iframe source strategy: `srcdoc`, decided.** The production case the spike could not cover
+  is a `tauri://localhost` page embedding a frame. With `srcdoc` there is no frame URL at all:
+  no `http://127.0.0.1:<port>` cross-scheme embed, no `media_server.rs` route, no
+  `Content-Type`, no CORS. The shell is a ~3 KB string; Butterchurn's text is `postMessage`d in
+  and run as an inline `<script>` (so no `</script>` escaping problem either). A sandboxed frame
+  has an opaque origin and could not fetch a same-origin file anyway. `media_server.rs` is
+  **unchanged**. (This supersedes "served from the media server" in "Milkdrop renderer" item 4.)
+- **Protocol.** Preset JSON *text* travels in `VizPluginPayload.source` (`format: 'milkdrop'`)
+  and to the frame by `postMessage`; the frame `JSON.parse`s it, so a malformed file is a
+  frame-side error, not a control-window one. PCM: the three 1024-byte blocks are copied out of
+  the frame message's `pcm` and transferred (3 KB/frame, spike-verified free). Frame -> parent:
+  `presetOk` / `error` / `stats` (every 5 s: `[viz] plugin=… format=milkdrop frames=… pcm_recv=…
+  frame_ms p50=… p95=…`, `SLOW(>8ms budget)` appended past 8 ms median; **log only, not yet
+  flagged in the picker**). Opacity is CSS `opacity` on the iframe; at 0 the frame also stops
+  rendering. The frame stays invisible until the first preset loads (no black rectangle over
+  the decks). Buffer is fixed 1280x720 (`MILKDROP_BUFFER`), CSS-stretched, not 1920x1080: a
+  guess at the budget on weak GPUs, unmeasured there.
+- **Ids.** `milkdrop/<file>.json`. ISF ids end in `.fs` and the ISF scan skips the `milkdrop/`
+  folder, so the two cannot collide (unit-tested). `viz_read_plugin` accepts only exactly
+  `milkdrop/<file>.json` (no nesting, no traversal; 4 MB cap; must be JSON with a `baseVals`
+  object). A bad file is listed with `error` set, not dropped. Picker: a **Milkdrop `<select>`**
+  (not buttons: a pack is hundreds of presets), separate from the ISF "Plugins" row.
+  ⚠️ Hot reload now scans `milkdrop/` too: a pack of N presets is N `stat` calls per 2 s poll.
+- **Params (in `Visualization.params`, persisted with the selection).** `blendTime` (s, default
+  2; the first preset of a fresh frame always loads with 0), `cycleMode` (0 off / 1 seconds /
+  2 bars), `cycleSeconds` (default 30; also the no-grid fallback for bars), `cycleBars`
+  (default 8), `cycleShuffle`.
+- **Auto-cycle** runs in `App.svelte`'s rAF tick (`tickAutoCycle`): the dominant deck's
+  `getPhase()`; a wrap of the beat phase counts a beat, 4 beats = a bar, and the switch fires
+  **on the wrap tick**, i.e. on a beat. No grid (no dominant deck, bpm 0, or deck paused, whose
+  phase is frozen) falls back to `cycleSeconds`. ⚠️ "Bar" = 4 beats counted from when the cycle
+  (re)started: `deck.downbeat` is a beat-level anchor, nothing knows where beat 1 of a bar is.
+  A switch is an ordinary selection change (same resolve -> `viz` message path), a manual pick
+  restarts the interval, and errored presets are skipped. It advances through the picker's list
+  order (or random).
+- **PCM gate.** `pluginWantsPcm` is true for every Milkdrop preset (Butterchurn runs its own
+  FFT), so the phase-5a tap is built lazily on the first Milkdrop selection and, as before, is
+  never torn down (valve only).
+
+**Verification (mele, Xvfb `:97`, `GDK_BACKEND=x11`, `WEBKIT_DISABLE_DMABUF_RENDERER=1`,
+isolated XDG dirs, WebKitGTK 2.52).** `cargo test --lib viz_plugins` 20 pass (4 new: listing,
+bad-file flagging, read + traversal guard, hot-reload ids); `npm run check` 0 errors; `npm test`
+282 pass (new: `vizCycle.test.ts`, Milkdrop cases in `vizPcm.test.ts`); `vite build` emits the two
+lazy chunks. **`scripts/probes/milkdrop_output_window_probe.py`** loads the real `output.html`
+in a WebKitGTK view and drives it with the same BroadcastChannel messages `outputBus.ts` sends.
+Two arms, both PASS: `dev` (Vite over http) and **`scheme`: the built `dist/` served through a
+registered `tauri://` scheme, embedding the `srcdoc` frame, i.e. the production mixed-scheme
+case minus Tauri's own protocol handler.** 25 checks each, 8 real presets from the Minimal pack:
+
+| Check | Result |
+|---|---|
+| ISF path untouched with an ISF plugin selected | `<iframe>` count 0; neither Milkdrop chunk requested; `vizOk`; screen non-black (plasma, mean luma 148) |
+| Milkdrop renders | frame `sandbox` attribute is exactly `allow-scripts`; `vizOk`; `xwd` of the X screen (not WebGL readback) shows a real preset (looked at it: yellow/orange geometry on black); frames advancing, render p50 6-8 ms / p95 9-14 ms **under llvmpipe** |
+| PCM reaches the frame | frame's own `recv` counter 179 -> 261 in 1.5 s; the loud-vs-silent picture difference was printed but **not asserted** (presets animate on their own, so "PCM drives the picture" is unproven here) |
+| Opacity | computed CSS opacity 0.5 applied; opacity 0 -> screen back to black (lit fraction 0.0) |
+| Bad presets | invalid JSON, a syntax error in the equations, and a preset with no `shapes`/`waves` each produce a `vizError` (`stage: compile`, with the engine's message), which is what the panel and `cuemark.log` show; a bad preset after a good one leaves the good one rendering; a bad *first* preset shows nothing and reports the error |
+| ISF <-> Milkdrop churn | 60 and 120 round trips (120 / 240 switches), all `vizOk`, frame count back to 0. WebKitWebProcess RSS **before -> after: 357 -> 372 MB (+15) at 60, 356 -> 374 MB (+17) at 120** (mid-run peaks 440-550 MB with a live frame, sawtooth, not a ramp); ISF-only control arm 553 -> 556 MB (+2) over 120. The dev arm read +69 MB at 60 (Vite module state included; not chased) |
+
+**NOT verified.**
+- **The real production build.** The `tauri` scheme here is registered by the probe, not by
+  wry, and `cargo tauri build` was not run (no launcher build/deploy). Whether wry's `tauri://`
+  handler treats a `srcdoc` sandboxed frame the same is untested; expected to, since `srcdoc`
+  involves no navigation, but only a production build settles it.
+- **Live listening / a real audio-reactive look.** No audio device, no real deck, no Tauri:
+  the control-window half (`vizPcm` gate -> `viz_set_listening` -> `audio-pcm` -> `pcm` field)
+  is unit-tested and phase-5a-soaked but was not run together with the frame. **Nobody heard or
+  watched a preset react to music.**
+- **The auto-cycle in the running app.** `stepCycle`/`nextPresetId`/`tickAutoCycle` are unit-
+  tested (bars fire exactly on the wrap tick; no-grid, paused and bpm-0 fall back to seconds;
+  a manual pick restarts the interval), but the `App.svelte` call site was only type-checked,
+  and the "changes on a beat" claim is by construction, not by ear or by watching the grid.
+- **GPU frame budget on the projector, and the MacBook Pro.** The 6-8 ms is software GL on
+  the N150 under Xvfb. The `crocus` machine was not run. The 1280x720 buffer is a guess.
+- **`viz_list_plugins`/`viz_read_plugin` end to end through Tauri IPC** (only the pure Rust
+  functions are tested), the panel UI rendering (only type-checked), preset-pack scale (a
+  1000-preset folder: list latency, hot-reload polling cost), and multi-hour behaviour of the
+  frame (a stalled or lost GL context is reported as a `vizError` but never auto-recovered;
+  the `cuemark:vizQuarantine` idea in "Hazards" still does not exist for either format).
+- **Preset compatibility.** Only 8 of the Minimal pack's presets ran; a preset whose GLSL
+  `warp`/`comp` fails to compile inside Butterchurn was not tried, and Butterchurn may fall
+  back silently rather than throw, which would still show as a picture with no error.
+
+**Risks.** Presets are arbitrary JS run in the sandbox: it blocks parent DOM and Tauri IPC
+(spike-verified), not CPU burn or an infinite loop in `frame_eqs`, which freezes the *output
+window's* thread (the freeze-watchdog would reload it, and the `hello` resend would load the
+same preset again: the reload-loop hazard has no guard for Milkdrop). Peak memory with a live
+frame is ~+100-190 MB over ISF.
+
 ### Phase 7: metadata-driven selection (joins `track-visual-override.md`)
 
 - Fetch mood/genre tags from Digger when a track loads (the endpoint exists in Digger; see
@@ -698,4 +806,5 @@ and auto-cycle changes presets on a beat.
    the simplest version is a `viz_set_listening(bool)` command driven by that liveness, and the
    appsink callback returns early when it's false.
 5. Preset-pack licensing for anything cuemark might ever ship or link to (see "Preset
-   formats"). Not blocking: packs are user-supplied.
+   formats"). Not blocking: packs are user-supplied. `butterchurn` itself (MIT) is a
+   dependency since phase 6; `butterchurn-presets` (MIT package, unlicensed presets) is not.
