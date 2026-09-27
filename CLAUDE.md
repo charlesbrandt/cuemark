@@ -532,8 +532,11 @@ feedback loop now.
 keeps float precision) — animations restart on every switch.
 
 **Milkdrop (phase 6, 2026-09-26, headless-verified only)**: presets are Butterchurn JSON files in
-`<plugins>/milkdrop/` (id `milkdrop/<file>.json`; user-supplied, no pack is bundled: the presets
-have no per-preset licence). The output window runs them in a `sandbox="allow-scripts"`
+`<plugins>/milkdrop/` (id `milkdrop/<file>.json`; user-supplied, no pack is bundled **in the
+repo** — the presets have no per-preset licence, so they're fetched per-machine into the local
+app-data folder instead; see `skills/visualizations/SKILL.md` for sources and the drop-in
+procedure, and that folder's own `SOURCES.md` for what's actually on a given machine). The
+output window runs them in a `sandbox="allow-scripts"`
 `srcdoc` iframe stacked above the compositor canvas (`lib/renderer/milkdrop/`), because preset
 equations are `new Function` JS and this window has Tauri IPC. PCM comes from the phase-5a
 tap (`pluginWantsPcm` is true for Milkdrop); opacity is CSS opacity; Butterchurn and the frame
@@ -542,8 +545,12 @@ are lazy and cost nothing until a preset is picked. Params `blendTime`, `cycleMo
 Result" in the design doc, including what was **not** verified (production build, listening,
 projector GPU).
 
-**UI**: `src/components/VisualizationPanel.svelte` (built-ins, discovered plugins with error
-badges and thumbnails, Milkdrop preset picker + blend/auto-cycle, Rescan, opacity), toggled from the toolbar.
+**UI**: `src/components/VisualizationPanel.svelte` — one grouped dropdown (Built-in / Plugins /
+Milkdrop, `vizPicker.ts`'s `buildVizOptionGroups`) replaced the earlier button-chip row plus a
+separate Milkdrop-only `<select>` (2026-09-27); a "⚠" suffix flags any errored option, and a
+single preview thumbnail beside the dropdown shows the current selection (per-row thumbnails
+don't fit in a native `<select>`). Plus Milkdrop's blend/auto-cycle controls, Rescan, opacity,
+toggled from the toolbar.
 
 ## Active architecture plan (2026-07-25)
 
@@ -680,6 +687,7 @@ needed — don't load them on every session.
 | `digger-integration` | Digger API endpoints, WebSocket queue updates, cuemark/Digger boundary rules |
 | `perf-log-reading` | Investigating a performance regression or reading a `[poll-stats]`/`[deliver-tel]`/`[scrub-deliver]` log dump |
 | `tuning-knobs` | A feature is running and correct but *feels* wrong live, or a shipped fix reads as "not working" — which constant to reach for, its live symptom, and which ones are known traps |
+| `visualizations` | Sourcing/downloading ISF shaders or Milkdrop presets, troubleshooting a plugin that renders black or errors, or explaining the picker's Built-in/Plugins/Milkdrop groups |
 
 Several automated test scripts build on `verify-ui`'s setup (tauri-driver + Xvfb +
 `VITE_ENABLE_DEBUG_HOOK=1`). **`docs/scripts-reference.md` is the full index** — which

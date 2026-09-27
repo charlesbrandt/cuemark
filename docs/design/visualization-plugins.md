@@ -5,10 +5,20 @@ good live, Phase 3 judged live ("a bit muted", `fft-bars` visibly reacts). Phase
 hot reload, image inputs) **verified headless on mele** ("Result 2026-09-26, late" item C), not
 yet judged by the user. **Follow-ups 1-3 DONE** (IMPORTED warning, missing-plugin fallback,
 `inMixOut`/`liked` removed from the binding vocabulary; see "Follow-up result 2026-09-26").
-**Phase 6 BUILT 2026-09-26, headless-verified only** (see "Phase 6 → Result": not heard, not
-seen on a projector, not run in a production build). Phase 6 iframe spike: PASS. Output-window **RSS creep reproduced but
-unattributed** (not viz-specific, no fix); the **6 s output stall after selecting particles/scope
-was not reproduced** in 402 selections. Phases 5-7 not started. Still open: `beatPhase`/`bpm`
+**Phase 5a (PCM tap) BUILT 2026-09-26, headless-verified only** (see "Phase 5a → Result": tap
+gated behind `viz_set_listening`+a plugin declaring an `audio` input, 600 s soak clean, not
+heard live). **Phase 6 (Milkdrop) BUILT 2026-09-26, headless-verified only** (see "Phase 6 →
+Result": not heard, not seen on a projector, not run in a production build until 2026-09-27's
+build, which succeeded — see that section). Phase 6 iframe spike: PASS. Output-window **RSS
+creep reproduced but unattributed** (not viz-specific, no fix); the **6 s output stall after
+selecting particles/scope was not reproduced** in 402 selections. **External plugin/preset
+content** (real ISF shaders + Milkdrop presets, sourced 2026-09-27) now exists per-machine in
+`~/.local/share/com.cuemark.app/visualizations/` — never in this repo; see
+`skills/visualizations/SKILL.md` for sourcing, licensing and the drop-in procedure, and that
+folder's own `SOURCES.md` for what a given machine actually has. The first ISF batch
+under-selected (picked from a stale pre-phase-4 worktree that wrongly assumed no multipass/
+image-input support); re-running it against the full source repo is open follow-up work.
+Phase 7 not started. Still open: `beatPhase`/`bpm`
 live judgement, params persistence across restart and MIDI (Phase 2, uncovered), `inMixOut`/`liked` (need a real source; see
 "Cuemark bindings"). Scope was decided with the user in conversation: build on **ISF** and
 **Milkdrop** (via Butterchurn); **no arbitrary JS plugins**. Richer and controllable
@@ -732,6 +742,23 @@ case minus Tauri's own protocol handler.** 25 checks each, 8 real presets from t
 - **Preset compatibility.** Only 8 of the Minimal pack's presets ran; a preset whose GLSL
   `warp`/`comp` fails to compile inside Butterchurn was not tried, and Butterchurn may fall
   back silently rather than throw, which would still show as a picture with no error.
+
+#### Addendum (2026-09-27): production build + real shipped-preset sample
+
+**Production build now done.** `cargo tauri build` succeeded end to end (release binary
+produced). First attempt failed — `butterchurn` was in `package-lock.json` from the phase-6
+merge but missing from `node_modules` (a merge landed the lockfile entry without an `npm
+install` having run against it); `npm install` fixed it, no code change needed. Still not
+run: the launcher/deploy step itself, and this only proves the bundle *builds*, not the wry
+`tauri://` + `srcdoc` combination live (that's still the untested item above).
+
+**A real preset-library sample was verified against the actual shipped content**, not just
+the Minimal pack: `milkdrop_output_window_probe.py --presets
+~/.local/share/com.cuemark.app/visualizations/milkdrop --mode dev` (the 100-file library
+sourced from `butterchurn-presets`, see `skills/visualizations/SKILL.md`) — all 21 checks
+PASS on the first two presets (alphabetical), including PCM reactivity, opacity, and both
+bad-preset error paths. Still only 2 of 100 exercised at runtime; the rest rest on the
+structural `baseVals` check alone (see the skill for how to sample more).
 
 **Risks.** Presets are arbitrary JS run in the sandbox: it blocks parent DOM and Tauri IPC
 (spike-verified), not CPU burn or an infinite loop in `frame_eqs`, which freezes the *output

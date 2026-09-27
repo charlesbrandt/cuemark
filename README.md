@@ -126,6 +126,21 @@ Developed for the **Hercules DJControl Starlight** USB MIDI controller. Plug in 
 launching — MIDI is detected at startup. See `CLAUDE.md` for the full control map and
 calibration instructions.
 
+## Visualizations
+
+Five built-in shaders ship with the app. For more, cuemark reads ISF (Interactive Shader
+Format) shaders and Milkdrop/Butterchurn presets from a per-machine folder — **never from the
+repo**, since community preset packs typically carry unclear per-file licenses:
+
+```
+~/.local/share/com.cuemark.app/visualizations/
+```
+
+Drop a `.fs` shader (or a folder with its image assets) or a `milkdrop/*.json` preset in
+there, hit **Rescan** in the Visualization panel, and pick it from the dropdown. See
+`skills/visualizations/SKILL.md` for known sources, license notes, the exact preset format
+Milkdrop needs, and how to verify a batch actually works before trusting it.
+
 ## Architecture
 
 See [`CLAUDE.md`](CLAUDE.md) for a full description of the rendering pipeline, data model,
