@@ -37,12 +37,13 @@ to finish right now.
 | Doc | What's open |
 |---|---|
 | [`audio-dropout-mid-playback.md`](audio-dropout-mid-playback.md) | D1 (10.8s mid-track silence): never reproduced on demand. ⚠️ The doc explicitly warns against closing this on "haven't heard it in a while" grounds — nothing in the pipeline can detect brief clipping, only >1s hard silence or starvation, so "no reports" and "fixed" are nearly independent claims here. |
+| [`viz-panel-and-settings-restyle.md`](viz-panel-and-settings-restyle.md) | Phase 1 (picker + layer column) built and headless-verified 2026-09-27; not yet looked at by the user. Phases 2–4 (toolbar split control, Settings tabs restyle, auto-visualize wiring) not started. Auto-visualize *behaviour* lives in `track-visual-override.md`. Mockups on a claude.ai design canvas linked in the doc. |
 | [`button-to-audio-latency.md`](button-to-audio-latency.md) | Exploration only, nothing built. Open decisions listed at the tail. |
 | [`cross-platform-windows-mac.md`](cross-platform-windows-mac.md) | Not started. Guidance-only doc for a future port. |
 | [`preroll-latency.md`](preroll-latency.md) | Design only, nothing built — direct follow-on from `queue-prefetch-cache.md`'s phase-1 gate. |
 | [`sink-clock-stall.md`](sink-clock-stall.md) | Open (2026-09-26). Decks silent, or audio delayed by minutes, after the output graph idles; shared `GstPulseSinkClock` stalls/steps. Mechanism proposed (H1), not proven; instrumentation (§6) and clock-pinning fix (§5) next. Includes a corrected reading of the gdb stacks. |
 | [`scratch-feeder-underruns.md`](scratch-feeder-underruns.md) | Open, not yet investigated. |
-| [`track-visual-override.md`](track-visual-override.md) | Design only (2026-09-20), nothing built. Per-deck viz / alternate video per track, stored in Digger. |
+| [`track-visual-override.md`](track-visual-override.md) | Design only, nothing built. **2026-09-27: now also holds auto-visualize** ("Automatic fallback": no-video/still-image tracks drive the global layer, louder deck decides; approved and can ship before any Digger work; still-image detection unprobed). **Design updated 2026-09-26 to the ISF `pluginId` model, and Digger now owns storage** — this doc is the cuemark presentation half (per-deck viz / alternate video per deck, the render path, missing-plugin degradation). Schema, visual-content search, pairing history and the precedence rule live in `digger/docs/design/visual-library.md`, which carries the open decisions that need the user. |
 
 ## 🟡 Partially resolved — core work is done, something specific remains
 

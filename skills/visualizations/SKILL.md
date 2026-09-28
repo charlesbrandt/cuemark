@@ -43,6 +43,13 @@ error banner and `cuemark.log` (`[viz] …` / `[output] visualization <id> faile
 Per-row thumbnails don't fit in a native `<select>`, so there's one small preview image beside
 the dropdown showing the *current* selection instead.
 
+⚠️ **Being replaced** (design approved 2026-09-27, `docs/design/viz-panel-and-settings-restyle.md`):
+a custom thumbnail picker with two groups only (Milkdrop / Shaders; built-ins folded into
+Shaders), a global Layer column, and auto-visualize (behaviour spec in
+`docs/design/track-visual-override.md` "Automatic fallback"). Check that doc before extending this
+`<select>`. If a screenshot still shows rows of buttons instead of a dropdown, the running
+app is a stale pre-`8e748bf` build, not the current code.
+
 ## Adding ISF plugins
 
 **Format**: ISF (Interactive Shader Format) `.fs` files — a JSON header block (`INPUTS`,
