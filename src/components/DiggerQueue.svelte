@@ -42,6 +42,10 @@
   // this same laptop for offline/travel use. Free-text input stays available below
   // for anything else (e.g. a Tailscale address).
   const DIGGER_PRESETS = {
+    // Per-install default — override in the settings panel (the persisted URL in
+    // localStorage wins). This repo is public, so this is a working default for the
+    // maintainer's setup, not a documented address (see
+    // skills/digger-integration/SKILL.md).
     Home: 'http://10.20.2.99:8200',
     Local: 'http://localhost:8200',
   } as const;
