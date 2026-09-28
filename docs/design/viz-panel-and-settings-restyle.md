@@ -1,7 +1,7 @@
 # Visualization panel overhaul and settings restyle (UI)
 
-**Status (2026-09-28): Phases 1–2 (picker + layer column, toolbar split control) built and
-headless-verified on `mele`; phases 3–4 not started.** The mockups are a claude.ai design canvas:
+**Status (2026-09-28): Phases 1–3 (picker + layer column, toolbar split control, Settings
+tabs restyle) built and headless-verified on `mele`; phase 4 not started.** The mockups are a claude.ai design canvas:
 https://claude.ai/artifact/F2eBGJ3geKm8q6ZyTLPxTk (private to the owner). Every decision
 below comes from the user, or from a proposal the user saw and didn't object to. Nothing
 here needs another design pass. Build from this doc.
@@ -42,6 +42,37 @@ field). Headless-verified end to end on `mele`: toggle-off preserves both `plugi
 `visualizationOpacity` (confirmed across a full off→on cycle), toolbar and panel toggles stay
 in sync, opacity slider syncs between toolbar and panel, zero `[output] visualization ...
 failed` lines. Not yet looked at by the user on the real app.
+
+**Phase 3 (2026-09-28)**: Settings tabs restyled to the phase-1 visual language and split per
+the doc's ask. `ControlsSettings.svelte` (Tempo/Jog/Platter/Mixer sliders) shed its Auto Mix,
+Auto Preload, Beatmatch and Display sections into two new tabs: `AutoDjSettings.svelte` (also
+gained the "last minute of a track" strip — a read-only `$derived` timeline, no new store,
+right-anchored at track end, with Preload/Mix-start/Fade markers computed as percentages of
+`max(preloadSec, mixStartSec, fadeSec) * 1.15`) and `DisplaySettings.svelte` (just the
+font-scale slider, intentionally sparse). `SettingsPanel.svelte` now lists **Audio · Controls ·
+Auto DJ · MIDI · Record · Display**. Every tab: `<select>`s for a short fixed set of options
+became segmented pill-button rows, checkboxes became pill-button switches (`.switch`/`.on`,
+same shape as phase 1/2's `.on-air`/`.viz-split-toggle`), paragraph-length `.hint-inline` text
+became a short `.source-hint` one-liner with the full original wording moved to `title=""`
+(every fact preserved, none dropped), sliders got larger `tabular-nums` readouts, Snapcast
+network targets in `AudioSettings.svelte` became bordered cards, and MIDI's unmapped rows in
+`MidiMonitor.svelte` got an amber (`var(--accent-queue)`) left-border highlight. Accent
+throughout is `var(--accent-deck)` (`#7c8cff`), never a hardcoded hex. Pure restyle — no store,
+range, default, or Tauri-command changed; one real pre-existing bug was caught and fixed along
+the way (the Mixer-sliders switch's `onclick` was calling `setCompactControls` with its own
+current value, a no-op — now correctly inverts).
+
+Built via four parallel subagents (one per file/split), two of which were interrupted mid-task
+by a session rate limit and needed a second pass to finish (`MidiMonitor.svelte`'s hint/amber
+work, `ControlsSettings`' actual file split — the trimmed `ControlsSettings.svelte` itself had
+already landed cleanly before the interruption). `npm run check`/`npm test` clean throughout
+(299 files/3713 tests). Headless-verified end to end on `mele`: all 6 tabs render and switch
+cleanly, Tempo/Jog segmented buttons and the Mixer-sliders switch drive their real stores (the
+compactControls bug fix confirmed live, both directions), the Auto DJ strip's markers move
+live with the sliders, Beatmatch correctly shows/hides the drift-back row, Display's slider
+live-scales the UI font, MIDI mounts/unmounts cleanly (0 unmapped rows during the run, so the
+amber styling itself wasn't visually exercised), Record's format pills and controls work with
+no real recording started. Not yet looked at by the user on the real app.
 
 ## The ask (user, 2026-09-27)
 
@@ -107,7 +138,9 @@ Palette: the app's existing tokens (`src/app.css`), cyan `#7ec8e3` for viz, deck
 2. **Toolbar split control.** Needs a real on/off that keeps opacity. Today "off" =
    `visualization: null`, which loses the pluginId. Add something like a
    `Session.visualizationEnabled` field (types.ts plus a `bootRestore` migration).
-3. **Settings restyle**, one tab per commit. Frontend only.
+3. **Settings restyle**, one tab per commit *in principle* — shipped 2026-09-28 as one
+   combined commit instead, since splitting `ControlsSettings.svelte` into three tabs
+   couldn't be cleanly separated from restyling the pieces it produced. Frontend only.
 4. **Auto-visualize**: build it per `track-visual-override.md` "Automatic fallback" (a
    still-image probe first, then `autoViz.ts`), and wire it to the auto strip and badges
    designed here.

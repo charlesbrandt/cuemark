@@ -7,10 +7,12 @@
    */
   import AudioSettings from "./AudioSettings.svelte";
   import ControlsSettings from "./ControlsSettings.svelte";
+  import AutoDjSettings from "./AutoDjSettings.svelte";
   import MidiMonitor from "./MidiMonitor.svelte";
   import RecordPanel from "./RecordPanel.svelte";
+  import DisplaySettings from "./DisplaySettings.svelte";
 
-  type Tab = "audio" | "controls" | "midi" | "record";
+  type Tab = "audio" | "controls" | "autodj" | "midi" | "record" | "display";
   let tab = $state<Tab>("audio");
 </script>
 
@@ -18,8 +20,10 @@
   <div class="settings-tabs">
     <button class:active={tab === "audio"} onclick={() => (tab = "audio")}>Audio</button>
     <button class:active={tab === "controls"} onclick={() => (tab = "controls")}>Controls</button>
+    <button class:active={tab === "autodj"} onclick={() => (tab = "autodj")}>Auto DJ</button>
     <button class:active={tab === "midi"} onclick={() => (tab = "midi")}>MIDI</button>
     <button class:active={tab === "record"} onclick={() => (tab = "record")}>Record</button>
+    <button class:active={tab === "display"} onclick={() => (tab = "display")}>Display</button>
   </div>
 
   <!-- {#if}, not CSS display:none — MidiMonitor's onMount/onDestroy is what flips the Rust
@@ -29,10 +33,14 @@
     <AudioSettings />
   {:else if tab === "controls"}
     <ControlsSettings />
+  {:else if tab === "autodj"}
+    <AutoDjSettings />
   {:else if tab === "midi"}
     <MidiMonitor />
-  {:else}
+  {:else if tab === "record"}
     <RecordPanel />
+  {:else}
+    <DisplaySettings />
   {/if}
 </div>
 

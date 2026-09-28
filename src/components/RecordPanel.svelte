@@ -80,25 +80,29 @@
 <div class="record-panel">
   <span class="settings-title">Record</span>
 
+  <span class="group-label">Destination</span>
   <div class="settings-row">
-    <span class="row-label">Folder</span>
     {#if $recordingsDir}
       <span class="rec-path" title={$recordingsDir}>{$recordingsDir}</span>
-      <button class="fmt-btn" disabled={$isRecording} onclick={chooseFolder}>Change</button>
-      <button class="fmt-btn" disabled={$isRecording} onclick={() => recordingsDir.set("")}>Clear</button>
+      <button class="action-btn" disabled={$isRecording} onclick={chooseFolder}>Change</button>
+      <button class="action-btn" disabled={$isRecording} onclick={() => recordingsDir.set("")}>Clear</button>
     {:else}
-      <span class="rec-path rec-unset">not set — Start will prompt each time</span>
-      <button class="fmt-btn" disabled={$isRecording} onclick={chooseFolder}>Choose…</button>
+      <span class="source-hint" title="No folder configured — Start will open a save dialog every time">
+        Not set — Start will prompt each time
+      </span>
+      <button class="action-btn" disabled={$isRecording} onclick={chooseFolder}>Choose…</button>
     {/if}
   </div>
 
-  <div class="settings-row">
+  <span class="group-label">Format</span>
+  <div class="settings-row quick-row">
     {#each FORMATS as f}
       <button
-        class="fmt-btn"
-        class:fmt-active={$recordFormat === f.id}
+        class="quick-btn"
+        class:active={$recordFormat === f.id}
         disabled={$isRecording || starting}
         onclick={() => recordFormat.set(f.id)}
+        title={f.id === "flac" ? "Lossless, larger files" : "Small files, lossy — both mux into Ogg, so a crash mid-recording still leaves a playable file"}
       >{f.label}</button>
     {/each}
   </div>
@@ -114,6 +118,7 @@
     />
   </div>
 
+  <span class="group-label">Status</span>
   <div class="settings-row">
     {#if !$isRecording}
       <button class="record-btn start" disabled={starting} onclick={handleStart}>
@@ -125,7 +130,7 @@
         {stopping ? "Stopping…" : "■ Stop Recording"}
       </button>
       <span class="rec-indicator">● REC</span>
-      <span class="rec-elapsed">{elapsed}</span>
+      <span class="rec-elapsed-big">{elapsed}</span>
     {/if}
   </div>
 
@@ -180,32 +185,66 @@
     min-width: 50px;
   }
 
-  .fmt-btn {
+  .group-label {
     font-family: var(--font-heading);
-    font-weight: 600;
-    padding: 5px 10px;
+    font-weight: 800;
+    color: color-mix(in srgb, var(--text) 55%, transparent);
+    letter-spacing: 0.08em;
+    font-size: calc(10px * var(--font-scale));
+    text-transform: uppercase;
+    margin-top: 4px;
+  }
+
+  .quick-row {
+    gap: 4px;
+  }
+
+  .quick-btn {
+    height: 26px;
+    padding: 0 10px;
+    border-radius: 5px;
+    font-family: var(--font-heading);
+    font-weight: 700;
     font-size: calc(11px * var(--font-scale));
-    background: var(--surface2);
     border: 1px solid var(--divider);
-    border-radius: var(--radius-sm);
+    background: var(--surface2);
     color: color-mix(in srgb, var(--text) 55%, transparent);
     cursor: pointer;
   }
 
-  .fmt-btn:hover:not(:disabled) {
+  .quick-btn:hover:not(:disabled) {
     border-color: #e04040;
     color: #e04040;
   }
 
-  .fmt-btn:disabled {
+  .quick-btn:disabled {
     cursor: not-allowed;
     opacity: 0.6;
   }
 
-  .fmt-btn.fmt-active {
+  .quick-btn.active {
     background: #e04040;
     border-color: #e04040;
     color: #fff;
+  }
+
+  .action-btn {
+    font-family: var(--font-body);
+    font-size: calc(11px * var(--font-scale));
+    background: var(--surface2);
+    border: 1px solid var(--divider);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    padding: 3px 8px;
+    cursor: pointer;
+  }
+  .action-btn:hover:not(:disabled) {
+    border-color: #e04040;
+    color: #e04040;
+  }
+  .action-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
   }
 
   .notes-input {
@@ -267,9 +306,11 @@
     51%, 100% { opacity: 0.25; }
   }
 
-  .rec-elapsed {
+  .rec-elapsed-big {
     font-variant-numeric: tabular-nums;
-    color: color-mix(in srgb, var(--text) 70%, transparent);
+    font-weight: 700;
+    font-size: calc(20px * var(--font-scale));
+    color: var(--text);
   }
 
   .rec-preview,
@@ -282,8 +323,9 @@
     max-width: 480px;
   }
 
-  .rec-unset {
-    font-style: italic;
+  .source-hint {
+    color: color-mix(in srgb, var(--text) 45%, transparent);
+    font-size: calc(10px * var(--font-scale));
   }
 
   .rec-error {

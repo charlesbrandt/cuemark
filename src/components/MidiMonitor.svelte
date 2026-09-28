@@ -122,6 +122,9 @@
   let midiSlots = $derived($session.midiMapping[activeProfileId] ?? []);
   let midiLeft = $derived(midiSlots[0] ?? decks[0]?.id ?? "");
   let midiRight = $derived(midiSlots[1] ?? decks[1]?.id ?? "");
+  let activeProfileName = $derived(
+    controllers.find((c) => c.profile_id === activeProfileId)?.profile_name ?? activeProfileId
+  );
 
   const hex2 = (v: number) => v.toString(16).toUpperCase().padStart(2, "0");
 
@@ -325,7 +328,7 @@
   </div>
 
   {#if savedPath}
-    <div class="settings-row"><span class="row-label"></span><span class="hint-inline">saved → {savedPath}</span></div>
+    <div class="settings-row"><span class="row-label"></span><span class="source-hint">saved → {savedPath}</span></div>
   {/if}
   {#if saveError}
     <div class="settings-row"><span class="row-label"></span><span class="mm-warn">{saveError}</span></div>
@@ -336,7 +339,7 @@
     {#if portError}
       <span class="mm-warn">{portError}</span>
     {:else if ports.length === 0}
-      <span class="hint-inline">no MIDI input ports — is the controller plugged in?</span>
+      <span class="source-hint">no MIDI input ports — is the controller plugged in?</span>
     {:else}
       {#each ports as p (p.name)}
         <span class="mm-port" class:live={p.connected}>{p.name}{p.connected ? " ●" : ""}</span>
@@ -345,10 +348,10 @@
   </div>
   <div class="settings-row">
     <span class="row-label"></span>
-    <span class="hint-inline">
-      ● = the port cuemark opened. A port listed without it is enumerating but unclaimed —
-      cuemark connects to one port, chosen by name at startup, and does not rescan.
-    </span>
+    <span
+      class="source-hint"
+      title="cuemark connects to one port, chosen by name at startup, and does not rescan. A port listed without ● is enumerating but unclaimed."
+    >● = the port cuemark opened at startup (name-matched, no rescan)</span>
   </div>
 
   <div class="settings-row">
@@ -372,12 +375,15 @@
       {/each}
     </select>
     {#if controllers.length > 0}
-      <span class="hint-inline">
-        editing {controllers.find((c) => c.profile_id === activeProfileId)?.profile_name ?? activeProfileId}
-        {#if controllers.length > 1}(other live controllers use default slot routing){/if}
-      </span>
+      <span
+        class="source-hint"
+        title="Editing {activeProfileName}.{controllers.length > 1 ? ' Other live controllers stay on this profile’s default slot routing — this panel edits one controller’s slots at a time.' : ''}"
+      >editing {activeProfileName}{controllers.length > 1 ? " (+others, default routing)" : ""}</span>
     {:else}
-      <span class="hint-inline">no controller connected — showing default routing</span>
+      <span
+        class="source-hint"
+        title="No controller connected — deck routing above falls back to default slot-i → decks[i] mapping (session.ts) until one is detected."
+      >no controller connected — default routing</span>
     {/if}
   </div>
 
@@ -409,7 +415,7 @@
   {:else}
     <div class="settings-row">
       <span class="row-label"></span>
-      <span class="hint-inline">Move a control on the controller — every message shows up here, mapped or not.</span>
+      <span class="source-hint">Move a control on the controller — every message shows up here, mapped or not.</span>
     </div>
   {/if}
 
@@ -468,9 +474,9 @@
     font-size: calc(10px * var(--font-scale));
   }
 
-  .hint-inline {
-    color: color-mix(in srgb, var(--text) 40%, transparent);
-    font-style: italic;
+  .source-hint {
+    color: color-mix(in srgb, var(--text) 45%, transparent);
+    font-size: calc(10px * var(--font-scale));
   }
 
   .mono {
@@ -539,7 +545,11 @@
   }
 
   .mm-row:nth-child(even) { background: color-mix(in srgb, var(--surface2) 40%, transparent); }
-  .mm-row.unmapped { color: color-mix(in srgb, var(--text) 65%, transparent); }
+  .mm-row.unmapped {
+    color: color-mix(in srgb, var(--text) 65%, transparent);
+    border-left: 3px solid var(--accent-queue);
+    padding-left: 5px;
+  }
 
   .vals, .mapped, .mm-guess {
     overflow: hidden;
@@ -559,6 +569,10 @@
     padding: 4px 8px;
     font-size: calc(11px * var(--font-scale));
   }
-  .mm-tail-row.unmapped { color: color-mix(in srgb, var(--text) 55%, transparent); }
+  .mm-tail-row.unmapped {
+    color: color-mix(in srgb, var(--text) 55%, transparent);
+    border-left: 3px solid var(--accent-queue);
+    padding-left: 5px;
+  }
   .mm-tail-map { color: var(--accent-deck); margin-left: 12px; }
 </style>

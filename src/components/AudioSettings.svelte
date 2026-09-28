@@ -131,26 +131,26 @@
   {:else if devices.length === 0}
     <span class="hint">No audio sinks found — is PipeWire/PulseAudio running?</span>
   {:else}
+    <span class="subsection-label">Main output</span>
     <div class="settings-row">
-      <span class="row-label">Main</span>
-      <div class="device-checks">
-        <label class="device-check">
-          <input
-            type="checkbox"
-            checked={$mainOutputDeviceIds.includes("")}
-            onchange={(e) => toggleMainDevice("", e.currentTarget.checked)}
-          />
+      <div class="switch-row">
+        <button
+          class="switch-pill"
+          class:on={$mainOutputDeviceIds.includes("")}
+          aria-pressed={$mainOutputDeviceIds.includes("")}
+          onclick={() => toggleMainDevice("", !$mainOutputDeviceIds.includes(""))}
+        >
           Default{defaultLabel ? ` (${defaultLabel})` : ""}
-        </label>
+        </button>
         {#each devices as d (d.id)}
-          <label class="device-check">
-            <input
-              type="checkbox"
-              checked={$mainOutputDeviceIds.includes(d.id)}
-              onchange={(e) => toggleMainDevice(d.id, e.currentTarget.checked)}
-            />
+          <button
+            class="switch-pill"
+            class:on={$mainOutputDeviceIds.includes(d.id)}
+            aria-pressed={$mainOutputDeviceIds.includes(d.id)}
+            onclick={() => toggleMainDevice(d.id, !$mainOutputDeviceIds.includes(d.id))}
+          >
             {d.label}
-          </label>
+          </button>
         {/each}
       </div>
     </div>
@@ -164,6 +164,7 @@
       </div>
     {/if}
 
+    <span class="subsection-label">Cue</span>
     <div class="settings-row">
       <span class="row-label">🎧</span>
       <select bind:value={$cueOutputDeviceId}>
@@ -172,16 +173,16 @@
           <option value={d.id}>{d.label}</option>
         {/each}
       </select>
-      <span class="hint-inline">volume moved to the toolbar's Headphone Volume slider</span>
     </div>
+    <span class="source-hint">Volume moved to the toolbar's Headphone Volume slider.</span>
   {/if}
 
   <!--
     Outside the device-enumeration {#if} on purpose: a network target must stay addable when
     there are no local sinks at all, which is exactly the machine most likely to need one.
   -->
+  <span class="subsection-label">Network targets</span>
   <div class="settings-row">
-    <span class="row-label">Net</span>
     <div class="net-outputs">
       <input class="net-host" placeholder="snapcast host" bind:value={newHost} />
       <input class="net-port" placeholder="port" bind:value={newPort} />
@@ -190,29 +191,31 @@
     </div>
   </div>
   {#if addError}
-    <div class="settings-row"><span class="row-label"></span><span class="error">{addError}</span></div>
+    <div class="settings-row"><span class="error">{addError}</span></div>
   {/if}
 
   {#each $networkOutputs as n (n.id)}
-    <div class="settings-row">
-      <span class="row-label"></span>
-      <label class="device-check">
-        <input
-          type="checkbox"
-          checked={$mainOutputDeviceIds.includes(n.id)}
-          onchange={(e) => setStreaming(n.id, e.currentTarget.checked)}
-        />
-        Stream
-      </label>
-      <span class="net-chip">{n.label}</span>
-      <span class="side-label">{n.id.replace("snapcast://", "")}</span>
-      {#if $outputAttachStatus[n.id] && !$outputAttachStatus[n.id].ok}
-        <span class="net-error" title={$outputAttachStatus[n.id].message ?? ""}>
-          ⚠ not connected
-        </span>
-      {/if}
-      <label class="device-check">
-        delay
+    <div class="net-card">
+      <div class="net-card-head">
+        <button
+          class="switch-pill"
+          class:on={$mainOutputDeviceIds.includes(n.id)}
+          aria-pressed={$mainOutputDeviceIds.includes(n.id)}
+          onclick={() => setStreaming(n.id, !$mainOutputDeviceIds.includes(n.id))}
+        >
+          Stream
+        </button>
+        <span class="net-chip">{n.label}</span>
+        <span class="side-label">{n.id.replace("snapcast://", "")}</span>
+        {#if $outputAttachStatus[n.id] && !$outputAttachStatus[n.id].ok}
+          <span class="net-error" title={$outputAttachStatus[n.id].message ?? ""}>
+            ⚠ not connected
+          </span>
+        {/if}
+        <button class="net-remove" title="Remove {n.id}" onclick={() => removeNetworkOutput(n.id)}>✕</button>
+      </div>
+      <div class="net-card-row">
+        <span class="row-label">Delay</span>
         <input
           class="net-port"
           type="number"
@@ -221,22 +224,18 @@
           value={n.latencyMs ?? 0}
           oninput={(e) => setLatency(n.id, e.currentTarget.value)}
         />
-        ms
-      </label>
-      <button class="net-remove" title="Remove {n.id}" onclick={() => removeNetworkOutput(n.id)}>✕</button>
+        <span class="side-label">ms</span>
+      </div>
     </div>
   {/each}
 
   {#if $networkOutputs.length > 0}
-    <div class="settings-row">
-      <span class="row-label"></span>
-      <span class="hint-inline">
-        delay = the server's own end-to-end buffer (Snapcast's <code>buffer</code> setting)
-        plus its client delay — how late the room hears it. It only moves the video when the
-        network target is <em>first</em> in Main; list the booth monitor first to keep video
-        synced to the booth. Tune by ear, it applies live.
-      </span>
-    </div>
+    <span
+      class="source-hint"
+      title="delay = the server's own end-to-end buffer (Snapcast's buffer setting) plus its client delay — how late the room hears it. It only moves the video when the network target is first in Main; list the booth monitor first to keep video synced to the booth. Tune by ear, it applies live."
+    >
+      Delay compensates for Snapcast's own buffering (hover for the full rule) — list the booth monitor first in Main to keep video synced.
+    </span>
   {/if}
 
 </div>
@@ -264,6 +263,16 @@
     text-transform: uppercase;
   }
 
+  .subsection-label {
+    font-family: var(--font-heading);
+    font-weight: 800;
+    color: color-mix(in srgb, var(--text) 55%, transparent);
+    letter-spacing: 0.08em;
+    font-size: calc(10px * var(--font-scale));
+    text-transform: uppercase;
+    margin-top: 4px;
+  }
+
   .settings-row {
     display: flex;
     align-items: center;
@@ -289,9 +298,9 @@
     font-style: italic;
   }
 
-  .hint-inline {
-    color: color-mix(in srgb, var(--text) 40%, transparent);
-    font-style: italic;
+  .source-hint {
+    color: color-mix(in srgb, var(--text) 45%, transparent);
+    font-size: calc(10px * var(--font-scale));
   }
 
   .error {
@@ -299,24 +308,30 @@
     font-style: italic;
   }
 
-  .device-checks {
+  .switch-row {
     display: flex;
-    gap: 10px;
+    gap: 8px;
     flex-wrap: wrap;
   }
 
-  .device-check {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    color: var(--text);
+  .switch-pill {
+    height: 26px;
+    padding: 0 12px;
+    border-radius: 13px;
+    font-family: var(--font-body);
+    font-size: calc(11px * var(--font-scale));
+    font-weight: 700;
+    border: 1px solid var(--divider);
+    background: transparent;
+    color: color-mix(in srgb, var(--text) 55%, transparent);
     cursor: pointer;
     white-space: nowrap;
   }
 
-  .device-check input[type="checkbox"] {
-    accent-color: var(--accent-deck);
-    cursor: pointer;
+  .switch-pill.on {
+    border-color: var(--accent-deck);
+    background: var(--accent-deck);
+    color: var(--bg);
   }
 
   .net-outputs {
@@ -347,6 +362,28 @@
     cursor: help;
   }
 
+  .net-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 10px;
+    border: 1px solid var(--divider);
+    border-radius: var(--radius-sm);
+  }
+
+  .net-card-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .net-card-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
   .net-remove,
   .net-add {
     background: none;
@@ -360,6 +397,7 @@
   .net-remove {
     border: none;
     padding: 0 2px;
+    margin-left: auto;
   }
 
   .net-remove:hover,
