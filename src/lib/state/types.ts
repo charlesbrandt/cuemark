@@ -170,6 +170,11 @@ export interface Session {
   effects: Effect[];      // global post-process chain
   visualization: Visualization | null; // global layer, composited above all decks
   visualizationOpacity: number;        // 0–1 — how it blends over the deck output
+  // Whether the layer is actually live, distinct from which plugin is picked. Toggling
+  // this off no longer clears `visualization` (pre-2026-09-28 "off" was `visualization:
+  // null`, which lost the pluginId) — the toolbar/panel's OFF state keeps the selection
+  // and opacity, it just stops shipping the plugin/opacity to the output window.
+  visualizationEnabled: boolean;
   // Which audio feeds the visualization's CUEMARK_BIND analysis: 'mix' (max across decks),
   // 'cue' (headphone-cued decks), or 'deck:<deck.id>'. Analysis is pre-EQ. Invariant: a
   // 'deck:<id>' value names an existing deck — removeDeck() resets it to 'mix'. Old snapshots

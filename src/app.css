@@ -183,6 +183,50 @@ body {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.25; }
 }
+/* Toolbar visualization split control (docs/design/viz-panel-and-settings-restyle.md):
+   VIZ on/off toggle + opacity + panel-open arrow, one visual unit. Cyan is the doc's
+   viz accent, distinct from the amber Auto DJ/queue accent and the record-toggle red. */
+.viz-split {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  background: var(--surface2);
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.viz-split-toggle,
+.viz-split-open {
+  font-family: var(--font-heading);
+  font-weight: 600;
+  font-size: calc(12px * var(--font-scale));
+  letter-spacing: 0.02em;
+  padding: 7px 10px;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  cursor: pointer;
+}
+.viz-split-toggle:hover,
+.viz-split-open:hover { color: #7ec8e3; }
+.viz-split.live .viz-split-toggle {
+  background: #7ec8e3;
+  color: var(--on-accent);
+  font-weight: 800;
+}
+.viz-split-open.active {
+  background: color-mix(in srgb, #7ec8e3 25%, transparent);
+}
+.viz-split-opacity {
+  width: 70px;
+  accent-color: #7ec8e3;
+}
+.viz-split-pct {
+  font-size: calc(11px * var(--font-scale));
+  color: color-mix(in srgb, var(--text) 60%, transparent);
+  padding: 0 8px 0 4px;
+  min-width: 30px;
+}
 .master-vol {
   display: flex;
   align-items: center;

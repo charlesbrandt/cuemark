@@ -50,6 +50,7 @@ const initial: Session = {
   effects: [],
   visualization: null,
   visualizationOpacity: 0.5,
+  visualizationEnabled: true,
   vizAudioSource: 'mix',
 };
 
@@ -251,6 +252,11 @@ export function setVisualizationParams(patch: Record<string, number | number[] |
 
 export function setVisualizationOpacity(value: number) {
   session.update((s) => ({ ...s, visualizationOpacity: value }));
+}
+
+/** Toggle the layer live without touching which plugin is selected. See `Session.visualizationEnabled`. */
+export function setVisualizationEnabled(enabled: boolean) {
+  session.update((s) => ({ ...s, visualizationEnabled: enabled }));
 }
 
 /** 'mix' | 'cue' | 'deck:<deck.id>' — see Session.vizAudioSource. */

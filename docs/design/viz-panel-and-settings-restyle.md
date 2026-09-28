@@ -1,7 +1,7 @@
 # Visualization panel overhaul and settings restyle (UI)
 
-**Status (2026-09-27): Phase 1 (picker + layer column) built and headless-verified on
-`mele`; phases 2–4 not started.** The mockups are a claude.ai design canvas:
+**Status (2026-09-28): Phases 1–2 (picker + layer column, toolbar split control) built and
+headless-verified on `mele`; phases 3–4 not started.** The mockups are a claude.ai design canvas:
 https://claude.ai/artifact/F2eBGJ3geKm8q6ZyTLPxTk (private to the owner). Every decision
 below comes from the user, or from a proposal the user saw and didn't object to. Nothing
 here needs another design pass. Build from this doc.
@@ -23,6 +23,25 @@ disk plugins + 5 built-ins = 137, 0 build errors, matching the picker's own coun
 (off is still `setVisualization(null)` under the hood) — the real persisted field is
 phase 2's job; this is an interim UX that round-trips correctly within one session but
 not across a reload. Not yet looked at by the user on the real projector.
+
+**Phase 2 (2026-09-28)**: added the real `Session.visualizationEnabled: boolean` (`types.ts`,
+default `true`; `bootRestore.ts` migrates both boot paths with `?? true`, same pattern as
+`vizAudioSource`). Off no longer nulls `Session.visualization` — it now only gates whether
+the resolved plugin payload/opacity/params are shipped to the output window and whether
+audio routing + Milkdrop auto-cycle run (`App.svelte`'s frame loop, `vizLive` = visualization
+present AND enabled); the plugin itself stays warmly resolved via `activeVizPayload()`
+throughout, so toggling back on is instant, no shader recompile. `VisualizationPanel.svelte`'s
+ON AIR toggle now drives the real field (the old `lastViz` component-local cache is gone);
+picking a plugin from the Source picker while off also flips `visualizationEnabled` true
+(otherwise picking a shader while off would silently do nothing visible). Toolbar's single
+"Visualization" button became the `.viz-split` control (`App.svelte`): VIZ toggle (cyan
+`#7ec8e3` when live), mini opacity slider + `%`, and a ▾ that opens/closes the panel — same
+store as the panel, so either one dragging the slider updates the other live. `npm run
+check`/`npm test` clean (230 files/3713 tests, 3 fixture literals needed the new required
+field). Headless-verified end to end on `mele`: toggle-off preserves both `pluginId` and
+`visualizationOpacity` (confirmed across a full off→on cycle), toolbar and panel toggles stay
+in sync, opacity slider syncs between toolbar and panel, zero `[output] visualization ...
+failed` lines. Not yet looked at by the user on the real app.
 
 ## The ask (user, 2026-09-27)
 

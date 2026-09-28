@@ -104,6 +104,7 @@ async function setup() {
       effects: [],
       visualization: null,
       visualizationOpacity: 0.5,
+      visualizationEnabled: true,
       ...overrides,
     };
     sessionMod.session.set(s);

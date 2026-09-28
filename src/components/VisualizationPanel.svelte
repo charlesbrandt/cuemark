@@ -1,6 +1,5 @@
 <script lang="ts">
-  import { session, setVisualization, setVisualizationOpacity, setVisualizationParams, setVizAudioSource } from "../lib/state/session";
-  import type { Visualization } from "../lib/state/types";
+  import { session, setVisualization, setVisualizationOpacity, setVisualizationEnabled, setVisualizationParams, setVizAudioSource } from "../lib/state/session";
   import { BUILTIN_ISF } from "../lib/renderer/isf/builtins";
   import { diskPlugins, vizErrors, vizWarnings, vizFallback, refreshPluginList, mediaUrl, pluginName, activeInputs, isMilkdropId, DEFAULT_VIZ_ID } from "../lib/viz/vizPlugins";
   import { cycleConfig, CYCLE_OFF, CYCLE_SECONDS, CYCLE_BARS, DEFAULT_BLEND_SECONDS } from "../lib/viz/vizCycle";
@@ -44,18 +43,17 @@
     selectedId ? ($vizErrors[selectedId] ?? $diskPlugins.find((p) => p.id === selectedId)?.error) : null,
   );
 
-  // Layer: on/off distinct from opacity. Off is still `visualization: null` under the hood
-  // (Session.visualizationEnabled — a real persisted flag that keeps the pluginId while off —
-  // is phase 2, docs/design/viz-panel-and-settings-restyle.md). This component-local cache is
-  // just enough to make the ON AIR toggle round-trip within one session.
-  let lastViz = $state<Visualization | null>(null);
-  let live = $derived(visualization !== null);
+  // Layer: on/off distinct from opacity, and distinct from which plugin is selected.
+  // `Session.visualizationEnabled` (phase 2, docs/design/viz-panel-and-settings-restyle.md)
+  // persists both the pluginId and the opacity while off — toggling no longer nulls
+  // `visualization` the way it did in phase 1.
+  let live = $derived($session.visualizationEnabled && visualization !== null);
   function toggleLive() {
     if (live) {
-      lastViz = visualization;
-      setVisualization(null);
+      setVisualizationEnabled(false);
     } else {
-      setVisualization(lastViz ?? { pluginId: DEFAULT_VIZ_ID, params: {} });
+      if (!visualization) setVisualization({ pluginId: DEFAULT_VIZ_ID, params: {} });
+      setVisualizationEnabled(true);
     }
   }
   const quickPcts = [0, 25, 50, 75, 100];
@@ -76,6 +74,7 @@
 
   function select(pluginId: string | null) {
     setVisualization(pluginId === null ? null : { pluginId, params: {} });
+    if (pluginId !== null) setVisualizationEnabled(true);
   }
 
   // Moving between two Milkdrop presets keeps the blend/cycle params; every other transition —
@@ -83,6 +82,7 @@
   function selectViz(id: string | null) {
     if (id !== null && isMilkdropId(id) && milkdropActive) {
       setVisualization({ pluginId: id, params: { ...params } });
+      setVisualizationEnabled(true);
     } else {
       select(id);
     }

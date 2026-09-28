@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { get } from "svelte/store";
-  import { session, addDeck, updateDeck, setSnapToBeat, setVisualization } from "./lib/state/session";
+  import { session, addDeck, updateDeck, setSnapToBeat, setVisualization, setVisualizationOpacity, setVisualizationEnabled } from "./lib/state/session";
   import VisualizationPanel from "./components/VisualizationPanel.svelte";
   import { startMidiListener } from "./lib/midi/handler";
   import { syncHeadphoneCueLed, syncPlayLed, syncSyncLed } from "./lib/midi/ledSync";
@@ -21,7 +21,7 @@
   import { routeAudio, computeBindings, effectiveDeckGain, type DeckAudioSample, type RoutedAudio } from "./lib/viz/vizBindings";
   import { postFrame, takeResendRequest, releaseDeck, onVizReport, hasListener as outputHasListener, type DeckFrameSource } from "./lib/renderer/outputBus";
   import { startVizPcm, stopVizPcm, noteActivePlugin, latestPcm } from "./lib/viz/vizPcm";
-  import { activeVizPayload, startVizPluginSync, refreshPluginList, isMilkdropId, diskPlugins, vizErrors } from "./lib/viz/vizPlugins";
+  import { activeVizPayload, startVizPluginSync, refreshPluginList, isMilkdropId, diskPlugins, vizErrors, DEFAULT_VIZ_ID } from "./lib/viz/vizPlugins";
   import { tickAutoCycle, resetAutoCycle } from "./lib/viz/vizCycle";
   import DeckCard from "./components/DeckCard.svelte";
   import Crossfader from "./components/Crossfader.svelte";
@@ -68,6 +68,15 @@
   // its Rust raw-MIDI feed gate on tab switch — see its own doc comment, unchanged by this.
   let showSettings = $state(false);
   let showVisualizationPanel = $state(false);
+  let vizToolbarLive = $derived($session.visualizationEnabled && $session.visualization !== null);
+  function toggleToolbarViz() {
+    if (vizToolbarLive) {
+      setVisualizationEnabled(false);
+    } else {
+      if (!$session.visualization) setVisualization({ pluginId: DEFAULT_VIZ_ID, params: {} });
+      setVisualizationEnabled(true);
+    }
+  }
 
   // DJ selector — "who's on the decks" (docs/design/guest-djs.md in the digger
   // repo). Local input mirrors the persisted store; committed on Enter/blur/
@@ -762,7 +771,11 @@
     advanceSweep(sweepClockSec());
     try {
       if (rendererReady) {
-        const { decks, visualization, visualizationOpacity } = get(session);
+        const { decks, visualization, visualizationOpacity, visualizationEnabled } = get(session);
+        // The layer can hold a pluginId while switched off (Session.visualizationEnabled,
+        // phase 2 of viz-panel-and-settings-restyle.md) — only ship/animate/route audio for
+        // it while both are true, so OFF behaves exactly like the old `visualization: null`.
+        const vizLive = visualization !== null && visualizationEnabled;
         const timeSecs = performance.now() / 1000;
         // The output window asks for this when it opens or is reloaded. Forgetting what has
         // already been shipped makes every deck count as changed below, so a paused deck —
@@ -784,7 +797,7 @@
         const analysis: BandAnalysis = { bass, mid, high };
         let vizRouted: RoutedAudio | null = null;
         let vizBindingValues: Record<string, number> = { bass, mid, high };
-        if (visualization) {
+        if (visualization && visualizationEnabled) {
           const s = get(session);
           const xfIn = s.crossfaderTargets.includes('volume');
           const samples: DeckAudioSample[] = decks.map((d) => {
@@ -860,16 +873,18 @@
         // ride along per frame, never the plugin source (see outputProtocol.ts).
         // It keeps animating with every deck paused — the screensaver behaviour decided in
         // visualization-plugins.md. With the output window closed, postFrame() does nothing.
-        if (visualization) {
+        if (vizLive) {
           dirty = true;
         }
         // The plugin payload is resolved once per tick: it feeds both postFrame and the PCM
-        // gate (does the active plugin declare an `audio` input?).
-        const vizPayload = activeVizPayload();
+        // gate (does the active plugin declare an `audio` input?). Resolved from the pluginId
+        // regardless of `vizLive` (see startVizPluginSync) so it stays warm while switched
+        // off — only whether it's *shipped* is gated below.
+        const vizPayload = vizLive ? activeVizPayload() : null;
         noteActivePlugin(vizPayload);
         // Catch changes that don't come from per-frame video/visualization advancement:
         // opacity (crossfader), source swaps, deck add/remove, visualization toggle.
-        const sig = `${visualization ? visualizationOpacity : 0}|` +
+        const sig = `${vizLive ? visualizationOpacity : 0}|` +
           decks.map((d) => `${d.id}:${d.source?.type}:${d.opacity}`).join('|');
         if (sig !== lastFrameSig) {
           lastFrameSig = sig;
@@ -879,8 +894,8 @@
           postFrame({
             decks: outputDecks,
             vizPlugin: vizPayload,
-            vizOpacity: visualization ? visualizationOpacity : 0,
-            vizParams: visualization?.params ?? {},
+            vizOpacity: vizLive ? visualizationOpacity : 0,
+            vizParams: vizLive ? (visualization?.params ?? {}) : {},
             bindings: vizBindingValues,
             vizFft: vizRouted?.bands,
             pcm: latestPcm(),
@@ -934,11 +949,31 @@
       class:active={$showDiggerQueue}
       onclick={() => { showDiggerQueue.set(!$showDiggerQueue); }}
     >Queue</button>
-    <button
-      class="output-btn"
-      class:active={showVisualizationPanel}
-      onclick={() => { showVisualizationPanel = !showVisualizationPanel; }}
-    >Visualization</button>
+    <div class="viz-split" class:live={vizToolbarLive}>
+      <button
+        class="viz-split-toggle"
+        onclick={toggleToolbarViz}
+        title={vizToolbarLive ? "Turn visualization off" : "Turn visualization on"}
+      >VIZ</button>
+      <input
+        type="range"
+        min="0"
+        max="100"
+        step="1"
+        value={Math.round($session.visualizationOpacity * 100)}
+        oninput={(e) => setVisualizationOpacity(+e.currentTarget.value / 100)}
+        class="viz-split-opacity"
+        aria-label="Visualization opacity"
+        title="Visualization opacity"
+      />
+      <span class="viz-split-pct num">{Math.round($session.visualizationOpacity * 100)}%</span>
+      <button
+        class="viz-split-open"
+        class:active={showVisualizationPanel}
+        onclick={() => { showVisualizationPanel = !showVisualizationPanel; }}
+        title="Visualization settings"
+      >▾</button>
+    </div>
     <button class="output-btn" onclick={openOutputWindow}>Output Window</button>
     <button
       class="output-btn"

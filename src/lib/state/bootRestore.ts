@@ -108,6 +108,7 @@ export async function restoreSessionOnBoot(): Promise<BootRestoreResult> {
         }
       }
       restored.visualization = migrateVisualization(restored.visualization);
+      restored.visualizationEnabled ??= true;
       session.set(restored);
     } else if (recovery.snapshot) {
       // Not a recovery boot — no live pipeline to adopt, so decks stay at their fresh
@@ -160,6 +161,7 @@ export async function restoreSessionOnBoot(): Promise<BootRestoreResult> {
         compactControls: restored.compactControls ?? true,
         visualization: migrateVisualization(restored.visualization),
         visualizationOpacity: restored.visualizationOpacity,
+        visualizationEnabled: restored.visualizationEnabled ?? true,
         vizAudioSource: restored.vizAudioSource ?? 'mix',
       }));
       globalsRestoredFromSnapshot = true;

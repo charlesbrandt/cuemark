@@ -37,7 +37,7 @@ to finish right now.
 | Doc | What's open |
 |---|---|
 | [`audio-dropout-mid-playback.md`](audio-dropout-mid-playback.md) | D1 (10.8s mid-track silence): never reproduced on demand. ⚠️ The doc explicitly warns against closing this on "haven't heard it in a while" grounds — nothing in the pipeline can detect brief clipping, only >1s hard silence or starvation, so "no reports" and "fixed" are nearly independent claims here. |
-| [`viz-panel-and-settings-restyle.md`](viz-panel-and-settings-restyle.md) | Phase 1 (picker + layer column) built and headless-verified 2026-09-27; not yet looked at by the user. Phases 2–4 (toolbar split control, Settings tabs restyle, auto-visualize wiring) not started. Auto-visualize *behaviour* lives in `track-visual-override.md`. Mockups on a claude.ai design canvas linked in the doc. |
+| [`viz-panel-and-settings-restyle.md`](viz-panel-and-settings-restyle.md) | Phases 1–2 (picker + layer column, toolbar split control) built and headless-verified 2026-09-28; not yet looked at by the user. Phases 3–4 (Settings tabs restyle, auto-visualize wiring) not started. Auto-visualize *behaviour* lives in `track-visual-override.md`. Mockups on a claude.ai design canvas linked in the doc. |
 | [`button-to-audio-latency.md`](button-to-audio-latency.md) | Exploration only, nothing built. Open decisions listed at the tail. |
 | [`cross-platform-windows-mac.md`](cross-platform-windows-mac.md) | Not started. Guidance-only doc for a future port. |
 | [`preroll-latency.md`](preroll-latency.md) | Design only, nothing built — direct follow-on from `queue-prefetch-cache.md`'s phase-1 gate. |

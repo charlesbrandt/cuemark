@@ -56,6 +56,7 @@ function resetSession(decks: ReturnType<typeof baseDeck>[], midiMapping: Session
     effects: [],
     visualization: null,
     visualizationOpacity: 0.5,
+    visualizationEnabled: true,
   });
 }
 
