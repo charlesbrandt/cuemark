@@ -135,7 +135,7 @@ All four build-order steps landed. Three deviations from the plan above, each de
 
 **Before §1 is done:**
 - ✅ **Migration + backfill run against production 2026-09-20.** Deployed `2d69173` to
-  192.168.2.99, backed up first (`~/backups/digger/digger-20260920-150357.db.gz`, 100,023,501
+  [digger_ip], backed up first (`~/backups/digger/digger-20260920-150357.db.gz`, 100,023,501
   bytes, mirrored to T7), then `migrate.py` (step 54) and
   `importers/backfill_mix_points.py --execute`. Marker counts:
 
@@ -224,7 +224,7 @@ consumes *exactly that* rather than raw audio. So an envelope-only derivation:
 - can be **iterated on cheaply**: re-run over cached envelopes, re-score, adjust, repeat.
 
 **First thing to measure, before designing anything**: what fraction of the library actually
-has a `waveform_cache` row, on the **production** instance (192.168.2.99 — the local dev db is
+has a `waveform_cache` row, on the **production** instance ([digger_ip] — the local dev db is
 a different database with the same catalog and almost no analysis, see the
 `digger-integration` skill). If coverage is low, an envelope-only approach loses its advantage
 and the decision changes. One query; do not skip it.

@@ -425,7 +425,7 @@ Carried over from the beat-grid handoff spec (`todo.md`) once all five of its st
    if it doesn't hold up by ear, nothing else is worth starting.
 2. ~~**Digger trust rule** (root cause #2).~~ **Done 2026-08-23** — see the "fix that
    shipped" section above and `digger/docs/design/beat-grid-precision.md`. Not yet
-   deployed to the live Digger instance (192.168.2.99) or run against the real
+   deployed to the live Digger instance ([digger_ip]) or run against the real
    library — that doc's "Deployment"/"Rollout" sections cover what's left.
 3. **Quantized play**, beat-level first.
 4. **Phase lock (PLL).**

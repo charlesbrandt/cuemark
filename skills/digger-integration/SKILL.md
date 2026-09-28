@@ -54,8 +54,11 @@ from the offline-crate/travel scenario in the digger repo's `docs/design/offline
 covers Digger itself lacking the file). **`getDiggerFileUrl()` needs an absolute base URL** — it
 returns `undefined` for the dev-mode Vite proxy path (`/digger-api`), since that's relative and
 only resolvable in the browser, not from the separate Rust process. Set an absolute URL (e.g.
-`http://10.20.2.99:8200`) via the Home/Local toggle in `DiggerQueue.svelte` for this fallback to
-work.
+`http://[digger_ip]:8200`) via the Home/Local toggle in `DiggerQueue.svelte` for this fallback to
+work. **`[digger_ip]` is a token, not a real address** — this repo is public; the actual Digger
+host IP is tracked privately (see the `digger` skill), so point it at whatever host actually runs
+your Digger instance, and likewise adjust the `Home` preset in `DiggerQueue.svelte` for your own
+setup rather than shipping a real private IP in the repo.
 
 **Gotcha — a truncated remote fetch used to get cached as if it were complete, and then
 reused forever (FIXED 2026-08-28).** `ensure_cached()`'s remote-fetch branch used
@@ -237,8 +240,8 @@ in a separate language, not a shared module, and the two have already drifted on
 
 ⚠️ **Local dev Digger (this machine, port 8200 — what the Vite dev proxy's
 `/digger-api` target points at) is a different database from the live production
-instance (192.168.2.99), and this is already documented convention** — see the
-`digger` skill's "Important conventions" section ("192.168.2.99 is the only
+instance ([digger_ip]), and this is already documented convention** — see the
+`digger` skill's "Important conventions" section ("[digger_ip] is the only
 production instance") before assuming a local test proves anything about the real
 library. Concretely hit while building this feature: the local dev DB has the same
 track *catalog* as production (same row count) but had **zero** tracks with `bpm`
