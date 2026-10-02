@@ -1,6 +1,6 @@
 ---
 name: visualizations
-description: Adding external ISF shaders and Milkdrop/Butterchurn presets to cuemark's visualization layer — where they live, source packs and licensing, the drop-in + Rescan procedure, and how to headless-verify a batch before trusting it. Load when sourcing/downloading visualization content, troubleshooting a plugin that renders black or errors, or explaining the picker's Built-in/Plugins/Milkdrop groups.
+description: Adding external ISF shaders and Milkdrop/Butterchurn presets to cuemark's visualization layer — where they live, source packs and licensing, the drop-in + Rescan procedure, and how to headless-verify a batch before trusting it. Load when sourcing/downloading visualization content, troubleshooting a plugin that renders black or errors, or explaining the picker's Milkdrop/Shaders groups (built-ins tagged into Shaders, not their own group).
 ---
 
 # Cuemark visualizations — sourcing and adding external content
@@ -36,19 +36,22 @@ app) — the folder isn't watched live.
 
 ## The picker
 
-`VisualizationPanel.svelte` is one grouped `<select>` (`vizPicker.ts`'s
-`buildVizOptionGroups`): **Built-in** / **Plugins** (disk ISF) / **Milkdrop** (disk presets).
-A "⚠" suffix on any option means it has an error — hover for the message, or check the panel's
-error banner and `cuemark.log` (`[viz] …` / `[output] visualization <id> failed (<stage>): …`).
-Per-row thumbnails don't fit in a native `<select>`, so there's one small preview image beside
-the dropdown showing the *current* selection instead.
-
-⚠️ **Being replaced** (design approved 2026-09-27, `docs/design/viz-panel-and-settings-restyle.md`):
-a custom thumbnail picker with two groups only (Milkdrop / Shaders; built-ins folded into
-Shaders), a global Layer column, and auto-visualize (behaviour spec in
-`docs/design/track-visual-override.md` "Automatic fallback"). Check that doc before extending this
-`<select>`. If a screenshot still shows rows of buttons instead of a dropdown, the running
-app is a stale pre-`8e748bf` build, not the current code.
+`VisualizationPanel.svelte` (rebuilt 2026-09-27/28, `docs/design/viz-panel-and-settings-restyle.md`
+phases 1–3 — **not** a native `<select>` anymore) is three columns — **Layer** (global
+ON AIR/OFF + opacity), **Source**, **Settings for the selected plugin** — plus a toolbar
+split control (`App.svelte`'s `.viz-split`). The Source column is a custom popover picker
+(`vizPicker.ts`'s `buildVizPickerItems`/`groupPickerItems`/`filterPickerItems`) with a
+thumbnail per row, search, and **two groups only: Milkdrop and Shaders (ISF)** — the five
+built-ins are folded into Shaders with a small "built-in" tag, not their own group (the user
+considers them weak compared to sourced content). Filter chips: All / Milkdrop / Shaders /
+★ Favorites (`vizFavorites.ts`, `cuemark:vizFavorites`). A "⚠" suffix on any row means it has
+an error — hover for the message, or check the panel's error banner and `cuemark.log`
+(`[viz] …` / `[output] visualization <id> failed (<stage>): …`). If a screenshot shows a
+single grouped `<select>` or a row of plain button-chips instead of this popover, the running
+app is a stale pre-`07215b7` build, not current code — check `cuemark.log`'s `[build]`
+provenance line (`skills/run-app/SKILL.md`) before trusting a screenshot. Auto-visualize
+(behaviour spec in `docs/design/track-visual-override.md` "Automatic fallback") is phase 4,
+not yet built — the panel has no auto strip and the toolbar control has no AUTO state yet.
 
 ## Adding ISF plugins
 
@@ -78,7 +81,7 @@ follow-up work, not yet done.
    non-commercial one).
 2. Drop the `.fs` (or a folder, for one with `IMPORTED` image assets) into the visualizations
    folder.
-3. Rescan, then pick it in the dropdown. A build failure shows in the panel with the stage
+3. Rescan, then pick it from the Source popover. A build failure shows in the panel with the stage
    (`parse`/`compile`/`link`) and the exact GLSL error, plus a `cuemark.log` line — never a
    silent black layer.
 4. **Vetting a batch before shipping it**: there's no saved reusable probe for this yet (the
@@ -149,6 +152,8 @@ UI state, not per-preset.
 - `docs/design/visualization-plugins.md` — architecture, phase status, hazards, open
   follow-ups (dominant-deck routing for `inMixOut`/`liked`, the ISF batch-vet probe, live
   projector verification).
+- `docs/design/viz-panel-and-settings-restyle.md` — the current panel/toolbar UI (phases
+  1–3 shipped 2026-09-28), its build order, and the still-open phase 4 (auto-visualize).
 - `docs/scripts-reference.md` — `milkdrop_sandbox_iframe_probe.py` (Phase 6 feasibility spike)
   and `milkdrop_output_window_probe.py` (the end-to-end probe used above).
 - `skills/verify-ui/SKILL.md` — the tauri-driver + Xvfb headless setup these probes build on.

@@ -545,12 +545,19 @@ are lazy and cost nothing until a preset is picked. Params `blendTime`, `cycleMo
 Result" in the design doc, including what was **not** verified (production build, listening,
 projector GPU).
 
-**UI**: `src/components/VisualizationPanel.svelte` — one grouped dropdown (Built-in / Plugins /
-Milkdrop, `vizPicker.ts`'s `buildVizOptionGroups`) replaced the earlier button-chip row plus a
-separate Milkdrop-only `<select>` (2026-09-27); a "⚠" suffix flags any errored option, and a
-single preview thumbnail beside the dropdown shows the current selection (per-row thumbnails
-don't fit in a native `<select>`). Plus Milkdrop's blend/auto-cycle controls, Rescan, opacity,
-toggled from the toolbar.
+**UI**: `src/components/VisualizationPanel.svelte` — rebuilt (2026-09-28) to three columns
+(Layer / Source / per-plugin Settings) plus a toolbar split control (`App.svelte`'s
+`.viz-split`: VIZ toggle, mini opacity slider, ▾ opens the panel), replacing the single
+grouped-dropdown picker that itself had replaced an earlier button-chip row. The Source
+column is a custom popover (thumbnails, search, All/Milkdrop/Shaders/★Favorites filters,
+prev/next) rather than a native `<select>`, since a `<select>` can't show per-row
+thumbnails. `Session.visualizationEnabled` is a real persisted on/off flag, separate from
+which plugin is selected — turning the layer off keeps the pluginId and opacity, it only
+stops shipping/rendering them. Full rationale, build order and phase status:
+`docs/design/viz-panel-and-settings-restyle.md` — **read it before touching this panel,
+the toolbar control, or `Session.visualizationEnabled`.** That doc's phase 3 also restyled
+all six `SettingsPanel.svelte` tabs (Audio · Controls · Auto DJ · MIDI · Record · Display —
+Auto DJ and Display split out of the old Controls tab) to the same visual language.
 
 ## Active architecture plan (2026-07-25)
 
